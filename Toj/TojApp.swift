@@ -1,10 +1,3 @@
-//
-//  TojApp.swift
-//  Toj
-//
-//  Created by Muhammad Marufov on 7/2/26.
-//
-
 import SwiftUI
 
 @main

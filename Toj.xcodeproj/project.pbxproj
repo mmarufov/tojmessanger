@@ -6,13 +6,47 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A7237A13A5A375D4580965 /* TojTests.swift */; };
+		160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
+		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
+		3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */; };
+		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
+		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
+		E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		DA20B4300784965FDDE35BB9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 65F7816C2FF68D07000D35EE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 65F781732FF68D07000D35EE;
+			remoteInfo = Toj;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
+		13415778815A010ACF1EC8F6 /* Pods-TojTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TojTests.debug.xcconfig"; path = "Target Support Files/Pods-TojTests/Pods-TojTests.debug.xcconfig"; sourceTree = "<group>"; };
+		3DD0437071A3938BAE23617C /* Pods_TojTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_TojTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		4F8DF8F3E80AB4C80C4C67B0 /* Pods-Toj.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.debug.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.debug.xcconfig"; sourceTree = "<group>"; };
+		51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EnvelopeTests.swift; sourceTree = "<group>"; };
 		65F781742FF68D07000D35EE /* Toj.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Toj.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CryptoSpikeTests.swift; sourceTree = "<group>"; };
+		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
+		B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.release.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.release.xcconfig"; sourceTree = "<group>"; };
+		C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Toj.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		C675B0B03C30BD47406B7692 /* TojTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TojTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TojTests.release.xcconfig"; path = "Target Support Files/Pods-TojTests/Pods-TojTests.release.xcconfig"; sourceTree = "<group>"; };
+		F0C03914F0029DBF5289BE42 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackoffPolicyTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		65F781762FF68D07000D35EE /* Toj */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = Toj;
 			sourceTree = "<group>";
 		};
@@ -23,17 +57,64 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C5F3DFBA8645D758F2C61B83 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */,
+				A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		227E262CA0870AFCBC751B27 /* TojTests */ = {
+			isa = PBXGroup;
+			children = (
+				A6A7237A13A5A375D4580965 /* TojTests.swift */,
+				FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */,
+				51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */,
+				8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */,
+			);
+			name = TojTests;
+			path = TojTests;
+			sourceTree = "<group>";
+		};
+		23069261A8C1657CB5CB4AD3 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				85E79E9C0A40DFE9F527E2D0 /* iOS */,
+				C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */,
+				3DD0437071A3938BAE23617C /* Pods_TojTests.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		568303A52439F1F4CEE6D1B4 /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				4F8DF8F3E80AB4C80C4C67B0 /* Pods-Toj.debug.xcconfig */,
+				B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */,
+				C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */,
+				13415778815A010ACF1EC8F6 /* Pods-TojTests.debug.xcconfig */,
+			);
+			name = Pods;
+			path = Pods;
+			sourceTree = "<group>";
+		};
 		65F7816B2FF68D07000D35EE = {
 			isa = PBXGroup;
 			children = (
 				65F781762FF68D07000D35EE /* Toj */,
 				65F781752FF68D07000D35EE /* Products */,
+				23069261A8C1657CB5CB4AD3 /* Frameworks */,
+				227E262CA0870AFCBC751B27 /* TojTests */,
+				568303A52439F1F4CEE6D1B4 /* Pods */,
 			);
 			sourceTree = "<group>";
 		};
@@ -41,20 +122,50 @@
 			isa = PBXGroup;
 			children = (
 				65F781742FF68D07000D35EE /* Toj.app */,
+				C675B0B03C30BD47406B7692 /* TojTests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		85E79E9C0A40DFE9F527E2D0 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				F0C03914F0029DBF5289BE42 /* Foundation.framework */,
+			);
+			name = iOS;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		3AF456BBB488BAA1093F650B /* TojTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6D0CB8F875CD7010D1047A6C /* Build configuration list for PBXNativeTarget "TojTests" */;
+			buildPhases = (
+				358C10D6E26CA279A6FD6143 /* [CP] Check Pods Manifest.lock */,
+				28BAEDA83108696F47564874 /* Sources */,
+				C5F3DFBA8645D758F2C61B83 /* Frameworks */,
+				4BFB64BAF912FB67976FE149 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1DDEBC72031C7881FCE49AE9 /* PBXTargetDependency */,
+			);
+			name = TojTests;
+			productName = TojTests;
+			productReference = C675B0B03C30BD47406B7692 /* TojTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		65F781732FF68D07000D35EE /* Toj */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 65F7817F2FF68D08000D35EE /* Build configuration list for PBXNativeTarget "Toj" */;
 			buildPhases = (
+				42EB7108C05C63950FD80B9B /* [CP] Check Pods Manifest.lock */,
 				65F781702FF68D07000D35EE /* Sources */,
 				65F781712FF68D07000D35EE /* Frameworks */,
 				65F781722FF68D07000D35EE /* Resources */,
+				CE707EEF5DBF8CE6CAEF3F92 /* [CP] Embed Pods Frameworks */,
 			);
 			buildRules = (
 			);
@@ -64,8 +175,6 @@
 				65F781762FF68D07000D35EE /* Toj */,
 			);
 			name = Toj;
-			packageProductDependencies = (
-			);
 			productName = Toj;
 			productReference = 65F781742FF68D07000D35EE /* Toj.app */;
 			productType = "com.apple.product-type.application";
@@ -100,11 +209,19 @@
 			projectRoot = "";
 			targets = (
 				65F781732FF68D07000D35EE /* Toj */,
+				3AF456BBB488BAA1093F650B /* TojTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		4BFB64BAF912FB67976FE149 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		65F781722FF68D07000D35EE /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -114,7 +231,82 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		358C10D6E26CA279A6FD6143 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-TojTests-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		42EB7108C05C63950FD80B9B /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-Toj-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		CE707EEF5DBF8CE6CAEF3F92 /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Toj/Pods-Toj-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Toj/Pods-Toj-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Toj/Pods-Toj-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
+		28BAEDA83108696F47564874 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */,
+				2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */,
+				E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */,
+				CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		65F781702FF68D07000D35EE /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -124,7 +316,59 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		1DDEBC72031C7881FCE49AE9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = Toj;
+			target = 65F781732FF68D07000D35EE /* Toj */;
+			targetProxy = DA20B4300784965FDDE35BB9 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		244C12B54990E01FDEF0EA41 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 13415778815A010ACF1EC8F6 /* Pods-TojTests.debug.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Toj.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Toj";
+			};
+			name = Debug;
+		};
+		510EAE3CDD3D351F9BD1527A /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Toj.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Toj";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
 		65F7817D2FF68D08000D35EE /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -160,7 +404,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 8F69C3FG49;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -184,6 +427,7 @@
 				ONLY_ACTIVE_ARCH = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = complete;
 			};
 			name = Debug;
 		};
@@ -222,7 +466,6 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 8F69C3FG49;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -238,20 +481,20 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_STRICT_CONCURRENCY = complete;
 			};
 			name = Release;
 		};
 		65F781802FF68D08000D35EE /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = 4F8DF8F3E80AB4C80C4C67B0 /* Pods-Toj.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 8F69C3FG49;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -264,38 +507,38 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.mmarufov.Toj;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.Toj;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 26.5;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
 		};
 		65F781812FF68D08000D35EE /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 8F69C3FG49;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -308,24 +551,25 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.mmarufov.Toj;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.Toj;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 26.5;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
@@ -346,6 +590,15 @@
 			buildConfigurations = (
 				65F781802FF68D08000D35EE /* Debug */,
 				65F781812FF68D08000D35EE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6D0CB8F875CD7010D1047A6C /* Build configuration list for PBXNativeTarget "TojTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				510EAE3CDD3D351F9BD1527A /* Release */,
+				244C12B54990E01FDEF0EA41 /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
