@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# CocoaPods — Podfile.lock IS committed; the Pods dir is not
+Pods/
+
+# Conductor agent workspace
+.context/
+
+# Local agent context; keep public repos free of private project/security notes.
+CLAUDE.md
+
+# Server
+node_modules/
+*.log
+.env
