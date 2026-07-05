@@ -20,3 +20,8 @@ CLAUDE.md
 node_modules/
 *.log
 .env
+
+# Local-only build config — never commit real relay endpoints / infra / secrets
+*.local.xcconfig
+Local.xcconfig
+secrets.xcconfig
