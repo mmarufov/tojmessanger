@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "bun run server.ts",
+    "cloud": "bun run src/cloud.ts",
+    "migrate": "bun run src/migrate.ts",
     "test": "bun test"
   },
   "devDependencies": {
