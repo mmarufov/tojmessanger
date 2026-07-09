@@ -11,6 +11,7 @@
 		160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
 		3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */; };
+		3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
 		E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */; };
@@ -35,6 +36,7 @@
 		8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CryptoSpikeTests.swift; sourceTree = "<group>"; };
 		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
 		B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.release.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.release.xcconfig"; sourceTree = "<group>"; };
+		C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudLocalStoreTests.swift; sourceTree = "<group>"; };
 		C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Toj.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		C675B0B03C30BD47406B7692 /* TojTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TojTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TojTests.release.xcconfig"; path = "Target Support Files/Pods-TojTests/Pods-TojTests.release.xcconfig"; sourceTree = "<group>"; };
@@ -80,6 +82,7 @@
 				FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */,
 				51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */,
 				8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */,
+				C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */,
 			);
 			name = TojTests;
 			path = TojTests;
@@ -304,6 +307,7 @@
 				2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */,
 				E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */,
 				CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */,
+				3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

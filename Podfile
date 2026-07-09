@@ -8,6 +8,7 @@ ENV['LIBSIGNAL_FFI_PREBUILD_CHECKSUM'] = 'afac333d0ee6dd86786316bb8346d8dd61ca15
 
 target 'Toj' do
   pod 'LibSignalClient', git: 'https://github.com/signalapp/libsignal.git', tag: 'v0.96.4'
+  pod 'GRDB.swift/SQLCipher'
 
   target 'TojTests' do
     inherit! :search_paths

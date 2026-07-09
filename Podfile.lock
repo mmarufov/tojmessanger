@@ -1,8 +1,21 @@
 PODS:
+  - GRDB.swift/SQLCipher (6.24.1):
+    - SQLCipher (>= 3.4.2)
   - LibSignalClient (0.96.4)
+  - SQLCipher (4.10.0):
+    - SQLCipher/standard (= 4.10.0)
+  - SQLCipher/common (4.10.0)
+  - SQLCipher/standard (4.10.0):
+    - SQLCipher/common
 
 DEPENDENCIES:
+  - GRDB.swift/SQLCipher
   - LibSignalClient (from `https://github.com/signalapp/libsignal.git`, tag `v0.96.4`)
+
+SPEC REPOS:
+  trunk:
+    - GRDB.swift
+    - SQLCipher
 
 EXTERNAL SOURCES:
   LibSignalClient:
@@ -15,8 +28,10 @@ CHECKOUT OPTIONS:
     :tag: v0.96.4
 
 SPEC CHECKSUMS:
+  GRDB.swift: 136dcb5d8dddca50aae3ba7d77475f79e7232cd8
   LibSignalClient: 3f510b4274fccf02d365f51c3e06d18725d9fba1
+  SQLCipher: eb79c64049cb002b4e9fcb30edb7979bf4706dfc
 
-PODFILE CHECKSUM: 98db8b0ada581d7e916777b7fe3ff3e78317324c
+PODFILE CHECKSUM: 212a54f4606ac2e66dcda3f8f8df0e33d83d60f7
 
 COCOAPODS: 1.16.2
