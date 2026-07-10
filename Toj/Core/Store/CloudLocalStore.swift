@@ -60,7 +60,7 @@ actor CloudLocalStore {
         }
         do {
             return try CloudLocalStore(path: path, configuration: configuration)
-        } catch {
+        } catch let error as DatabaseError where error.resultCode == .SQLITE_NOTADB {
             try removeSQLiteFiles(at: path)
             return try CloudLocalStore(path: path, configuration: configuration)
         }
@@ -286,11 +286,21 @@ actor CloudLocalStore {
                             db,
                             dialogId: message.dialogId,
                             type: "direct",
-                            title: nil,
+                            title: update.dialogTitle,
                             lastMsgId: message.msgId,
                             updatedAt: message.serverTs
                         )
                         try upsertMessage(db, message: message, localState: "sent")
+                    case "dialog.created":
+                        guard let dialogId = update.dialogId else { continue }
+                        try upsertDialog(
+                            db,
+                            dialogId: dialogId,
+                            type: "direct",
+                            title: update.dialogTitle,
+                            lastMsgId: 0,
+                            updatedAt: nil
+                        )
                     case "read.updated":
                         guard
                             let dialogId = update.dialogId,
@@ -672,23 +682,17 @@ actor CloudLocalStore {
     }
 }
 
-private struct LocalDatabaseKeyStore {
-    private let service = "com.toj.cloud-db"
-    private let account = "sqlcipher-key"
+nonisolated struct LocalDatabaseKeyStore {
+    private let service: String
+    private let account: String
+
+    init(service: String = "com.toj.cloud-db", account: String = "sqlcipher-key") {
+        self.service = service
+        self.account = account
+    }
 
     func loadOrCreateKey() throws -> Data {
-        var query = baseQuery()
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, let data = item as? Data {
-            return data
-        }
-        if status != errSecItemNotFound {
-            throw KeychainError(status: status)
-        }
+        if let existing = try loadKey() { return existing }
 
         var bytes = [UInt8](repeating: 0, count: 32)
         let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
@@ -697,11 +701,27 @@ private struct LocalDatabaseKeyStore {
         }
 
         let data = Data(bytes)
-        query[kSecValueData as String] = data
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let addStatus = SecItemAdd(query as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw KeychainError(status: addStatus)
+        var addQuery = baseQuery()
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecSuccess { return data }
+        if addStatus == errSecDuplicateItem, let existing = try loadKey() {
+            return existing
+        }
+        throw KeychainError(status: addStatus)
+    }
+
+    private func loadKey() throws -> Data? {
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else {
+            throw KeychainError(status: status)
         }
         return data
     }

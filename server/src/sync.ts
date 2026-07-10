@@ -183,9 +183,18 @@ export async function getDifference(
   if (sincePts < n(st.pruned_through_pts)) return { kind: "difference_too_long", state: { pts: statePts } };
 
   const rows = await sql`
-    SELECT pts, type, dialog_id, msg_id, actor_account_id, data
-    FROM account_events WHERE account_id = ${accountId} AND pts > ${sincePts}
-    ORDER BY pts ASC LIMIT ${maxEvents}`;
+    SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
+           CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title
+    FROM account_events ae
+    LEFT JOIN dialogs d ON d.id = ae.dialog_id
+    LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
+    LEFT JOIN accounts peer ON peer.id = CASE
+      WHEN pair.account_low = ${accountId} THEN pair.account_high
+      WHEN pair.account_high = ${accountId} THEN pair.account_low
+      ELSE NULL
+    END
+    WHERE ae.account_id = ${accountId} AND ae.pts > ${sincePts}
+    ORDER BY ae.pts ASC LIMIT ${maxEvents}`;
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
@@ -195,13 +204,20 @@ export async function getDifference(
     if (ev.type === "message.new" || ev.type === "message.edited") {
       const message = await loadMessage(sql, ev.dialog_id, n(ev.msg_id));
       if (!message) {
-        update = { pts, ptsCount: 1, type: "message.missing", dialog_id: ev.dialog_id, msg_id: n(ev.msg_id) };
+        update = {
+          pts, ptsCount: 1, type: "message.missing", dialog_id: ev.dialog_id,
+          dialog_title: ev.dialog_title ?? undefined, msg_id: n(ev.msg_id),
+        };
       } else {
-        update = { pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id, message };
+        update = {
+          pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
+          dialog_title: ev.dialog_title ?? undefined, message,
+        };
       }
     } else {
       update = {
         pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
+        dialog_title: ev.dialog_title ?? undefined,
         msg_id: ev.msg_id ? n(ev.msg_id) : undefined,
         actor_account_id: ev.actor_account_id, ...eventData(ev.data),
       };
@@ -275,17 +291,33 @@ export async function getBootstrapDialogsPage(
 
   const rows = cursor
     ? await sql`
-        SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type, d.title, d.updated_at
+        SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
+               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               d.updated_at
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
+        LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
+        LEFT JOIN accounts peer ON peer.id = CASE
+          WHEN pair.account_low = ${accountId} THEN pair.account_high
+          WHEN pair.account_high = ${accountId} THEN pair.account_low
+          ELSE NULL
+        END
         WHERE bsd.snapshot_id = ${token}
           AND (bsd.sort_updated_at, bsd.dialog_id) < (${cursor.updatedAt}::timestamptz, ${cursor.dialogId}::uuid)
         ORDER BY bsd.sort_updated_at DESC, bsd.dialog_id DESC
         LIMIT ${limit + 1}`
     : await sql`
-        SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type, d.title, d.updated_at
+        SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
+               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               d.updated_at
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
+        LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
+        LEFT JOIN accounts peer ON peer.id = CASE
+          WHEN pair.account_low = ${accountId} THEN pair.account_high
+          WHEN pair.account_high = ${accountId} THEN pair.account_low
+          ELSE NULL
+        END
         WHERE bsd.snapshot_id = ${token}
         ORDER BY bsd.sort_updated_at DESC, bsd.dialog_id DESC
         LIMIT ${limit + 1}`;

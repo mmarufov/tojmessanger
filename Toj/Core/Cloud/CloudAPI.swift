@@ -30,6 +30,7 @@ struct CloudUpdate: Codable, Sendable {
     let ptsCount: Int64
     let type: String
     let dialogId: String?
+    let dialogTitle: String?
     let message: CloudMessage?
     let readerAccountId: String?
     let maxReadMsgId: Int64?
@@ -39,6 +40,7 @@ struct CloudUpdate: Codable, Sendable {
         case ptsCount
         case type
         case dialogId = "dialog_id"
+        case dialogTitle = "dialog_title"
         case message
         case readerAccountId = "reader_account_id"
         case maxReadMsgId = "max_read_msg_id"

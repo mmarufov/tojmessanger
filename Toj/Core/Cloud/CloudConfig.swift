@@ -4,8 +4,15 @@ nonisolated struct CloudConfig: Sendable {
     var baseURL: URL
 
     static var current: CloudConfig {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["TOJ_CLOUD_BASE_URL"], let url = URL(string: raw) {
+        resolve(environment: ProcessInfo.processInfo.environment, defaults: .standard)
+    }
+
+    static func resolve(environment: [String: String], defaults: UserDefaults) -> CloudConfig {
+        if let raw = environment["TOJ_CLOUD_BASE_URL"], let url = URL(string: raw) {
+            defaults.set(raw, forKey: "TOJ_CLOUD_BASE_URL")
+            return CloudConfig(baseURL: url)
+        }
+        if let raw = defaults.string(forKey: "TOJ_CLOUD_BASE_URL"), let url = URL(string: raw) {
             return CloudConfig(baseURL: url)
         }
         return CloudConfig(baseURL: URL(string: "http://127.0.0.1:8788")!)

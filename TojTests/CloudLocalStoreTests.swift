@@ -1,8 +1,42 @@
 import XCTest
 import GRDB
+import Security
 @testable import Toj
 
 final class CloudLocalStoreTests: XCTestCase {
+    func testCloudConfigPersistsInjectedURLForManualRelaunch() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let expected = try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+
+        let injected = CloudConfig.resolve(
+            environment: ["TOJ_CLOUD_BASE_URL": expected.absoluteString],
+            defaults: defaults
+        )
+        let restored = CloudConfig.resolve(environment: [:], defaults: defaults)
+
+        XCTAssertEqual(injected.baseURL, expected)
+        XCTAssertEqual(restored.baseURL, expected)
+    }
+
+    func testLocalDatabaseKeyPersistsAcrossLookups() throws {
+        let service = "com.toj.tests.cloud-db.\(UUID().uuidString)"
+        let account = "sqlcipher-key"
+        let store = LocalDatabaseKeyStore(service: service, account: account)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        defer { SecItemDelete(query as CFDictionary) }
+
+        let created = try store.loadOrCreateKey()
+        let loaded = try store.loadOrCreateKey()
+
+        XCTAssertEqual(loaded, created)
+    }
+
     @MainActor
     func testLocalStorePersistsSendReconcileAndDifference() async throws {
         let store = try makeStore()
@@ -77,6 +111,7 @@ final class CloudLocalStoreTests: XCTestCase {
             ptsCount: 1,
             type: "message.new",
             dialogId: dialogId,
+            dialogTitle: "Bob",
             message: remote,
             readerAccountId: nil,
             maxReadMsgId: nil
@@ -95,6 +130,7 @@ final class CloudLocalStoreTests: XCTestCase {
             ptsCount: 1,
             type: "read.updated",
             dialogId: dialogId,
+            dialogTitle: "Bob",
             message: nil,
             readerAccountId: peerId,
             maxReadMsgId: 1
@@ -125,6 +161,38 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDifferencePersistsDirectPeerTitle() async throws {
+        let store = try makeStore()
+        let accountId = "account-a"
+        let dialogId = "dialog-incoming"
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: DifferenceResponse.State(pts: 1),
+                updates: [
+                    CloudUpdate(
+                        pts: 1,
+                        ptsCount: 1,
+                        type: "dialog.created",
+                        dialogId: dialogId,
+                        dialogTitle: "Bob",
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil
+                    )
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let dialogs = try await store.dialogs()
+        XCTAssertEqual(dialogs.map(\.dialogId), [dialogId])
+        XCTAssertEqual(dialogs.map(\.title), ["Bob"])
+    }
+
+    @MainActor
     func testBootstrapPageDoesNotAdvancePtsUntilFinished() async throws {
         let store = try makeStore()
         let accountId = "account-a"
@@ -148,7 +216,7 @@ final class CloudLocalStoreTests: XCTestCase {
                 BootstrapDialog(
                     dialogId: dialogId,
                     type: "direct",
-                    title: nil,
+                    title: "Alice",
                     lastMsgId: 9,
                     updatedAt: "2026-07-09T00:00:09Z",
                     members: [
@@ -198,6 +266,7 @@ final class CloudLocalStoreTests: XCTestCase {
         let dialogs = try await store.dialogs()
         XCTAssertEqual(ptsAfterFinish, 44)
         XCTAssertEqual(latestDialogId, dialogId)
+        XCTAssertEqual(dialogs.first?.title, "Alice")
         XCTAssertEqual(dialogs.first?.lastText, "snapshot message")
     }
 
