@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct CloudRootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var model = CloudAppModel()
 
     var body: some View {
@@ -13,6 +14,10 @@ struct CloudRootView: View {
         }
         .task {
             await model.start()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
+            Task { await model.resume() }
         }
     }
 }

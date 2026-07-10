@@ -273,7 +273,7 @@ final class CloudAppModel {
     }
 
     private func afterSignIn() async {
-        guard let token = storedSession?.session.token, let accountId = storedSession?.session.accountId else { return }
+        guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
         do {
             pts = try await localStore?.loadPts(accountId: accountId) ?? 0
             await refreshDialogs()
@@ -284,14 +284,19 @@ final class CloudAppModel {
         } catch {
             pts = 0
         }
-        startHints(token: token)
+        await resume()
+    }
+
+    func resume() async {
+        guard let token = storedSession?.session.token else { return }
+        await startHints(token: token)
         scheduleSync()
         scheduleOutboxRetry()
     }
 
-    private func startHints(token: String) {
+    private func startHints(token: String) async {
         hintTask?.cancel()
-        Task { await hintSocket?.stop() }
+        await hintSocket?.stop()
 
         let socket = CloudHintSocket(url: api.config.wsURL(token: token))
         hintSocket = socket

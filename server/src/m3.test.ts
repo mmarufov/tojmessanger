@@ -36,7 +36,7 @@ async function resetDb() {
 
 async function makeAccount(phone: string, name: string) {
   const { code } = await startVerification(db, phone);
-  return await checkVerification(db, phone, code, "ios", name);
+  return await checkVerification(db, phone, code, "ios", "Test iPhone", name);
 }
 
 async function makePair() {
@@ -134,6 +134,10 @@ describe("M3 cloud sync", () => {
 
   test("bootstrap snapshot does not duplicate or swallow messages sent during onboarding", async () => {
     const { alice, bob, dialogId } = await makePair();
+    const aliceCreation = await getDifference(db, alice.accountId, 0);
+    const bobCreation = await getDifference(db, bob.accountId, 0);
+    expect(aliceCreation.updates.find((u) => u.type === "dialog.created")?.dialog_title).toBe("Bob");
+    expect(bobCreation.updates.find((u) => u.type === "dialog.created")?.dialog_title).toBe("Alice");
     await sendMessage(db, {
       senderAccountId: alice.accountId,
       senderDeviceId: alice.deviceId,
@@ -155,6 +159,7 @@ describe("M3 cloud sync", () => {
     const page = await getBootstrapDialogsPage(db, bob.accountId, bootstrap.token, { previewMessages: 10 });
     expect(page.state.pts).toBe(bootstrap.state.pts);
     expect(page.dialogs).toHaveLength(1);
+    expect(page.dialogs[0].title).toBe("Alice");
     expect(page.dialogs[0].messages.map((m) => m.text)).toEqual(["before snapshot"]);
 
     const diff = await getDifference(db, bob.accountId, bootstrap.state.pts);
