@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct CloudRootView: View {
+    private static let isRunningUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     @Environment(\.scenePhase) private var scenePhase
     @State private var model = CloudAppModel()
 
@@ -13,10 +14,11 @@ struct CloudRootView: View {
             }
         }
         .task {
+            guard !Self.isRunningUnitTests else { return }
             await model.start()
         }
         .onChange(of: scenePhase) { _, phase in
-            guard phase == .active else { return }
+            guard phase == .active, !Self.isRunningUnitTests else { return }
             Task { await model.resume() }
         }
     }
@@ -40,16 +42,24 @@ private struct CloudAuthView: View {
                     Button("Request code") {
                         Task { await model.requestCode() }
                     }
-                    .disabled(model.phone.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!model.canRequestCode)
+
+                    if model.authRequestInFlight {
+                        ProgressView("Sending code")
+                    } else if model.resendSeconds > 0 {
+                        Text("You can request another code in \(model.resendSeconds)s")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
 
                     if model.requestedCode {
                         TextField("Code", text: $model.code)
                             .textContentType(.oneTimeCode)
                             .keyboardType(.numberPad)
-                        Button("Sign in") {
+                        Button(model.authVerifyInFlight ? "Signing in…" : "Sign in") {
                             Task { await model.verifyCode() }
                         }
-                        .disabled(model.code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(!model.canVerifyCode)
                     }
                 }
 
@@ -67,6 +77,7 @@ private struct CloudAuthView: View {
 private struct CloudChatView: View {
     @Bindable var model: CloudAppModel
     @State private var path: [String] = []
+    @State private var showingDevices = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -108,6 +119,12 @@ private struct CloudChatView: View {
             }
             .navigationTitle(model.storedSession?.displayName.isEmpty == false ? model.storedSession?.displayName ?? "Toj" : "Toj")
             .toolbar {
+                Button {
+                    showingDevices = true
+                } label: {
+                    Image(systemName: "iphone.gen3")
+                }
+                .accessibilityLabel("Devices")
                 Button("Sign out") {
                     Task { await model.signOut() }
                 }
@@ -115,8 +132,189 @@ private struct CloudChatView: View {
             .navigationDestination(for: String.self) { dialogId in
                 CloudConversationView(model: model, dialogId: dialogId)
             }
+            .sheet(isPresented: $showingDevices) {
+                CloudDevicesView(model: model)
+            }
         }
     }
+}
+
+private struct CloudDevicesView: View {
+    @Bindable var model: CloudAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingDeletionWarning = false
+    @State private var showingDeletionCode = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if model.loadingDevices && model.devices.isEmpty {
+                    HStack {
+                        Spacer()
+                        ProgressView("Loading devices")
+                        Spacer()
+                    }
+                } else {
+                    ForEach(model.devices) { device in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Image(systemName: device.platform == "ios" ? "iphone" : "desktopcomputer")
+                                Text(device.deviceName.flatMap { $0.isEmpty ? nil : $0 } ?? device.platform.capitalized)
+                                    .font(.headline)
+                                if device.current {
+                                    Text("This device")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(lastSeenText(device))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            if !device.current {
+                                Button("Sign out", role: .destructive) {
+                                    Task { await model.revokeDevice(device) }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Section("Account") {
+                    Button("Delete Account", role: .destructive) {
+                        showingDeletionWarning = true
+                    }
+                    .disabled(model.accountDeletionInFlight)
+                }
+            }
+            .overlay {
+                if !model.loadingDevices && model.devices.isEmpty {
+                    ContentUnavailableView("No active devices", systemImage: "iphone.slash")
+                }
+            }
+            .navigationTitle("Devices")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                Button("Done") { dismiss() }
+            }
+            .task { await model.loadDevices() }
+            .refreshable { await model.loadDevices() }
+            .confirmationDialog(
+                "Delete your Toj account?",
+                isPresented: $showingDeletionWarning,
+                titleVisibility: .visible
+            ) {
+                Button("Request Deletion Code", role: .destructive) {
+                    Task {
+                        if await model.requestAccountDeletionCode() {
+                            showingDeletionCode = true
+                        }
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Your phone number, profile name, sessions, and push tokens will be erased. Messages already delivered remain in the other participants’ chat history.")
+            }
+            .sheet(isPresented: $showingDeletionCode) {
+                AccountDeletionView(model: model)
+            }
+        }
+    }
+
+    private func lastSeenText(_ device: CloudDevice) -> String {
+        let raw = device.lastSeenAt ?? device.createdAt
+        guard let date = ISO8601DateFormatter.toj.date(from: raw) else {
+            return "Activity time unavailable"
+        }
+        return "Active \(RelativeDateTimeFormatter.toj.localizedString(for: date, relativeTo: Date()))"
+    }
+}
+
+private struct AccountDeletionView: View {
+    @Bindable var model: CloudAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingFinalConfirmation = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("6-digit code", text: $model.accountDeletionCode)
+                        .keyboardType(.numberPad)
+                        .textContentType(.oneTimeCode)
+                    Button("Request New Code") {
+                        Task { _ = await model.requestAccountDeletionCode() }
+                    }
+                    .disabled(model.accountDeletionInFlight)
+                } header: {
+                    Text("Verification")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("For your security, account deletion requires a fresh verification code.")
+                        Text(model.status)
+                    }
+                }
+
+                Section {
+                    Button("Permanently Delete Account", role: .destructive) {
+                        showingFinalConfirmation = true
+                    }
+                    .disabled(model.accountDeletionInFlight || model.accountDeletionCode.filter(\.isNumber).count != 6)
+                } footer: {
+                    Text("This cannot be undone. You may register the same phone number later, but it creates a new account.")
+                }
+
+                if model.accountDeletionInFlight {
+                    HStack {
+                        Spacer()
+                        ProgressView("Deleting account")
+                        Spacer()
+                    }
+                }
+            }
+            .navigationTitle("Delete Account")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                Button("Cancel") {
+                    model.cancelAccountDeletion()
+                    dismiss()
+                }
+                    .disabled(model.accountDeletionInFlight)
+            }
+            .alert("Permanently delete account?", isPresented: $showingFinalConfirmation) {
+                Button("Delete Forever", role: .destructive) {
+                    Task {
+                        if await model.deleteAccount() { dismiss() }
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("All devices will be signed out and your identifying account data will be erased.")
+            }
+            .interactiveDismissDisabled(model.accountDeletionInFlight)
+            .onChange(of: model.storedSession == nil) { _, signedOut in
+                if signedOut { dismiss() }
+            }
+            .onDisappear { model.cancelAccountDeletion() }
+        }
+    }
+}
+
+private extension ISO8601DateFormatter {
+    static let toj: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+}
+
+private extension RelativeDateTimeFormatter {
+    static let toj: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
 }
 
 private struct CloudDialogRow: View {

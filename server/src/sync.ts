@@ -1,11 +1,13 @@
 import type { SQL } from "bun";
 import { seal, open, bodyAAD } from "./crypto";
+import { enqueuePushDeliveries } from "./push";
 
 export class SyncError extends Error {}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
-//   1 send_requests row → 2 direct_dialog_pairs → 3 dialogs row → 4 dialog_members
-//   → 5 messages → 6 account_sync_states (ascending account_id) → 7 account_events insert
+//   1 send_requests row → 2 accounts (ascending, FOR SHARE) → 3 direct_dialog_pairs
+//   → 4 dialogs row → 5 dialog_members → 6 messages → 7 account_sync_states (ascending account_id)
+//   → 8 account_events insert → 9 push_deliveries insert
 
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
@@ -44,6 +46,14 @@ async function requireActiveMember(sql: SQL, accountId: string, dialogId: string
   if (rows.length === 0) throw new SyncError("not a member of this dialog");
 }
 
+async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> {
+  const rows = await sql`
+    SELECT id FROM accounts
+    WHERE id = ${accountId} AND status IN ('active','limited')
+    FOR SHARE`;
+  if (rows.length === 0) throw new SyncError("account unavailable");
+}
+
 async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
   const r = (await sql`
     SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
@@ -68,6 +78,8 @@ export async function getOrCreateDirectDialog(sql: SQL, aId: string, bId: string
   if (aId === bId) throw new SyncError("cannot open a direct dialog with yourself");
   const [low, high] = aId < bId ? [aId, bId] : [bId, aId];
   return await sql.begin(async (tx) => {
+    await requireActiveAccount(tx, low);
+    await requireActiveAccount(tx, high);
     // Serialize the unordered pair before creating a dialog row. This preserves the B4 lock order
     // even though the FK means the direct_dialog_pairs row cannot exist before dialogs.id exists.
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`direct:${low}:${high}`}, 0))`;
@@ -125,6 +137,7 @@ export async function sendMessage(sql: SQL, p: {
       };
     }
 
+    await requireActiveAccount(tx, p.senderAccountId);
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
 
     // 3) allocate per-dialog msg_id
@@ -146,6 +159,12 @@ export async function sendMessage(sql: SQL, p: {
       const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${m.account_id} RETURNING pts`;
       const pts = n(upd[0].pts);
       await tx`INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id) VALUES (${m.account_id}, ${pts}, 'message.new', ${p.dialogId}, ${msgId}, ${p.senderAccountId})`;
+      await enqueuePushDeliveries(tx, {
+        accountId: m.account_id,
+        pts,
+        senderAccountId: p.senderAccountId,
+        sourceDeviceId: p.senderDeviceId,
+      });
       if (m.account_id === p.senderAccountId) senderPts = pts;
       pushes.push({ accountId: m.account_id, pts, ptsCount: 1 });
     }
@@ -401,6 +420,7 @@ export async function readHistory(sql: SQL, p: {
   accountId: string; dialogId: string; maxReadMsgId: number;
 }): Promise<{ dialogId: string; maxReadMsgId: number; pushes: Push[] }> {
   return await sql.begin(async (tx) => {
+    await requireActiveAccount(tx, p.accountId);
     await requireActiveMember(tx, p.accountId, p.dialogId);
     const member = (await tx`
       UPDATE dialog_members SET last_read_msg_id = ${p.maxReadMsgId}

@@ -4,6 +4,57 @@ import Security
 @testable import Toj
 
 final class CloudLocalStoreTests: XCTestCase {
+    func testAccountDeletionRequestUsesBearerAndPurposeCodeBody() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud")))
+        let api = CloudAPI(config: config, session: session)
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/account")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer session-token")
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: body) as? [String: String], ["code": "123456"])
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            ))
+            return (response, Data("{\"deleted\":true}".utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let response = try await api.deleteAccount(code: "123456", token: "session-token")
+        XCTAssertTrue(response.deleted)
+    }
+
+    func testAPNsDeviceTokenUsesLowercaseTwoDigitHex() {
+        let token = PushRegistrationCenter.hexadecimalToken(from: Data([0x00, 0x01, 0x0f, 0xa0, 0xff]))
+        XCTAssertEqual(token, "00010fa0ff")
+    }
+
+    func testPushActivationIsFrozenByDefault() {
+        XCTAssertFalse(PushRegistrationCenter.isEnabled)
+    }
+
+    func testCloudWebSocketURLDoesNotContainBearerToken() throws {
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud")))
+        let url = config.wsURL()
+        XCTAssertEqual(url.absoluteString, "wss://cloud.example.test/cloud/v1/ws")
+        XCTAssertNil(URLComponents(url: url, resolvingAgainstBaseURL: false)?.query)
+    }
+
+    func testPendingSessionRevocationTokenPersistsSeparately() async throws {
+        let store = TokenStore()
+        try? await store.clearPendingRevocationToken()
+        try await store.savePendingRevocationToken("test-revocation-token")
+        let loaded = try await store.loadPendingRevocationToken()
+        XCTAssertEqual(loaded, "test-revocation-token")
+        try await store.clearPendingRevocationToken()
+        let cleared = try await store.loadPendingRevocationToken()
+        XCTAssertNil(cleared)
+    }
+
     func testCloudConfigPersistsInjectedURLForManualRelaunch() throws {
         let suiteName = "CloudConfigTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
@@ -278,14 +329,46 @@ final class CloudLocalStoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
 
-        var configuration = Configuration()
-        configuration.prepareDatabase { db in
-            try db.usePassphrase("test-passphrase")
-        }
-
         return try CloudLocalStore(
             path: directory.appending(path: "cloud.sqlite").path,
-            configuration: configuration
+            key: Data("test-passphrase".utf8)
         )
     }
+}
+
+private final class CloudAPIMockURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    static func bodyData(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1_024)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count < 0 { return nil }
+            if count == 0 { break }
+            data.append(buffer, count: count)
+        }
+        return data
+    }
+
+    override func startLoading() {
+        do {
+            let handler = try XCTUnwrap(Self.handler)
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

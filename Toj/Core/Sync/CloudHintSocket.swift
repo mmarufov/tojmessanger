@@ -14,6 +14,7 @@ actor CloudHintSocket {
     }
 
     private let url: URL
+    private let token: String
     private let session: URLSession
     private var task: URLSessionWebSocketTask?
     private var runLoop: Task<Void, Never>?
@@ -23,8 +24,9 @@ actor CloudHintSocket {
     private let hintsContinuation: AsyncStream<SyncHint>.Continuation
     nonisolated let hints: AsyncStream<SyncHint>
 
-    init(url: URL, session: URLSession = URLSession(configuration: .ephemeral)) {
+    init(url: URL, token: String, session: URLSession = URLSession(configuration: .ephemeral)) {
         self.url = url
+        self.token = token
         self.session = session
         (hints, hintsContinuation) = AsyncStream.makeStream(of: SyncHint.self)
     }
@@ -44,7 +46,9 @@ actor CloudHintSocket {
 
     private func run() async {
         while !Task.isCancelled {
-            let task = session.webSocketTask(with: url)
+            var request = URLRequest(url: url)
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let task = session.webSocketTask(with: request)
             self.task = task
             state = .connecting
             task.resume()

@@ -22,10 +22,9 @@ nonisolated struct CloudConfig: Sendable {
         baseURL.appending(path: path)
     }
 
-    func wsURL(token: String) -> URL {
+    func wsURL() -> URL {
         var components = URLComponents(url: httpURL(path: "v1/ws"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
         return components.url!
     }
 }
