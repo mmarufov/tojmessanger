@@ -1,7 +1,7 @@
 import Foundation
 
 struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
-    var id: String { "\(dialogId):\(msgId)" }
+    nonisolated var id: String { "\(dialogId):\(msgId)" }
     let dialogId: String
     let msgId: Int64
     let senderAccountId: String
@@ -67,6 +67,7 @@ struct StoredCloudSession: Codable, Equatable, Sendable {
 
 struct AuthStartResponse: Codable, Sendable {
     let code: String?
+    let retryAfter: Int?
 }
 
 struct ContactLookupResponse: Codable, Sendable {
@@ -186,9 +187,35 @@ struct ReadResponse: Codable, Sendable {
     let maxReadMsgId: Int64
 }
 
+struct PushRegistrationResponse: Codable, Sendable {
+    let registered: Bool
+}
+
+struct SessionRevocationResponse: Codable, Sendable {
+    let revoked: Bool
+}
+
+struct AccountDeletionResponse: Codable, Sendable {
+    let deleted: Bool
+}
+
+struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
+    let id: String
+    let platform: String
+    let deviceName: String?
+    let createdAt: String
+    let lastSeenAt: String?
+    let current: Bool
+}
+
+private struct DeviceListResponse: Codable, Sendable {
+    let devices: [CloudDevice]
+}
+
 struct CloudAPIError: Error, LocalizedError {
     let status: Int
     let message: String
+    let retryAfter: Int?
 
     var errorDescription: String? {
         message
@@ -290,6 +317,39 @@ struct CloudAPI: Sendable {
         )
     }
 
+    func registerPushToken(_ deviceToken: String, environment: String, token: String) async throws -> PushRegistrationResponse {
+        try await post(
+            "v1/devices/push",
+            body: PushRegistrationRequest(token: deviceToken, environment: environment),
+            token: token
+        )
+    }
+
+    func unregisterPushToken(token: String) async throws -> PushRegistrationResponse {
+        try await delete("v1/devices/push", token: token)
+    }
+
+    func revokeSession(token: String) async throws -> SessionRevocationResponse {
+        try await delete("v1/session", token: token)
+    }
+
+    func listDevices(token: String) async throws -> [CloudDevice] {
+        let response: DeviceListResponse = try await get("v1/devices", token: token)
+        return response.devices
+    }
+
+    func revokeDevice(id: String, token: String) async throws -> SessionRevocationResponse {
+        try await delete("v1/devices/\(id)", token: token)
+    }
+
+    func startAccountDeletion(token: String) async throws -> AuthStartResponse {
+        try await post("v1/account/deletion/start", body: EmptyBody(), token: token)
+    }
+
+    func deleteAccount(code: String, token: String) async throws -> AccountDeletionResponse {
+        try await delete("v1/account", body: ["code": code], token: token)
+    }
+
     private func get<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "GET"
@@ -310,16 +370,41 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
+    private func delete<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
+        var request = URLRequest(url: config.httpURL(path: path))
+        request.httpMethod = "DELETE"
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return try await run(request)
+    }
+
+    private func delete<Body: Encodable, Response: Decodable>(
+        _ path: String,
+        body: Body,
+        token: String?
+    ) async throws -> Response {
+        var request = URLRequest(url: config.httpURL(path: path))
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(body)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return try await run(request)
+    }
+
     private func run<Response: Decodable>(_ request: URLRequest) async throws -> Response {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw CloudAPIError(status: -1, message: "Invalid server response")
+            throw CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil)
         }
         guard (200..<300).contains(http.statusCode) else {
             let message = (try? decoder.decode(ServerError.self, from: data).error)
                 ?? String(data: data, encoding: .utf8)
                 ?? "HTTP \(http.statusCode)"
-            throw CloudAPIError(status: http.statusCode, message: message)
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
+            throw CloudAPIError(status: http.statusCode, message: message, retryAfter: retryAfter)
         }
         return try decoder.decode(Response.self, from: data)
     }
@@ -347,4 +432,9 @@ private struct HistoryRequest: Encodable {
 private struct ReadRequest: Encodable {
     let dialogId: String
     let maxReadMsgId: Int64
+}
+
+private struct PushRegistrationRequest: Encodable {
+    let token: String
+    let environment: String
 }

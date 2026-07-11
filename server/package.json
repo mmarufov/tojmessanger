@@ -6,6 +6,8 @@
     "start": "bun run server.ts",
     "cloud": "bun run src/cloud.ts",
     "migrate": "bun run src/migrate.ts",
+    "backup": "bash scripts/backup-postgres.sh",
+    "restore-drill": "bash scripts/restore-drill.sh",
     "test": "bun test"
   },
   "devDependencies": {

@@ -48,14 +48,21 @@ export function bodyAAD(dialogId: string, msgId: number | bigint, senderId: stri
 }
 export const PHONE_AAD = Buffer.from("toj/phone", "utf8");
 
+/** Binds an APNs device token to the exact authenticated device row. */
+export function pushTokenAAD(deviceId: string): Buffer {
+  return Buffer.from(`toj/apns-token|${deviceId}`, "utf8");
+}
+
 export function normalizePhone(p: string): string {
   return p.replace(/[^\d+]/g, "");
 }
 export function phoneLookupHash(e164: string): Buffer {
   return createHmac("sha256", HMAC_KEY).update(normalizePhone(e164)).digest();
 }
-export function codeHash(code: string): Buffer {
-  return createHmac("sha256", HMAC_KEY).update(code).digest();
+export function codeHash(code: string, salt?: Uint8Array): Buffer {
+  const hmac = createHmac("sha256", HMAC_KEY);
+  if (salt) hmac.update(salt);
+  return hmac.update(code).digest();
 }
 export function hashToken(token: string): Buffer {
   return createHmac("sha256", HMAC_KEY).update(token).digest();

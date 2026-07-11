@@ -33,40 +33,90 @@ final class CloudAppModel {
     private(set) var storedSession: StoredCloudSession?
     private(set) var status = "Starting"
     private(set) var requestedCode = false
+    private(set) var authRequestInFlight = false
+    private(set) var authVerifyInFlight = false
+    private(set) var resendSeconds = 0
     private(set) var activeDialogId: String?
     private(set) var dialogs: [Dialog] = []
     private(set) var lines: [Line] = []
     private(set) var canLoadEarlier = false
     private(set) var loadingEarlier = false
+    private(set) var devices: [CloudDevice] = []
+    private(set) var loadingDevices = false
+    private(set) var accountDeletionRequested = false
+    private(set) var accountDeletionInFlight = false
 
-    var phone = ""
+    var phone = "+992 "
     var displayName = ""
     var code = ""
     var peerPhone = ""
     var draft = ""
+    var accountDeletionCode = ""
 
     private let api: CloudAPI
     private let tokenStore: TokenStore
     private let localStore: CloudLocalStore?
+    private let pushCenter: PushRegistrationCenter
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
     private var hintTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
+    private var resendTask: Task<Void, Never>?
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
+    private var uploadedPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
 
-    init(config: CloudConfig = .current, tokenStore: TokenStore = TokenStore()) {
+    var canRequestCode: Bool {
+        let digits = phone.filter(\.isNumber)
+        let validLength = phone.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("+992")
+            ? digits.count == 12
+            : (8...15).contains(digits.count)
+        return !authRequestInFlight && resendSeconds == 0 && validLength
+    }
+
+    var canVerifyCode: Bool {
+        !authVerifyInFlight
+            && code.filter(\.isNumber).count == 6
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    init(
+        config: CloudConfig = .current,
+        tokenStore: TokenStore = TokenStore(),
+        pushCenter: PushRegistrationCenter = .shared
+    ) {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
+        self.pushCenter = pushCenter
         self.localStore = try? CloudLocalStore.default()
+        pushCenter.bind(
+            tokenHandler: { [weak self] token, environment in
+                await self?.uploadPushToken(token, environment: environment)
+            },
+            notificationHandler: { [weak self] in
+                await self?.syncFromPush() ?? false
+            }
+        )
     }
 
     func start() async {
         do {
-            if let saved = try await tokenStore.load() {
+            let pendingRevocation = try await tokenStore.loadPendingRevocationToken()
+            let savedSession = try await tokenStore.load()
+            if let pendingRevocation {
+                Task { [weak self] in await self?.revokeSignedOutToken(pendingRevocation) }
+            }
+            if savedSession?.session.token == pendingRevocation {
+                // Sign-out was interrupted after its intent was persisted but before the active
+                // Keychain item was removed. Finish locally instead of restoring a revoked session.
+                try await tokenStore.clear()
+                status = "Signed out"
+                return
+            }
+            if let saved = savedSession {
                 storedSession = saved
                 phone = saved.phone
                 displayName = saved.displayName
@@ -81,26 +131,36 @@ final class CloudAppModel {
     }
 
     func requestCode() async {
+        guard canRequestCode else { return }
         let trimmed = phone.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        authRequestInFlight = true
+        defer { authRequestInFlight = false }
         do {
             let response = try await api.startAuth(phone: trimmed)
             requestedCode = true
             if let devCode = response.code {
                 code = devCode
             }
+            startResendCountdown(response.retryAfter ?? 30)
             status = "Code requested"
         } catch {
+            if let retryAfter = (error as? CloudAPIError)?.retryAfter {
+                startResendCountdown(retryAfter)
+            }
             status = "Code request failed: \(error.localizedDescription)"
         }
     }
 
     func verifyCode() async {
+        guard canVerifyCode else { return }
         let trimmedPhone = phone.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCode = code.filter(\.isNumber)
         let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPhone.isEmpty, !trimmedCode.isEmpty else { return }
 
+        authVerifyInFlight = true
+        defer { authVerifyInFlight = false }
         do {
             let session = try await api.checkAuth(
                 phone: trimmedPhone,
@@ -111,6 +171,9 @@ final class CloudAppModel {
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
             storedSession = stored
+            resendTask?.cancel()
+            resendTask = nil
+            resendSeconds = 0
             status = "Signed in"
             await afterSignIn()
         } catch {
@@ -119,18 +182,127 @@ final class CloudAppModel {
     }
 
     func signOut() async {
+        let sessionToken = storedSession?.session.token
+        if let sessionToken {
+            // Save before clearing the active session. If the app is killed or offline, the next
+            // launch still has enough information to revoke the server session.
+            try? await tokenStore.savePendingRevocationToken(sessionToken)
+        }
+        await clearLocalSession(finalStatus: "Signed out")
+        if let sessionToken {
+            Task { [weak self] in await self?.revokeSignedOutToken(sessionToken) }
+        }
+    }
+
+    private func revokeSignedOutToken(_ token: String) async {
+        do {
+            _ = try await api.revokeSession(token: token)
+            try await tokenStore.clearPendingRevocationToken()
+        } catch {
+            if revocationIsTerminal(error) {
+                try? await tokenStore.clearPendingRevocationToken()
+            }
+        }
+    }
+
+    private func revocationIsTerminal(_ error: Error) -> Bool {
+        guard let apiError = error as? CloudAPIError else { return false }
+        return apiError.status == 401 || apiError.status == 404
+    }
+
+    func loadDevices() async {
+        guard let token = storedSession?.session.token, !loadingDevices else { return }
+        loadingDevices = true
+        defer { loadingDevices = false }
+        do {
+            devices = try await api.listDevices(token: token)
+            status = "Devices updated"
+        } catch {
+            status = "Could not load devices: \(error.localizedDescription)"
+        }
+    }
+
+    func revokeDevice(_ device: CloudDevice) async {
+        guard !device.current, let token = storedSession?.session.token else { return }
+        do {
+            _ = try await api.revokeDevice(id: device.id, token: token)
+            devices.removeAll { $0.id == device.id }
+            status = "Device signed out"
+        } catch {
+            status = "Could not revoke device: \(error.localizedDescription)"
+        }
+    }
+
+    func requestAccountDeletionCode() async -> Bool {
+        guard let token = storedSession?.session.token, !accountDeletionInFlight else { return false }
+        accountDeletionInFlight = true
+        defer { accountDeletionInFlight = false }
+        do {
+            let response = try await api.startAccountDeletion(token: token)
+            accountDeletionRequested = true
+            accountDeletionCode = response.code ?? ""
+            status = "Deletion code requested"
+            return true
+        } catch {
+            status = "Could not request deletion code: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func cancelAccountDeletion() {
+        guard !accountDeletionInFlight else { return }
+        accountDeletionRequested = false
+        accountDeletionCode = ""
+    }
+
+    func deleteAccount() async -> Bool {
+        guard let saved = storedSession, !accountDeletionInFlight else { return false }
+        let digits = accountDeletionCode.filter(\.isNumber)
+        guard digits.count == 6 else {
+            status = "Enter the 6-digit deletion code"
+            return false
+        }
+        accountDeletionInFlight = true
+        defer { accountDeletionInFlight = false }
+        // Persist intent before the network call. If the app is killed after the server commits,
+        // launch will not restore a now-invalid session or leave the local replica visible.
+        try? await tokenStore.savePendingRevocationToken(saved.session.token)
+        do {
+            _ = try await api.deleteAccount(code: digits, token: saved.session.token)
+            await clearLocalSession(finalStatus: "Account deleted")
+            try? await tokenStore.clearPendingRevocationToken()
+            return true
+        } catch {
+            if let apiError = error as? CloudAPIError {
+                if apiError.status == 401 || apiError.status == 403 {
+                    await clearLocalSession(finalStatus: "Session ended")
+                    try? await tokenStore.clearPendingRevocationToken()
+                    return true
+                }
+                // The server definitely rejected this request before deletion completed.
+                try? await tokenStore.clearPendingRevocationToken()
+            }
+            status = "Could not confirm account deletion: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func clearLocalSession(finalStatus: String) async {
         hintTask?.cancel()
         syncTask?.cancel()
         retryTask?.cancel()
+        resendTask?.cancel()
+        resendTask = nil
         await hintSocket?.stop()
         hintSocket = nil
+        var cleanupFailure: String?
         do {
             if let accountId = storedSession?.session.accountId {
                 try await localStore?.clearAccount(accountId: accountId)
             }
             try await tokenStore.clear()
         } catch {
-            status = "Sign out cleanup failed: \(error.localizedDescription)"
+            cleanupFailure = error.localizedDescription
         }
         storedSession = nil
         activeDialogId = nil
@@ -139,10 +311,35 @@ final class CloudAppModel {
         canLoadEarlier = false
         loadingEarlier = false
         historyHasMoreByDialog = [:]
+        devices = []
+        loadingDevices = false
+        uploadedPushRegistration = nil
         pts = 0
         requestedCode = false
+        authRequestInFlight = false
+        authVerifyInFlight = false
+        resendSeconds = 0
         code = ""
-        status = "Signed out"
+        accountDeletionRequested = false
+        accountDeletionCode = ""
+        status = cleanupFailure.map { "Local cleanup failed: \($0)" } ?? finalStatus
+    }
+
+    private func startResendCountdown(_ seconds: Int) {
+        resendTask?.cancel()
+        resendSeconds = max(0, seconds)
+        guard resendSeconds > 0 else {
+            resendTask = nil
+            return
+        }
+        resendTask = Task { [weak self] in
+            while let self, self.resendSeconds > 0, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                self.resendSeconds -= 1
+            }
+            self?.resendTask = nil
+        }
     }
 
     func openPeer() async -> String? {
@@ -284,11 +481,38 @@ final class CloudAppModel {
         } catch {
             pts = 0
         }
+        await pushCenter.requestAuthorization()
         await resume()
+    }
+
+    private func uploadPushToken(_ deviceToken: String, environment: String) async {
+        guard let token = storedSession?.session.token else { return }
+        let registration = "\(environment):\(deviceToken)"
+        guard uploadedPushRegistration != registration else { return }
+        do {
+            _ = try await api.registerPushToken(deviceToken, environment: environment, token: token)
+            guard storedSession?.session.token == token else {
+                // Registration and sign-out can overlap at an await point. If sign-out won the
+                // race, undo this late registration so the signed-out device receives no alerts.
+                _ = try? await api.unregisterPushToken(token: token)
+                return
+            }
+            uploadedPushRegistration = registration
+        } catch {
+            // Token registration is retried when APNs rotates the token or on the next app launch.
+            status = "Push registration failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func syncFromPush() async -> Bool {
+        let previousPts = pts
+        await syncNow()
+        return pts > previousPts
     }
 
     func resume() async {
         guard let token = storedSession?.session.token else { return }
+        pushCenter.refreshRegistration()
         await startHints(token: token)
         scheduleSync()
         scheduleOutboxRetry()
@@ -298,7 +522,7 @@ final class CloudAppModel {
         hintTask?.cancel()
         await hintSocket?.stop()
 
-        let socket = CloudHintSocket(url: api.config.wsURL(token: token))
+        let socket = CloudHintSocket(url: api.config.wsURL(), token: token)
         hintSocket = socket
         hintTask = Task { [weak self, socket] in
             await socket.start()

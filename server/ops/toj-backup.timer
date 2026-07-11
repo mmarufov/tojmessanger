@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Toj encrypted PostgreSQL backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=toj-backup.service
+
+[Install]
+WantedBy=timers.target

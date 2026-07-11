@@ -33,23 +33,58 @@ CREATE TABLE IF NOT EXISTS devices (
   platform              TEXT NOT NULL CHECK (platform IN ('ios','android','web','desktop')),
   device_name           TEXT,
   auth_token_hash       BYTEA NOT NULL UNIQUE,        -- SHA-256 of the bearer token
+  push_token_hash       BYTEA,
   push_token_ciphertext BYTEA,
+  push_token_nonce      BYTEA,
+  push_token_key_id     TEXT,
+  push_environment      TEXT CHECK (push_environment IN ('sandbox','production')),
+  push_updated_at       TIMESTAMPTZ,
   last_seen_at          TIMESTAMPTZ,
   revoked_at            TIMESTAMPTZ,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Existing M3 deployments already have devices.push_token_ciphertext, so M4 adds the remaining
+-- token metadata with idempotent ALTERs. The token itself is never stored as plaintext.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_hash BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_nonce BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_key_id TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_environment TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_updated_at TIMESTAMPTZ;
+DO $$ BEGIN
+  ALTER TABLE devices ADD CONSTRAINT devices_push_environment_check
+    CHECK (push_environment IN ('sandbox','production'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS devices_account_active_idx ON devices(account_id) WHERE revoked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS devices_push_token_active_idx
+  ON devices(push_environment, push_token_hash)
+  WHERE push_token_hash IS NOT NULL AND revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS otp_challenges (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   phone_lookup_hash BYTEA NOT NULL,
   code_hash         BYTEA NOT NULL,                   -- HMAC of the 6-digit code
+  code_salt         BYTEA,
+  network_hash      BYTEA,
+  purpose           TEXT NOT NULL DEFAULT 'login'
+                      CHECK (purpose IN ('login','account_deletion')),
   attempts          INT NOT NULL DEFAULT 0,
   expires_at        TIMESTAMPTZ NOT NULL,
   consumed_at       TIMESTAMPTZ,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_salt BYTEA;
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS network_hash BYTEA;
+ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'login';
+DO $$ BEGIN
+  ALTER TABLE otp_challenges ADD CONSTRAINT otp_challenges_purpose_check
+    CHECK (purpose IN ('login','account_deletion'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS otp_active_idx ON otp_challenges(phone_lookup_hash, expires_at) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS otp_phone_requests_idx ON otp_challenges(phone_lookup_hash, created_at DESC);
+CREATE INDEX IF NOT EXISTS otp_network_requests_idx ON otp_challenges(network_hash, created_at DESC)
+  WHERE network_hash IS NOT NULL;
 
 -- ============ conversations ============
 CREATE TABLE IF NOT EXISTS dialogs (
@@ -130,6 +165,32 @@ CREATE TABLE IF NOT EXISTS send_requests (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
+
+-- ============ APNs durable outbox (M4.1) ============
+-- APNs is only a wake-up hint. The authoritative update remains account_events + get_difference.
+-- Rows are created in the same transaction as message.new, so a process crash cannot lose the hint.
+CREATE TABLE IF NOT EXISTS push_deliveries (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id   UUID NOT NULL,
+  pts          BIGINT NOT NULL,
+  device_id    UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  alert        BOOLEAN NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending','sending','sent','dead')),
+  attempts     INT NOT NULL DEFAULT 0,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at   TIMESTAMPTZ,
+  expires_at   TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '24 hours'),
+  apns_id      TEXT,
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at      TIMESTAMPTZ,
+  FOREIGN KEY (account_id, pts) REFERENCES account_events(account_id, pts) ON DELETE CASCADE,
+  UNIQUE (account_id, pts, device_id)
+);
+CREATE INDEX IF NOT EXISTS push_deliveries_ready_idx
+  ON push_deliveries(available_at, created_at)
+  WHERE status IN ('pending','sending');
 
 -- ============ resumable bootstrap (B1/I2): snapshot token + per-dialog ceilings ============
 CREATE TABLE IF NOT EXISTS bootstrap_snapshots (

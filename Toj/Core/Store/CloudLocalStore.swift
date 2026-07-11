@@ -41,7 +41,7 @@ struct PendingOutboxItem: Identifiable, Equatable, Sendable {
 actor CloudLocalStore {
     private let dbQueue: DatabaseQueue
 
-    static func `default`() throws -> CloudLocalStore {
+    nonisolated static func `default`() throws -> CloudLocalStore {
         let key = try LocalDatabaseKeyStore().loadOrCreateKey()
         let directory = try FileManager.default.url(
             for: .applicationSupportDirectory,
@@ -53,22 +53,22 @@ actor CloudLocalStore {
         try FileManager.default.createDirectory(at: appDirectory, withIntermediateDirectories: true)
         let path = appDirectory.appending(path: "cloud.sqlite").path
 
+        do {
+            return try CloudLocalStore(path: path, key: key)
+        } catch let error as DatabaseError where error.resultCode == .SQLITE_NOTADB {
+            try removeSQLiteFiles(at: path)
+            return try CloudLocalStore(path: path, key: key)
+        }
+    }
+
+    init(path: String, key: Data) throws {
         var configuration = Configuration()
         configuration.prepareDatabase { db in
             try db.usePassphrase(key)
             try db.execute(sql: "PRAGMA foreign_keys = ON")
         }
-        do {
-            return try CloudLocalStore(path: path, configuration: configuration)
-        } catch let error as DatabaseError where error.resultCode == .SQLITE_NOTADB {
-            try removeSQLiteFiles(at: path)
-            return try CloudLocalStore(path: path, configuration: configuration)
-        }
-    }
-
-    init(path: String, configuration: Configuration) throws {
         dbQueue = try DatabaseQueue(path: path, configuration: configuration)
-        try migrate()
+        try Self.migrate(dbQueue)
     }
 
     func loadPts(accountId: String) throws -> Int64 {
@@ -475,7 +475,7 @@ actor CloudLocalStore {
         }
     }
 
-    private func migrate() throws {
+    private static func migrate(_ dbQueue: DatabaseQueue) throws {
         try dbQueue.write { db in
             try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS sync_state (

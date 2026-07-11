@@ -1,6 +1,26 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { makeSql } from "./db";
-import { startVerification, checkVerification, lookupAccountByPhone } from "./auth";
+import {
+  startVerification,
+  checkVerification,
+  lookupAccountByPhone,
+  startAccountDeletion,
+  deleteAccount,
+  resolveDevice,
+  AuthError,
+  type OTPDelivery,
+} from "./auth";
+import { hashToken, open, pushTokenAAD } from "./crypto";
+import { startCloudServer } from "./cloud";
+import { cleanupExpiredData, OperationalMetrics, requestIdFrom, safeRoute } from "./ops";
+import {
+  buildAPNsPayload,
+  processPushBatch,
+  registerPushToken,
+  type APNsSendRequest,
+  type APNsSendResult,
+  type PushSender,
+} from "./push";
 import {
   getBootstrapDialogsPage,
   getDifference,
@@ -22,6 +42,7 @@ async function resetDb() {
       bootstrap_snapshot_dialogs,
       bootstrap_snapshots,
       send_requests,
+      push_deliveries,
       account_events,
       messages,
       dialog_members,
@@ -37,6 +58,48 @@ async function resetDb() {
 async function makeAccount(phone: string, name: string) {
   const { code } = await startVerification(db, phone);
   return await checkVerification(db, phone, code, "ios", "Test iPhone", name);
+}
+
+function testPhone(suffix: number): string {
+  return ["+", "1650", "555", String(suffix).padStart(4, "0")].join("");
+}
+
+async function addIOSDevice(accountId: string): Promise<{ deviceId: string }> {
+  const authTokenHash = hashToken(crypto.randomUUID());
+  const row = (await db`
+    INSERT INTO devices (account_id, platform, device_name, auth_token_hash)
+    VALUES (${accountId}, 'ios', 'Test iPhone', ${authTokenHash})
+    RETURNING id`)[0];
+  return { deviceId: row.id };
+}
+
+class StubPushSender implements PushSender {
+  requests: APNsSendRequest[] = [];
+
+  constructor(private readonly responses: APNsSendResult[]) {}
+
+  async send(request: APNsSendRequest): Promise<APNsSendResult> {
+    this.requests.push(request);
+    return this.responses.shift() ?? { status: 200 };
+  }
+}
+
+class RotatingPushSender implements PushSender {
+  constructor(
+    private readonly rotate: () => Promise<void>,
+    private readonly response: APNsSendResult,
+  ) {}
+
+  async send(_request: APNsSendRequest): Promise<APNsSendResult> {
+    await this.rotate();
+    return this.response;
+  }
+}
+
+class FailingOTPDelivery implements OTPDelivery {
+  async send(_phone: string, _code: string, _purpose: "login" | "account_deletion"): Promise<void> {
+    throw new Error("provider unavailable");
+  }
 }
 
 async function makePair() {
@@ -58,6 +121,558 @@ describe("M3 cloud sync", () => {
     const state = (await db`SELECT pts, pruned_through_pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0];
     expect(Number(state.pts)).toBe(0);
     expect(Number(state.pruned_through_pts)).toBe(0);
+  });
+
+  test("OTP requests enforce cooldown and store a per-challenge salt", async () => {
+    const phone = testPhone(120);
+    const first = await startVerification(db, phone, { networkKey: "test-network" });
+    expect(first.code).toMatch(/^\d{6}$/);
+    expect(first.retryAfter).toBe(30);
+    const stored = (await db`
+      SELECT code_salt, network_hash FROM otp_challenges`)[0];
+    expect(Buffer.from(stored.code_salt)).toHaveLength(16);
+    expect(stored.network_hash).not.toBeNull();
+
+    let error: unknown;
+    try {
+      await startVerification(db, phone, { networkKey: "test-network" });
+    } catch (value) {
+      error = value;
+    }
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).status).toBe(429);
+    expect((error as AuthError).retryAfter).toBeGreaterThan(0);
+  });
+
+  test("OTP request windows cap phone and network abuse", async () => {
+    const phone = testPhone(130);
+    for (let request = 0; request < 5; request += 1) {
+      await startVerification(db, phone, { networkKey: "phone-limit-network" });
+      await db`
+        UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'
+        WHERE id = (SELECT id FROM otp_challenges ORDER BY created_at DESC LIMIT 1)`;
+    }
+    let phoneError: unknown;
+    try { await startVerification(db, phone, { networkKey: "phone-limit-network" }); }
+    catch (value) { phoneError = value; }
+    expect(phoneError).toBeInstanceOf(AuthError);
+    expect((phoneError as AuthError).status).toBe(429);
+
+    await resetDb();
+    for (let request = 0; request < 20; request += 1) {
+      await startVerification(db, testPhone(200 + request), { networkKey: "shared-network" });
+    }
+    let networkError: unknown;
+    try { await startVerification(db, testPhone(220), { networkKey: "shared-network" }); }
+    catch (value) { networkError = value; }
+    expect(networkError).toBeInstanceOf(AuthError);
+    expect((networkError as AuthError).status).toBe(429);
+  });
+
+  test("production refuses to issue an OTP without a delivery adapter", async () => {
+    const previous = process.env.NODE_ENV;
+    const previousReturnOTP = process.env.TOJ_RETURN_OTP;
+    process.env.NODE_ENV = "production";
+    delete process.env.TOJ_RETURN_OTP;
+    let error: unknown;
+    try { await startVerification(db, testPhone(131)); }
+    catch (value) { error = value; }
+    finally {
+      if (previous === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previous;
+      if (previousReturnOTP === undefined) delete process.env.TOJ_RETURN_OTP;
+      else process.env.TOJ_RETURN_OTP = previousReturnOTP;
+    }
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).status).toBe(503);
+    expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
+  });
+
+  test("private-beta OTP return requires the explicit server switch", async () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousReturnOTP = process.env.TOJ_RETURN_OTP;
+    process.env.NODE_ENV = "production";
+    process.env.TOJ_RETURN_OTP = "1";
+    try {
+      const issued = await startVerification(db, testPhone(132));
+      expect(issued.code).toMatch(/^\d{6}$/);
+      expect(issued.retryAfter).toBe(30);
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousReturnOTP === undefined) delete process.env.TOJ_RETURN_OTP;
+      else process.env.TOJ_RETURN_OTP = previousReturnOTP;
+    }
+  });
+
+  test("wrong OTP attempts persist and lock the challenge", async () => {
+    const phone = testPhone(121);
+    const { code } = await startVerification(db, phone);
+    const wrongCode = code === "000000" ? "000001" : "000000";
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try { await checkVerification(db, phone, wrongCode); } catch { /* expected */ }
+    }
+    expect(Number((await db`SELECT attempts FROM otp_challenges`)[0].attempts)).toBe(5);
+    let error: unknown;
+    try { await checkVerification(db, phone, code!); } catch (value) { error = value; }
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).status).toBe(429);
+  });
+
+  test("a verification code can create only one session under concurrency", async () => {
+    const phone = testPhone(122);
+    const { code } = await startVerification(db, phone);
+    const results = await Promise.allSettled([
+      checkVerification(db, phone, code!),
+      checkVerification(db, phone, code!),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(await db`SELECT id FROM devices`).toHaveLength(1);
+  });
+
+  test("account deletion requires a purpose-bound fresh code and erases identity", async () => {
+    const phone = testPhone(133);
+    const alice = await makeAccount(phone, "Alice Personal Name");
+    const bob = await makeAccount(testPhone(134), "Bob");
+    const secondDevice = await addIOSDevice(alice.accountId);
+    await registerPushToken(db, secondDevice.deviceId, "88".repeat(32), "sandbox");
+    const dialog = await getOrCreateDirectDialog(db, alice.accountId, bob.accountId);
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId: dialog.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "history remains for the other participant",
+    });
+
+    const original = (await db`
+      SELECT phone_lookup_hash, phone_e164_ciphertext FROM accounts WHERE id = ${alice.accountId}`)[0];
+    const deletion = await startAccountDeletion(db, alice.accountId);
+    expect(deletion.code).toMatch(/^\d{6}$/);
+    const activeChallenge = (await db`
+      SELECT purpose FROM otp_challenges WHERE consumed_at IS NULL`)[0];
+    expect(activeChallenge.purpose).toBe("account_deletion");
+
+    let loginError: unknown;
+    try { await checkVerification(db, phone, deletion.code!, "ios", "Wrong purpose", "Alice"); }
+    catch (error) { loginError = error; }
+    expect(loginError).toBeInstanceOf(AuthError);
+    expect(await db`SELECT id FROM devices WHERE account_id = ${alice.accountId}`).toHaveLength(2);
+
+    const result = await deleteAccount(db, alice.accountId, deletion.code!);
+    expect(result).toEqual({ deleted: true });
+    const deleted = (await db`
+      SELECT phone_lookup_hash, phone_e164_ciphertext, display_name, status
+      FROM accounts WHERE id = ${alice.accountId}`)[0];
+    expect(deleted.status).toBe("deleted");
+    expect(deleted.display_name).toBe("Deleted Account");
+    expect(Buffer.from(deleted.phone_lookup_hash).equals(Buffer.from(original.phone_lookup_hash))).toBe(false);
+    expect(Buffer.from(deleted.phone_e164_ciphertext).includes(Buffer.from(phone))).toBe(false);
+    expect(await db`
+      SELECT id FROM devices WHERE account_id = ${alice.accountId} AND revoked_at IS NULL`).toHaveLength(0);
+    const erasedDevice = (await db`
+      SELECT push_token_hash, device_name FROM devices WHERE id = ${secondDevice.deviceId}`)[0];
+    expect(erasedDevice.push_token_hash).toBeNull();
+    expect(erasedDevice.device_name).toBeNull();
+    expect(await db`SELECT id FROM otp_challenges WHERE phone_lookup_hash = ${Buffer.from(original.phone_lookup_hash)}`)
+      .toHaveLength(0);
+    expect(await lookupAccountByPhone(db, phone)).toBeNull();
+    await expect(resolveDevice(db, alice.token)).rejects.toBeInstanceOf(AuthError);
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId: dialog.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "must not send after deletion",
+    })).rejects.toThrow("account unavailable");
+    expect((await getHistory(db, bob.accountId, dialog.dialogId)).messages.map((message) => message.text))
+      .toContain("history remains for the other participant");
+
+    const replacement = await makeAccount(phone, "New Alice");
+    expect(replacement.accountId).not.toBe(alice.accountId);
+  });
+
+  test("concurrent account deletion consumes one code once and never partially deletes", async () => {
+    const phone = testPhone(135);
+    const account = await makeAccount(phone, "Concurrency");
+    const { code } = await startAccountDeletion(db, account.accountId);
+    const wrong = code === "000000" ? "000001" : "000000";
+    let wrongError: unknown;
+    try { await deleteAccount(db, account.accountId, wrong); } catch (error) { wrongError = error; }
+    expect(wrongError).toBeInstanceOf(AuthError);
+    expect((wrongError as AuthError).status).toBe(400);
+    expect(Number((await db`
+      SELECT attempts FROM otp_challenges WHERE purpose = 'account_deletion'`)[0].attempts)).toBe(1);
+    expect((await db`SELECT status FROM accounts WHERE id = ${account.accountId}`)[0].status).toBe("active");
+
+    const results = await Promise.allSettled([
+      deleteAccount(db, account.accountId, code!),
+      deleteAccount(db, account.accountId, code!),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect((await db`SELECT status FROM accounts WHERE id = ${account.accountId}`)[0].status).toBe("deleted");
+    expect(await db`
+      SELECT id FROM devices WHERE account_id = ${account.accountId} AND revoked_at IS NULL`).toHaveLength(0);
+  });
+
+  test("account deletion HTTP flow requires auth and invalidates the session", async () => {
+    const server = startCloudServer(0, db, null, null);
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const account = await makeAccount(testPhone(136), "HTTP Delete");
+      const unauthorized = await fetch(`${base}/v1/account/deletion/start`, { method: "POST" });
+      expect(unauthorized.status).toBe(401);
+      const started = await fetch(`${base}/v1/account/deletion/start`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${account.token}` },
+      });
+      expect(started.status).toBe(200);
+      const { code } = await started.json() as { code: string };
+      const deleted = await fetch(`${base}/v1/account`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${account.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      expect(deleted.status).toBe(200);
+      expect(await deleted.json()).toEqual({ deleted: true });
+      const oldSession = await fetch(`${base}/v1/devices`, {
+        headers: { authorization: `Bearer ${account.token}` },
+      });
+      expect(oldSession.status).toBe(401);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("cloud auth maps throttles and accepts WebSocket bearer tokens only in headers", async () => {
+    const server = startCloudServer(0, db, null, null);
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const invalid = await fetch(`${base}/v1/auth/start`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phone: "invalid" }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(invalid.headers.get("cache-control")).toBe("no-store");
+
+      const session = await makeAccount(testPhone(124), "Alice");
+      const extraDevice = await addIOSDevice(session.accountId);
+      const queryToken = await fetch(`${base}/v1/ws?token=${encodeURIComponent(session.token)}`);
+      expect(queryToken.status).toBe(401);
+      let legacyQueryToken: Response;
+      try {
+        process.env.TOJ_ALLOW_LEGACY_WS_QUERY_TOKEN = "1";
+        legacyQueryToken = await fetch(`${base}/v1/ws?token=${encodeURIComponent(session.token)}`);
+      } finally {
+        delete process.env.TOJ_ALLOW_LEGACY_WS_QUERY_TOKEN;
+      }
+      expect(legacyQueryToken.status).toBe(400);
+      const headerToken = await fetch(`${base}/v1/ws`, {
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      expect(headerToken.status).toBe(400);
+
+      const devices = await fetch(`${base}/v1/devices`, {
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      expect(devices.status).toBe(200);
+      const deviceBody = await devices.json() as { devices: Array<{ id: string; current: boolean }> };
+      expect(deviceBody.devices).toHaveLength(2);
+      expect(deviceBody.devices.find((device) => device.id === session.deviceId)?.current).toBe(true);
+
+      const revokeOther = await fetch(`${base}/v1/devices/${extraDevice.deviceId}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      expect(revokeOther.status).toBe(200);
+      expect((await db`SELECT revoked_at FROM devices WHERE id = ${extraDevice.deviceId}`)[0].revoked_at).not.toBeNull();
+
+      const revoked = await fetch(`${base}/v1/session`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      expect(revoked.status).toBe(200);
+      expect(await revoked.json()).toEqual({ revoked: true });
+      const afterRevoke = await fetch(`${base}/v1/sync/state`, {
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      expect(afterRevoke.status).toBe(401);
+      expect((await db`SELECT revoked_at FROM devices WHERE id = ${session.deviceId}`)[0].revoked_at).not.toBeNull();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("operations endpoints expose safe readiness, correlation IDs, and protected metrics", async () => {
+    const previousMetricsToken = process.env.TOJ_METRICS_TOKEN;
+    const previousReturnOTP = process.env.TOJ_RETURN_OTP;
+    process.env.TOJ_METRICS_TOKEN = "test-metrics-token";
+    delete process.env.TOJ_RETURN_OTP;
+    const server = startCloudServer(0, db, null, null);
+    const base = `http://127.0.0.1:${server.port}`;
+    try {
+      const ready = await fetch(`${base}/ready`, { headers: { "x-request-id": "client-request-123" } });
+      expect(ready.status).toBe(200);
+      expect(ready.headers.get("x-request-id")).toBe("client-request-123");
+      expect(await ready.json()).toMatchObject({
+        status: "ready", database: "ready", providers: { sms: "disabled", push: "disabled" },
+      });
+
+      const unauthorized = await fetch(`${base}/metrics`);
+      expect(unauthorized.status).toBe(401);
+      expect(await unauthorized.text()).not.toContain("test-metrics-token");
+
+      const metrics = await fetch(`${base}/metrics`, {
+        headers: { authorization: "Bearer test-metrics-token" },
+      });
+      expect(metrics.status).toBe(200);
+      const text = await metrics.text();
+      expect(text).toContain("toj_http_requests_total");
+      expect(text).toContain('route="/ready"');
+      expect(text).not.toContain("client-request-123");
+    } finally {
+      await server.stop(true);
+      if (previousMetricsToken === undefined) delete process.env.TOJ_METRICS_TOKEN;
+      else process.env.TOJ_METRICS_TOKEN = previousMetricsToken;
+      if (previousReturnOTP === undefined) delete process.env.TOJ_RETURN_OTP;
+      else process.env.TOJ_RETURN_OTP = previousReturnOTP;
+    }
+  });
+
+  test("operations sanitize request metadata and cleanup only bounded expired data", async () => {
+    const malformed = new Request("https://example.test/v1/devices/private", {
+      headers: { "x-request-id": "bad id with spaces" },
+    });
+    expect(requestIdFrom(malformed)).toMatch(/^[0-9a-f-]{36}$/);
+    expect(safeRoute("/v1/devices/00000000-0000-0000-0000-000000000000")).toBe("/v1/devices/:id");
+    expect(safeRoute("/private/phone-number")).toBe("unmatched");
+    const metrics = new OperationalMetrics();
+    metrics.record("GET", "unmatched", 404, 1);
+    expect(metrics.render()).not.toContain("phone-number");
+
+    await startVerification(db, testPhone(125));
+    await db`UPDATE otp_challenges SET expires_at = now() - interval '25 hours'`;
+    const account = await makeAccount(testPhone(126), "Cleanup");
+    await startBootstrap(db, account.accountId);
+    await db`UPDATE bootstrap_snapshots SET expires_at = now() - interval '1 minute'`;
+
+    const deleted = await cleanupExpiredData(db, 1);
+    expect(deleted).toMatchObject({ otp: 1, snapshots: 1, pushDeliveries: 0 });
+    expect(await db`SELECT id FROM bootstrap_snapshots`).toHaveLength(0);
+  });
+
+  test("failed OTP delivery consumes the unusable challenge", async () => {
+    let error: unknown;
+    try {
+      await startVerification(db, testPhone(123), { delivery: new FailingOTPDelivery() });
+    } catch (value) {
+      error = value;
+    }
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).status).toBe(503);
+    expect((await db`SELECT consumed_at FROM otp_challenges`)[0].consumed_at).not.toBeNull();
+  });
+
+  test("APNs token registration encrypts at rest and transfers a reused token", async () => {
+    const { alice: first } = await makePair();
+    const token = "ab".repeat(32);
+    await registerPushToken(db, first.deviceId, token, "sandbox");
+
+    const stored = (await db`
+      SELECT push_token_hash, push_token_ciphertext, push_token_nonce, push_token_key_id, push_environment
+      FROM devices WHERE id = ${first.deviceId}`)[0];
+    expect(stored.push_token_hash).not.toBeNull();
+    expect(Buffer.from(stored.push_token_ciphertext).includes(Buffer.from(token))).toBe(false);
+    expect(open({
+      keyId: stored.push_token_key_id,
+      nonce: Buffer.from(stored.push_token_nonce),
+      ciphertext: Buffer.from(stored.push_token_ciphertext),
+    }, pushTokenAAD(first.deviceId)).toString("utf8")).toBe(token);
+
+    const second = await addIOSDevice(first.accountId);
+    await registerPushToken(db, second.deviceId, token.toUpperCase(), "sandbox");
+    const rows = await db`
+      SELECT id, push_token_hash FROM devices
+      WHERE account_id = ${first.accountId} ORDER BY created_at`;
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.id === first.deviceId)?.push_token_hash).toBeNull();
+    expect(rows.find((row) => row.id === second.deviceId)?.push_token_hash).not.toBeNull();
+
+    let rejected = false;
+    try {
+      await registerPushToken(db, second.deviceId, "not-a-device-token", "sandbox");
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+  });
+
+  test("concurrent APNs registrations serialize token ownership without a server error", async () => {
+    const { alice: first } = await makePair();
+    const second = await addIOSDevice(first.accountId);
+    const third = await addIOSDevice(first.accountId);
+    const token = "cd".repeat(32);
+
+    await Promise.all([
+      registerPushToken(db, first.deviceId, token, "sandbox"),
+      registerPushToken(db, second.deviceId, token, "sandbox"),
+      registerPushToken(db, third.deviceId, token, "sandbox"),
+    ]);
+
+    const owners = await db`
+      SELECT id FROM devices
+      WHERE account_id = ${first.accountId} AND push_token_hash IS NOT NULL`;
+    expect(owners).toHaveLength(1);
+  });
+
+  test("APNs payload is a generic sync hint with no message metadata", () => {
+    const alert = buildAPNsPayload({ pts: 42, alert: true });
+    const silent = buildAPNsPayload({ pts: 43, alert: false });
+    expect(alert).toEqual({
+      aps: {
+        alert: { title: "Toj", body: "New message" },
+        sound: "default",
+        "content-available": 1,
+      },
+      toj: { pts: 42 },
+    });
+    expect(silent).toEqual({ aps: { "content-available": 1 }, toj: { pts: 43 } });
+    const serialized = JSON.stringify([alert, silent]);
+    expect(serialized).not.toContain("dialog");
+    expect(serialized).not.toContain("sender");
+    expect(serialized).not.toContain("phone");
+  });
+
+  test("message commit queues recipient alerts and silent sender-device catch-up", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const aliceSecond = await addIOSDevice(alice.accountId);
+    await registerPushToken(db, alice.deviceId, "11".repeat(32), "sandbox");
+    await registerPushToken(db, aliceSecond.deviceId, "22".repeat(32), "sandbox");
+    await registerPushToken(db, bob.deviceId, "33".repeat(32), "sandbox");
+
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "push me",
+    });
+
+    const deliveries = await db`
+      SELECT account_id, device_id, alert, status FROM push_deliveries ORDER BY alert, device_id`;
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries.find((row) => row.device_id === alice.deviceId)).toBeUndefined();
+    expect(deliveries.find((row) => row.device_id === aliceSecond.deviceId)?.alert).toBe(false);
+    expect(deliveries.find((row) => row.device_id === bob.deviceId)?.alert).toBe(true);
+    expect(deliveries.every((row) => row.status === "pending")).toBe(true);
+  });
+
+  test("push worker marks success and removes an unregistered device token", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    await registerPushToken(db, bob.deviceId, "44".repeat(32), "sandbox");
+
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "first",
+    });
+    const success = new StubPushSender([{ status: 200, apnsId: "apns-ok" }]);
+    expect(await processPushBatch(db, success)).toBe(1);
+    expect(success.requests).toEqual([{
+      token: "44".repeat(32), environment: "sandbox", pts: expect.any(Number), alert: true,
+    }]);
+    expect((await db`SELECT status, apns_id FROM push_deliveries`)[0]).toMatchObject({
+      status: "sent", apns_id: "apns-ok",
+    });
+
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "second",
+    });
+    const invalid = new StubPushSender([{ status: 410, reason: "Unregistered" }]);
+    expect(await processPushBatch(db, invalid)).toBe(1);
+    expect((await db`SELECT push_token_hash FROM devices WHERE id = ${bob.deviceId}`)[0].push_token_hash).toBeNull();
+    expect((await db`
+      SELECT status, last_error FROM push_deliveries ORDER BY created_at DESC LIMIT 1`)[0]).toMatchObject({
+      status: "dead", last_error: "Unregistered",
+    });
+  });
+
+  test("stale APNs rejection cannot erase a rotated token or newer delivery", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const oldToken = "66".repeat(32);
+    const newToken = "77".repeat(32);
+    await registerPushToken(db, bob.deviceId, oldToken, "sandbox");
+
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "old token delivery",
+    });
+
+    const sender = new RotatingPushSender(async () => {
+      await registerPushToken(db, bob.deviceId, newToken, "sandbox");
+      await sendMessage(db, {
+        senderAccountId: alice.accountId,
+        senderDeviceId: alice.deviceId,
+        dialogId,
+        clientMsgId: crypto.randomUUID(),
+        body: "new token delivery",
+      });
+    }, { status: 410, reason: "Unregistered" });
+
+    expect(await processPushBatch(db, sender, 1)).toBe(1);
+    const device = (await db`
+      SELECT push_token_ciphertext, push_token_nonce, push_token_key_id
+      FROM devices WHERE id = ${bob.deviceId}`)[0];
+    expect(open({
+      keyId: device.push_token_key_id,
+      nonce: Buffer.from(device.push_token_nonce),
+      ciphertext: Buffer.from(device.push_token_ciphertext),
+    }, pushTokenAAD(bob.deviceId)).toString("utf8")).toBe(newToken);
+
+    const deliveries = await db`
+      SELECT status, last_error FROM push_deliveries ORDER BY created_at`;
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[0]).toMatchObject({ status: "dead", last_error: "Unregistered" });
+    expect(deliveries[1]).toMatchObject({ status: "pending", last_error: null });
+  });
+
+  test("push worker retries transient APNs failures without dropping the delivery", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    await registerPushToken(db, bob.deviceId, "55".repeat(32), "production");
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "retry",
+    });
+
+    const throttled = new StubPushSender([{ status: 429, reason: "TooManyRequests" }]);
+    expect(await processPushBatch(db, throttled)).toBe(1);
+    const row = (await db`SELECT status, attempts, available_at, last_error FROM push_deliveries`)[0];
+    expect(row.status).toBe("pending");
+    expect(Number(row.attempts)).toBe(1);
+    expect(new Date(row.available_at).getTime()).toBeGreaterThan(Date.now());
+    expect(row.last_error).toBe("TooManyRequests");
+
+    await db`
+      UPDATE push_deliveries
+      SET status = 'sending', claimed_at = now() - interval '10 minutes', available_at = now()`;
+    const recovered = new StubPushSender([{ status: 200 }]);
+    expect(await processPushBatch(db, recovered)).toBe(1);
+    expect((await db`SELECT status FROM push_deliveries`)[0].status).toBe("sent");
   });
 
   test("send retries are idempotent and do not burn message ids", async () => {

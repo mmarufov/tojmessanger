@@ -1,0 +1,16 @@
+[Unit]
+Description=Toj encrypted PostgreSQL backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/toj/backup.env
+ExecStart=/usr/local/sbin/toj-backup-postgres
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/toj
