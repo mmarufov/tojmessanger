@@ -206,7 +206,7 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(latestDialogId, dialogId)
         XCTAssertEqual(peerReadMsgId, 1)
 
-        let dialogs = try await store.dialogs()
+        let dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(dialogs.map(\.title), ["Bob"])
         XCTAssertEqual(dialogs.map(\.lastText), ["remote reply"])
     }
@@ -238,7 +238,7 @@ final class CloudLocalStoreTests: XCTestCase {
             accountId: accountId
         )
 
-        let dialogs = try await store.dialogs()
+        let dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(dialogs.map(\.dialogId), [dialogId])
         XCTAssertEqual(dialogs.map(\.title), ["Bob"])
     }
@@ -314,11 +314,95 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.finishBootstrap(accountId: accountId, pts: page.state.pts)
         let ptsAfterFinish = try await store.loadPts(accountId: accountId)
         let latestDialogId = try await store.latestDialogId()
-        let dialogs = try await store.dialogs()
+        let dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(ptsAfterFinish, 44)
         XCTAssertEqual(latestDialogId, dialogId)
         XCTAssertEqual(dialogs.first?.title, "Alice")
         XCTAssertEqual(dialogs.first?.lastText, "snapshot message")
+    }
+
+    @MainActor
+    func testUnreadCountsOnlyVisiblePeerMessagesAfterReadPosition() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        let dialogId = "dialog-unread"
+
+        try await store.upsertDialog(dialogId: dialogId, title: "Mehrona")
+        try await store.saveMembers(dialogId: dialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+
+        let messages = [
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: 1,
+                senderAccountId: peerId,
+                clientMsgId: UUID().uuidString,
+                kind: "text",
+                text: "peer one",
+                editVersion: 0,
+                state: "visible",
+                serverTs: "2026-07-12T10:00:00Z"
+            ),
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: 2,
+                senderAccountId: accountId,
+                clientMsgId: UUID().uuidString,
+                kind: "text",
+                text: "my reply",
+                editVersion: 0,
+                state: "visible",
+                serverTs: "2026-07-12T10:00:01Z"
+            ),
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: 3,
+                senderAccountId: peerId,
+                clientMsgId: UUID().uuidString,
+                kind: "text",
+                text: "peer two",
+                editVersion: 0,
+                state: "visible",
+                serverTs: "2026-07-12T10:00:02Z"
+            ),
+        ]
+
+        for (index, message) in messages.enumerated() {
+            try await store.applyDifference(
+                DifferenceResponse(
+                    kind: "difference",
+                    state: DifferenceResponse.State(pts: Int64(index + 1)),
+                    updates: [
+                        CloudUpdate(
+                            pts: Int64(index + 1),
+                            ptsCount: 1,
+                            type: "message.new",
+                            dialogId: dialogId,
+                            dialogTitle: "Mehrona",
+                            message: message,
+                            readerAccountId: nil,
+                            maxReadMsgId: nil
+                        )
+                    ],
+                    hasMore: false
+                ),
+                accountId: accountId
+            )
+        }
+
+        var dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(dialogs.first?.unreadCount, 2, "The current user's own message must not count as unread")
+
+        try await store.markRead(dialogId: dialogId, accountId: accountId, maxReadMsgId: 1)
+        dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(dialogs.first?.unreadCount, 1)
+
+        try await store.markRead(dialogId: dialogId, accountId: accountId, maxReadMsgId: 3)
+        dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(dialogs.first?.unreadCount, 0)
     }
 
     private func makeStore() throws -> CloudLocalStore {

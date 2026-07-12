@@ -27,6 +27,7 @@ struct LocalDialog: Identifiable, Equatable, Sendable {
     let lastSenderAccountId: String?
     let lastLocalState: String?
     let lastServerTs: String?
+    let unreadCount: Int
 }
 
 struct PendingOutboxItem: Identifiable, Equatable, Sendable {
@@ -431,7 +432,7 @@ actor CloudLocalStore {
         }
     }
 
-    func dialogs() throws -> [LocalDialog] {
+    func dialogs(accountId: String) throws -> [LocalDialog] {
         try dbQueue.read { db in
             let rows = try Row.fetchAll(
                 db,
@@ -445,7 +446,21 @@ actor CloudLocalStore {
                   m.text AS last_text,
                   m.sender_account_id AS last_sender_account_id,
                   m.local_state AS last_local_state,
-                  m.server_ts AS last_server_ts
+                  m.server_ts AS last_server_ts,
+                  (
+                    SELECT COUNT(*)
+                    FROM messages unread
+                    WHERE unread.dialog_id = d.dialog_id
+                      AND unread.msg_id IS NOT NULL
+                      AND unread.sender_account_id != ?
+                      AND unread.state = 'visible'
+                      AND unread.msg_id > COALESCE((
+                        SELECT member.last_read_msg_id
+                        FROM dialog_members member
+                        WHERE member.dialog_id = d.dialog_id
+                          AND member.account_id = ?
+                      ), 0)
+                  ) AS unread_count
                 FROM dialogs d
                 LEFT JOIN messages m ON m.rowid = (
                   SELECT rowid
@@ -455,7 +470,8 @@ actor CloudLocalStore {
                   LIMIT 1
                 )
                 ORDER BY d.updated_at DESC, d.dialog_id DESC
-                """
+                """,
+                arguments: [accountId, accountId]
             )
             return rows.map(Self.dialog(from:))
         }
@@ -637,7 +653,8 @@ actor CloudLocalStore {
             lastText: row["last_text"],
             lastSenderAccountId: row["last_sender_account_id"],
             lastLocalState: row["last_local_state"],
-            lastServerTs: row["last_server_ts"]
+            lastServerTs: row["last_server_ts"],
+            unreadCount: row["unread_count"]
         )
     }
 

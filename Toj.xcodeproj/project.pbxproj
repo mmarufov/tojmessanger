@@ -12,6 +12,7 @@
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
 		3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */; };
 		3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */; };
+		5FBC1A8DF7D90DF358C187F1 /* MessagingPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
 		E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */; };
@@ -34,6 +35,7 @@
 		51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EnvelopeTests.swift; sourceTree = "<group>"; };
 		65F781742FF68D07000D35EE /* Toj.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Toj.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CryptoSpikeTests.swift; sourceTree = "<group>"; };
+		9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessagingPresentationTests.swift; sourceTree = "<group>"; };
 		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
 		B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.release.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.release.xcconfig"; sourceTree = "<group>"; };
 		C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudLocalStoreTests.swift; sourceTree = "<group>"; };
@@ -83,6 +85,7 @@
 				51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */,
 				8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */,
 				C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */,
+				9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */,
 			);
 			name = TojTests;
 			path = TojTests;
@@ -202,6 +205,8 @@
 			hasScannedForEncodings = 0;
 			knownRegions = (
 				en,
+				ru,
+				tg,
 				Base,
 			);
 			mainGroup = 65F7816B2FF68D07000D35EE;
@@ -308,6 +313,7 @@
 				E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */,
 				CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */,
 				3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */,
+				5FBC1A8DF7D90DF358C187F1 /* MessagingPresentationTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -339,7 +345,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -360,7 +366,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -503,7 +509,6 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Toj-Info.plist";
-				TOJ_PUSH_ENABLED = NO;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -514,7 +519,7 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -533,6 +538,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				TOJ_PUSH_ENABLED = NO;
 			};
 			name = Debug;
 		};
@@ -550,7 +556,6 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Toj-Info.plist";
-				TOJ_PUSH_ENABLED = NO;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -561,7 +566,7 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -580,6 +585,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				TOJ_PUSH_ENABLED = NO;
 			};
 			name = Release;
 		};

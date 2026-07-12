@@ -1,5 +1,5 @@
 # One-time project surgery for Milestone 1: run with `ruby scripts/project_prep.rb`
-# - iOS-only, deployment target 17.0 (skeleton doesn't need Liquid Glass / iOS 26)
+# - iOS-only, deployment target 26.0 for native Liquid Glass
 # - strict concurrency warnings project-wide
 # - adds the TojTests unit-test target and a shared Toj scheme that runs it
 require 'xcodeproj'
@@ -16,7 +16,7 @@ end
 
 app.build_configurations.each do |c|
   bs = c.build_settings
-  bs['IPHONEOS_DEPLOYMENT_TARGET'] = '17.0'
+  bs['IPHONEOS_DEPLOYMENT_TARGET'] = '26.0'
   bs['SUPPORTED_PLATFORMS'] = 'iphoneos iphonesimulator'
   bs['TARGETED_DEVICE_FAMILY'] = '1,2'
   # LibSignalClient does not support explicitly built modules (per its podspec)
@@ -27,7 +27,7 @@ end
 if project.targets.any? { |t| t.name == 'TojTests' }
   puts 'TojTests already exists — skipping target creation'
 else
-  test = project.new_target(:unit_test_bundle, 'TojTests', :ios, '17.0')
+  test = project.new_target(:unit_test_bundle, 'TojTests', :ios, '26.0')
   test.add_dependency(app)
   test.build_configurations.each do |c|
     bs = c.build_settings
@@ -36,7 +36,7 @@ else
     bs['PRODUCT_BUNDLE_IDENTIFIER'] = 'com.toj.TojTests'
     bs['GENERATE_INFOPLIST_FILE'] = 'YES'
     bs['SWIFT_VERSION'] = '5.0'
-    bs['IPHONEOS_DEPLOYMENT_TARGET'] = '17.0'
+    bs['IPHONEOS_DEPLOYMENT_TARGET'] = '26.0'
     bs['SUPPORTED_PLATFORMS'] = 'iphoneos iphonesimulator'
     bs['TARGETED_DEVICE_FAMILY'] = '1,2'
     bs['DEVELOPMENT_TEAM'] = TEAM if TEAM && !TEAM.empty?
