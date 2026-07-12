@@ -1,5 +1,15 @@
 import Foundation
 
+struct CloudReaction: Codable, Equatable, Sendable {
+    let accountId: String
+    let emoji: String
+
+    enum CodingKeys: String, CodingKey {
+        case accountId = "account_id"
+        case emoji
+    }
+}
+
 struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     nonisolated var id: String { "\(dialogId):\(msgId)" }
     let dialogId: String
@@ -9,6 +19,11 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let kind: String
     let text: String
     let replyToMsgId: Int64?
+    let forwardedFromAccountId: String?
+    let forwardedFromDialogId: String?
+    let forwardedFromMsgId: Int64?
+    let isForwarded: Bool
+    let reactions: [CloudReaction]
     let editVersion: Int
     let state: String
     let serverTs: String
@@ -21,6 +36,11 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         kind: String,
         text: String,
         replyToMsgId: Int64? = nil,
+        forwardedFromAccountId: String? = nil,
+        forwardedFromDialogId: String? = nil,
+        forwardedFromMsgId: Int64? = nil,
+        isForwarded: Bool = false,
+        reactions: [CloudReaction] = [],
         editVersion: Int,
         state: String,
         serverTs: String
@@ -32,6 +52,11 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         self.kind = kind
         self.text = text
         self.replyToMsgId = replyToMsgId
+        self.forwardedFromAccountId = forwardedFromAccountId
+        self.forwardedFromDialogId = forwardedFromDialogId
+        self.forwardedFromMsgId = forwardedFromMsgId
+        self.isForwarded = isForwarded
+        self.reactions = reactions
         self.editVersion = editVersion
         self.state = state
         self.serverTs = serverTs
@@ -45,9 +70,33 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case kind
         case text
         case replyToMsgId = "reply_to_msg_id"
+        case forwardedFromAccountId = "forwarded_from_account_id"
+        case forwardedFromDialogId = "forwarded_from_dialog_id"
+        case forwardedFromMsgId = "forwarded_from_msg_id"
+        case isForwarded = "forwarded"
+        case reactions
         case editVersion = "edit_version"
         case state
         case serverTs = "server_ts"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        dialogId = try values.decode(String.self, forKey: .dialogId)
+        msgId = try values.decode(Int64.self, forKey: .msgId)
+        senderAccountId = try values.decode(String.self, forKey: .senderAccountId)
+        clientMsgId = try values.decode(String.self, forKey: .clientMsgId)
+        kind = try values.decode(String.self, forKey: .kind)
+        text = try values.decode(String.self, forKey: .text)
+        replyToMsgId = try values.decodeIfPresent(Int64.self, forKey: .replyToMsgId)
+        forwardedFromAccountId = try values.decodeIfPresent(String.self, forKey: .forwardedFromAccountId)
+        forwardedFromDialogId = try values.decodeIfPresent(String.self, forKey: .forwardedFromDialogId)
+        forwardedFromMsgId = try values.decodeIfPresent(Int64.self, forKey: .forwardedFromMsgId)
+        isForwarded = try values.decodeIfPresent(Bool.self, forKey: .isForwarded) ?? false
+        reactions = try values.decodeIfPresent([CloudReaction].self, forKey: .reactions) ?? []
+        editVersion = try values.decode(Int.self, forKey: .editVersion)
+        state = try values.decode(String.self, forKey: .state)
+        serverTs = try values.decode(String.self, forKey: .serverTs)
     }
 }
 
@@ -341,7 +390,29 @@ struct CloudAPI: Sendable {
                 clientMsgId: clientMsgId,
                 kind: "text",
                 body: body,
-                replyToMsgId: replyToMsgId
+                replyToMsgId: replyToMsgId,
+                forwardedFrom: nil
+            ),
+            token: token
+        )
+    }
+
+    func forwardMessage(
+        dialogId: String,
+        clientMsgId: String,
+        sourceDialogId: String,
+        sourceMsgId: Int64,
+        token: String
+    ) async throws -> SendMessageResponse {
+        try await post(
+            "v1/messages/send",
+            body: SendMessageRequest(
+                dialogId: dialogId,
+                clientMsgId: clientMsgId,
+                kind: "text",
+                body: nil,
+                replyToMsgId: nil,
+                forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId)
             ),
             token: token
         )
@@ -380,6 +451,25 @@ struct CloudAPI: Sendable {
                 dialogId: dialogId,
                 msgId: msgId,
                 clientMutationId: clientMutationId
+            ),
+            token: token
+        )
+    }
+
+    func setReaction(
+        dialogId: String,
+        msgId: Int64,
+        clientMutationId: String,
+        emoji: String?,
+        token: String
+    ) async throws -> MessageMutationResponse {
+        try await post(
+            "v1/messages/react",
+            body: ReactionRequest(
+                dialogId: dialogId,
+                msgId: msgId,
+                clientMutationId: clientMutationId,
+                emoji: emoji
             ),
             token: token
         )
@@ -517,8 +607,14 @@ private struct SendMessageRequest: Encodable {
     let dialogId: String
     let clientMsgId: String
     let kind: String
-    let body: String
+    let body: String?
     let replyToMsgId: Int64?
+    let forwardedFrom: ForwardedFromRequest?
+}
+
+private struct ForwardedFromRequest: Encodable {
+    let dialogId: String
+    let msgId: Int64
 }
 
 private struct EditMessageRequest: Encodable {
@@ -533,6 +629,13 @@ private struct DeleteMessageRequest: Encodable {
     let dialogId: String
     let msgId: Int64
     let clientMutationId: String
+}
+
+private struct ReactionRequest: Encodable {
+    let dialogId: String
+    let msgId: Int64
+    let clientMutationId: String
+    let emoji: String?
 }
 
 private struct ReadRequest: Encodable {

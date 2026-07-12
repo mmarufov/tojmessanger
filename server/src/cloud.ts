@@ -31,6 +31,7 @@ import {
   sendMessage,
   editMessage,
   deleteMessage,
+  setReaction,
   startBootstrap,
   SyncError,
   type Push,
@@ -272,6 +273,21 @@ export function startCloudServer(
             kind: body.kind,
             body: body.body ?? "",
             replyToMsgId: body.replyToMsgId,
+            forwardedFrom: body.forwardedFrom,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+
+        if (url.pathname === "/v1/messages/react" && req.method === "POST") {
+          if (!body.dialogId || !body.msgId || !body.clientMutationId) throw new SyncError("reaction fields required");
+          const result = await setReaction(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: body.dialogId,
+            msgId: Number(body.msgId),
+            clientMutationId: body.clientMutationId,
+            emoji: body.emoji ?? null,
           });
           pushHints(sockets, result.pushes);
           response = json(result);

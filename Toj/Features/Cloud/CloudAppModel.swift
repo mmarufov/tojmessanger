@@ -32,6 +32,7 @@ final class CloudAppModel {
         var dialogId: String?
         var msgId: Int64?
         var clientMsgId: String
+        var senderAccountId: String? = nil
         var text: String
         var mine: Bool
         var delivery: Delivery
@@ -39,6 +40,11 @@ final class CloudAppModel {
         var replyToMsgId: Int64? = nil
         var replyPreview: String? = nil
         var reactions: [String] = []
+        var myReaction: String? = nil
+        var forwardedFromAccountId: String? = nil
+        var forwardedFromDialogId: String? = nil
+        var forwardedFromMsgId: Int64? = nil
+        var isForwarded = false
         var editVersion = 0
         var isEdited = false
         var isDeleted = false
@@ -682,10 +688,10 @@ final class CloudAppModel {
         if line.isDeleted { return [.inspect] }
         var actions: [MessageAction] = [.copy]
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
-        if capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
+        if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
         if line.mine, capabilities.contains(.editing) { actions.append(.edit) }
-        if capabilities.contains(.forwarding) { actions.append(.forward) }
-        if capabilities.contains(.deletion) { actions.append(.delete) }
+        if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
+        if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
         if case .failed = line.delivery { actions.append(.retry) }
         actions.append(.inspect)
         return actions
@@ -772,6 +778,8 @@ final class CloudAppModel {
                     dialogId: dialogId,
                     body: text,
                     replyToMsgId: replyToMsgId,
+                    forwardedFromDialogId: nil,
+                    forwardedFromMsgId: nil,
                     retryCount: 0,
                     nextRetryAt: nil
                 ),
@@ -1028,12 +1036,19 @@ final class CloudAppModel {
             dialogId: message.dialogId,
             msgId: message.msgId,
             clientMsgId: message.clientMsgId,
+            senderAccountId: message.senderAccountId,
             text: message.state == "deleted_for_all" ? String(localized: "Message deleted") : message.text,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
             replyToMsgId: message.replyToMsgId,
             replyPreview: replyPreview,
+            reactions: Self.reactionBadges(message.reactions),
+            myReaction: message.reactions.first(where: { $0.accountId == storedSession?.session.accountId })?.emoji,
+            forwardedFromAccountId: message.forwardedFromAccountId,
+            forwardedFromDialogId: message.forwardedFromDialogId,
+            forwardedFromMsgId: message.forwardedFromMsgId,
+            isForwarded: message.isForwarded,
             editVersion: message.editVersion,
             isEdited: message.editVersion > 0 && message.state == "visible",
             isDeleted: message.state == "deleted_for_all"
@@ -1131,13 +1146,24 @@ final class CloudAppModel {
     }
 
     private func sendOutboxItem(_ item: PendingOutboxItem, token: String) async throws {
-        let response = try await api.sendMessage(
-            dialogId: item.dialogId,
-            clientMsgId: item.clientMsgId,
-            body: item.body,
-            replyToMsgId: item.replyToMsgId,
-            token: token
-        )
+        let response: SendMessageResponse
+        if let sourceDialogId = item.forwardedFromDialogId, let sourceMsgId = item.forwardedFromMsgId {
+            response = try await api.forwardMessage(
+                dialogId: item.dialogId,
+                clientMsgId: item.clientMsgId,
+                sourceDialogId: sourceDialogId,
+                sourceMsgId: sourceMsgId,
+                token: token
+            )
+        } else {
+            response = try await api.sendMessage(
+                dialogId: item.dialogId,
+                clientMsgId: item.clientMsgId,
+                body: item.body,
+                replyToMsgId: item.replyToMsgId,
+                token: token
+            )
+        }
 
         if let localStore, let accountId = storedSession?.session.accountId {
             try await localStore.markSent(response, senderAccountId: accountId)
@@ -1169,8 +1195,15 @@ final class CloudAppModel {
         if let index = lines.firstIndex(where: { $0.clientMsgId == message.clientMsgId }) {
             lines[index].dialogId = message.dialogId
             lines[index].msgId = message.msgId
+            lines[index].senderAccountId = message.senderAccountId
             lines[index].text = message.text
             lines[index].replyToMsgId = message.replyToMsgId
+            lines[index].reactions = Self.reactionBadges(message.reactions)
+            lines[index].myReaction = message.reactions.first(where: { $0.accountId == storedSession?.session.accountId })?.emoji
+            lines[index].forwardedFromAccountId = message.forwardedFromAccountId
+            lines[index].forwardedFromDialogId = message.forwardedFromDialogId
+            lines[index].forwardedFromMsgId = message.forwardedFromMsgId
+            lines[index].isForwarded = message.isForwarded
             lines[index].editVersion = message.editVersion
             lines[index].isEdited = message.editVersion > 0 && message.state == "visible"
             lines[index].isDeleted = message.state == "deleted_for_all"
@@ -1184,11 +1217,18 @@ final class CloudAppModel {
             dialogId: message.dialogId,
             msgId: message.msgId,
             clientMsgId: message.clientMsgId,
+            senderAccountId: message.senderAccountId,
             text: message.text,
             mine: mine,
             delivery: .sent,
             timestamp: message.serverTs,
             replyToMsgId: message.replyToMsgId,
+            reactions: Self.reactionBadges(message.reactions),
+            myReaction: message.reactions.first(where: { $0.accountId == storedSession?.session.accountId })?.emoji,
+            forwardedFromAccountId: message.forwardedFromAccountId,
+            forwardedFromDialogId: message.forwardedFromDialogId,
+            forwardedFromMsgId: message.forwardedFromMsgId,
+            isForwarded: message.isForwarded,
             editVersion: message.editVersion,
             isEdited: message.editVersion > 0 && message.state == "visible",
             isDeleted: message.state == "deleted_for_all"
@@ -1264,6 +1304,100 @@ final class CloudAppModel {
             scheduleSync()
         } catch {
             status = "Delete failed: \(error.localizedDescription)"
+        }
+    }
+
+    func reactToMessage(_ line: Line, reaction: String = "❤️") async {
+        #if DEBUG
+        if isDemoMode {
+            reactToDemoMessage(line.id, reaction: reaction)
+            return
+        }
+        #endif
+        guard
+            !line.isDeleted,
+            let token = storedSession?.session.token,
+            let dialogId = line.dialogId,
+            let msgId = line.msgId
+        else { return }
+        let mutationId = UUID().uuidString.lowercased()
+        let desiredReaction: String? = line.myReaction == reaction ? nil : reaction
+        do {
+            let response = try await retryTransientMutation {
+                try await self.api.setReaction(
+                    dialogId: dialogId,
+                    msgId: msgId,
+                    clientMutationId: mutationId,
+                    emoji: desiredReaction,
+                    token: token
+                )
+            }
+            try await localStore?.applyMessageMutation(response)
+            await loadLocalLines(dialogId: dialogId)
+            status = desiredReaction == nil ? "Reaction removed" : "Reacted"
+            scheduleSync()
+        } catch {
+            status = "Reaction failed: \(error.localizedDescription)"
+        }
+    }
+
+    func forwardMessage(_ line: Line, to targetDialogId: String) async {
+        #if DEBUG
+        if isDemoMode {
+            status = "Forwarded"
+            return
+        }
+        #endif
+        guard
+            !line.isDeleted,
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId,
+            let sourceDialogId = line.dialogId,
+            let sourceMsgId = line.msgId
+        else { return }
+        let clientMsgId = UUID().uuidString.lowercased()
+        do {
+            if let localStore {
+                _ = try await localStore.insertSending(
+                    dialogId: targetDialogId,
+                    clientMsgId: clientMsgId,
+                    text: line.text,
+                    senderAccountId: accountId,
+                    forwardedFromAccountId: line.senderAccountId,
+                    forwardedFromDialogId: sourceDialogId,
+                    forwardedFromMsgId: sourceMsgId
+                )
+            }
+            await refreshDialogs()
+            try await sendOutboxItem(
+                PendingOutboxItem(
+                    clientMsgId: clientMsgId,
+                    dialogId: targetDialogId,
+                    body: line.text,
+                    replyToMsgId: nil,
+                    forwardedFromDialogId: sourceDialogId,
+                    forwardedFromMsgId: sourceMsgId,
+                    retryCount: 0,
+                    nextRetryAt: nil
+                ),
+                token: token
+            )
+            status = "Forwarded"
+        } catch {
+            if let localStore {
+                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: retryDelay(forRetryCount: 1))
+                await refreshDialogs()
+                scheduleOutboxRetry(after: retryDelay(forRetryCount: 1))
+            }
+            status = "Forward failed: \(error.localizedDescription)"
+        }
+    }
+
+    private static func reactionBadges(_ reactions: [CloudReaction]) -> [String] {
+        let grouped = Dictionary(grouping: reactions, by: \.emoji)
+        return grouped.keys.sorted().map { emoji in
+            let count = grouped[emoji]?.count ?? 0
+            return count > 1 ? "\(emoji) \(count)" : emoji
         }
     }
 

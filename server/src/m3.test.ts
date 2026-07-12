@@ -30,6 +30,7 @@ import {
   sendMessage,
   editMessage,
   deleteMessage,
+  setReaction,
   startBootstrap,
 } from "./sync";
 
@@ -44,6 +45,7 @@ async function resetDb() {
       bootstrap_snapshot_dialogs,
       bootstrap_snapshots,
       message_mutation_requests,
+      message_reactions,
       send_requests,
       push_deliveries,
       account_events,
@@ -744,6 +746,194 @@ describe("M3 cloud sync", () => {
     const bootstrap = await startBootstrap(db, bob.accountId);
     const page = await getBootstrapDialogsPage(db, bob.accountId, bootstrap.token, { previewMessages: 10 });
     expect(page.dialogs[0].messages.at(-1)?.reply_to_msg_id).toBe(original.msgId);
+  });
+
+  test("reactions are idempotent, replaceable, removable, and sync as full message state", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "react to this",
+    });
+    const mutationId = crypto.randomUUID();
+    const [first, retry] = await Promise.all([
+      setReaction(db, {
+        actorAccountId: bob.accountId,
+        actorDeviceId: bob.deviceId,
+        dialogId,
+        msgId: sent.msgId,
+        clientMutationId: mutationId,
+        emoji: "❤️",
+      }),
+      setReaction(db, {
+        actorAccountId: bob.accountId,
+        actorDeviceId: bob.deviceId,
+        dialogId,
+        msgId: sent.msgId,
+        clientMutationId: mutationId,
+        emoji: "❤️",
+      }),
+    ]);
+    expect([first.duplicate, retry.duplicate].sort()).toEqual([false, true]);
+    expect(first.actorPts).toBe(retry.actorPts);
+    expect(first.message.reactions).toEqual([{ account_id: bob.accountId, emoji: "❤️" }]);
+
+    const replacement = await setReaction(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      emoji: "👍",
+    });
+    expect(replacement.message.reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+
+    const difference = await getDifference(db, alice.accountId, 0);
+    const reactionUpdates = difference.updates.filter((update) => update.type === "reaction.updated");
+    expect(reactionUpdates).toHaveLength(2);
+    expect(reactionUpdates.at(-1)?.message?.reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+
+    const history = await getHistory(db, alice.accountId, dialogId);
+    expect(history.messages[0].reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+    const bootstrap = await startBootstrap(db, bob.accountId);
+    const page = await getBootstrapDialogsPage(db, bob.accountId, bootstrap.token, { previewMessages: 10 });
+    expect(page.dialogs[0].messages[0].reactions).toEqual([{ account_id: bob.accountId, emoji: "👍" }]);
+
+    const removed = await setReaction(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      emoji: null,
+    });
+    expect(removed.message.reactions).toEqual([]);
+  });
+
+  test("reactions require membership and a visible message", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const charlie = await makeAccount(testPhone(777), "Charlie");
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "private message",
+    });
+    await expect(setReaction(db, {
+      actorAccountId: charlie.accountId,
+      actorDeviceId: charlie.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      emoji: "👀",
+    })).rejects.toThrow("not a member");
+
+    await deleteMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+    });
+    await expect(setReaction(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      emoji: "👀",
+    })).rejects.toThrow("message not found");
+  });
+
+  test("forwarding copies authorized visible text with immutable provenance and idempotency", async () => {
+    const { alice, bob, dialogId: sourceDialogId } = await makePair();
+    const charlie = await makeAccount(testPhone(778), "Charlie");
+    const target = await getOrCreateDirectDialog(db, alice.accountId, charlie.accountId);
+    const source = await sendMessage(db, {
+      senderAccountId: bob.accountId,
+      senderDeviceId: bob.deviceId,
+      dialogId: sourceDialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "useful source text",
+    });
+    const clientMsgId = crypto.randomUUID();
+    const forwarded = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId: target.dialogId,
+      clientMsgId,
+      forwardedFrom: { dialogId: sourceDialogId, msgId: source.msgId },
+    });
+    const retry = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId: target.dialogId,
+      clientMsgId,
+      forwardedFrom: { dialogId: sourceDialogId, msgId: source.msgId },
+    });
+    expect(forwarded.text).toBe("useful source text");
+    expect(retry.duplicate).toBe(true);
+    expect(retry.msgId).toBe(forwarded.msgId);
+
+    await editMessage(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId: sourceDialogId,
+      msgId: source.msgId,
+      clientMutationId: crypto.randomUUID(),
+      expectedEditVersion: 0,
+      body: "changed later",
+    });
+    const history = await getHistory(db, charlie.accountId, target.dialogId);
+    expect(history.messages[0]).toMatchObject({ text: "useful source text", forwarded: true });
+    expect(history.messages[0]).not.toHaveProperty("forwarded_from_account_id");
+    expect(history.messages[0]).not.toHaveProperty("forwarded_from_dialog_id");
+    const provenance = (await db`
+      SELECT forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id
+      FROM messages WHERE dialog_id = ${target.dialogId} AND msg_id = ${forwarded.msgId}`)[0];
+    expect(provenance).toMatchObject({
+      forwarded_from_account_id: bob.accountId,
+      forwarded_from_dialog_id: sourceDialogId,
+    });
+    expect(Number(provenance.forwarded_from_msg_id)).toBe(source.msgId);
+  });
+
+  test("forwarding rejects inaccessible or deleted source messages", async () => {
+    const { alice, bob, dialogId: sourceDialogId } = await makePair();
+    const charlie = await makeAccount(testPhone(779), "Charlie");
+    const target = await getOrCreateDirectDialog(db, charlie.accountId, bob.accountId);
+    const source = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId: sourceDialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "not Charlie's message",
+    });
+    await expect(sendMessage(db, {
+      senderAccountId: charlie.accountId,
+      senderDeviceId: charlie.deviceId,
+      dialogId: target.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      forwardedFrom: { dialogId: sourceDialogId, msgId: source.msgId },
+    })).rejects.toThrow("not a member");
+
+    await deleteMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId: sourceDialogId,
+      msgId: source.msgId,
+      clientMutationId: crypto.randomUUID(),
+    });
+    await expect(sendMessage(db, {
+      senderAccountId: bob.accountId,
+      senderDeviceId: bob.deviceId,
+      dialogId: target.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      forwardedFrom: { dialogId: sourceDialogId, msgId: source.msgId },
+    })).rejects.toThrow("forward source not found");
   });
 
   test("edits and deletions are idempotent tombstones that sync to every member", async () => {

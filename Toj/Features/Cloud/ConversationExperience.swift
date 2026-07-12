@@ -9,9 +9,11 @@ struct TojConversationExperience: View {
     @State private var showingProfile = false
     @State private var showingAttachments = false
     @State private var showingForwarding = false
+    @State private var forwardLine: CloudAppModel.Line?
     @State private var showingCall = false
     @State private var detailsLine: CloudAppModel.Line?
     @State private var deleteLine: CloudAppModel.Line?
+    @State private var reactionLine: CloudAppModel.Line?
     @State private var initialUnreadCount = 0
     @State private var isAtBottom = true
 
@@ -56,7 +58,11 @@ struct TojConversationExperience: View {
             .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showingForwarding) {
-            DemoForwardingView(dialogs: model.dialogs) {
+            DemoForwardingView(dialogs: model.dialogs) { targetDialogId in
+                if let forwardLine {
+                    Task { await model.forwardMessage(forwardLine, to: targetDialogId) }
+                }
+                forwardLine = nil
                 showingForwarding = false
             }
             .presentationDetents([.medium])
@@ -76,6 +82,24 @@ struct TojConversationExperience: View {
             Button("Cancel", role: .cancel) { deleteLine = nil }
         } message: {
             Text("This removes the message for everyone in this conversation.")
+        }
+        .confirmationDialog(
+            "Choose a reaction",
+            isPresented: Binding(
+                get: { reactionLine != nil },
+                set: { if !$0 { reactionLine = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            ForEach(["❤️", "👍", "😂", "🔥", "😮", "😢"], id: \.self) { reaction in
+                Button(reactionLine?.myReaction == reaction ? "Remove \(reaction)" : reaction) {
+                    if let reactionLine {
+                        Task { await model.reactToMessage(reactionLine, reaction: reaction) }
+                    }
+                    reactionLine = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { reactionLine = nil }
         }
         .sheet(item: $detailsLine) { line in
             MessageDetailsView(line: line)
@@ -352,7 +376,7 @@ struct TojConversationExperience: View {
             model.beginReply(to: line)
             composerFocused = true
         case .react:
-            model.reactToDemoMessage(line.id)
+            reactionLine = line
         case .copy:
             UIPasteboard.general.string = line.text
             TojFeedback.selection()
@@ -360,6 +384,7 @@ struct TojConversationExperience: View {
             model.beginEditing(line)
             composerFocused = true
         case .forward:
+            forwardLine = line
             showingForwarding = true
         case .delete:
             deleteLine = line
@@ -395,6 +420,12 @@ private struct TojMessageBubble: View {
             if line.mine { Spacer(minLength: 54) }
 
             VStack(alignment: line.mine ? .trailing : .leading, spacing: 5) {
+                if line.isForwarded {
+                    Label("Forwarded message", systemImage: "arrowshape.turn.up.right.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 if let replyPreview = line.replyPreview {
                     HStack(spacing: 7) {
                         Rectangle().fill(TojTheme.secure).frame(width: 2, height: 28)
@@ -667,14 +698,14 @@ private struct DemoAttachmentPicker: View {
 
 private struct DemoForwardingView: View {
     let dialogs: [CloudAppModel.Dialog]
-    let onDone: () -> Void
+    let onDone: (String) -> Void
 
     var body: some View {
         NavigationStack {
             List(dialogs.filter { !$0.isArchived }) { dialog in
                 Button {
                     TojFeedback.sent()
-                    onDone()
+                    onDone(dialog.id)
                 } label: {
                     HStack(spacing: 12) {
                         TojAvatar(title: dialog.title, size: 42)

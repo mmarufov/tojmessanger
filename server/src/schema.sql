@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS messages (
   body_nonce        BYTEA NOT NULL,
   body_ciphertext   BYTEA NOT NULL,                   -- AEAD; AAD binds dialog_id‖msg_id‖sender (S1)
   reply_to_msg_id   BIGINT,
+  forwarded_from_account_id UUID REFERENCES accounts(id),
+  forwarded_from_dialog_id UUID,
+  forwarded_from_msg_id BIGINT,
   edit_version      INT NOT NULL DEFAULT 0,
   state             TEXT NOT NULL DEFAULT 'visible' CHECK (state IN ('visible','deleted_for_all')),
   server_ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -137,11 +140,29 @@ CREATE TABLE IF NOT EXISTS messages (
   PRIMARY KEY (dialog_id, msg_id),
   UNIQUE (sender_account_id, client_msg_id)           -- belt-and-suspenders vs send_requests
 );
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_account_id UUID REFERENCES accounts(id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_dialog_id UUID;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_msg_id BIGINT;
 DO $$ BEGIN
   ALTER TABLE messages ADD CONSTRAINT messages_reply_target_fk
     FOREIGN KEY (dialog_id, reply_to_msg_id) REFERENCES messages(dialog_id, msg_id);
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+DO $$ BEGIN
+  ALTER TABLE messages ADD CONSTRAINT messages_forward_source_fk
+    FOREIGN KEY (forwarded_from_dialog_id, forwarded_from_msg_id) REFERENCES messages(dialog_id, msg_id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS message_reactions (
+  dialog_id  UUID NOT NULL,
+  msg_id     BIGINT NOT NULL,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  emoji      TEXT NOT NULL CHECK (char_length(emoji) BETWEEN 1 AND 16),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (dialog_id, msg_id, account_id),
+  FOREIGN KEY (dialog_id, msg_id) REFERENCES messages(dialog_id, msg_id) ON DELETE CASCADE
+);
 -- No separate DESC index (C1): the PK (dialog_id, msg_id) serves ORDER BY msg_id DESC via reverse scan.
 
 -- ============ the sync log (crown jewel) ============
@@ -149,7 +170,7 @@ CREATE TABLE IF NOT EXISTS account_events (
   account_id        UUID   NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
-                       ('message.new','message.edited','message.deleted','read.updated',
+                       ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
                         'dialog.created','member.added','member.removed')),
   dialog_id         UUID,
   msg_id            BIGINT,
@@ -158,6 +179,10 @@ CREATE TABLE IF NOT EXISTS account_events (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, pts)                            -- serves get_difference: WHERE account_id=? AND pts>? ORDER BY pts
 );
+ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
+ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
+  ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+   'dialog.created','member.added','member.removed'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -176,7 +201,7 @@ CREATE TABLE IF NOT EXISTS send_requests (
 CREATE TABLE IF NOT EXISTS message_mutation_requests (
   actor_account_id  UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   client_mutation_id UUID NOT NULL,
-  operation         TEXT NOT NULL CHECK (operation IN ('edit','delete')),
+  operation         TEXT NOT NULL CHECK (operation IN ('edit','delete','reaction')),
   dialog_id         UUID NOT NULL,
   msg_id            BIGINT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
@@ -188,6 +213,9 @@ CREATE TABLE IF NOT EXISTS message_mutation_requests (
 -- the message row is locked (global lock order), so validation happens transactionally in sync.ts.
 ALTER TABLE message_mutation_requests
   DROP CONSTRAINT IF EXISTS message_mutation_requests_dialog_id_msg_id_fkey;
+ALTER TABLE message_mutation_requests DROP CONSTRAINT IF EXISTS message_mutation_requests_operation_check;
+ALTER TABLE message_mutation_requests ADD CONSTRAINT message_mutation_requests_operation_check
+  CHECK (operation IN ('edit','delete','reaction'));
 
 -- ============ APNs durable outbox (M4.1) ============
 -- APNs is only a wake-up hint. The authoritative update remains account_events + get_difference.

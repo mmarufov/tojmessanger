@@ -12,6 +12,7 @@ export class SyncError extends Error {}
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
   kind: string; text: string; reply_to_msg_id: number | null; edit_version: number;
+  forwarded: boolean; reactions: { account_id: string; emoji: string }[];
   state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
@@ -58,7 +59,9 @@ async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> 
 async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
   const r = (await sql`
     SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
-           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id, edit_version, state, server_ts
+           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
+           forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
+           edit_version, state, server_ts
     FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0];
   if (!r) return null;
   const text = r.state === "deleted_for_all"
@@ -67,10 +70,18 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
         { keyId: r.body_key_id, nonce: buf(r.body_nonce), ciphertext: buf(r.body_ciphertext) },
         bodyAAD(dialogId, n(r.msg_id), r.sender_account_id),
       ).toString("utf8");
+  const reactions = await sql`
+    SELECT account_id, emoji FROM message_reactions
+    WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}
+    ORDER BY created_at, account_id`;
   return {
     dialog_id: dialogId, msg_id: n(r.msg_id), sender_account_id: r.sender_account_id,
     client_msg_id: r.client_msg_id, kind: r.kind, text,
     reply_to_msg_id: r.reply_to_msg_id == null ? null : n(r.reply_to_msg_id), edit_version: r.edit_version,
+    // Source identifiers stay server-side. Recipients only need the presentation marker; exposing
+    // source dialog/account ids would create a cross-dialog privacy leak.
+    forwarded: r.forwarded_from_dialog_id != null && r.forwarded_from_msg_id != null,
+    reactions: reactions.map((reaction) => ({ account_id: reaction.account_id, emoji: reaction.emoji })),
     state: r.state, server_ts: iso(r.server_ts),
   };
 }
@@ -132,10 +143,13 @@ export type SendResult = {
 /** review B2: claim the idempotency row BEFORE allocating a msg_id; a retry echoes the original result. */
 export async function sendMessage(sql: SQL, p: {
   senderAccountId: string; senderDeviceId?: string | null; dialogId: string;
-  clientMsgId: string; kind?: string; body: string; replyToMsgId?: number | null;
+  clientMsgId: string; kind?: string; body?: string; replyToMsgId?: number | null;
+  forwardedFrom?: { dialogId: string; msgId: number } | null;
 }): Promise<SendResult> {
   return await sql.begin(async (tx) => {
-    const body = requireTextBody(p.body);
+    let body = p.forwardedFrom ? "" : requireTextBody(p.body);
+    let kind = p.kind ?? "text";
+    let forwardedFromAccountId: string | null = null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
@@ -160,6 +174,22 @@ export async function sendMessage(sql: SQL, p: {
     await requireActiveAccount(tx, p.senderAccountId);
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
 
+    if (p.forwardedFrom) {
+      const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
+      await requireActiveMember(tx, p.senderAccountId, p.forwardedFrom.dialogId);
+      const source = (await tx`
+        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext
+        FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}`)[0];
+      if (!source || source.state !== "visible") throw new SyncError("forward source not found");
+      if (source.kind !== "text") throw new SyncError("this message type cannot be forwarded yet");
+      body = open(
+        { keyId: source.body_key_id, nonce: buf(source.body_nonce), ciphertext: buf(source.body_ciphertext) },
+        bodyAAD(p.forwardedFrom.dialogId, sourceMsgId, source.sender_account_id),
+      ).toString("utf8");
+      kind = source.kind;
+      forwardedFromAccountId = source.sender_account_id;
+    }
+
     if (replyToMsgId != null) {
       const target = await tx`
         SELECT state FROM messages
@@ -176,9 +206,11 @@ export async function sendMessage(sql: SQL, p: {
     const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
     const inserted = await tx`
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
-                            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id)
+                            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
+                            forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
-              ${p.kind ?? "text"}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId})
+              ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
+              ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null})
       RETURNING server_ts`;
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
@@ -324,6 +356,79 @@ export async function deleteMessage(sql: SQL, p: {
   return mutateMessage(sql, { ...p, operation: "delete" });
 }
 
+export async function setReaction(sql: SQL, p: {
+  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  clientMutationId: string; emoji: string | null;
+}): Promise<MessageMutationResult> {
+  return await sql.begin(async (tx) => {
+    const msgId = optionalMessageId(p.msgId)!;
+    if (!UUID_PATTERN.test(p.clientMutationId)) throw new SyncError("invalid client mutation id");
+    const emoji = p.emoji == null ? null : String(p.emoji).trim();
+    if (emoji != null && (emoji.length < 1 || [...emoji].length > 8)) throw new SyncError("invalid reaction");
+
+    const claim = await tx`
+      INSERT INTO message_mutation_requests
+        (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status)
+      VALUES (${p.actorAccountId}, ${p.clientMutationId}, 'reaction', ${p.dialogId}, ${msgId}, 'pending')
+      ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING RETURNING status`;
+    if (claim.length === 0) {
+      const existing = (await tx`
+        SELECT operation, dialog_id, msg_id, status, actor_pts FROM message_mutation_requests
+        WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}
+        FOR UPDATE`)[0];
+      if (existing.operation !== "reaction" || existing.dialog_id !== p.dialogId || n(existing.msg_id) !== msgId) {
+        throw new SyncError("client mutation id already used");
+      }
+      if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
+      const message = await loadMessage(tx, p.dialogId, msgId);
+      if (!message) throw new SyncError("message not found");
+      return { dialogId: p.dialogId, msgId, actorPts: n(existing.actor_pts), duplicate: true, message, pushes: [] };
+    }
+
+    await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveMember(tx, p.actorAccountId, p.dialogId);
+    const members = await tx`
+      SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
+      ORDER BY account_id FOR UPDATE`;
+    const messageRow = (await tx`
+      SELECT state FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} FOR UPDATE`)[0];
+    if (!messageRow || messageRow.state !== "visible") throw new SyncError("message not found");
+    if (emoji == null) {
+      await tx`DELETE FROM message_reactions WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} AND account_id = ${p.actorAccountId}`;
+    } else {
+      await tx`
+        INSERT INTO message_reactions (dialog_id, msg_id, account_id, emoji)
+        VALUES (${p.dialogId}, ${msgId}, ${p.actorAccountId}, ${emoji})
+        ON CONFLICT (dialog_id, msg_id, account_id) DO UPDATE SET emoji = excluded.emoji, created_at = now()`;
+    }
+
+    let actorPts = 0;
+    const pushes: Push[] = [];
+    for (const member of members) {
+      const upd = await tx`
+        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
+        WHERE account_id = ${member.account_id} RETURNING pts`;
+      const pts = n(upd[0].pts);
+      await tx`
+        INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id, data)
+        VALUES (${member.account_id}, ${pts}, 'reaction.updated', ${p.dialogId}, ${msgId}, ${p.actorAccountId},
+                ${JSON.stringify({ reactor_account_id: p.actorAccountId, emoji })}::jsonb)`;
+      await enqueuePushDeliveries(tx, {
+        accountId: member.account_id, pts, senderAccountId: p.actorAccountId,
+        sourceDeviceId: p.actorDeviceId, alertRecipients: false,
+      });
+      if (member.account_id === p.actorAccountId) actorPts = pts;
+      pushes.push({ accountId: member.account_id, pts, ptsCount: 1 });
+    }
+    await tx`
+      UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
+      WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}`;
+    const message = await loadMessage(tx, p.dialogId, msgId);
+    if (!message) throw new SyncError("message not found");
+    return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
+  });
+}
+
 export async function getState(sql: SQL, accountId: string): Promise<{ pts: number }> {
   const r = (await sql`SELECT pts FROM account_sync_states WHERE account_id = ${accountId}`)[0];
   if (!r) throw new SyncError("unknown account");
@@ -365,7 +470,7 @@ export async function getDifference(
   for (const ev of rows) {
     const pts = n(ev.pts);
     let update: any;
-    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted") {
+    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
       const message = await loadMessage(sql, ev.dialog_id, n(ev.msg_id));
       if (!message) {
         update = {

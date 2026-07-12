@@ -12,6 +12,11 @@ struct LocalMessage: Identifiable, Equatable, Sendable {
     let kind: String
     let text: String
     let replyToMsgId: Int64?
+    let forwardedFromAccountId: String?
+    let forwardedFromDialogId: String?
+    let forwardedFromMsgId: Int64?
+    let isForwarded: Bool
+    let reactions: [CloudReaction]
     let editVersion: Int
     let state: String
     let serverTs: String?
@@ -39,6 +44,8 @@ struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let dialogId: String
     let body: String
     let replyToMsgId: Int64?
+    let forwardedFromDialogId: String?
+    let forwardedFromMsgId: Int64?
     let retryCount: Int
     let nextRetryAt: String?
 }
@@ -183,7 +190,10 @@ actor CloudLocalStore {
         clientMsgId: String,
         text: String,
         senderAccountId: String,
-        replyToMsgId: Int64? = nil
+        replyToMsgId: Int64? = nil,
+        forwardedFromAccountId: String? = nil,
+        forwardedFromDialogId: String? = nil,
+        forwardedFromMsgId: Int64? = nil
     ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
         try dbQueue.write { db in
@@ -192,26 +202,43 @@ actor CloudLocalStore {
                 sql: """
                 INSERT INTO messages (
                   local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
-                  reply_to_msg_id, edit_version, state, server_ts, local_state
+                  reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
+                  forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
                 )
-                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, 0, 'visible', NULL, 'sending')
+                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   text = excluded.text,
                   reply_to_msg_id = excluded.reply_to_msg_id,
+                  forwarded_from_account_id = excluded.forwarded_from_account_id,
+                  forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
+                  forwarded_from_msg_id = excluded.forwarded_from_msg_id,
+                  is_forwarded = excluded.is_forwarded,
                   local_state = 'sending'
                 """,
-                arguments: [localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId]
+                arguments: [
+                    localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId,
+                    forwardedFromAccountId, forwardedFromDialogId, forwardedFromMsgId,
+                    forwardedFromMsgId != nil
+                ]
             )
             try db.execute(
                 sql: """
-                INSERT INTO pending_outbox (client_msg_id, dialog_id, body, reply_to_msg_id, created_at)
-                VALUES (?, ?, ?, ?, datetime('now'))
+                INSERT INTO pending_outbox (
+                  client_msg_id, dialog_id, body, reply_to_msg_id,
+                  forwarded_from_dialog_id, forwarded_from_msg_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   body = excluded.body,
                   reply_to_msg_id = excluded.reply_to_msg_id,
+                  forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
+                  forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   next_retry_at = NULL
                 """,
-                arguments: [clientMsgId, dialogId, text, replyToMsgId]
+                arguments: [
+                    clientMsgId, dialogId, text, replyToMsgId,
+                    forwardedFromDialogId, forwardedFromMsgId
+                ]
             )
         }
         return LocalMessage(
@@ -223,6 +250,11 @@ actor CloudLocalStore {
             kind: "text",
             text: text,
             replyToMsgId: replyToMsgId,
+            forwardedFromAccountId: forwardedFromAccountId,
+            forwardedFromDialogId: forwardedFromDialogId,
+            forwardedFromMsgId: forwardedFromMsgId,
+            isForwarded: forwardedFromMsgId != nil,
+            reactions: [],
             editVersion: 0,
             state: "visible",
             serverTs: nil,
@@ -298,6 +330,7 @@ actor CloudLocalStore {
     func applyDifference(_ difference: DifferenceResponse, accountId: String) throws {
         try dbQueue.write { db in
             if difference.kind == "difference_too_long" {
+                try db.execute(sql: "DELETE FROM message_reactions")
                 try db.execute(sql: "DELETE FROM messages")
                 try db.execute(sql: "DELETE FROM dialog_members")
                 try db.execute(sql: "DELETE FROM dialogs")
@@ -306,7 +339,7 @@ actor CloudLocalStore {
             } else {
                 for update in difference.updates ?? [] {
                     switch update.type {
-                    case "message.new", "message.edited", "message.deleted":
+                    case "message.new", "message.edited", "message.deleted", "reaction.updated":
                         guard let message = update.message else { continue }
                         try upsertDialog(
                             db,
@@ -380,18 +413,39 @@ actor CloudLocalStore {
 
     func messages(dialogId: String) throws -> [LocalMessage] {
         try dbQueue.read { db in
+            let reactionRows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT msg_id, account_id, emoji
+                FROM message_reactions
+                WHERE dialog_id = ?
+                ORDER BY msg_id, account_id
+                """,
+                arguments: [dialogId]
+            )
+            var reactionsByMessage: [Int64: [CloudReaction]] = [:]
+            for row in reactionRows {
+                let msgId: Int64 = row["msg_id"]
+                reactionsByMessage[msgId, default: []].append(
+                    CloudReaction(accountId: row["account_id"], emoji: row["emoji"])
+                )
+            }
             let rows = try Row.fetchAll(
                 db,
                 sql: """
                 SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
-                       reply_to_msg_id, edit_version, state, server_ts, local_state
+                       reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
+                       forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
                 FROM messages
                 WHERE dialog_id = ?
                 ORDER BY COALESCE(msg_id, 9223372036854775807), rowid
                 """,
                 arguments: [dialogId]
             )
-            return rows.map(Self.message(from:))
+            return rows.map { row in
+                let msgId: Int64? = row["msg_id"]
+                return Self.message(from: row, reactions: msgId.flatMap { reactionsByMessage[$0] } ?? [])
+            }
         }
     }
 
@@ -415,7 +469,8 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT client_msg_id, dialog_id, body, reply_to_msg_id, retry_count, next_retry_at
+                SELECT client_msg_id, dialog_id, body, reply_to_msg_id,
+                       forwarded_from_dialog_id, forwarded_from_msg_id, retry_count, next_retry_at
                 FROM pending_outbox
                 WHERE next_retry_at IS NULL OR next_retry_at <= ?
                 ORDER BY created_at ASC, client_msg_id ASC
@@ -552,6 +607,10 @@ actor CloudLocalStore {
               kind TEXT NOT NULL,
               text TEXT NOT NULL,
               reply_to_msg_id INTEGER,
+              forwarded_from_account_id TEXT,
+              forwarded_from_dialog_id TEXT,
+              forwarded_from_msg_id INTEGER,
+              is_forwarded INTEGER NOT NULL DEFAULT 0,
               edit_version INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL,
               server_ts TEXT,
@@ -570,9 +629,19 @@ actor CloudLocalStore {
               dialog_id TEXT NOT NULL,
               body TEXT NOT NULL,
               reply_to_msg_id INTEGER,
+              forwarded_from_dialog_id TEXT,
+              forwarded_from_msg_id INTEGER,
               retry_count INTEGER NOT NULL DEFAULT 0,
               next_retry_at TEXT,
               created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS message_reactions (
+              dialog_id TEXT NOT NULL,
+              msg_id INTEGER NOT NULL,
+              account_id TEXT NOT NULL,
+              emoji TEXT NOT NULL,
+              PRIMARY KEY (dialog_id, msg_id, account_id)
             );
             """)
 
@@ -583,9 +652,27 @@ actor CloudLocalStore {
             if !messageColumns.contains("edit_version") {
                 try db.execute(sql: "ALTER TABLE messages ADD COLUMN edit_version INTEGER NOT NULL DEFAULT 0")
             }
+            if !messageColumns.contains("forwarded_from_account_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN forwarded_from_account_id TEXT")
+            }
+            if !messageColumns.contains("forwarded_from_dialog_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN forwarded_from_dialog_id TEXT")
+            }
+            if !messageColumns.contains("forwarded_from_msg_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN forwarded_from_msg_id INTEGER")
+            }
+            if !messageColumns.contains("is_forwarded") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN is_forwarded INTEGER NOT NULL DEFAULT 0")
+            }
             let outboxColumns = try db.columns(in: "pending_outbox").map(\.name)
             if !outboxColumns.contains("reply_to_msg_id") {
                 try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN reply_to_msg_id INTEGER")
+            }
+            if !outboxColumns.contains("forwarded_from_dialog_id") {
+                try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN forwarded_from_dialog_id TEXT")
+            }
+            if !outboxColumns.contains("forwarded_from_msg_id") {
+                try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN forwarded_from_msg_id INTEGER")
             }
         }
     }
@@ -642,9 +729,10 @@ actor CloudLocalStore {
             sql: """
             INSERT INTO messages (
               local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
-              reply_to_msg_id, edit_version, state, server_ts, local_state
+              reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
+              forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -653,6 +741,10 @@ actor CloudLocalStore {
               kind = excluded.kind,
               text = excluded.text,
               reply_to_msg_id = excluded.reply_to_msg_id,
+              forwarded_from_account_id = excluded.forwarded_from_account_id,
+              forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
+              forwarded_from_msg_id = excluded.forwarded_from_msg_id,
+              is_forwarded = excluded.is_forwarded,
               edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
@@ -667,15 +759,32 @@ actor CloudLocalStore {
                 message.kind,
                 message.text,
                 message.replyToMsgId,
+                message.forwardedFromAccountId,
+                message.forwardedFromDialogId,
+                message.forwardedFromMsgId,
+                message.isForwarded,
                 message.editVersion,
                 message.state,
                 message.serverTs,
                 localState
             ]
         )
+        try db.execute(
+            sql: "DELETE FROM message_reactions WHERE dialog_id = ? AND msg_id = ?",
+            arguments: [message.dialogId, message.msgId]
+        )
+        for reaction in message.reactions {
+            try db.execute(
+                sql: """
+                INSERT INTO message_reactions (dialog_id, msg_id, account_id, emoji)
+                VALUES (?, ?, ?, ?)
+                """,
+                arguments: [message.dialogId, message.msgId, reaction.accountId, reaction.emoji]
+            )
+        }
     }
 
-    private static func message(from row: Row) -> LocalMessage {
+    private static func message(from row: Row, reactions: [CloudReaction]) -> LocalMessage {
         LocalMessage(
             localId: row["local_id"],
             dialogId: row["dialog_id"],
@@ -685,6 +794,11 @@ actor CloudLocalStore {
             kind: row["kind"],
             text: row["text"],
             replyToMsgId: row["reply_to_msg_id"],
+            forwardedFromAccountId: row["forwarded_from_account_id"],
+            forwardedFromDialogId: row["forwarded_from_dialog_id"],
+            forwardedFromMsgId: row["forwarded_from_msg_id"],
+            isForwarded: row["is_forwarded"],
+            reactions: reactions,
             editVersion: row["edit_version"],
             state: row["state"],
             serverTs: row["server_ts"],
@@ -714,6 +828,8 @@ actor CloudLocalStore {
             dialogId: row["dialog_id"],
             body: row["body"],
             replyToMsgId: row["reply_to_msg_id"],
+            forwardedFromDialogId: row["forwarded_from_dialog_id"],
+            forwardedFromMsgId: row["forwarded_from_msg_id"],
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"]
         )
@@ -743,6 +859,7 @@ actor CloudLocalStore {
     }
 
     private func deleteReplicaData(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM message_reactions")
         try db.execute(sql: "DELETE FROM messages")
         try db.execute(sql: "DELETE FROM dialog_members")
         try db.execute(sql: "DELETE FROM dialogs")

@@ -89,6 +89,58 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(requests[1].1["msgId"] as? Int, 7)
     }
 
+    @MainActor
+    func testReactionAndForwardRequestsCarryStableSourceAndMutationIdentifiers() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        var requests: [(String, [String: Any])] = []
+        CloudAPIMockURLProtocol.handler = { request in
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            requests.append((request.url!.path, try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])))
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            ))
+            if request.url!.path.hasSuffix("react") {
+                return (response, Data("""
+                {"dialogId":"dialog-1","msgId":7,"actorPts":9,"duplicate":false,"message":{
+                  "dialog_id":"dialog-1","msg_id":7,"sender_account_id":"account-a",
+                  "client_msg_id":"11111111-1111-1111-1111-111111111111","kind":"text",
+                  "text":"hello","reply_to_msg_id":null,"reactions":[{"account_id":"account-b","emoji":"❤️"}],
+                  "edit_version":0,"state":"visible","server_ts":"2026-07-12T00:00:00Z"}}
+                """.utf8))
+            }
+            return (response, Data("""
+            {"dialogId":"dialog-2","clientMsgId":"33333333-3333-3333-3333-333333333333",
+             "msgId":8,"senderPts":10,"duplicate":false,"serverTs":"2026-07-12T00:00:01Z","text":"hello"}
+            """.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        _ = try await api.setReaction(
+            dialogId: "dialog-1", msgId: 7,
+            clientMutationId: "22222222-2222-2222-2222-222222222222",
+            emoji: "❤️", token: "session-token"
+        )
+        _ = try await api.forwardMessage(
+            dialogId: "dialog-2",
+            clientMsgId: "33333333-3333-3333-3333-333333333333",
+            sourceDialogId: "dialog-1", sourceMsgId: 7, token: "session-token"
+        )
+
+        XCTAssertEqual(requests.map(\.0), ["/cloud/v1/messages/react", "/cloud/v1/messages/send"])
+        XCTAssertEqual(requests[0].1["clientMutationId"] as? String, "22222222-2222-2222-2222-222222222222")
+        XCTAssertEqual(requests[0].1["emoji"] as? String, "❤️")
+        let source = try XCTUnwrap(requests[1].1["forwardedFrom"] as? [String: Any])
+        XCTAssertEqual(source["dialogId"] as? String, "dialog-1")
+        XCTAssertEqual(source["msgId"] as? Int, 7)
+        XCTAssertNil(requests[1].1["body"])
+    }
+
     func testPendingSessionRevocationTokenPersistsSeparately() async throws {
         let store = TokenStore()
         try? await store.clearPendingRevocationToken()
@@ -513,6 +565,79 @@ final class CloudLocalStoreTests: XCTestCase {
         let dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(savedPts, 4)
         XCTAssertEqual(dialogs.first?.lastState, "deleted_for_all")
+    }
+
+    @MainActor
+    func testReactionsForwardProvenanceAndForwardOutboxPersistInEncryptedReplica() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let dialogId = "dialog-source"
+        let targetDialogId = "dialog-target"
+        let message = CloudMessage(
+            dialogId: dialogId,
+            msgId: 4,
+            senderAccountId: "account-peer",
+            clientMsgId: UUID().uuidString,
+            kind: "text",
+            text: "forward me",
+            forwardedFromAccountId: "account-original",
+            forwardedFromDialogId: "dialog-original",
+            forwardedFromMsgId: 2,
+            isForwarded: true,
+            reactions: [
+                CloudReaction(accountId: accountId, emoji: "❤️"),
+                CloudReaction(accountId: "account-peer", emoji: "❤️"),
+            ],
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-12T12:00:00Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: DifferenceResponse.State(pts: 5),
+                updates: [CloudUpdate(
+                    pts: 5,
+                    ptsCount: 1,
+                    type: "reaction.updated",
+                    dialogId: dialogId,
+                    dialogTitle: "Peer",
+                    message: message,
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let storedMessages = try await store.messages(dialogId: dialogId)
+        let stored = try XCTUnwrap(storedMessages.first)
+        XCTAssertEqual(stored.forwardedFromAccountId, "account-original")
+        XCTAssertEqual(stored.forwardedFromDialogId, "dialog-original")
+        XCTAssertEqual(stored.forwardedFromMsgId, 2)
+        XCTAssertTrue(stored.isForwarded)
+        XCTAssertEqual(stored.reactions, message.reactions)
+
+        let clientMsgId = UUID().uuidString.lowercased()
+        _ = try await store.insertSending(
+            dialogId: targetDialogId,
+            clientMsgId: clientMsgId,
+            text: stored.text,
+            senderAccountId: accountId,
+            forwardedFromAccountId: stored.senderAccountId,
+            forwardedFromDialogId: dialogId,
+            forwardedFromMsgId: stored.msgId
+        )
+        let pendingItems = try await store.pendingOutboxReady()
+        let pending = try XCTUnwrap(pendingItems.first)
+        XCTAssertEqual(pending.forwardedFromDialogId, dialogId)
+        XCTAssertEqual(pending.forwardedFromMsgId, 4)
+        let optimisticMessages = try await store.messages(dialogId: targetDialogId)
+        let optimistic = try XCTUnwrap(optimisticMessages.first)
+        XCTAssertEqual(optimistic.text, "forward me")
+        XCTAssertEqual(optimistic.forwardedFromDialogId, dialogId)
+        XCTAssertEqual(optimistic.forwardedFromMsgId, 4)
     }
 
     @MainActor
