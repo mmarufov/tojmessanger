@@ -3,7 +3,11 @@ import XCTest
 
 final class MessagingPresentationTests: XCTestCase {
     func testCapabilitySetsKeepProductionTruthful() {
-        XCTAssertTrue(MessagingCapabilities.productionText.isEmpty)
+        XCTAssertTrue(MessagingCapabilities.productionText.contains(.replies))
+        XCTAssertTrue(MessagingCapabilities.productionText.contains(.editing))
+        XCTAssertTrue(MessagingCapabilities.productionText.contains(.deletion))
+        XCTAssertFalse(MessagingCapabilities.productionText.contains(.reactions))
+        XCTAssertFalse(MessagingCapabilities.productionText.contains(.media))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.media))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.voiceNotes))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.groups))
@@ -29,18 +33,19 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testDemoEnablesRichCapabilitiesAndProductionModelDoesNot() {
-        let model = CloudAppModel()
+    func testDemoEnablesRichCapabilitiesAndProductionModelDoesNot() async {
+        let model = CloudAppModel(useDefaultLocalStore: false)
         XCTAssertEqual(model.capabilities, .productionText)
 
         model.enterDemoMode()
 
         XCTAssertEqual(model.capabilities, .demo)
+        await Task.yield()
     }
 
     @MainActor
     func testDemoSearchScopesMessagesAndAttachments() async {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
 
         XCTAssertEqual(model.dialogs(matching: "Олично", scope: .messages).map(\.id), ["demo-mehrona"])
@@ -53,7 +58,7 @@ final class MessagingPresentationTests: XCTestCase {
 
     @MainActor
     func testDraftPersistsPerConversationAndAppearsInChatRow() async {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
 
         await model.selectDialog("demo-mehrona")
@@ -68,7 +73,7 @@ final class MessagingPresentationTests: XCTestCase {
 
     @MainActor
     func testOpeningDemoConversationClearsUnreadWithoutDroppingOrganizationState() async {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
         let before = model.dialogs.first(where: { $0.id == "demo-mehrona" })
         XCTAssertEqual(before?.isPinned, true)
@@ -84,7 +89,7 @@ final class MessagingPresentationTests: XCTestCase {
 
     @MainActor
     func testReplyAndEditComposerModesAreDeterministic() async throws {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
         await model.selectDialog("demo-mehrona")
         let incoming = try XCTUnwrap(model.lines.first(where: { !$0.mine }))
@@ -103,8 +108,8 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testDemoChatOrganizationStateChangesWithoutServerMutation() {
-        let model = CloudAppModel()
+    func testDemoChatOrganizationStateChangesWithoutServerMutation() async {
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
 
         model.toggleMuted("demo-mehrona")
@@ -114,11 +119,12 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(model.dialogs.first(where: { $0.id == "demo-mehrona" })?.isMuted, true)
         XCTAssertEqual(model.dialogs.first?.id, "demo-mehrona", "Existing pinned chat remains first")
         XCTAssertFalse(model.dialogs(matching: "", scope: .chats).contains(where: { $0.id == "demo-aziz" }))
+        await Task.yield()
     }
 
     @MainActor
     func testDemoReactionAndDeletionUpdateTheActiveConversation() async throws {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
         await model.selectDialog("demo-mehrona")
         let line = try XCTUnwrap(model.lines.first)
@@ -135,7 +141,7 @@ final class MessagingPresentationTests: XCTestCase {
 
     @MainActor
     func testDemoAttachmentAndVoiceNoteUsePresentationPayloads() async throws {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
         await model.selectDialog("demo-firooz")
 
@@ -153,7 +159,7 @@ final class MessagingPresentationTests: XCTestCase {
 
     @MainActor
     func testSendingAnEditUpdatesInsteadOfAppending() async throws {
-        let model = CloudAppModel()
+        let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()
         await model.selectDialog("demo-mehrona")
         let outgoing = try XCTUnwrap(model.lines.first(where: { $0.mine }))

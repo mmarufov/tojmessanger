@@ -44,6 +44,51 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertNil(URLComponents(url: url, resolvingAgainstBaseURL: false)?.query)
     }
 
+    @MainActor
+    func testMessageMutationRequestsCarryStableIdentifiersAndVersions() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        var requests: [(String, [String: Any])] = []
+        CloudAPIMockURLProtocol.handler = { request in
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            requests.append((request.url!.path, try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])))
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            ))
+            let state = request.url!.path.hasSuffix("delete") ? "deleted_for_all" : "visible"
+            let text = state == "visible" ? "corrected" : ""
+            return (response, Data("""
+            {"dialogId":"dialog-1","msgId":7,"actorPts":9,"duplicate":false,"message":{
+              "dialog_id":"dialog-1","msg_id":7,"sender_account_id":"account-a",
+              "client_msg_id":"11111111-1111-1111-1111-111111111111","kind":"text",
+              "text":"\(text)","reply_to_msg_id":null,"edit_version":1,"state":"\(state)",
+              "server_ts":"2026-07-12T00:00:00Z"}}
+            """.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        _ = try await api.editMessage(
+            dialogId: "dialog-1", msgId: 7,
+            clientMutationId: "22222222-2222-2222-2222-222222222222",
+            expectedEditVersion: 0, body: "corrected", token: "session-token"
+        )
+        _ = try await api.deleteMessage(
+            dialogId: "dialog-1", msgId: 7,
+            clientMutationId: "33333333-3333-3333-3333-333333333333",
+            token: "session-token"
+        )
+
+        XCTAssertEqual(requests.map(\.0), ["/cloud/v1/messages/edit", "/cloud/v1/messages/delete"])
+        XCTAssertEqual(requests[0].1["expectedEditVersion"] as? Int, 0)
+        XCTAssertEqual(requests[0].1["clientMutationId"] as? String, "22222222-2222-2222-2222-222222222222")
+        XCTAssertEqual(requests[1].1["msgId"] as? Int, 7)
+    }
+
     func testPendingSessionRevocationTokenPersistsSeparately() async throws {
         let store = TokenStore()
         try? await store.clearPendingRevocationToken()
@@ -403,6 +448,137 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.markRead(dialogId: dialogId, accountId: accountId, maxReadMsgId: 3)
         dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(dialogs.first?.unreadCount, 0)
+    }
+
+    @MainActor
+    func testReplyEditAndDeletePersistAcrossLocalReplicaReloads() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        let dialogId = "dialog-actions"
+        let originalClientId = UUID().uuidString
+        let replyClientId = UUID().uuidString
+
+        func update(_ pts: Int64, type: String, message: CloudMessage) -> DifferenceResponse {
+            DifferenceResponse(
+                kind: "difference",
+                state: DifferenceResponse.State(pts: pts),
+                updates: [CloudUpdate(
+                    pts: pts,
+                    ptsCount: 1,
+                    type: type,
+                    dialogId: dialogId,
+                    dialogTitle: "Mehrona",
+                    message: message,
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            )
+        }
+
+        let original = CloudMessage(
+            dialogId: dialogId, msgId: 1, senderAccountId: peerId,
+            clientMsgId: originalClientId, kind: "text", text: "before",
+            editVersion: 0, state: "visible", serverTs: "2026-07-12T10:00:00Z"
+        )
+        let reply = CloudMessage(
+            dialogId: dialogId, msgId: 2, senderAccountId: accountId,
+            clientMsgId: replyClientId, kind: "text", text: "reply",
+            replyToMsgId: 1, editVersion: 0, state: "visible", serverTs: "2026-07-12T10:00:01Z"
+        )
+        try await store.applyDifference(update(1, type: "message.new", message: original), accountId: accountId)
+        try await store.applyDifference(update(2, type: "message.new", message: reply), accountId: accountId)
+
+        let edited = CloudMessage(
+            dialogId: dialogId, msgId: 1, senderAccountId: peerId,
+            clientMsgId: originalClientId, kind: "text", text: "after",
+            editVersion: 1, state: "visible", serverTs: "2026-07-12T10:00:00Z"
+        )
+        try await store.applyDifference(update(3, type: "message.edited", message: edited), accountId: accountId)
+
+        let deletedReply = CloudMessage(
+            dialogId: dialogId, msgId: 2, senderAccountId: accountId,
+            clientMsgId: replyClientId, kind: "text", text: "",
+            replyToMsgId: 1, editVersion: 0, state: "deleted_for_all", serverTs: "2026-07-12T10:00:01Z"
+        )
+        try await store.applyDifference(update(4, type: "message.deleted", message: deletedReply), accountId: accountId)
+
+        let messages = try await store.messages(dialogId: dialogId)
+        XCTAssertEqual(messages.map(\.text), ["after", ""])
+        XCTAssertEqual(messages[0].editVersion, 1)
+        XCTAssertEqual(messages[1].replyToMsgId, 1)
+        XCTAssertEqual(messages[1].state, "deleted_for_all")
+        let savedPts = try await store.loadPts(accountId: accountId)
+        let dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(savedPts, 4)
+        XCTAssertEqual(dialogs.first?.lastState, "deleted_for_all")
+    }
+
+    @MainActor
+    func testExistingSQLCipherReplicaMigratesReplyAndEditColumnsWithoutDataLoss() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("legacy-test-passphrase".utf8)
+
+        do {
+            var configuration = Configuration()
+            configuration.prepareDatabase { db in
+                try db.usePassphrase(key)
+                try db.execute(sql: "PRAGMA foreign_keys = ON")
+            }
+            let legacy = try DatabaseQueue(path: path, configuration: configuration)
+            try await legacy.write { db in
+                try db.execute(sql: """
+                CREATE TABLE messages (
+                  local_id TEXT PRIMARY KEY,
+                  dialog_id TEXT NOT NULL,
+                  msg_id INTEGER,
+                  client_msg_id TEXT NOT NULL UNIQUE,
+                  sender_account_id TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  text TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  server_ts TEXT,
+                  local_state TEXT NOT NULL
+                );
+                CREATE TABLE pending_outbox (
+                  client_msg_id TEXT PRIMARY KEY,
+                  dialog_id TEXT NOT NULL,
+                  body TEXT NOT NULL,
+                  retry_count INTEGER NOT NULL DEFAULT 0,
+                  next_retry_at TEXT,
+                  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO messages (
+                  local_id, dialog_id, msg_id, client_msg_id, sender_account_id,
+                  kind, text, state, server_ts, local_state
+                ) VALUES (
+                  'dialog-legacy:1', 'dialog-legacy', 1, 'legacy-client-id', 'account-peer',
+                  'text', 'preserve me', 'visible', '2026-07-12T09:00:00Z', 'sent'
+                );
+                """)
+            }
+        }
+
+        let store = try CloudLocalStore(path: path, key: key)
+        let preserved = try await store.messages(dialogId: "dialog-legacy")
+        XCTAssertEqual(preserved.first?.text, "preserve me")
+        XCTAssertNil(preserved.first?.replyToMsgId)
+        XCTAssertEqual(preserved.first?.editVersion, 0)
+
+        _ = try await store.insertSending(
+            dialogId: "dialog-legacy",
+            clientMsgId: UUID().uuidString,
+            text: "reply after upgrade",
+            senderAccountId: "account-me",
+            replyToMsgId: 1
+        )
+        let outbox = try await store.pendingOutboxReady()
+        XCTAssertEqual(outbox.first?.replyToMsgId, 1)
     }
 
     private func makeStore() throws -> CloudLocalStore {

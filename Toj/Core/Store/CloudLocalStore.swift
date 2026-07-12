@@ -11,6 +11,8 @@ struct LocalMessage: Identifiable, Equatable, Sendable {
     let senderAccountId: String
     let kind: String
     let text: String
+    let replyToMsgId: Int64?
+    let editVersion: Int
     let state: String
     let serverTs: String?
     let localState: String
@@ -24,6 +26,7 @@ struct LocalDialog: Identifiable, Equatable, Sendable {
     let lastMsgId: Int64
     let updatedAt: String
     let lastText: String?
+    let lastState: String?
     let lastSenderAccountId: String?
     let lastLocalState: String?
     let lastServerTs: String?
@@ -35,6 +38,7 @@ struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     var id: String { clientMsgId }
     let dialogId: String
     let body: String
+    let replyToMsgId: Int64?
     let retryCount: Int
     let nextRetryAt: String?
 }
@@ -174,27 +178,40 @@ actor CloudLocalStore {
         }
     }
 
-    func insertSending(dialogId: String, clientMsgId: String, text: String, senderAccountId: String) throws -> LocalMessage {
+    func insertSending(
+        dialogId: String,
+        clientMsgId: String,
+        text: String,
+        senderAccountId: String,
+        replyToMsgId: Int64? = nil
+    ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
         try dbQueue.write { db in
             try upsertDialog(db, dialogId: dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
             try db.execute(
                 sql: """
                 INSERT INTO messages (
-                  local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text, state, server_ts, local_state
+                  local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+                  reply_to_msg_id, edit_version, state, server_ts, local_state
                 )
-                VALUES (?, ?, NULL, ?, ?, 'text', ?, 'visible', NULL, 'sending')
-                ON CONFLICT(client_msg_id) DO UPDATE SET text = excluded.text, local_state = 'sending'
+                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, 0, 'visible', NULL, 'sending')
+                ON CONFLICT(client_msg_id) DO UPDATE SET
+                  text = excluded.text,
+                  reply_to_msg_id = excluded.reply_to_msg_id,
+                  local_state = 'sending'
                 """,
-                arguments: [localId, dialogId, clientMsgId, senderAccountId, text]
+                arguments: [localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId]
             )
             try db.execute(
                 sql: """
-                INSERT INTO pending_outbox (client_msg_id, dialog_id, body, created_at)
-                VALUES (?, ?, ?, datetime('now'))
-                ON CONFLICT(client_msg_id) DO UPDATE SET body = excluded.body, next_retry_at = NULL
+                INSERT INTO pending_outbox (client_msg_id, dialog_id, body, reply_to_msg_id, created_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(client_msg_id) DO UPDATE SET
+                  body = excluded.body,
+                  reply_to_msg_id = excluded.reply_to_msg_id,
+                  next_retry_at = NULL
                 """,
-                arguments: [clientMsgId, dialogId, text]
+                arguments: [clientMsgId, dialogId, text, replyToMsgId]
             )
         }
         return LocalMessage(
@@ -205,6 +222,8 @@ actor CloudLocalStore {
             senderAccountId: senderAccountId,
             kind: "text",
             text: text,
+            replyToMsgId: replyToMsgId,
+            editVersion: 0,
             state: "visible",
             serverTs: nil,
             localState: "sending"
@@ -270,6 +289,12 @@ actor CloudLocalStore {
         }
     }
 
+    func applyMessageMutation(_ response: MessageMutationResponse) throws {
+        try dbQueue.write { db in
+            try upsertMessage(db, message: response.message, localState: "sent")
+        }
+    }
+
     func applyDifference(_ difference: DifferenceResponse, accountId: String) throws {
         try dbQueue.write { db in
             if difference.kind == "difference_too_long" {
@@ -281,7 +306,7 @@ actor CloudLocalStore {
             } else {
                 for update in difference.updates ?? [] {
                     switch update.type {
-                    case "message.new":
+                    case "message.new", "message.edited", "message.deleted":
                         guard let message = update.message else { continue }
                         try upsertDialog(
                             db,
@@ -358,7 +383,8 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text, state, server_ts, local_state
+                SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+                       reply_to_msg_id, edit_version, state, server_ts, local_state
                 FROM messages
                 WHERE dialog_id = ?
                 ORDER BY COALESCE(msg_id, 9223372036854775807), rowid
@@ -389,7 +415,7 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT client_msg_id, dialog_id, body, retry_count, next_retry_at
+                SELECT client_msg_id, dialog_id, body, reply_to_msg_id, retry_count, next_retry_at
                 FROM pending_outbox
                 WHERE next_retry_at IS NULL OR next_retry_at <= ?
                 ORDER BY created_at ASC, client_msg_id ASC
@@ -444,6 +470,7 @@ actor CloudLocalStore {
                   d.last_msg_id,
                   d.updated_at,
                   m.text AS last_text,
+                  m.state AS last_state,
                   m.sender_account_id AS last_sender_account_id,
                   m.local_state AS last_local_state,
                   m.server_ts AS last_server_ts,
@@ -524,6 +551,8 @@ actor CloudLocalStore {
               sender_account_id TEXT NOT NULL,
               kind TEXT NOT NULL,
               text TEXT NOT NULL,
+              reply_to_msg_id INTEGER,
+              edit_version INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL,
               server_ts TEXT,
               local_state TEXT NOT NULL
@@ -540,11 +569,24 @@ actor CloudLocalStore {
               client_msg_id TEXT PRIMARY KEY,
               dialog_id TEXT NOT NULL,
               body TEXT NOT NULL,
+              reply_to_msg_id INTEGER,
               retry_count INTEGER NOT NULL DEFAULT 0,
               next_retry_at TEXT,
               created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             """)
+
+            let messageColumns = try db.columns(in: "messages").map(\.name)
+            if !messageColumns.contains("reply_to_msg_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN reply_to_msg_id INTEGER")
+            }
+            if !messageColumns.contains("edit_version") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN edit_version INTEGER NOT NULL DEFAULT 0")
+            }
+            let outboxColumns = try db.columns(in: "pending_outbox").map(\.name)
+            if !outboxColumns.contains("reply_to_msg_id") {
+                try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN reply_to_msg_id INTEGER")
+            }
         }
     }
 
@@ -599,9 +641,10 @@ actor CloudLocalStore {
         try db.execute(
             sql: """
             INSERT INTO messages (
-              local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text, state, server_ts, local_state
+              local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+              reply_to_msg_id, edit_version, state, server_ts, local_state
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -609,6 +652,8 @@ actor CloudLocalStore {
               sender_account_id = excluded.sender_account_id,
               kind = excluded.kind,
               text = excluded.text,
+              reply_to_msg_id = excluded.reply_to_msg_id,
+              edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
               local_state = excluded.local_state
@@ -621,6 +666,8 @@ actor CloudLocalStore {
                 message.senderAccountId,
                 message.kind,
                 message.text,
+                message.replyToMsgId,
+                message.editVersion,
                 message.state,
                 message.serverTs,
                 localState
@@ -637,6 +684,8 @@ actor CloudLocalStore {
             senderAccountId: row["sender_account_id"],
             kind: row["kind"],
             text: row["text"],
+            replyToMsgId: row["reply_to_msg_id"],
+            editVersion: row["edit_version"],
             state: row["state"],
             serverTs: row["server_ts"],
             localState: row["local_state"]
@@ -651,6 +700,7 @@ actor CloudLocalStore {
             lastMsgId: row["last_msg_id"],
             updatedAt: row["updated_at"],
             lastText: row["last_text"],
+            lastState: row["last_state"],
             lastSenderAccountId: row["last_sender_account_id"],
             lastLocalState: row["last_local_state"],
             lastServerTs: row["last_server_ts"],
@@ -663,6 +713,7 @@ actor CloudLocalStore {
             clientMsgId: row["client_msg_id"],
             dialogId: row["dialog_id"],
             body: row["body"],
+            replyToMsgId: row["reply_to_msg_id"],
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"]
         )

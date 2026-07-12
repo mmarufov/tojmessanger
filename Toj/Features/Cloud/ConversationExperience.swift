@@ -70,12 +70,12 @@ struct TojConversationExperience: View {
             set: { if !$0 { deleteLine = nil } }
         )) {
             Button("Delete", role: .destructive) {
-                if let deleteLine { model.deleteDemoMessage(deleteLine.id) }
+                if let deleteLine { Task { await model.deleteMessage(deleteLine) } }
                 deleteLine = nil
             }
             Button("Cancel", role: .cancel) { deleteLine = nil }
         } message: {
-            Text("This removes the message from this demo conversation.")
+            Text("This removes the message for everyone in this conversation.")
         }
         .sheet(item: $detailsLine) { line in
             MessageDetailsView(line: line)

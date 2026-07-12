@@ -8,9 +8,34 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let clientMsgId: String
     let kind: String
     let text: String
+    let replyToMsgId: Int64?
     let editVersion: Int
     let state: String
     let serverTs: String
+
+    init(
+        dialogId: String,
+        msgId: Int64,
+        senderAccountId: String,
+        clientMsgId: String,
+        kind: String,
+        text: String,
+        replyToMsgId: Int64? = nil,
+        editVersion: Int,
+        state: String,
+        serverTs: String
+    ) {
+        self.dialogId = dialogId
+        self.msgId = msgId
+        self.senderAccountId = senderAccountId
+        self.clientMsgId = clientMsgId
+        self.kind = kind
+        self.text = text
+        self.replyToMsgId = replyToMsgId
+        self.editVersion = editVersion
+        self.state = state
+        self.serverTs = serverTs
+    }
 
     enum CodingKeys: String, CodingKey {
         case dialogId = "dialog_id"
@@ -19,6 +44,7 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case clientMsgId = "client_msg_id"
         case kind
         case text
+        case replyToMsgId = "reply_to_msg_id"
         case editVersion = "edit_version"
         case state
         case serverTs = "server_ts"
@@ -89,6 +115,14 @@ struct SendMessageResponse: Codable, Sendable {
     let duplicate: Bool
     let serverTs: String?
     let text: String?
+}
+
+struct MessageMutationResponse: Codable, Sendable {
+    let dialogId: String
+    let msgId: Int64
+    let actorPts: Int64
+    let duplicate: Bool
+    let message: CloudMessage
 }
 
 struct SyncStateResponse: Codable, Sendable {
@@ -293,10 +327,60 @@ struct CloudAPI: Sendable {
         )
     }
 
-    func sendMessage(dialogId: String, clientMsgId: String, body: String, token: String) async throws -> SendMessageResponse {
+    func sendMessage(
+        dialogId: String,
+        clientMsgId: String,
+        body: String,
+        replyToMsgId: Int64? = nil,
+        token: String
+    ) async throws -> SendMessageResponse {
         try await post(
             "v1/messages/send",
-            body: ["dialogId": dialogId, "clientMsgId": clientMsgId, "kind": "text", "body": body],
+            body: SendMessageRequest(
+                dialogId: dialogId,
+                clientMsgId: clientMsgId,
+                kind: "text",
+                body: body,
+                replyToMsgId: replyToMsgId
+            ),
+            token: token
+        )
+    }
+
+    func editMessage(
+        dialogId: String,
+        msgId: Int64,
+        clientMutationId: String,
+        expectedEditVersion: Int,
+        body: String,
+        token: String
+    ) async throws -> MessageMutationResponse {
+        try await post(
+            "v1/messages/edit",
+            body: EditMessageRequest(
+                dialogId: dialogId,
+                msgId: msgId,
+                clientMutationId: clientMutationId,
+                expectedEditVersion: expectedEditVersion,
+                body: body
+            ),
+            token: token
+        )
+    }
+
+    func deleteMessage(
+        dialogId: String,
+        msgId: Int64,
+        clientMutationId: String,
+        token: String
+    ) async throws -> MessageMutationResponse {
+        try await post(
+            "v1/messages/delete",
+            body: DeleteMessageRequest(
+                dialogId: dialogId,
+                msgId: msgId,
+                clientMutationId: clientMutationId
+            ),
             token: token
         )
     }
@@ -427,6 +511,28 @@ private struct HistoryRequest: Encodable {
     let dialogId: String
     let beforeMsgId: Int64?
     let limit: Int
+}
+
+private struct SendMessageRequest: Encodable {
+    let dialogId: String
+    let clientMsgId: String
+    let kind: String
+    let body: String
+    let replyToMsgId: Int64?
+}
+
+private struct EditMessageRequest: Encodable {
+    let dialogId: String
+    let msgId: Int64
+    let clientMutationId: String
+    let expectedEditVersion: Int
+    let body: String
+}
+
+private struct DeleteMessageRequest: Encodable {
+    let dialogId: String
+    let msgId: Int64
+    let clientMutationId: String
 }
 
 private struct ReadRequest: Encodable {

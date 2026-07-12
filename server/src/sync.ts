@@ -5,13 +5,14 @@ import { enqueuePushDeliveries } from "./push";
 export class SyncError extends Error {}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
-//   1 send_requests row → 2 accounts (ascending, FOR SHARE) → 3 direct_dialog_pairs
+//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 direct_dialog_pairs
 //   → 4 dialogs row → 5 dialog_members → 6 messages → 7 account_sync_states (ascending account_id)
 //   → 8 account_events insert → 9 push_deliveries insert
 
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
-  kind: string; text: string; edit_version: number; state: string; server_ts: string;
+  kind: string; text: string; reply_to_msg_id: number | null; edit_version: number;
+  state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
 
@@ -57,7 +58,7 @@ async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> 
 async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
   const r = (await sql`
     SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
-           body_key_id, body_nonce, body_ciphertext, edit_version, state, server_ts
+           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id, edit_version, state, server_ts
     FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0];
   if (!r) return null;
   const text = r.state === "deleted_for_all"
@@ -68,9 +69,26 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
       ).toString("utf8");
   return {
     dialog_id: dialogId, msg_id: n(r.msg_id), sender_account_id: r.sender_account_id,
-    client_msg_id: r.client_msg_id, kind: r.kind, text, edit_version: r.edit_version,
+    client_msg_id: r.client_msg_id, kind: r.kind, text,
+    reply_to_msg_id: r.reply_to_msg_id == null ? null : n(r.reply_to_msg_id), edit_version: r.edit_version,
     state: r.state, server_ts: iso(r.server_ts),
   };
+}
+
+const MAX_TEXT_BYTES = 16 * 1024;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function requireTextBody(body: unknown): string {
+  if (typeof body !== "string" || body.trim().length === 0) throw new SyncError("message body required");
+  if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
+  return body;
+}
+
+function optionalMessageId(value: unknown): number | null {
+  if (value == null) return null;
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new SyncError("invalid message id");
+  return id;
 }
 
 /** Idempotent 1:1 dialog creation (review I5: conflict-safe on the pair). Emits dialog.created. */
@@ -114,9 +132,11 @@ export type SendResult = {
 /** review B2: claim the idempotency row BEFORE allocating a msg_id; a retry echoes the original result. */
 export async function sendMessage(sql: SQL, p: {
   senderAccountId: string; senderDeviceId?: string | null; dialogId: string;
-  clientMsgId: string; kind?: string; body: string;
+  clientMsgId: string; kind?: string; body: string; replyToMsgId?: number | null;
 }): Promise<SendResult> {
   return await sql.begin(async (tx) => {
+    const body = requireTextBody(p.body);
+    const replyToMsgId = optionalMessageId(p.replyToMsgId);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
       INSERT INTO send_requests (sender_account_id, client_msg_id, dialog_id, status)
@@ -140,15 +160,25 @@ export async function sendMessage(sql: SQL, p: {
     await requireActiveAccount(tx, p.senderAccountId);
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
 
+    if (replyToMsgId != null) {
+      const target = await tx`
+        SELECT state FROM messages
+        WHERE dialog_id = ${p.dialogId} AND msg_id = ${replyToMsgId}`;
+      if (target.length === 0) throw new SyncError("reply target not found");
+      if (target[0].state !== "visible") throw new SyncError("cannot reply to a deleted message");
+    }
+
     // 3) allocate per-dialog msg_id
     const dlg = await tx`UPDATE dialogs SET last_msg_id = last_msg_id + 1, updated_at = now() WHERE id = ${p.dialogId} RETURNING last_msg_id`;
     const msgId = n(dlg[0].last_msg_id);
 
     // 5) encrypt + store the body once
-    const sealed = seal(p.body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
+    const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
     const inserted = await tx`
-      INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind, body_key_id, body_nonce, body_ciphertext)
-      VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId}, ${p.kind ?? "text"}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext})
+      INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
+                            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id)
+      VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
+              ${p.kind ?? "text"}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId})
       RETURNING server_ts`;
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
@@ -174,9 +204,124 @@ export async function sendMessage(sql: SQL, p: {
 
     return {
       dialogId: p.dialogId, clientMsgId: p.clientMsgId, msgId, senderPts, duplicate: false,
-      serverTs: iso(inserted[0].server_ts), text: p.body, senderAccountId: p.senderAccountId, pushes,
+      serverTs: iso(inserted[0].server_ts), text: body, senderAccountId: p.senderAccountId, pushes,
     };
   });
+}
+
+export type MessageMutationResult = {
+  dialogId: string; msgId: number; actorPts: number; duplicate: boolean;
+  message: MessageDTO; pushes: Push[];
+};
+
+async function mutateMessage(sql: SQL, p: {
+  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  clientMutationId: string; operation: "edit" | "delete"; body?: string;
+  expectedEditVersion?: number;
+}): Promise<MessageMutationResult> {
+  return await sql.begin(async (tx) => {
+    const msgId = optionalMessageId(p.msgId)!;
+    const mutationId = String(p.clientMutationId ?? "");
+    if (!UUID_PATTERN.test(mutationId)) throw new SyncError("invalid client mutation id");
+
+    const claim = await tx`
+      INSERT INTO message_mutation_requests
+        (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status)
+      VALUES (${p.actorAccountId}, ${mutationId}, ${p.operation}, ${p.dialogId}, ${msgId}, 'pending')
+      ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING
+      RETURNING status`;
+    if (claim.length === 0) {
+      const existing = (await tx`
+        SELECT operation, dialog_id, msg_id, status, actor_pts
+        FROM message_mutation_requests
+        WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}
+        FOR UPDATE`)[0];
+      if (existing.operation !== p.operation || existing.dialog_id !== p.dialogId || n(existing.msg_id) !== msgId) {
+        throw new SyncError("client mutation id already used");
+      }
+      if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
+      const message = await loadMessage(tx, p.dialogId, msgId);
+      if (!message) throw new SyncError("message not found");
+      return {
+        dialogId: p.dialogId, msgId, actorPts: n(existing.actor_pts), duplicate: true,
+        message, pushes: [],
+      };
+    }
+
+    await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveMember(tx, p.actorAccountId, p.dialogId);
+    const members = await tx`
+      SELECT account_id FROM dialog_members
+      WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
+      ORDER BY account_id FOR UPDATE`;
+    const row = (await tx`
+      SELECT sender_account_id, kind, state, edit_version
+      FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}
+      FOR UPDATE`)[0];
+    if (!row) throw new SyncError("message not found");
+    if (row.sender_account_id !== p.actorAccountId) throw new SyncError("only the sender can change this message");
+    if (row.state !== "visible") throw new SyncError("message already deleted");
+    if (p.operation === "edit") {
+      if (row.kind !== "text") throw new SyncError("only text messages can be edited");
+      const body = requireTextBody(p.body);
+      const expected = Number(p.expectedEditVersion);
+      if (!Number.isSafeInteger(expected) || expected < 0) throw new SyncError("expected edit version required");
+      if (n(row.edit_version) !== expected) throw new SyncError("message was edited on another device");
+      const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.actorAccountId));
+      await tx`
+        UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
+          body_ciphertext = ${sealed.ciphertext}, edit_version = edit_version + 1,
+          edited_at = now()
+        WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+    } else {
+      // Replace the live ciphertext as well as returning a tombstone. This prevents deleted text
+      // from remaining decryptable in the primary database (backups retain their normal lifecycle).
+      const sealed = seal("", bodyAAD(p.dialogId, msgId, p.actorAccountId));
+      await tx`
+        UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
+          body_ciphertext = ${sealed.ciphertext}, state = 'deleted_for_all', deleted_at = now()
+        WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+    }
+
+    let actorPts = 0;
+    const pushes: Push[] = [];
+    const eventType = p.operation === "edit" ? "message.edited" : "message.deleted";
+    for (const member of members) {
+      const upd = await tx`
+        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
+        WHERE account_id = ${member.account_id} RETURNING pts`;
+      const pts = n(upd[0].pts);
+      await tx`
+        INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id)
+        VALUES (${member.account_id}, ${pts}, ${eventType}, ${p.dialogId}, ${msgId}, ${p.actorAccountId})`;
+      await enqueuePushDeliveries(tx, {
+        accountId: member.account_id, pts, senderAccountId: p.actorAccountId,
+        sourceDeviceId: p.actorDeviceId, alertRecipients: false,
+      });
+      if (member.account_id === p.actorAccountId) actorPts = pts;
+      pushes.push({ accountId: member.account_id, pts, ptsCount: 1 });
+    }
+    await tx`
+      UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
+      WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}`;
+    const message = await loadMessage(tx, p.dialogId, msgId);
+    if (!message) throw new SyncError("message not found after mutation");
+    return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
+  });
+}
+
+export async function editMessage(sql: SQL, p: {
+  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  clientMutationId: string; body: string; expectedEditVersion: number;
+}): Promise<MessageMutationResult> {
+  return mutateMessage(sql, { ...p, operation: "edit" });
+}
+
+export async function deleteMessage(sql: SQL, p: {
+  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  clientMutationId: string;
+}): Promise<MessageMutationResult> {
+  return mutateMessage(sql, { ...p, operation: "delete" });
 }
 
 export async function getState(sql: SQL, accountId: string): Promise<{ pts: number }> {
@@ -220,7 +365,7 @@ export async function getDifference(
   for (const ev of rows) {
     const pts = n(ev.pts);
     let update: any;
-    if (ev.type === "message.new" || ev.type === "message.edited") {
+    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted") {
       const message = await loadMessage(sql, ev.dialog_id, n(ev.msg_id));
       if (!message) {
         update = {

@@ -36,9 +36,12 @@ final class CloudAppModel {
         var mine: Bool
         var delivery: Delivery
         var timestamp: String?
+        var replyToMsgId: Int64? = nil
         var replyPreview: String? = nil
         var reactions: [String] = []
+        var editVersion = 0
         var isEdited = false
+        var isDeleted = false
         var attachment: DemoAttachment? = nil
     }
 
@@ -133,12 +136,14 @@ final class CloudAppModel {
     init(
         config: CloudConfig = .current,
         tokenStore: TokenStore = TokenStore(),
-        pushCenter: PushRegistrationCenter = .shared
+        pushCenter: PushRegistrationCenter = .shared,
+        localStore injectedLocalStore: CloudLocalStore? = nil,
+        useDefaultLocalStore: Bool = true
     ) {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
-        self.localStore = try? CloudLocalStore.default()
+        self.localStore = injectedLocalStore ?? (useDefaultLocalStore ? try? CloudLocalStore.default() : nil)
         pushCenter.bind(
             tokenHandler: { [weak self] token, environment in
                 await self?.uploadPushToken(token, environment: environment)
@@ -624,12 +629,25 @@ final class CloudAppModel {
                 return
             }
             #endif
+            guard let line = lines.first(where: { $0.id == messageId }) else {
+                status = "Message is no longer available"
+                return
+            }
+            await edit(line, text: text)
+            return
         }
         let replyPreview: String?
-        if case let .replying(_, preview) = composerMode {
+        let replyToMsgId: Int64?
+        if case let .replying(messageId, preview) = composerMode {
             replyPreview = preview
+            replyToMsgId = lines.first(where: { $0.id == messageId })?.msgId
+            guard replyToMsgId != nil else {
+                status = "Reply target is not available yet"
+                return
+            }
         } else {
             replyPreview = nil
+            replyToMsgId = nil
         }
         draft = ""
         composerMode = .text
@@ -639,16 +657,16 @@ final class CloudAppModel {
             return
         }
         #endif
-        await send(text)
+        await send(text, replyToMsgId: replyToMsgId)
     }
 
     func beginReply(to line: Line) {
-        guard capabilities.contains(.replies) else { return }
+        guard capabilities.contains(.replies), !line.isDeleted, line.msgId != nil else { return }
         composerMode = .replying(messageId: line.id, preview: line.text)
     }
 
     func beginEditing(_ line: Line) {
-        guard line.mine, capabilities.contains(.editing) else { return }
+        guard line.mine, !line.isDeleted, line.msgId != nil, capabilities.contains(.editing) else { return }
         composerMode = .editing(messageId: line.id, original: line.text)
         draft = line.text
     }
@@ -661,6 +679,7 @@ final class CloudAppModel {
     }
 
     func actions(for line: Line) -> [MessageAction] {
+        if line.isDeleted { return [.inspect] }
         var actions: [MessageAction] = [.copy]
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
@@ -714,7 +733,7 @@ final class CloudAppModel {
         }
     }
 
-    private func send(_ text: String) async {
+    private func send(_ text: String, replyToMsgId: Int64? = nil) async {
         guard let token = storedSession?.session.token, let dialogId = activeDialogId else { return }
         let clientMsgId = UUID().uuidString.lowercased()
         do {
@@ -723,7 +742,8 @@ final class CloudAppModel {
                     dialogId: dialogId,
                     clientMsgId: clientMsgId,
                     text: text,
-                    senderAccountId: accountId
+                    senderAccountId: accountId,
+                    replyToMsgId: replyToMsgId
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -736,7 +756,8 @@ final class CloudAppModel {
                     text: text,
                     mine: true,
                     delivery: .sending,
-                    timestamp: nil
+                    timestamp: nil,
+                    replyToMsgId: replyToMsgId
                 ))
             }
         } catch {
@@ -750,6 +771,7 @@ final class CloudAppModel {
                     clientMsgId: clientMsgId,
                     dialogId: dialogId,
                     body: text,
+                    replyToMsgId: replyToMsgId,
                     retryCount: 0,
                     nextRetryAt: nil
                 ),
@@ -914,7 +936,8 @@ final class CloudAppModel {
             }
         } else {
             for update in difference.updates ?? [] {
-                guard update.type == "message.new", let message = update.message else { continue }
+                guard ["message.new", "message.edited", "message.deleted"].contains(update.type),
+                      let message = update.message else { continue }
                 upsert(message)
             }
         }
@@ -974,7 +997,16 @@ final class CloudAppModel {
             } else {
                 peerReadMsgId = 0
             }
-            lines = messages.map { line(from: $0, peerReadMsgId: peerReadMsgId) }
+            let messagesById = Dictionary(uniqueKeysWithValues: messages.compactMap { message in
+                message.msgId.map { ($0, message) }
+            })
+            lines = messages.map { message in
+                let replyPreview = message.replyToMsgId.map { targetId in
+                    guard let target = messagesById[targetId] else { return String(localized: "Earlier message") }
+                    return target.state == "deleted_for_all" ? String(localized: "Deleted message") : target.text
+                }
+                return line(from: message, peerReadMsgId: peerReadMsgId, replyPreview: replyPreview)
+            }
             let hasServerMessage = try await localStore.oldestServerMsgId(dialogId: dialogId) != nil
             canLoadEarlier = hasServerMessage && (historyHasMoreByDialog[dialogId] ?? true)
             await markReadIfNeeded(dialogId: dialogId, messages: messages)
@@ -983,7 +1015,7 @@ final class CloudAppModel {
         }
     }
 
-    private func line(from message: LocalMessage, peerReadMsgId: Int64) -> Line {
+    private func line(from message: LocalMessage, peerReadMsgId: Int64, replyPreview: String?) -> Line {
         let mine = message.senderAccountId == storedSession?.session.accountId
         let deliveryState: Line.Delivery
         if mine, let msgId = message.msgId, msgId <= peerReadMsgId {
@@ -996,10 +1028,15 @@ final class CloudAppModel {
             dialogId: message.dialogId,
             msgId: message.msgId,
             clientMsgId: message.clientMsgId,
-            text: message.text,
+            text: message.state == "deleted_for_all" ? String(localized: "Message deleted") : message.text,
             mine: mine,
             delivery: deliveryState,
-            timestamp: message.serverTs
+            timestamp: message.serverTs,
+            replyToMsgId: message.replyToMsgId,
+            replyPreview: replyPreview,
+            editVersion: message.editVersion,
+            isEdited: message.editVersion > 0 && message.state == "visible",
+            isDeleted: message.state == "deleted_for_all"
         )
     }
 
@@ -1007,7 +1044,9 @@ final class CloudAppModel {
         let title = displayTitle(local.title, fallback: shortDialogId(local.dialogId))
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let subtitle: String
-        if let lastText, !lastText.isEmpty {
+        if local.lastState == "deleted_for_all" {
+            subtitle = String(localized: "Message deleted")
+        } else if let lastText, !lastText.isEmpty {
             subtitle = lastText
         } else {
             subtitle = "No messages yet"
@@ -1096,6 +1135,7 @@ final class CloudAppModel {
             dialogId: item.dialogId,
             clientMsgId: item.clientMsgId,
             body: item.body,
+            replyToMsgId: item.replyToMsgId,
             token: token
         )
 
@@ -1130,6 +1170,10 @@ final class CloudAppModel {
             lines[index].dialogId = message.dialogId
             lines[index].msgId = message.msgId
             lines[index].text = message.text
+            lines[index].replyToMsgId = message.replyToMsgId
+            lines[index].editVersion = message.editVersion
+            lines[index].isEdited = message.editVersion > 0 && message.state == "visible"
+            lines[index].isDeleted = message.state == "deleted_for_all"
             lines[index].mine = mine
             lines[index].delivery = .sent
             lines[index].timestamp = message.serverTs
@@ -1143,7 +1187,11 @@ final class CloudAppModel {
             text: message.text,
             mine: mine,
             delivery: .sent,
-            timestamp: message.serverTs
+            timestamp: message.serverTs,
+            replyToMsgId: message.replyToMsgId,
+            editVersion: message.editVersion,
+            isEdited: message.editVersion > 0 && message.state == "visible",
+            isDeleted: message.state == "deleted_for_all"
         ))
         lines.sort {
             switch ($0.msgId, $1.msgId) {
@@ -1152,6 +1200,79 @@ final class CloudAppModel {
             case (nil, .some): return false
             case (nil, nil): return $0.id < $1.id
             }
+        }
+    }
+
+    private func edit(_ line: Line, text: String) async {
+        guard
+            let token = storedSession?.session.token,
+            let dialogId = line.dialogId,
+            let msgId = line.msgId
+        else { return }
+        do {
+            let mutationId = UUID().uuidString.lowercased()
+            let response = try await retryTransientMutation {
+                try await self.api.editMessage(
+                    dialogId: dialogId,
+                    msgId: msgId,
+                    clientMutationId: mutationId,
+                    expectedEditVersion: line.editVersion,
+                    body: text,
+                    token: token
+                )
+            }
+            try await localStore?.applyMessageMutation(response)
+            draft = ""
+            composerMode = .text
+            await loadLocalLines(dialogId: dialogId)
+            await refreshDialogs()
+            status = response.duplicate ? "Edit confirmed" : "Edited"
+            scheduleSync()
+        } catch {
+            status = "Edit failed: \(error.localizedDescription)"
+        }
+    }
+
+    func deleteMessage(_ line: Line) async {
+        #if DEBUG
+        if isDemoMode {
+            deleteDemoMessage(line.id)
+            return
+        }
+        #endif
+        guard
+            line.mine,
+            !line.isDeleted,
+            let token = storedSession?.session.token,
+            let dialogId = line.dialogId,
+            let msgId = line.msgId
+        else { return }
+        do {
+            let mutationId = UUID().uuidString.lowercased()
+            let response = try await retryTransientMutation {
+                try await self.api.deleteMessage(
+                    dialogId: dialogId,
+                    msgId: msgId,
+                    clientMutationId: mutationId,
+                    token: token
+                )
+            }
+            try await localStore?.applyMessageMutation(response)
+            await loadLocalLines(dialogId: dialogId)
+            await refreshDialogs()
+            status = response.duplicate ? "Deletion confirmed" : "Message deleted"
+            scheduleSync()
+        } catch {
+            status = "Delete failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func retryTransientMutation<T>(_ operation: () async throws -> T) async throws -> T {
+        do {
+            return try await operation()
+        } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
+            try await Task.sleep(for: .milliseconds(250))
+            return try await operation()
         }
     }
 
