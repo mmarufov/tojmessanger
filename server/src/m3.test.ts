@@ -10,7 +10,7 @@ import {
   AuthError,
   type OTPDelivery,
 } from "./auth";
-import { hashToken, open, pushTokenAAD } from "./crypto";
+import { bodyAAD, hashToken, open, pushTokenAAD } from "./crypto";
 import { startCloudServer } from "./cloud";
 import { cleanupExpiredData, OperationalMetrics, requestIdFrom, safeRoute } from "./ops";
 import {
@@ -28,6 +28,8 @@ import {
   getOrCreateDirectDialog,
   readHistory,
   sendMessage,
+  editMessage,
+  deleteMessage,
   startBootstrap,
 } from "./sync";
 
@@ -41,6 +43,7 @@ async function resetDb() {
       content_access_audit,
       bootstrap_snapshot_dialogs,
       bootstrap_snapshots,
+      message_mutation_requests,
       send_requests,
       push_deliveries,
       account_events,
@@ -708,6 +711,148 @@ describe("M3 cloud sync", () => {
       GROUP BY d.last_msg_id`)[0];
     expect(Number(counts.last_msg_id)).toBe(1);
     expect(Number(counts.message_count)).toBe(1);
+  });
+
+  test("replies survive difference, history, and bootstrap contracts", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const original = await sendMessage(db, {
+      senderAccountId: bob.accountId,
+      senderDeviceId: bob.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "original",
+    });
+    const reply = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "reply",
+      replyToMsgId: original.msgId,
+    });
+
+    const difference = await getDifference(db, bob.accountId, 0);
+    const replyUpdate = difference.updates.find((update) => update.message?.msg_id === reply.msgId);
+    expect(replyUpdate?.message?.reply_to_msg_id).toBe(original.msgId);
+
+    const history = await getHistory(db, alice.accountId, dialogId);
+    expect(history.messages.map((message) => [message.text, message.reply_to_msg_id])).toEqual([
+      ["original", null],
+      ["reply", original.msgId],
+    ]);
+
+    const bootstrap = await startBootstrap(db, bob.accountId);
+    const page = await getBootstrapDialogsPage(db, bob.accountId, bootstrap.token, { previewMessages: 10 });
+    expect(page.dialogs[0].messages.at(-1)?.reply_to_msg_id).toBe(original.msgId);
+  });
+
+  test("edits and deletions are idempotent tombstones that sync to every member", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "sensitive original",
+    });
+    const mutationId = crypto.randomUUID();
+    const [firstEdit, retryEdit] = await Promise.all([
+      editMessage(db, {
+        actorAccountId: alice.accountId,
+        actorDeviceId: alice.deviceId,
+        dialogId,
+        msgId: sent.msgId,
+        clientMutationId: mutationId,
+        expectedEditVersion: 0,
+        body: "corrected",
+      }),
+      editMessage(db, {
+        actorAccountId: alice.accountId,
+        actorDeviceId: alice.deviceId,
+        dialogId,
+        msgId: sent.msgId,
+        clientMutationId: mutationId,
+        expectedEditVersion: 0,
+        body: "corrected",
+      }),
+    ]);
+    expect(firstEdit.actorPts).toBe(retryEdit.actorPts);
+    expect([firstEdit.duplicate, retryEdit.duplicate].sort()).toEqual([false, true]);
+    expect(firstEdit.message.text).toBe("corrected");
+    expect(firstEdit.message.edit_version).toBe(1);
+
+    const deletion = await deleteMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+    });
+    expect(deletion.message.state).toBe("deleted_for_all");
+    expect(deletion.message.text).toBe("");
+
+    const bobDifference = await getDifference(db, bob.accountId, 0);
+    expect(bobDifference.updates.map((update) => update.type)).toContain("message.edited");
+    const tombstone = bobDifference.updates.find((update) => update.type === "message.deleted");
+    expect(tombstone?.message?.state).toBe("deleted_for_all");
+    expect(tombstone?.message?.text).toBe("");
+
+    const row = (await db`
+      SELECT body_key_id, body_nonce, body_ciphertext, sender_account_id
+      FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${sent.msgId}`)[0];
+    const liveBody = open({
+      keyId: row.body_key_id,
+      nonce: Buffer.from(row.body_nonce),
+      ciphertext: Buffer.from(row.body_ciphertext),
+    }, bodyAAD(dialogId, sent.msgId, row.sender_account_id)).toString("utf8");
+    expect(liveBody).toBe("");
+  });
+
+  test("only a message sender can edit or delete and stale edits are rejected", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "owned by Alice",
+    });
+
+    await expect(editMessage(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      expectedEditVersion: 0,
+      body: "hijacked",
+    })).rejects.toThrow("only the sender");
+
+    await editMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      expectedEditVersion: 0,
+      body: "version one",
+    });
+    await expect(editMessage(db, {
+      actorAccountId: alice.accountId,
+      actorDeviceId: alice.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      expectedEditVersion: 0,
+      body: "stale overwrite",
+    })).rejects.toThrow("another device");
+    await expect(deleteMessage(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+    })).rejects.toThrow("only the sender");
   });
 
   test("get_difference catches up in pts order and respects byte slicing", async () => {

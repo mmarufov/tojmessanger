@@ -137,6 +137,11 @@ CREATE TABLE IF NOT EXISTS messages (
   PRIMARY KEY (dialog_id, msg_id),
   UNIQUE (sender_account_id, client_msg_id)           -- belt-and-suspenders vs send_requests
 );
+DO $$ BEGIN
+  ALTER TABLE messages ADD CONSTRAINT messages_reply_target_fk
+    FOREIGN KEY (dialog_id, reply_to_msg_id) REFERENCES messages(dialog_id, msg_id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 -- No separate DESC index (C1): the PK (dialog_id, msg_id) serves ORDER BY msg_id DESC via reverse scan.
 
 -- ============ the sync log (crown jewel) ============
@@ -165,6 +170,24 @@ CREATE TABLE IF NOT EXISTS send_requests (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
+
+-- Edit/delete retries use a client-generated mutation id just like sends use client_msg_id.
+-- The claim is taken before locking the message so a timed-out request can safely be repeated.
+CREATE TABLE IF NOT EXISTS message_mutation_requests (
+  actor_account_id  UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  client_mutation_id UUID NOT NULL,
+  operation         TEXT NOT NULL CHECK (operation IN ('edit','delete')),
+  dialog_id         UUID NOT NULL,
+  msg_id            BIGINT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+  actor_pts         BIGINT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (actor_account_id, client_mutation_id)
+);
+-- Early development versions briefly added this FK. The idempotency row must be claimable before
+-- the message row is locked (global lock order), so validation happens transactionally in sync.ts.
+ALTER TABLE message_mutation_requests
+  DROP CONSTRAINT IF EXISTS message_mutation_requests_dialog_id_msg_id_fkey;
 
 -- ============ APNs durable outbox (M4.1) ============
 -- APNs is only a wake-up hint. The authoritative update remains account_events + get_difference.

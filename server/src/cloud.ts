@@ -29,6 +29,8 @@ import {
   getState,
   readHistory,
   sendMessage,
+  editMessage,
+  deleteMessage,
   startBootstrap,
   SyncError,
   type Push,
@@ -269,6 +271,35 @@ export function startCloudServer(
             clientMsgId: body.clientMsgId,
             kind: body.kind,
             body: body.body ?? "",
+            replyToMsgId: body.replyToMsgId,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+
+        if (url.pathname === "/v1/messages/edit" && req.method === "POST") {
+          if (!body.dialogId || !body.msgId || !body.clientMutationId) throw new SyncError("message mutation fields required");
+          const result = await editMessage(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: body.dialogId,
+            msgId: Number(body.msgId),
+            clientMutationId: body.clientMutationId,
+            body: body.body,
+            expectedEditVersion: Number(body.expectedEditVersion),
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+
+        if (url.pathname === "/v1/messages/delete" && req.method === "POST") {
+          if (!body.dialogId || !body.msgId || !body.clientMutationId) throw new SyncError("message mutation fields required");
+          const result = await deleteMessage(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: body.dialogId,
+            msgId: Number(body.msgId),
+            clientMutationId: body.clientMutationId,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
