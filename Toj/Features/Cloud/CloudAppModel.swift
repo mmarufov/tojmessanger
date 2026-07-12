@@ -8,9 +8,16 @@ final class CloudAppModel {
     struct Dialog: Identifiable, Equatable {
         let id: String
         let title: String
-        let subtitle: String
-        let updatedAt: String
-        let isPending: Bool
+        var subtitle: String
+        var updatedAt: String
+        var isPending: Bool
+        var unreadCount: Int
+        var draftPreview: String? = nil
+        var isPinned = false
+        var isMuted = false
+        var isArchived = false
+        var mentionCount = 0
+        var isTyping = false
     }
 
     struct Line: Identifiable, Equatable {
@@ -28,6 +35,11 @@ final class CloudAppModel {
         var text: String
         var mine: Bool
         var delivery: Delivery
+        var timestamp: String?
+        var replyPreview: String? = nil
+        var reactions: [String] = []
+        var isEdited = false
+        var attachment: DemoAttachment? = nil
     }
 
     private(set) var storedSession: StoredCloudSession?
@@ -45,12 +57,25 @@ final class CloudAppModel {
     private(set) var loadingDevices = false
     private(set) var accountDeletionRequested = false
     private(set) var accountDeletionInFlight = false
+    private(set) var composerMode: ComposerMode = .text
+    #if DEBUG
+    private(set) var isDemoMode = false
+    #endif
 
     var phone = "+992 "
     var displayName = ""
     var code = ""
     var peerPhone = ""
-    var draft = ""
+    var draft = "" {
+        didSet {
+            guard let activeDialogId else { return }
+            draftsByDialog[activeDialogId] = draft
+            if let index = dialogs.firstIndex(where: { $0.id == activeDialogId }) {
+                let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                dialogs[index].draftPreview = trimmed.isEmpty ? nil : trimmed
+            }
+        }
+    }
     var accountDeletionCode = ""
 
     private let api: CloudAPI
@@ -68,6 +93,28 @@ final class CloudAppModel {
     private var retryInFlight = false
     private var uploadedPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
+    private var draftsByDialog: [String: String] = [:]
+    #if DEBUG
+    private var demoLinesByDialog: [String: [Line]] = [:]
+    #endif
+
+    var capabilities: MessagingCapabilities {
+        #if DEBUG
+        if isDemoMode { return .demo }
+        #endif
+        return .productionText
+    }
+
+    var connectionViewState: ConnectionViewState {
+        let normalized = status.lowercased()
+        if normalized.contains("failed") || normalized.contains("network") || normalized.contains("offline") {
+            return .offline
+        }
+        if normalized.contains("starting") || normalized.contains("looking") || normalized.contains("rebuild") {
+            return .connecting
+        }
+        return .connected
+    }
 
     var canRequestCode: Bool {
         let digits = phone.filter(\.isNumber)
@@ -181,7 +228,20 @@ final class CloudAppModel {
         }
     }
 
+    func resetAuthCode() {
+        guard !authRequestInFlight, !authVerifyInFlight else { return }
+        requestedCode = false
+        code = ""
+        status = "Signed out"
+    }
+
     func signOut() async {
+        #if DEBUG
+        if isDemoMode {
+            leaveDemoMode()
+            return
+        }
+        #endif
         let sessionToken = storedSession?.session.token
         if let sessionToken {
             // Save before clearing the active session. If the app is killed or offline, the next
@@ -211,6 +271,21 @@ final class CloudAppModel {
     }
 
     func loadDevices() async {
+        #if DEBUG
+        if isDemoMode {
+            devices = [
+                CloudDevice(
+                    id: "demo-device",
+                    platform: "ios",
+                    deviceName: UIDevice.current.name,
+                    createdAt: Self.demoTimestamp(minutesAgo: 1_440),
+                    lastSeenAt: Self.demoTimestamp(minutesAgo: 0),
+                    current: true
+                )
+            ]
+            return
+        }
+        #endif
         guard let token = storedSession?.session.token, !loadingDevices else { return }
         loadingDevices = true
         defer { loadingDevices = false }
@@ -234,6 +309,14 @@ final class CloudAppModel {
     }
 
     func requestAccountDeletionCode() async -> Bool {
+        #if DEBUG
+        if isDemoMode {
+            accountDeletionRequested = true
+            accountDeletionCode = "123456"
+            status = "Deletion code requested"
+            return true
+        }
+        #endif
         guard let token = storedSession?.session.token, !accountDeletionInFlight else { return false }
         accountDeletionInFlight = true
         defer { accountDeletionInFlight = false }
@@ -256,6 +339,12 @@ final class CloudAppModel {
     }
 
     func deleteAccount() async -> Bool {
+        #if DEBUG
+        if isDemoMode {
+            leaveDemoMode()
+            return true
+        }
+        #endif
         guard let saved = storedSession, !accountDeletionInFlight else { return false }
         let digits = accountDeletionCode.filter(\.isNumber)
         guard digits.count == 6 else {
@@ -343,6 +432,37 @@ final class CloudAppModel {
     }
 
     func openPeer() async -> String? {
+        #if DEBUG
+        if isDemoMode {
+            let trimmed = peerPhone.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let dialogId = "demo-\(trimmed.filter(\.isNumber))"
+            if !dialogs.contains(where: { $0.id == dialogId }) {
+                dialogs.insert(Dialog(
+                    id: dialogId,
+                    title: trimmed,
+                    subtitle: String(localized: "Demo conversation"),
+                    updatedAt: Self.demoTimestamp(minutesAgo: 0),
+                    isPending: false,
+                    unreadCount: 0
+                ), at: 0)
+                demoLinesByDialog[dialogId] = [Line(
+                    id: UUID().uuidString,
+                    dialogId: dialogId,
+                    msgId: 1,
+                    clientMsgId: UUID().uuidString,
+                    text: String(localized: "This chat is local to demo mode."),
+                    mine: false,
+                    delivery: .sent,
+                    timestamp: Self.demoTimestamp(minutesAgo: 0)
+                )]
+            }
+            peerPhone = ""
+            await selectDialog(dialogId)
+            status = "Chat ready"
+            return dialogId
+        }
+        #endif
         guard let token = storedSession?.session.token else { return nil }
         let trimmed = peerPhone.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -375,8 +495,93 @@ final class CloudAppModel {
     }
 
     func selectDialog(_ dialogId: String) async {
+        if let activeDialogId {
+            draftsByDialog[activeDialogId] = draft
+        }
         activeDialogId = dialogId
+        draft = draftsByDialog[dialogId] ?? ""
+        composerMode = .text
+        #if DEBUG
+        if isDemoMode {
+            lines = demoLinesByDialog[dialogId] ?? []
+            canLoadEarlier = false
+            dialogs = dialogs.map { dialog in
+                guard dialog.id == dialogId, dialog.unreadCount > 0 else { return dialog }
+                var updated = dialog
+                updated.unreadCount = 0
+                updated.mentionCount = 0
+                return updated
+            }
+            return
+        }
+        #endif
         await loadLocalLines(dialogId: dialogId)
+    }
+
+    func deselectDialog(_ dialogId: String) {
+        guard activeDialogId == dialogId else { return }
+        draftsByDialog[dialogId] = draft
+        activeDialogId = nil
+        draft = ""
+        composerMode = .text
+        lines = []
+        canLoadEarlier = false
+        loadingEarlier = false
+    }
+
+    func dialogs(matching query: String) -> [Dialog] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return dialogs }
+        return dialogs.filter {
+            $0.title.localizedStandardContains(trimmed)
+                || $0.subtitle.localizedStandardContains(trimmed)
+        }
+    }
+
+    func dialogs(matching query: String, scope: SearchScope) -> [Dialog] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return dialogs.filter { !$0.isArchived } }
+
+        switch scope {
+        case .chats:
+            return dialogs.filter {
+                !$0.isArchived && ($0.title.localizedStandardContains(trimmed) || $0.subtitle.localizedStandardContains(trimmed))
+            }
+        case .people:
+            return dialogs.filter { !$0.isArchived && $0.title.localizedStandardContains(trimmed) }
+        case .messages:
+            #if DEBUG
+            if isDemoMode {
+                let matchingIds = Set(demoLinesByDialog.compactMap { dialogId, lines in
+                    lines.contains(where: { $0.text.localizedStandardContains(trimmed) }) ? dialogId : nil
+                })
+                return dialogs.filter { matchingIds.contains($0.id) }
+            }
+            #endif
+            return dialogs(matching: trimmed)
+        case .media, .links, .files:
+            #if DEBUG
+            if isDemoMode {
+                let matchingIds = Set(demoLinesByDialog.compactMap { dialogId, lines in
+                    let matches = lines.contains { line in
+                        guard let attachment = line.attachment else { return false }
+                        let typeMatches: Bool
+                        switch (scope, attachment) {
+                        case (.media, .photo), (.media, .video), (.links, .link), (.files, .file): typeMatches = true
+                        default: typeMatches = false
+                        }
+                        return typeMatches && (
+                            attachment.title.localizedStandardContains(trimmed)
+                                || line.text.localizedStandardContains(trimmed)
+                        )
+                    }
+                    return matches ? dialogId : nil
+                })
+                return dialogs.filter { matchingIds.contains($0.id) }
+            }
+            #endif
+            return []
+        }
     }
 
     func loadEarlier() async {
@@ -410,8 +615,103 @@ final class CloudAppModel {
     func sendDraft() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        if case let .editing(messageId, _) = composerMode {
+            #if DEBUG
+            if isDemoMode {
+                updateDemoMessage(messageId: messageId, text: text)
+                draft = ""
+                composerMode = .text
+                return
+            }
+            #endif
+        }
+        let replyPreview: String?
+        if case let .replying(_, preview) = composerMode {
+            replyPreview = preview
+        } else {
+            replyPreview = nil
+        }
         draft = ""
+        composerMode = .text
+        #if DEBUG
+        if isDemoMode {
+            sendDemo(text, replyPreview: replyPreview)
+            return
+        }
+        #endif
         await send(text)
+    }
+
+    func beginReply(to line: Line) {
+        guard capabilities.contains(.replies) else { return }
+        composerMode = .replying(messageId: line.id, preview: line.text)
+    }
+
+    func beginEditing(_ line: Line) {
+        guard line.mine, capabilities.contains(.editing) else { return }
+        composerMode = .editing(messageId: line.id, original: line.text)
+        draft = line.text
+    }
+
+    func cancelComposerMode() {
+        if case let .editing(_, original) = composerMode, draft == original {
+            draft = ""
+        }
+        composerMode = .text
+    }
+
+    func actions(for line: Line) -> [MessageAction] {
+        var actions: [MessageAction] = [.copy]
+        if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
+        if capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
+        if line.mine, capabilities.contains(.editing) { actions.append(.edit) }
+        if capabilities.contains(.forwarding) { actions.append(.forward) }
+        if capabilities.contains(.deletion) { actions.append(.delete) }
+        if case .failed = line.delivery { actions.append(.retry) }
+        actions.append(.inspect)
+        return actions
+    }
+
+    func retryFailedMessage(_ line: Line) {
+        guard case .failed = line.delivery else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            if let localStore = self.localStore {
+                try? await localStore.markRetrying(clientMsgId: line.clientMsgId)
+                if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                    await self.loadLocalLines(dialogId: dialogId)
+                }
+            }
+            self.scheduleOutboxRetry()
+        }
+    }
+
+    func togglePinned(_ dialogId: String) {
+        guard capabilities.contains(.chatOrganization) else { return }
+        updateDialog(dialogId) { $0.isPinned.toggle() }
+        sortDialogsForPresentation()
+    }
+
+    func toggleMuted(_ dialogId: String) {
+        guard capabilities.contains(.chatOrganization) else { return }
+        updateDialog(dialogId) { $0.isMuted.toggle() }
+    }
+
+    func archive(_ dialogId: String) {
+        guard capabilities.contains(.chatOrganization) else { return }
+        updateDialog(dialogId) { $0.isArchived = true }
+    }
+
+    private func updateDialog(_ dialogId: String, mutation: (inout Dialog) -> Void) {
+        guard let index = dialogs.firstIndex(where: { $0.id == dialogId }) else { return }
+        mutation(&dialogs[index])
+    }
+
+    private func sortDialogsForPresentation() {
+        dialogs.sort {
+            if $0.isPinned != $1.isPinned { return $0.isPinned }
+            return $0.updatedAt > $1.updatedAt
+        }
     }
 
     private func send(_ text: String) async {
@@ -435,7 +735,8 @@ final class CloudAppModel {
                     clientMsgId: clientMsgId,
                     text: text,
                     mine: true,
-                    delivery: .sending
+                    delivery: .sending,
+                    timestamp: nil
                 ))
             }
         } catch {
@@ -474,10 +775,9 @@ final class CloudAppModel {
         do {
             pts = try await localStore?.loadPts(accountId: accountId) ?? 0
             await refreshDialogs()
-            if let dialogId = activeDialogId ?? dialogs.first?.id {
-                activeDialogId = dialogId
-                await loadLocalLines(dialogId: dialogId)
-            }
+            activeDialogId = nil
+            lines = []
+            canLoadEarlier = false
         } catch {
             pts = 0
         }
@@ -511,6 +811,9 @@ final class CloudAppModel {
     }
 
     func resume() async {
+        #if DEBUG
+        if isDemoMode { return }
+        #endif
         guard let token = storedSession?.session.token else { return }
         pushCenter.refreshRegistration()
         await startHints(token: token)
@@ -612,9 +915,6 @@ final class CloudAppModel {
         } else {
             for update in difference.updates ?? [] {
                 guard update.type == "message.new", let message = update.message else { continue }
-                if activeDialogId == nil {
-                    activeDialogId = message.dialogId
-                }
                 upsert(message)
             }
         }
@@ -649,19 +949,15 @@ final class CloudAppModel {
         try await localStore.finishBootstrap(accountId: accountId, pts: bootstrap.state.pts)
         pts = bootstrap.state.pts
         await refreshDialogs()
-        activeDialogId = try await localStore.latestDialogId()
-        if let dialogId = activeDialogId {
-            await loadLocalLines(dialogId: dialogId)
-        } else {
-            lines = []
-            canLoadEarlier = false
-        }
+        activeDialogId = nil
+        lines = []
+        canLoadEarlier = false
     }
 
     private func refreshDialogs() async {
-        guard let localStore else { return }
+        guard let localStore, let accountId = storedSession?.session.accountId else { return }
         do {
-            dialogs = try await localStore.dialogs().map(dialog(from:))
+            dialogs = try await localStore.dialogs(accountId: accountId).map(dialog(from:))
         } catch {
             status = "Dialog load failed: \(error.localizedDescription)"
         }
@@ -702,7 +998,8 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             text: message.text,
             mine: mine,
-            delivery: deliveryState
+            delivery: deliveryState,
+            timestamp: message.serverTs
         )
     }
 
@@ -720,7 +1017,8 @@ final class CloudAppModel {
             title: title,
             subtitle: subtitle,
             updatedAt: local.lastServerTs ?? local.updatedAt,
-            isPending: local.lastLocalState == "sending"
+            isPending: local.lastLocalState == "sending",
+            unreadCount: local.unreadCount
         )
     }
 
@@ -751,6 +1049,7 @@ final class CloudAppModel {
             guard maxMsgId > current else { return }
             let response = try await api.markRead(dialogId: dialogId, maxReadMsgId: maxMsgId, token: token)
             try await localStore.markRead(dialogId: response.dialogId, accountId: accountId, maxReadMsgId: response.maxReadMsgId)
+            await refreshDialogs()
         } catch {
             // Read receipts are opportunistic; sync will retry after the next hint or reload.
         }
@@ -833,6 +1132,7 @@ final class CloudAppModel {
             lines[index].text = message.text
             lines[index].mine = mine
             lines[index].delivery = .sent
+            lines[index].timestamp = message.serverTs
             return
         }
         lines.append(Line(
@@ -842,7 +1142,8 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             text: message.text,
             mine: mine,
-            delivery: .sent
+            delivery: .sent,
+            timestamp: message.serverTs
         ))
         lines.sort {
             switch ($0.msgId, $1.msgId) {
@@ -853,6 +1154,180 @@ final class CloudAppModel {
             }
         }
     }
+
+    #if DEBUG
+    func enterDemoMode() {
+        isDemoMode = true
+        storedSession = StoredCloudSession(
+            session: CloudSession(accountId: "debug-demo-account", deviceId: "debug-demo-device", token: "debug-demo-token"),
+            phone: "+992 00 000 00 00",
+            displayName: "Меҳмон"
+        )
+        status = "Demo mode"
+        activeDialogId = nil
+        draft = ""
+        peerPhone = ""
+        lines = []
+        canLoadEarlier = false
+
+        dialogs = [
+            Dialog(id: "demo-mehrona", title: "Меҳрона", subtitle: "Биё, пагоҳ суҳбат мекунем", updatedAt: Self.demoTimestamp(minutesAgo: 2), isPending: false, unreadCount: 2, isPinned: true, mentionCount: 1),
+            Dialog(id: "demo-firooz", title: "Фирӯз", subtitle: "Документы получил, спасибо", updatedAt: Self.demoTimestamp(minutesAgo: 23), isPending: false, unreadCount: 4, isMuted: true),
+            Dialog(id: "demo-madina", title: "Мадина", subtitle: "Дар роҳам", updatedAt: Self.demoTimestamp(minutesAgo: 1_480), isPending: false, unreadCount: 0, draftPreview: "Пас аз даҳ дақиқа…"),
+            Dialog(id: "demo-aziz", title: "Азиз", subtitle: "Созвонимся вечером?", updatedAt: Self.demoTimestamp(minutesAgo: 2_920), isPending: false, unreadCount: 0, isTyping: true),
+        ]
+        draftsByDialog = ["demo-madina": "Пас аз даҳ дақиқа…"]
+
+        demoLinesByDialog = [
+            "demo-mehrona": [
+                demoLine(dialogId: "demo-mehrona", messageId: 1, text: "Салом! Имрӯз вақт дорӣ?", mine: false, minutesAgo: 9),
+                demoLine(dialogId: "demo-mehrona", messageId: 2, text: "Салом 👋 Бале, баъди соати ҳафт.", mine: true, minutesAgo: 7, delivery: .seen),
+                demoLine(dialogId: "demo-mehrona", messageId: 3, text: "Олично. Тогда напишу ближе к вечеру.", mine: false, minutesAgo: 4),
+                demoLine(dialogId: "demo-mehrona", messageId: 4, text: "Хуб, мунтазир мешавам.", mine: true, minutesAgo: 2, delivery: .seen),
+                Line(id: "demo-mehrona-5", dialogId: "demo-mehrona", msgId: 5, clientMsgId: "demo-mehrona-5", text: "Шоми Душанбе", mine: false, delivery: .sent, timestamp: Self.demoTimestamp(minutesAgo: 1), attachment: .photo(name: "Шоми Душанбе")),
+            ],
+            "demo-firooz": [
+                demoLine(dialogId: "demo-firooz", messageId: 1, text: "Салом, файлҳоро фиристодам.", mine: true, minutesAgo: 31, delivery: .seen),
+                demoLine(dialogId: "demo-firooz", messageId: 2, text: "Документы получил, спасибо", mine: false, minutesAgo: 23),
+                Line(id: "demo-firooz-3", dialogId: "demo-firooz", msgId: 3, clientMsgId: "demo-firooz-3", text: "Toj product brief", mine: false, delivery: .sent, timestamp: Self.demoTimestamp(minutesAgo: 22), attachment: .file(name: "Toj-Brief.pdf", size: "2.4 MB")),
+            ],
+            "demo-madina": [
+                demoLine(dialogId: "demo-madina", messageId: 1, text: "Кай мерасӣ?", mine: true, minutesAgo: 1_490, delivery: .seen),
+                demoLine(dialogId: "demo-madina", messageId: 2, text: "Дар роҳам", mine: false, minutesAgo: 1_480),
+            ],
+            "demo-aziz": [
+                demoLine(dialogId: "demo-aziz", messageId: 1, text: "Созвонимся вечером?", mine: false, minutesAgo: 2_920),
+            ],
+        ]
+    }
+
+    private func leaveDemoMode() {
+        isDemoMode = false
+        storedSession = nil
+        activeDialogId = nil
+        dialogs = []
+        lines = []
+        devices = []
+        demoLinesByDialog = [:]
+        requestedCode = false
+        accountDeletionRequested = false
+        accountDeletionCode = ""
+        status = "Signed out"
+    }
+
+    private func sendDemo(_ text: String, replyPreview: String? = nil, attachment: DemoAttachment? = nil) {
+        guard let dialogId = activeDialogId else { return }
+        let lineId = UUID().uuidString
+        let nextMessageId = (demoLinesByDialog[dialogId]?.compactMap(\.msgId).max() ?? 0) + 1
+        let line = Line(
+            id: lineId,
+            dialogId: dialogId,
+            msgId: nextMessageId,
+            clientMsgId: lineId,
+            text: text,
+            mine: true,
+            delivery: .sent,
+            timestamp: Self.demoTimestamp(minutesAgo: 0),
+            replyPreview: replyPreview,
+            attachment: attachment
+        )
+        demoLinesByDialog[dialogId, default: []].append(line)
+        lines = demoLinesByDialog[dialogId] ?? []
+        dialogs = dialogs.map { dialog in
+            guard dialog.id == dialogId else { return dialog }
+            var updated = dialog
+            updated.subtitle = text
+            updated.updatedAt = Self.demoTimestamp(minutesAgo: 0)
+            updated.isPending = false
+            updated.unreadCount = 0
+            updated.draftPreview = nil
+            return updated
+        }
+
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard let self, self.isDemoMode, self.activeDialogId == dialogId else { return }
+            if let index = self.lines.firstIndex(where: { $0.id == lineId }) {
+                self.lines[index].delivery = .seen
+                self.demoLinesByDialog[dialogId] = self.lines
+            }
+        }
+    }
+
+    func reactToDemoMessage(_ lineId: String, reaction: String = "❤️") {
+        guard isDemoMode, let dialogId = activeDialogId,
+              let index = lines.firstIndex(where: { $0.id == lineId }) else { return }
+        if lines[index].reactions.contains(reaction) {
+            lines[index].reactions.removeAll(where: { $0 == reaction })
+        } else {
+            lines[index].reactions.append(reaction)
+        }
+        demoLinesByDialog[dialogId] = lines
+    }
+
+    func deleteDemoMessage(_ lineId: String) {
+        guard isDemoMode, let dialogId = activeDialogId else { return }
+        lines.removeAll(where: { $0.id == lineId })
+        demoLinesByDialog[dialogId] = lines
+    }
+
+    func sendDemoAttachment(_ attachment: DemoAttachment, caption: String = "") {
+        guard isDemoMode else { return }
+        sendDemo(caption.isEmpty ? attachment.title : caption, attachment: attachment)
+        composerMode = .text
+    }
+
+    func beginDemoRecording() {
+        guard isDemoMode, capabilities.contains(.voiceNotes) else { return }
+        composerMode = .recording(elapsedSeconds: 0)
+    }
+
+    func finishDemoRecording() {
+        guard isDemoMode else { return }
+        sendDemo(String(localized: "Voice message"), attachment: .voice(duration: "0:08"))
+        composerMode = .text
+    }
+
+    private func updateDemoMessage(messageId: String, text: String) {
+        guard let dialogId = activeDialogId,
+              let index = lines.firstIndex(where: { $0.id == messageId }) else { return }
+        lines[index].text = text
+        lines[index].isEdited = true
+        demoLinesByDialog[dialogId] = lines
+    }
+
+    private func demoLine(
+        dialogId: String,
+        messageId: Int64,
+        text: String,
+        mine: Bool,
+        minutesAgo: Int,
+        delivery: Line.Delivery = .sent
+    ) -> Line {
+        Line(
+            id: "\(dialogId)-\(messageId)",
+            dialogId: dialogId,
+            msgId: messageId,
+            clientMsgId: "\(dialogId)-\(messageId)",
+            text: text,
+            mine: mine,
+            delivery: delivery,
+            timestamp: Self.demoTimestamp(minutesAgo: minutesAgo)
+        )
+    }
+
+    private static func demoTimestamp(minutesAgo: Int) -> String {
+        ISO8601DateFormatter().string(from: Date().addingTimeInterval(TimeInterval(-minutesAgo * 60)))
+    }
+    #endif
+
+    #if !DEBUG
+    func reactToDemoMessage(_ lineId: String, reaction: String = "❤️") {}
+    func deleteDemoMessage(_ lineId: String) {}
+    func sendDemoAttachment(_ attachment: DemoAttachment, caption: String = "") {}
+    func beginDemoRecording() {}
+    func finishDemoRecording() {}
+    #endif
 }
 
 private enum CloudAppModelError: LocalizedError {
