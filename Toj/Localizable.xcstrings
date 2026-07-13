@@ -1,100 +1,1956 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-    "6-digit code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "6-значный код" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рамзи 6-рақама" } } } },
-    "Account" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Аккаунт" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳисоб" } } } },
-    "Activity time unavailable" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Время активности недоступно" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Вақти фаъолият дастрас нест" } } } },
-    "All devices will be signed out and your identifying account data will be erased." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Все устройства выйдут из аккаунта, а идентифицирующие данные будут удалены." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳамаи дастгоҳҳо аз ҳисоб мебароянд ва маълумоти шиносоии шумо нест карда мешавад." } } } },
-    "Back" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Назад" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Бозгашт" } } } },
-    "Cancel" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отмена" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Бекор кардан" } } } },
-    "Change number" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Изменить номер" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Иваз кардани рақам" } } } },
-    "Chats" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Чаты" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Чатҳо" } } } },
-    "Clear search" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Очистить поиск" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Тоза кардани ҷустуҷӯ" } } } },
-    "Coming soon" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Скоро" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ба наздикӣ" } } } },
-    "Contacts" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Контакты" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Тамосҳо" } } } },
-    "Delete account" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить аккаунт" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Нест кардани ҳисоб" } } } },
-    "Delete forever" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить навсегда" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳамеша нест кардан" } } } },
-    "Delete your Toj account?" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить аккаунт Toj?" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳисоби Toj-ро нест мекунед?" } } } },
-    "Deleting account" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удаление аккаунта" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Нест кардани ҳисоб" } } } },
-    "Devices" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Устройства" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Дастгоҳҳо" } } } },
-    "Display name" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Имя в профиле" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Номи намоишӣ" } } } },
-    "Earlier messages" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Предыдущие сообщения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёмҳои пешина" } } } },
-    "Earlier message" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Предыдущее сообщение" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёми пешина" } } } },
-    "Enter the fresh six-digit code. This action cannot be undone." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Введите новый шестизначный код. Это действие нельзя отменить." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рамзи нави шашрақамаро ворид кунед. Ин амал баргардонида намешавад." } } } },
-    "Enter the phone number of a Toj user." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Введите номер телефона пользователя Toj." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рақами телефони корбари Toj-ро ворид кунед." } } } },
-    "Enter your code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Введите код" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рамзро ворид кунед" } } } },
-    "Fast, private messaging made for your people." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Быстрое и приватное общение для своих." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёмрасонии зуду махфӣ барои наздикони шумо." } } } },
-    "Get code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Получить код" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Гирифтани рамз" } } } },
-    "Loading" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загрузка" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Боркунӣ" } } } },
-    "Loading devices" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Загрузка устройств" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Боркунии дастгоҳҳо" } } } },
-    "Message" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сообщение" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паём" } } } },
-    "Message deleted" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сообщение удалено" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паём нест карда шуд" } } } },
-    "Deleted message" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалённое сообщение" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёми нестшуда" } } } },
-    "New chat" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Новый чат" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Чати нав" } } } },
-    "No active devices" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Нет активных устройств" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Дастгоҳи фаъол нест" } } } },
-    "No chats yet" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Пока нет чатов" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳоло чат нест" } } } },
-    "No results" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ничего не найдено" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Натиҷа ёфт нашуд" } } } },
-    "Open chat" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Открыть чат" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Кушодани чат" } } } },
-    "Permanently delete account" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить аккаунт навсегда" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳисобро ҳамеша нест кардан" } } } },
-    "Permanently delete account?" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить аккаунт навсегда?" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳисобро ҳамеша нест мекунед?" } } } },
-    "Phone number" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Номер телефона" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рақами телефон" } } } },
-    "Protected" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Защищено" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳифзшуда" } } } },
-    "Protected conversation" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Защищённый разговор" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Суҳбати ҳифзшуда" } } } },
-    "Request deletion code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Запросить код удаления" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Гирифтани рамзи несткунӣ" } } } },
-    "Request new code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Запросить новый код" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Гирифтани рамзи нав" } } } },
-    "Search" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Поиск" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҷустуҷӯ" } } } },
-    "Search chats" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Поиск по чатам" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҷустуҷӯи чатҳо" } } } },
-    "Send" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отправить" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Фиристодан" } } } },
-    "Send again" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Отправить снова" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Аз нав фиристодан" } } } },
-    "Settings" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Настройки" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Танзимот" } } } },
-    "Sign in" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Войти" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ворид шудан" } } } },
-    "Sign out" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Выйти" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Баромадан" } } } },
-    "Sign out of Toj?" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Выйти из Toj?" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Аз Toj мебароед?" } } } },
-    "Start a private conversation with someone you know." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Начните приватный разговор с близким человеком." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Бо шахси шинос суҳбати махфӣ оғоз кунед." } } } },
-    "This device" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Это устройство" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ин дастгоҳ" } } } },
-    "Try another name or message." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Попробуйте другое имя или сообщение." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ном ё паёми дигарро санҷед." } } } },
-    "Verification code" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Код подтверждения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Рамзи тасдиқ" } } } },
-    "Verify deletion" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подтвердите удаление" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Тасдиқи несткунӣ" } } } },
-    "We sent a six-digit code to your phone." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Мы отправили шестизначный код на ваш телефон." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Мо рамзи шашрақамаро ба телефони шумо фиристодем." } } } },
-    "Welcome to Toj" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Добро пожаловать в Toj" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Хуш омадед ба Toj" } } } },
-    "Your contacts will appear here in a future update." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Контакты появятся здесь в одном из следующих обновлений." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Тамосҳои шумо дар навсозии оянда дар ин ҷо пайдо мешаванд." } } } },
-    "Your conversations stay private" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ваши разговоры остаются приватными" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Суҳбатҳои шумо махфӣ мемонанд" } } } },
-    "Your identifying account data will be erased. Delivered messages remain in other participants’ chat history." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Идентифицирующие данные аккаунта будут удалены. Доставленные сообщения останутся в истории других участников." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Маълумоти шиносоии ҳисоби шумо нест мешавад. Паёмҳои расонидашуда дар таърихи дигар иштирокчиён мемонанд." } } } },
-    "Demo conversation" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Демонстрационный чат" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Чати намоишӣ" } } } },
-    "Explore demo" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Открыть демо" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Дидани намуна" } } } },
-    "No account or SMS required" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Без аккаунта и SMS" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Бе ҳисоб ва SMS" } } } },
-    "This chat is local to demo mode." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Этот чат существует только в деморежиме." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ин чат танҳо дар ҳолати намоишӣ аст." } } } },
-    "Your name" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ваше имя" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Номи шумо" } } } },
-    "Reply" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ответить" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҷавоб додан" } } } },
-    "React" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Реакция" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Вокуниш" } } } },
-    "Copy" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Копировать" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Нусха бардоштан" } } } },
-    "Edit" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Изменить" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Таҳрир кардан" } } } },
-    "Forward" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Переслать" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Равон кардан" } } } },
-    "Delete" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Нест кардан" } } } },
-    "Delete message?" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Удалить сообщение?" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёмро нест мекунед?" } } } },
-    "This removes the message for everyone in this conversation." : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сообщение будет удалено у всех участников этого чата." } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ин паём барои ҳамаи иштирокчиёни ин суҳбат нест карда мешавад." } } } },
-    "Retry" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Повторить" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Такрор кардан" } } } },
-    "Details" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сведения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Маълумот" } } } },
-    "People" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Люди" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Одамон" } } } },
-    "Messages" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сообщения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёмҳо" } } } },
-    "Media" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Медиа" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Расонаҳо" } } } },
-    "Links" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ссылки" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Пайвандҳо" } } } },
-    "Files" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Файлы" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Файлҳо" } } } },
-    "Private conversation" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Приватный разговор" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Суҳбати махфӣ" } } } },
-    "Unread messages" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Непрочитанные сообщения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёмҳои нохонда" } } } },
-    "Waiting for network" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидание сети" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Интизори шабака" } } } },
-    "Connecting…" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Подключение…" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Пайвастшавӣ…" } } } },
-    "New group" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Новая группа" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Гурӯҳи нав" } } } },
-    "Group details" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Сведения о группе" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Маълумоти гурӯҳ" } } } },
-    "Audio" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Аудио" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Садо" } } } },
-    "Video" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Видео" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Навор" } } } },
-    "Privacy" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Конфиденциальность" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Махфият" } } } },
-    "Shared content" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Общие материалы" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Маводи муштарак" } } } },
-    "Notifications" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Уведомления" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Огоҳиҳо" } } } },
-    "Voice message" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Голосовое сообщение" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Паёми овозӣ" } } } },
-    "Editing message" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Редактирование сообщения" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Таҳрири паём" } } } },
-    "Replying" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ответ" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҷавоб" } } } },
-    "Interface states" : { "localizations" : { "ru" : { "stringUnit" : { "state" : "translated", "value" : "Состояния интерфейса" } }, "tg" : { "stringUnit" : { "state" : "translated", "value" : "Ҳолатҳои интерфейс" } } } }
+    "@" : {
+
+    },
+    "%@, %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@, %2$@"
+          }
+        }
+      }
+    },
+    "%lld" : {
+
+    },
+    "%lld members selected" : {
+
+    },
+    "%lld percent" : {
+
+    },
+    "%lld unread messages" : {
+
+    },
+    "+992" : {
+
+    },
+    "000000" : {
+
+    },
+    "00:01" : {
+
+    },
+    "4" : {
+
+    },
+    "6-digit code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "6-значный код"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рамзи 6-рақама"
+          }
+        }
+      }
+    },
+    "7" : {
+
+    },
+    "12" : {
+
+    },
+    "99+" : {
+
+    },
+    "Account" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аккаунт"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳисоб"
+          }
+        }
+      }
+    },
+    "Active" : {
+
+    },
+    "Activity time unavailable" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Время активности недоступно"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вақти фаъолият дастрас нест"
+          }
+        }
+      }
+    },
+    "Add attachment" : {
+
+    },
+    "All" : {
+
+    },
+    "All devices will be signed out and your identifying account data will be erased." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все устройства выйдут из аккаунта, а идентифицирующие данные будут удалены."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳамаи дастгоҳҳо аз ҳисоб мебароянд ва маълумоти шиносоии шумо нест карда мешавад."
+          }
+        }
+      }
+    },
+    "Archive" : {
+
+    },
+    "Attachment" : {
+
+    },
+    "Attachment failed" : {
+
+    },
+    "Attachment preview" : {
+
+    },
+    "Audio" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аудио"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Садо"
+          }
+        }
+      }
+    },
+    "Available when connected" : {
+
+    },
+    "Back" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Назад"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бозгашт"
+          }
+        }
+      }
+    },
+    "Block" : {
+
+    },
+    "Block or report" : {
+
+    },
+    "Block or report this contact?" : {
+
+    },
+    "Call ended" : {
+
+    },
+    "Call lifecycle" : {
+
+    },
+    "Camera" : {
+
+    },
+    "Cancel" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отмена"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бекор кардан"
+          }
+        }
+      }
+    },
+    "Cancel upload" : {
+
+    },
+    "Cancel voice message" : {
+
+    },
+    "Change number" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменить номер"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Иваз кардани рақам"
+          }
+        }
+      }
+    },
+    "Chat folders" : {
+
+    },
+    "Chats" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чаты"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чатҳо"
+          }
+        }
+      }
+    },
+    "Choose a conversation" : {
+
+    },
+    "Choose a reaction" : {
+
+    },
+    "Clear downloaded media?" : {
+
+    },
+    "Clear media" : {
+
+    },
+    "Clear search" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Очистить поиск"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тоза кардани ҷустуҷӯ"
+          }
+        }
+      }
+    },
+    "Close media" : {
+
+    },
+    "Coming soon" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скоро"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ба наздикӣ"
+          }
+        }
+      }
+    },
+    "Connecting" : {
+
+    },
+    "Connecting securely…" : {
+
+    },
+    "Connecting…" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подключение…"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пайвастшавӣ…"
+          }
+        }
+      }
+    },
+    "Connection" : {
+
+    },
+    "Connection security status" : {
+
+    },
+    "Contact" : {
+
+    },
+    "Contacts" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Контакты"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тамосҳо"
+          }
+        }
+      }
+    },
+    "Conversation" : {
+
+    },
+    "Copy" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Копировать"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нусха бардоштан"
+          }
+        }
+      }
+    },
+    "Could not encrypt the local media" : {
+
+    },
+    "Could not open media" : {
+
+    },
+    "Could not start recording" : {
+
+    },
+    "Create" : {
+
+    },
+    "Declined" : {
+
+    },
+    "Delete" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нест кардан"
+          }
+        }
+      }
+    },
+    "Delete account" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить аккаунт"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нест кардани ҳисоб"
+          }
+        }
+      }
+    },
+    "Delete forever" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить навсегда"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳамеша нест кардан"
+          }
+        }
+      }
+    },
+    "Delete message?" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить сообщение?"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёмро нест мекунед?"
+          }
+        }
+      }
+    },
+    "Delete your Toj account?" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить аккаунт Toj?"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳисоби Toj-ро нест мекунед?"
+          }
+        }
+      }
+    },
+    "Deleted message" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалённое сообщение"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёми нестшуда"
+          }
+        }
+      }
+    },
+    "Deleting account" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удаление аккаунта"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нест кардани ҳисоб"
+          }
+        }
+      }
+    },
+    "Deleting message…" : {
+
+    },
+    "Demo conversation" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Демонстрационный чат"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чати намоишӣ"
+          }
+        }
+      }
+    },
+    "Demo only — production shows connected capabilities" : {
+
+    },
+    "Demo only. No account action will be sent." : {
+
+    },
+    "Details" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сведения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Маълумот"
+          }
+        }
+      }
+    },
+    "Devices" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Устройства"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дастгоҳҳо"
+          }
+        }
+      }
+    },
+    "Display name" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имя в профиле"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Номи намоишӣ"
+          }
+        }
+      }
+    },
+    "Done" : {
+
+    },
+    "Downloading…" : {
+
+    },
+    "Draft: " : {
+
+    },
+    "Earlier message" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предыдущее сообщение"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёми пешина"
+          }
+        }
+      }
+    },
+    "Earlier messages" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предыдущие сообщения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёмҳои пешина"
+          }
+        }
+      }
+    },
+    "Edit" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Таҳрир кардан"
+          }
+        }
+      }
+    },
+    "edited" : {
+
+    },
+    "Edited" : {
+
+    },
+    "Editing message" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Редактирование сообщения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Таҳрири паём"
+          }
+        }
+      }
+    },
+    "End call" : {
+
+    },
+    "Ended" : {
+
+    },
+    "Enter the fresh six-digit code. This action cannot be undone." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите новый шестизначный код. Это действие нельзя отменить."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рамзи нави шашрақамаро ворид кунед. Ин амал баргардонида намешавад."
+          }
+        }
+      }
+    },
+    "Enter the phone number of a Toj user." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите номер телефона пользователя Toj."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рақами телефони корбари Toj-ро ворид кунед."
+          }
+        }
+      }
+    },
+    "Enter your code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите код"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рамзро ворид кунед"
+          }
+        }
+      }
+    },
+    "Explore demo" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть демо"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дидани намуна"
+          }
+        }
+      }
+    },
+    "failed" : {
+
+    },
+    "Failed: %@" : {
+
+    },
+    "Fast, private messaging made for your people." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Быстрое и приватное общение для своих."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёмрасонии зуду махфӣ барои наздикони шумо."
+          }
+        }
+      }
+    },
+    "File" : {
+
+    },
+    "Files" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файлы"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файлҳо"
+          }
+        }
+      }
+    },
+    "Files are encrypted in Toj's local cache before upload" : {
+
+    },
+    "Forward" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Переслать"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Равон кардан"
+          }
+        }
+      }
+    },
+    "Forward to" : {
+
+    },
+    "Forwarded message" : {
+
+    },
+    "Get code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Получить код"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Гирифтани рамз"
+          }
+        }
+      }
+    },
+    "Group details" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сведения о группе"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Маълумоти гурӯҳ"
+          }
+        }
+      }
+    },
+    "Group name" : {
+
+    },
+    "Hold a little longer to record a voice message" : {
+
+    },
+    "Hold to record voice message" : {
+
+    },
+    "I am Alice" : {
+
+    },
+    "I am Bob" : {
+
+    },
+    "Interface states" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Состояния интерфейса"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳолатҳои интерфейс"
+          }
+        }
+      }
+    },
+    "Jump to latest message" : {
+
+    },
+    "Link" : {
+
+    },
+    "Links" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ссылки"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пайвандҳо"
+          }
+        }
+      }
+    },
+    "Loading" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Боркунӣ"
+          }
+        }
+      }
+    },
+    "Loading devices" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка устройств"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Боркунии дастгоҳҳо"
+          }
+        }
+      }
+    },
+    "Media" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Медиа"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Расонаҳо"
+          }
+        }
+      }
+    },
+    "Mentioned" : {
+
+    },
+    "Message" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сообщение"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паём"
+          }
+        }
+      }
+    },
+    "Message %@…" : {
+
+    },
+    "Message deleted" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сообщение удалено"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паём нест карда шуд"
+          }
+        }
+      }
+    },
+    "Message delivery" : {
+
+    },
+    "Message details" : {
+
+    },
+    "Messages" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сообщения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёмҳо"
+          }
+        }
+      }
+    },
+    "Messaging unavailable" : {
+
+    },
+    "Microphone access is required for voice messages" : {
+
+    },
+    "Minimize call" : {
+
+    },
+    "Mute" : {
+
+    },
+    "New chat" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Новый чат"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чати нав"
+          }
+        }
+      }
+    },
+    "New group" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Новая группа"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Гурӯҳи нав"
+          }
+        }
+      }
+    },
+    "Next" : {
+
+    },
+    "No account or SMS required" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без аккаунта и SMS"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бе ҳисоб ва SMS"
+          }
+        }
+      }
+    },
+    "No active devices" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нет активных устройств"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дастгоҳи фаъол нест"
+          }
+        }
+      }
+    },
+    "No chats yet" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пока нет чатов"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳоло чат нест"
+          }
+        }
+      }
+    },
+    "No recording is active" : {
+
+    },
+    "No results" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ничего не найдено"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Натиҷа ёфт нашуд"
+          }
+        }
+      }
+    },
+    "Notifications" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Уведомления"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Огоҳиҳо"
+          }
+        }
+      }
+    },
+    "OK" : {
+
+    },
+    "Open %@ profile" : {
+
+    },
+    "Open chat" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть чат"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Кушодани чат"
+          }
+        }
+      }
+    },
+    "Open Settings" : {
+
+    },
+    "Opens contact and privacy details" : {
+
+    },
+    "Opens conversation. Long press for chat actions." : {
+
+    },
+    "Opens media viewer" : {
+
+    },
+    "Opens the demo group creation flow" : {
+
+    },
+    "Pending uploads stay protected. Sent photos, videos, files and voice notes download again when opened." : {
+
+    },
+    "People" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Люди"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Одамон"
+          }
+        }
+      }
+    },
+    "Permanently delete account" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить аккаунт навсегда"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳисобро ҳамеша нест кардан"
+          }
+        }
+      }
+    },
+    "Permanently delete account?" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить аккаунт навсегда?"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳисобро ҳамеша нест мекунед?"
+          }
+        }
+      }
+    },
+    "Phone number" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Номер телефона"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рақами телефон"
+          }
+        }
+      }
+    },
+    "Photo" : {
+
+    },
+    "Pick who this device is:" : {
+
+    },
+    "Pin" : {
+
+    },
+    "Pinch or double tap to zoom" : {
+
+    },
+    "Pinned" : {
+
+    },
+    "Preparing encrypted upload…" : {
+
+    },
+    "Privacy" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Конфиденциальность"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Махфият"
+          }
+        }
+      }
+    },
+    "Private conversation" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приватный разговор"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Суҳбати махфӣ"
+          }
+        }
+      }
+    },
+    "Protected" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Защищено"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҳифзшуда"
+          }
+        }
+      }
+    },
+    "Protected conversation" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Защищённый разговор"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Суҳбати ҳифзшуда"
+          }
+        }
+      }
+    },
+    "Queued for sending" : {
+
+    },
+    "React" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Реакция"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вокуниш"
+          }
+        }
+      }
+    },
+    "Received from contact" : {
+
+    },
+    "Reconnecting" : {
+
+    },
+    "Reconnecting…" : {
+
+    },
+    "Recording voice message" : {
+
+    },
+    "Release to send, slide left to cancel, or slide up to lock" : {
+
+    },
+    "Remove" : {
+
+    },
+    "Reply" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ответить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҷавоб додан"
+          }
+        }
+      }
+    },
+    "Replying" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ответ"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҷавоб"
+          }
+        }
+      }
+    },
+    "Report" : {
+
+    },
+    "Request deletion code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запросить код удаления"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Гирифтани рамзи несткунӣ"
+          }
+        }
+      }
+    },
+    "Request new code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запросить новый код"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Гирифтани рамзи нав"
+          }
+        }
+      }
+    },
+    "Resend in %llds" : {
+
+    },
+    "Retry" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Такрор кардан"
+          }
+        }
+      }
+    },
+    "Rich content" : {
+
+    },
+    "Ringing" : {
+
+    },
+    "Ringing…" : {
+
+    },
+    "Save" : {
+
+    },
+    "Save edited message" : {
+
+    },
+    "Search" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҷустуҷӯ"
+          }
+        }
+      }
+    },
+    "Search chats" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск по чатам"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ҷустуҷӯи чатҳо"
+          }
+        }
+      }
+    },
+    "Search filters" : {
+
+    },
+    "seen" : {
+
+    },
+    "Seen" : {
+
+    },
+    "Send" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отправить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Фиристодан"
+          }
+        }
+      }
+    },
+    "Send again" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отправить снова"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аз нав фиристодан"
+          }
+        }
+      }
+    },
+    "Send voice message" : {
+
+    },
+    "sending" : {
+
+    },
+    "sent" : {
+
+    },
+    "Sent" : {
+
+    },
+    "Sent by you" : {
+
+    },
+    "Settings" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Настройки"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Танзимот"
+          }
+        }
+      }
+    },
+    "Share" : {
+
+    },
+    "Share something" : {
+
+    },
+    "Shared content" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общие материалы"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Маводи муштарак"
+          }
+        }
+      }
+    },
+    "Sign in" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Войти"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ворид шудан"
+          }
+        }
+      }
+    },
+    "Sign out" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выйти"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Баромадан"
+          }
+        }
+      }
+    },
+    "Sign out of Toj?" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выйти из Toj?"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Аз Toj мебароед?"
+          }
+        }
+      }
+    },
+    "Speaker" : {
+
+    },
+    "Start a private conversation with someone you know." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Начните приватный разговор с близким человеком."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Бо шахси шинос суҳбати махфӣ оғоз кунед."
+          }
+        }
+      }
+    },
+    "Start of unread messages" : {
+
+    },
+    "Storage" : {
+
+    },
+    "Swipe to reply or use message actions" : {
+
+    },
+    "Tap to inspect" : {
+
+    },
+    "That file is larger than 25 MB" : {
+
+    },
+    "That item could not be read" : {
+
+    },
+    "The downloaded media is damaged or unsupported" : {
+
+    },
+    "The media preview is too large" : {
+
+    },
+    "The media transfer could not be resumed" : {
+
+    },
+    "The upload expired and must be restarted" : {
+
+    },
+    "These deterministic fixtures never call the production transport." : {
+
+    },
+    "This chat is local to demo mode." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот чат существует только в деморежиме."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ин чат танҳо дар ҳолати намоишӣ аст."
+          }
+        }
+      }
+    },
+    "This device" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Это устройство"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ин дастгоҳ"
+          }
+        }
+      }
+    },
+    "This file is empty or larger than 25 MB" : {
+
+    },
+    "This removes the message for everyone in this conversation." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сообщение будет удалено у всех участников этого чата."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ин паём барои ҳамаи иштирокчиёни ин суҳбат нест карда мешавад."
+          }
+        }
+      }
+    },
+    "Toj — M1 walking skeleton" : {
+
+    },
+    "Toj needs more free media storage on this device" : {
+
+    },
+    "Try again" : {
+
+    },
+    "Try another name or message." : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Попробуйте другое имя или сообщение."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ном ё паёми дигарро санҷед."
+          }
+        }
+      }
+    },
+    "Try another name, filter, or message." : {
+
+    },
+    "typing…" : {
+
+    },
+    "Unmute" : {
+
+    },
+    "Unpin" : {
+
+    },
+    "Unread" : {
+
+    },
+    "Unread messages" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Непрочитанные сообщения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёмҳои нохонда"
+          }
+        }
+      }
+    },
+    "Uploading" : {
+
+    },
+    "Verification" : {
+
+    },
+    "Verification code" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Код подтверждения"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рамзи тасдиқ"
+          }
+        }
+      }
+    },
+    "Verify deletion" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Подтвердите удаление"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тасдиқи несткунӣ"
+          }
+        }
+      }
+    },
+    "Video" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Видео"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Навор"
+          }
+        }
+      }
+    },
+    "Voice message" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Голосовое сообщение"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Паёми овозӣ"
+          }
+        }
+      }
+    },
+    "Voice message %@" : {
+
+    },
+    "Voice message position" : {
+
+    },
+    "Waiting for network" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ожидание сети"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Интизори шабака"
+          }
+        }
+      }
+    },
+    "We sent a six-digit code to your phone." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Мы отправили шестизначный код на ваш телефон."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Мо рамзи шашрақамаро ба телефони шумо фиристодем."
+          }
+        }
+      }
+    },
+    "Welcome to Toj" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Добро пожаловать в Toj"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Хуш омадед ба Toj"
+          }
+        }
+      }
+    },
+    "You" : {
+
+    },
+    "Your contacts will appear here in a future update." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Контакты появятся здесь в одном из следующих обновлений."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Тамосҳои шумо дар навсозии оянда дар ин ҷо пайдо мешаванд."
+          }
+        }
+      }
+    },
+    "Your conversations stay private" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ваши разговоры остаются приватными"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Суҳбатҳои шумо махфӣ мемонанд"
+          }
+        }
+      }
+    },
+    "Your identifying account data will be erased. Delivered messages remain in other participants’ chat history." : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Идентифицирующие данные аккаунта будут удалены. Доставленные сообщения останутся в истории других участников."
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Маълумоти шиносоии ҳисоби шумо нест мешавад. Паёмҳои расонидашуда дар таърихи дигар иштирокчиён мемонанд."
+          }
+        }
+      }
+    },
+    "Your messages will appear here." : {
+
+    },
+    "Your name" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ваше имя"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Номи шумо"
+          }
+        }
+      }
+    }
   },
   "version" : "1.0"
 }

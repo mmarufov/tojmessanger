@@ -1,9 +1,23 @@
 import SwiftUI
 import AVFoundation
 import AVKit
+import Combine
 import PhotosUI
+import Photos
 import UniformTypeIdentifiers
 import UIKit
+
+nonisolated enum VoiceGestureIntent: Equatable {
+    case recording
+    case cancel
+    case lock
+
+    static func resolve(translation: CGSize) -> VoiceGestureIntent {
+        if translation.width < -82 { return .cancel }
+        if translation.height < -72 { return .lock }
+        return .recording
+    }
+}
 
 struct TojConversationExperience: View {
     @Bindable var model: CloudAppModel
@@ -20,6 +34,10 @@ struct TojConversationExperience: View {
     @State private var reactionLine: CloudAppModel.Line?
     @State private var initialUnreadCount = 0
     @State private var isAtBottom = true
+    @State private var voiceFingerDown = false
+    @State private var voiceLocked = false
+    @State private var voiceCancelled = false
+    @State private var voiceStartTask: Task<Void, Never>?
 
     let dialogId: String
 
@@ -69,8 +87,10 @@ struct TojConversationExperience: View {
                 ProductionAttachmentPicker(model: model) { showingAttachments = false }
             #endif
             }
-            .presentationDetents([.height(390)])
-            .presentationDragIndicator(.visible)
+            .presentationDetents([.fraction(0.72), .large])
+            .presentationDragIndicator(.hidden)
+            .presentationCornerRadius(34)
+            .presentationBackground(TojTheme.base)
         }
         .sheet(isPresented: $showingForwarding) {
             DemoForwardingView(dialogs: model.dialogs) { targetDialogId in
@@ -97,6 +117,26 @@ struct TojConversationExperience: View {
             Button("Cancel", role: .cancel) { deleteLine = nil }
         } message: {
             Text("This removes the message for everyone in this conversation.")
+        }
+        .alert(item: Binding(
+            get: { model.operationNotice },
+            set: { if $0 == nil { model.dismissOperationNotice() } }
+        )) { notice in
+            if notice.opensSettings {
+                return Alert(
+                    title: Text(notice.title), message: Text(notice.message),
+                    primaryButton: .default(Text("Open Settings")) {
+                        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                        UIApplication.shared.open(url)
+                        model.dismissOperationNotice()
+                    },
+                    secondaryButton: .cancel { model.dismissOperationNotice() }
+                )
+            }
+            return Alert(
+                title: Text(notice.title), message: Text(notice.message),
+                dismissButton: .default(Text("OK")) { model.dismissOperationNotice() }
+            )
         }
         .confirmationDialog(
             "Choose a reaction",
@@ -317,27 +357,7 @@ struct TojConversationExperience: View {
                     .buttonStyle(.tojPressable)
                     .accessibilityLabel(model.composerMode.isEditing ? "Save edited message" : "Send")
                 } else if model.capabilities.contains(.voiceNotes) {
-                    Button {
-                        if model.composerMode.isRecording {
-                            Task {
-                                await model.finishVoiceRecording()
-                                TojFeedback.sent()
-                            }
-                        } else {
-                            Task {
-                                await model.beginVoiceRecording()
-                                TojFeedback.selection()
-                            }
-                        }
-                    } label: {
-                        Image(systemName: model.composerMode.isRecording ? "arrow.up" : "mic.fill")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(model.composerMode.isRecording ? TojTheme.onAccent : TojTheme.text)
-                            .frame(width: 44, height: 44)
-                            .background(model.composerMode.isRecording ? TojTheme.accent : TojTheme.strong, in: Circle())
-                    }
-                    .buttonStyle(.tojPressable)
-                    .accessibilityLabel(model.composerMode.isRecording ? "Send voice message" : "Record voice message")
+                    voiceRecordControl
                 } else {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 17, weight: .bold))
@@ -373,6 +393,17 @@ struct TojConversationExperience: View {
                     .foregroundStyle(TojTheme.secondaryText)
                     .lineLimit(1)
             }
+            if model.composerMode.isRecording {
+                HStack(alignment: .center, spacing: 2) {
+                    ForEach(0..<12, id: \.self) { index in
+                        Capsule()
+                            .fill(TojTheme.danger.opacity(0.9))
+                            .frame(width: 2, height: 5 + CGFloat(model.voiceRecordingLevel) * CGFloat(6 + (index % 5) * 3))
+                    }
+                }
+                .frame(height: 28)
+                .accessibilityHidden(true)
+            }
             Spacer()
             Button { model.cancelComposerMode() } label: {
                 Image(systemName: "xmark")
@@ -384,6 +415,92 @@ struct TojConversationExperience: View {
         }
         .padding(.horizontal, 12)
         .padding(.top, 8)
+    }
+
+    @ViewBuilder
+    private var voiceRecordControl: some View {
+        if voiceLocked && model.composerMode.isRecording {
+            HStack(spacing: 6) {
+                Button {
+                    voiceLocked = false
+                    model.cancelVoiceRecording()
+                    TojFeedback.selection()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .bold))
+                        .frame(width: 38, height: 38)
+                        .background(TojTheme.danger.opacity(0.18), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Cancel voice message")
+                Button {
+                    voiceLocked = false
+                    Task { await model.finishVoiceRecording(); TojFeedback.sent() }
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(TojTheme.onAccent)
+                        .frame(width: 44, height: 44)
+                        .background(TojTheme.accent, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Send voice message")
+            }
+        } else {
+            Image(systemName: model.composerMode.isRecording ? "mic.fill" : "mic.fill")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(model.composerMode.isRecording ? .white : TojTheme.text)
+                .frame(width: 44, height: 44)
+                .background(model.composerMode.isRecording ? TojTheme.danger : TojTheme.strong, in: Circle())
+                .scaleEffect(voiceFingerDown ? 1.08 : 1)
+                .contentShape(Circle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged(handleVoiceDrag)
+                        .onEnded(handleVoiceRelease)
+                )
+                .accessibilityLabel("Hold to record voice message")
+                .accessibilityHint("Release to send, slide left to cancel, or slide up to lock")
+        }
+    }
+
+    private func handleVoiceDrag(_ value: DragGesture.Value) {
+        if !voiceFingerDown {
+            voiceFingerDown = true
+            voiceCancelled = false
+            voiceStartTask?.cancel()
+            TojFeedback.selection()
+            voiceStartTask = Task {
+                await model.beginVoiceRecording()
+                guard !Task.isCancelled else { return }
+                if !voiceFingerDown, !voiceLocked, !voiceCancelled, model.composerMode.isRecording {
+                    await model.finishVoiceRecording()
+                }
+            }
+        }
+        switch VoiceGestureIntent.resolve(translation: value.translation) {
+        case .cancel where !voiceCancelled:
+            voiceCancelled = true
+            voiceLocked = false
+            voiceFingerDown = false
+            voiceStartTask?.cancel()
+            model.cancelVoiceRecording()
+            TojFeedback.selection()
+        case .lock where !voiceCancelled && !voiceLocked:
+            voiceLocked = true
+            TojFeedback.selection()
+        default:
+            break
+        }
+    }
+
+    private func handleVoiceRelease(_ value: DragGesture.Value) {
+        voiceFingerDown = false
+        guard !voiceCancelled else { voiceCancelled = false; return }
+        guard !voiceLocked else { return }
+        if model.composerMode.isRecording {
+            Task { await model.finishVoiceRecording(); TojFeedback.sent() }
+        }
     }
 
     private func send() {
@@ -461,7 +578,11 @@ private struct TojMessageBubble: View {
                 }
 
                 if let media = line.media {
-                    ProductionMediaBubble(model: model, media: media)
+                    ProductionMediaBubble(
+                        model: model, line: line, media: media,
+                        onRetry: { model.retryFailedMessage(line) },
+                        onRemove: { model.removeFailedMedia(line) }
+                    )
                         .contentShape(Rectangle())
                         .onTapGesture { if media.kind != "voice" { showingMedia = true } }
                 } else if let attachment = line.attachment {
@@ -477,22 +598,25 @@ private struct TojMessageBubble: View {
                         .font(.body)
                         .foregroundStyle(TojTheme.text)
                         .textSelection(.enabled)
+                        .padding(.horizontal, isVisualMedia ? 8 : 0)
                 }
 
-                if let progress = line.transferProgress, progress < 1 {
+                if line.media == nil, let progress = line.transferProgress, progress < 1 {
                     ProgressView(value: progress)
                         .tint(TojTheme.secure)
                         .accessibilityLabel("Uploading")
                         .accessibilityValue("\(Int(progress * 100)) percent")
                 }
 
-                HStack(spacing: 4) {
-                    if line.isEdited { Text("edited") }
-                    if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
-                    if line.mine { Image(systemName: deliverySymbol) }
+                if line.media == nil || !["photo", "video"].contains(line.media?.kind ?? "") || !line.text.isEmpty {
+                    HStack(spacing: 4) {
+                        if line.isEdited { Text("edited") }
+                        if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+                        if line.mine { Image(systemName: deliverySymbol) }
+                    }
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(deliveryColor)
                 }
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(deliveryColor)
 
                 if !line.reactions.isEmpty {
                     HStack(spacing: 4) {
@@ -505,8 +629,8 @@ private struct TojMessageBubble: View {
                     }
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
+            .padding(.horizontal, isVisualMedia ? 4 : 12)
+            .padding(.vertical, isVisualMedia ? 4 : 9)
             .background(line.mine ? TojTheme.bubbleMine : TojTheme.strong)
             .clipShape(bubbleShape)
             .overlay(bubbleShape.stroke(line.mine ? TojTheme.gold.opacity(0.16) : TojTheme.hairline, lineWidth: 0.5))
@@ -569,6 +693,10 @@ private struct TojMessageBubble: View {
             topTrailingRadius: TojRadius.bubble,
             style: .continuous
         )
+    }
+
+    private var isVisualMedia: Bool {
+        line.media.map { $0.kind == "photo" || $0.kind == "video" } ?? false
     }
 
     private var accessibilityDescription: String {
@@ -649,10 +777,31 @@ private struct DemoAttachmentBubble: View {
     }
 }
 
+nonisolated enum MediaBubbleLayout {
+    static func size(width: Int?, height: Int?, maxWidth: CGFloat = 268) -> CGSize {
+        guard let width, let height, width > 0, height > 0 else {
+            return CGSize(width: maxWidth, height: 180)
+        }
+        let ratio = CGFloat(width) / CGFloat(height)
+        let desiredHeight = maxWidth / ratio
+        if desiredHeight > 300 {
+            return CGSize(width: min(maxWidth, max(160, 300 * ratio)), height: 300)
+        }
+        return CGSize(width: maxWidth, height: max(116, desiredHeight))
+    }
+}
+
 private struct ProductionMediaBubble: View {
     let model: CloudAppModel
+    let line: CloudAppModel.Line
     let media: CloudMedia
+    let onRetry: () -> Void
+    let onRemove: () -> Void
     @State private var thumbnail: UIImage?
+
+    private var mediaSize: CGSize {
+        MediaBubbleLayout.size(width: media.width, height: media.height)
+    }
 
     var body: some View {
         Group {
@@ -662,7 +811,9 @@ private struct ProductionMediaBubble: View {
                     if let thumbnail {
                         Image(uiImage: thumbnail)
                             .resizable()
-                            .scaledToFill()
+                            .scaledToFit()
+                            .frame(width: mediaSize.width, height: mediaSize.height)
+                            .background(.black.opacity(0.18))
                     } else {
                         LinearGradient(
                             colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
@@ -676,15 +827,56 @@ private struct ProductionMediaBubble: View {
                             .frame(width: 52, height: 52)
                             .background(.black.opacity(0.55), in: Circle())
                     }
-                    VStack { Spacer(); HStack {
+                    if case let .failed(message) = line.delivery {
+                        VStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.circle.fill").font(.title2)
+                            Text(message).font(.caption).lineLimit(2).multilineTextAlignment(.center)
+                            HStack(spacing: 8) {
+                                Button("Retry", action: onRetry).buttonStyle(.borderedProminent)
+                                Button("Remove", role: .destructive, action: onRemove).buttonStyle(.bordered)
+                            }
+                        }
+                        .padding(12)
+                        .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 14))
+                        .padding(14)
+                    } else if let progress = line.transferProgress, progress < 1 {
+                        VStack(spacing: 7) {
+                            Button(action: onRemove) {
+                                ZStack {
+                                    Circle().fill(.black.opacity(0.62)).frame(width: 54, height: 54)
+                                    ProgressView(value: progress).tint(.white).frame(width: 42, height: 42)
+                                    Image(systemName: "xmark").font(.caption.bold()).foregroundStyle(.white)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            Text(transferStatus(progress: progress))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(.black.opacity(0.66), in: Capsule())
+                        }
+                        .accessibilityLabel("Cancel upload")
+                        .accessibilityValue(transferStatus(progress: progress))
+                    }
+                    VStack {
                         Spacer()
-                        Text(media.formattedDuration ?? media.formattedSize)
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 7).padding(.vertical, 4)
-                            .background(.black.opacity(0.62), in: Capsule())
-                    }.padding(8) }
+                        HStack(alignment: .bottom) {
+                            Text(media.formattedDuration ?? media.formattedSize)
+                            Spacer()
+                            HStack(spacing: 3) {
+                                if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+                                if line.mine { Image(systemName: deliverySymbol) }
+                            }
+                        }
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7).padding(.vertical, 5)
+                        .background(.black.opacity(0.58), in: Capsule())
+                        .padding(8)
+                    }
                 }
-                .frame(width: 235, height: 155)
+                .frame(width: mediaSize.width, height: mediaSize.height)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .task(id: media.id) {
                     guard thumbnail == nil, let data = await model.thumbnailData(for: media) else { return }
@@ -708,6 +900,24 @@ private struct ProductionMediaBubble: View {
         }
         .accessibilityLabel("\(media.displayName), \(media.formattedSize)")
     }
+
+    private func transferStatus(progress: Double) -> String {
+        switch line.transferStage {
+        case .preparing: String(localized: "Preparing")
+        case .finalizing: String(localized: "Finalizing")
+        case .retrying: String(localized: "Retrying") + " · \(Int(progress * 100))%"
+        case .uploading, .none: "\(Int(progress * 100))%"
+        }
+    }
+
+    private var deliverySymbol: String {
+        switch line.delivery {
+        case .sending: "clock"
+        case .sent: "checkmark"
+        case .seen: "checkmark.circle.fill"
+        case .failed: "exclamationmark.circle.fill"
+        }
+    }
 }
 
 private struct VoiceNotePlaybackView: View {
@@ -721,6 +931,7 @@ private struct VoiceNotePlaybackView: View {
     @State private var error: String?
     @State private var loadingTask: Task<Void, Never>?
     @State private var playbackTask: Task<Void, Never>?
+    @State private var playbackRate: Float = 1
 
     var body: some View {
         HStack(spacing: 10) {
@@ -737,24 +948,37 @@ private struct VoiceNotePlaybackView: View {
             .buttonStyle(.plain)
 
             VStack(alignment: .leading, spacing: 5) {
-                Slider(
-                    value: Binding(
-                        get: { progress },
-                        set: { value in
-                            progress = value
-                            if let player { player.currentTime = player.duration * value }
-                        }
-                    ),
-                    in: 0...1
-                )
-                .tint(TojTheme.secure)
-                .frame(width: 135)
+                HStack(spacing: 2) {
+                    ForEach(0..<24, id: \.self) { index in
+                        Capsule()
+                            .fill(Double(index) / 24 <= progress ? TojTheme.secure : TojTheme.secondaryText.opacity(0.42))
+                            .frame(width: 3, height: CGFloat(7 + (index * 7 % 15)))
+                    }
+                }
+                .frame(width: 135, height: 22)
+                .overlay {
+                    Slider(
+                        value: Binding(
+                            get: { progress },
+                            set: { value in
+                                progress = value
+                                if let player { player.currentTime = player.duration * value }
+                            }
+                        ), in: 0...1
+                    )
+                    .tint(.clear)
+                    .opacity(0.02)
+                }
                 .accessibilityLabel("Voice message position")
                 HStack {
                     Text(error ?? elapsedLabel)
                         .lineLimit(1)
                     Spacer()
                     Text(media.formattedDuration ?? "0:00")
+                    Button(rateLabel) { cyclePlaybackRate() }
+                        .font(.caption2.bold())
+                        .buttonStyle(.plain)
+                        .foregroundStyle(TojTheme.secure)
                 }
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(TojTheme.secondaryText)
@@ -796,6 +1020,8 @@ private struct VoiceNotePlaybackView: View {
                 }
                 try Task.checkCancellation()
                 let loaded = try AVAudioPlayer(data: data)
+                loaded.enableRate = true
+                loaded.rate = playbackRate
                 guard loaded.prepareToPlay() else { throw MediaPresentationError.unreadable }
                 player = loaded
                 isLoading = false
@@ -822,6 +1048,61 @@ private struct VoiceNotePlaybackView: View {
             isPlaying = false
         }
     }
+
+    private var rateLabel: String {
+        playbackRate == 1 ? "1×" : playbackRate == 1.5 ? "1.5×" : "2×"
+    }
+
+    private func cyclePlaybackRate() {
+        playbackRate = playbackRate == 1 ? 1.5 : playbackRate == 1.5 ? 2 : 1
+        player?.enableRate = true
+        player?.rate = playbackRate
+    }
+}
+
+private struct ZoomablePhotoView: View {
+    let image: UIImage
+    @State private var scale: CGFloat = 1
+    @State private var baseScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var baseOffset: CGSize = .zero
+
+    var body: some View {
+        Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .scaleEffect(scale)
+            .offset(offset)
+            .contentShape(Rectangle())
+            .gesture(
+                MagnifyGesture()
+                    .onChanged { value in scale = min(5, max(1, baseScale * value.magnification)) }
+                    .onEnded { _ in
+                        baseScale = scale
+                        if scale == 1 { offset = .zero; baseOffset = .zero }
+                    }
+            )
+            .simultaneousGesture(
+                DragGesture()
+                    .onChanged { value in
+                        guard scale > 1 else { return }
+                        offset = CGSize(
+                            width: baseOffset.width + value.translation.width,
+                            height: baseOffset.height + value.translation.height
+                        )
+                    }
+                    .onEnded { _ in baseOffset = offset }
+            )
+            .onTapGesture(count: 2) {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    scale = scale > 1 ? 1 : 2.5
+                    baseScale = scale
+                    if scale == 1 { offset = .zero; baseOffset = .zero }
+                }
+            }
+            .accessibilityLabel("Photo")
+            .accessibilityHint("Pinch or double tap to zoom")
+    }
 }
 
 private struct ProductionMediaViewer: View {
@@ -833,6 +1114,7 @@ private struct ProductionMediaViewer: View {
     @State private var temporaryURL: URL?
     @State private var error: String?
     @State private var downloadProgress = 0.0
+    @State private var saveMessage: String?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -848,16 +1130,14 @@ private struct ProductionMediaViewer: View {
                             .buttonStyle(.borderedProminent)
                     }
                 } else if media.kind == "photo", let photoImage {
-                    Image(uiImage: photoImage).resizable().scaledToFit().padding()
+                    ZoomablePhotoView(image: photoImage).padding(.vertical, 60)
                 } else if media.kind == "video", let player {
                     VideoPlayer(player: player).onAppear { player.play() }
-                } else if media.kind == "file", let temporaryURL {
+                } else if media.kind == "file", temporaryURL != nil {
                     VStack(spacing: 20) {
                         Image(systemName: "doc.fill").font(.system(size: 58)).foregroundStyle(TojTheme.secondaryText)
                         Text(media.displayName).font(.headline)
                         Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
-                        ShareLink(item: temporaryURL) { Label("Open or share", systemImage: "square.and.arrow.up") }
-                            .buttonStyle(.borderedProminent)
                     }
                 } else {
                     ProgressView(value: downloadProgress) {
@@ -872,12 +1152,40 @@ private struct ProductionMediaViewer: View {
             }
             .buttonStyle(.glass)
             .padding()
+
+            if let temporaryURL, error == nil {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        ShareLink(item: temporaryURL) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                                .frame(minWidth: 90)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        if media.kind == "photo" || media.kind == "video" {
+                            Button {
+                                Task { await saveToPhotos(temporaryURL) }
+                            } label: {
+                                Label("Save", systemImage: "square.and.arrow.down")
+                                    .frame(minWidth: 90)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding(.bottom, 24)
+                }
+            }
         }
         .task(id: media.id) { await load() }
         .onDisappear {
             player?.pause()
             if let temporaryURL { Task { await model.removeTemporaryMediaURL(temporaryURL) } }
         }
+        .alert("Media", isPresented: Binding(
+            get: { saveMessage != nil }, set: { if !$0 { saveMessage = nil } }
+        )) {
+            Button("OK") { saveMessage = nil }
+        } message: { Text(saveMessage ?? "") }
     }
 
     private func load() async {
@@ -897,11 +1205,14 @@ private struct ProductionMediaViewer: View {
                     throw MediaPresentationError.unreadable
                 }
                 photoImage = decoded.image
+                temporaryURL = try await model.temporaryMediaURL(
+                    data: downloaded, fileExtension: preferredFileExtension
+                )
                 return
             }
-            let ext = media.fileName.flatMap { URL(filePath: $0).pathExtension }.flatMap { $0.isEmpty ? nil : $0 }
-                ?? (media.kind == "video" ? "mp4" : "bin")
-            let url = try await model.temporaryMediaURL(data: downloaded, fileExtension: ext)
+            let url = try await model.temporaryMediaURL(
+                data: downloaded, fileExtension: preferredFileExtension
+            )
             temporaryURL = url
             if media.kind == "video" {
                 let asset = AVURLAsset(url: url)
@@ -922,6 +1233,34 @@ private struct ProductionMediaViewer: View {
             }
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+
+    private var preferredFileExtension: String {
+        if let value = media.fileName.map({ URL(filePath: $0).pathExtension }), !value.isEmpty {
+            return value
+        }
+        return UTType(mimeType: media.contentType)?.preferredFilenameExtension
+            ?? (media.kind == "video" ? "mp4" : media.kind == "photo" ? "jpg" : "bin")
+    }
+
+    private func saveToPhotos(_ url: URL) async {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else {
+            saveMessage = "Photos access is off. You can enable it in Settings."
+            return
+        }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                if media.kind == "video" {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                } else {
+                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
+                }
+            }
+            saveMessage = "Saved to Photos"
+        } catch {
+            saveMessage = error.localizedDescription
         }
     }
 }
@@ -969,7 +1308,7 @@ private extension ComposerMode {
         switch self {
         case let .replying(_, preview): preview
         case let .editing(_, original): original
-        case let .recording(seconds): String(format: "0:%02d · Tap send when ready", seconds)
+        case let .recording(seconds): String(format: "%d:%02d · Slide left to cancel · up to lock", seconds / 60, seconds % 60)
         case let .attachmentPreview(attachment): attachment.title
         case let .uploading(attachment, progress): "\(attachment.title) · \(Int(progress * 100))%"
         case let .disabled(reason): reason
@@ -981,53 +1320,41 @@ private extension ComposerMode {
 private struct ProductionAttachmentPicker: View {
     let model: CloudAppModel
     let onDone: () -> Void
+    @StateObject private var library = RecentMediaLibrary()
+    @State private var mediaItem: PhotosPickerItem?
     @State private var photoItem: PhotosPickerItem?
     @State private var videoItem: PhotosPickerItem?
+    @State private var selectedAsset: PHAsset?
+    @State private var selectedFile: PreparedFileSelection?
     @State private var importingFile = false
     @State private var working = false
     @State private var error: String?
     @State private var selectionTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Share something")
-                .font(TojTheme.heading(.title, weight: .bold))
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
-                PhotosPicker(selection: $photoItem, matching: .images) {
-                    pickerLabel("Photo", icon: "photo.fill")
-                }
-                PhotosPicker(selection: $videoItem, matching: .videos) {
-                    pickerLabel("Video", icon: "video.fill")
-                }
-                Button { importingFile = true } label: { pickerLabel("File", icon: "doc.fill") }
-                    .buttonStyle(.plain)
-            }
-            .disabled(working)
-            if working {
-                HStack {
-                    ProgressView("Preparing encrypted upload…").tint(TojTheme.secure)
-                    Spacer()
-                    Button("Cancel", role: .cancel) { cancelSelection() }
-                }
-            }
-            if let error {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.orange)
-            }
-            Label("Files are encrypted in Toj's local cache before upload", systemImage: "lock.fill")
-                .font(.caption)
-                .foregroundStyle(TojTheme.secondaryText)
+        VStack(spacing: 0) {
+            attachmentHeader
+            mediaContent
+            attachmentControls
         }
-        .padding(22)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(TojTheme.canvas)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TojTheme.base)
+        .task { await library.load() }
+        .onChange(of: mediaItem) { _, item in
+            guard let item else { return }
+            selectedFile = nil
+            selectionTask?.cancel()
+            selectionTask = Task { await loadMedia(item) }
+        }
         .onChange(of: photoItem) { _, item in
             guard let item else { return }
+            selectedFile = nil
             selectionTask?.cancel()
             selectionTask = Task { await loadPhoto(item) }
         }
         .onChange(of: videoItem) { _, item in
             guard let item else { return }
+            selectedFile = nil
             selectionTask?.cancel()
             selectionTask = Task { await loadVideo(item) }
         }
@@ -1041,68 +1368,383 @@ private struct ProductionAttachmentPicker: View {
         }
     }
 
-    nonisolated private func pickerLabel(_ title: LocalizedStringKey, icon: String) -> some View {
-        HStack(spacing: 11) {
-            Image(systemName: icon).frame(width: 36, height: 36).background(Color.white.opacity(0.08), in: Circle())
-            Text(title).font(.subheadline.weight(.semibold))
-            Spacer()
+    private var attachmentHeader: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.white.opacity(0.18))
+                .frame(width: 42, height: 5)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .padding(.top, 8)
+
+            HStack {
+                Button(action: onDone) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 19, weight: .semibold))
+                        .frame(width: 48, height: 48)
+                        .background(TojTheme.strong, in: Circle())
+                        .overlay(Circle().stroke(TojTheme.hairlineStrong, lineWidth: 0.5))
+                }
+                .buttonStyle(.tojPressable)
+                .foregroundStyle(TojTheme.text)
+                .accessibilityLabel("Close attachments")
+
+                Spacer()
+                if selectedFile != nil {
+                    AttachmentFileTitle()
+                } else {
+                    PhotosPicker(selection: $mediaItem, matching: .any(of: [.images, .videos])) {
+                        AttachmentLibraryTitle()
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Browse photo and video library")
+                }
+                Spacer()
+                Color.clear.frame(width: 48, height: 48)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 18)
         }
-        .padding(13)
-        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(height: 82)
+    }
+
+    @ViewBuilder
+    private var mediaContent: some View {
+        if let selectedFile {
+            SelectedFilePreview(
+                file: selectedFile,
+                onReplace: { importingFile = true },
+                onRemove: {
+                    self.selectedFile = nil
+                    error = nil
+                    TojFeedback.selection()
+                }
+            )
+        } else {
+            switch library.authorizationStatus {
+        case .authorized, .limited:
+            if library.assets.isEmpty {
+                attachmentEmptyState(
+                    title: "No recent media",
+                    detail: "Choose a photo or video from the library, or send a file.",
+                    icon: "photo.on.rectangle.angled"
+                )
+            } else {
+                ScrollView {
+                    LazyVGrid(
+                        columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3),
+                        spacing: 2
+                    ) {
+                        ForEach(library.assets, id: \.localIdentifier) { asset in
+                            RecentMediaTile(
+                                asset: asset,
+                                selected: selectedAsset?.localIdentifier == asset.localIdentifier,
+                                disabled: working
+                            ) {
+                                guard !working else { return }
+                                selectedAsset = selectedAsset?.localIdentifier == asset.localIdentifier ? nil : asset
+                                error = nil
+                                TojFeedback.selection()
+                            }
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
+        case .denied, .restricted:
+            photoPrivacyState
+        case .notDetermined:
+            VStack(spacing: 12) {
+                ProgressView().tint(TojTheme.gold)
+                Text("Loading recent media…")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(TojTheme.secondaryText)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            @unknown default:
+                attachmentEmptyState(
+                    title: "Choose something to send",
+                    detail: "Photos, videos, and files are available below.",
+                    icon: "paperclip"
+                )
+            }
+        }
+    }
+
+    private func attachmentEmptyState(
+        title: LocalizedStringKey,
+        detail: LocalizedStringKey,
+        icon: String
+    ) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(TojTheme.gold)
+                .frame(width: 62, height: 62)
+                .background(TojTheme.strong, in: Circle())
+            Text(title)
+                .font(TojTheme.heading(.headline, weight: .bold))
+            Text(detail)
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 290)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+
+    private var photoPrivacyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(TojTheme.gold)
+                .frame(width: 62, height: 62)
+                .background(TojTheme.strong, in: Circle())
+            Text("Recent media is private")
+                .font(TojTheme.heading(.headline, weight: .bold))
+            Text("Use Photo below, or allow access to show previews here.")
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            Button("Open Settings") {
+                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                UIApplication.shared.open(url)
+            }
+            .buttonStyle(.bordered)
+            .tint(TojTheme.gold)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+
+    private var attachmentControls: some View {
+        VStack(spacing: 10) {
+            if working {
+                HStack(spacing: 12) {
+                    ProgressView().tint(TojTheme.gold)
+                    Text("Loading attachment…")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button("Cancel", role: .cancel) { cancelSelection() }
+                        .font(.subheadline.weight(.semibold))
+                }
+                .padding(.horizontal, 16)
+                .frame(height: 48)
+                .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(.horizontal, 12)
+            } else if let selectedFile {
+                Button {
+                    sendFile(selectedFile)
+                } label: {
+                    Label("Send file", systemImage: "arrow.up")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(TojTheme.onAccent)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .background(TojTheme.accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .buttonStyle(.tojPressable)
+                .padding(.horizontal, 12)
+            } else if selectedAsset != nil {
+                Button {
+                    guard let selectedAsset else { return }
+                    selectionTask?.cancel()
+                    selectionTask = Task {
+                        if selectedAsset.mediaType == .video {
+                            await loadVideo(selectedAsset)
+                        } else {
+                            await loadPhoto(selectedAsset)
+                        }
+                    }
+                } label: {
+                    Label(
+                        selectedAsset?.mediaType == .video ? "Send video" : "Send photo",
+                        systemImage: "arrow.up"
+                    )
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(TojTheme.onAccent)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .background(TojTheme.accent, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .buttonStyle(.tojPressable)
+                .padding(.horizontal, 12)
+            }
+
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 16)
+            }
+
+            HStack(spacing: 3) {
+                Button {
+                    selectedAsset = nil
+                    selectedFile = nil
+                    Task { await library.load() }
+                } label: {
+                    AttachmentActionLabel(title: "Recents", icon: "photo.stack.fill", selected: true)
+                }
+                .buttonStyle(.tojPressable)
+
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    AttachmentActionLabel(title: "Photo", icon: "photo.fill")
+                }
+                .buttonStyle(.tojPressable)
+
+                PhotosPicker(selection: $videoItem, matching: .videos) {
+                    AttachmentActionLabel(title: "Video", icon: "video.fill")
+                }
+                .buttonStyle(.tojPressable)
+
+                Button { importingFile = true } label: {
+                    AttachmentActionLabel(title: "File", icon: "doc.fill", selected: selectedFile != nil)
+                }
+                .buttonStyle(.tojPressable)
+            }
+            .disabled(working)
+            .padding(8)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(TojTheme.hairlineStrong, lineWidth: 0.5)
+            )
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+        }
+        .padding(.top, 8)
+        .background(TojTheme.base.opacity(0.96))
+    }
+
+    private func loadMedia(_ item: PhotosPickerItem) async {
+        if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+            await loadVideo(item)
+        } else {
+            await loadPhoto(item)
+        }
     }
 
     private func loadPhoto(_ item: PhotosPickerItem) async {
         working = true
         defer { working = false }
         do {
-            guard let data = try await item.loadTransferable(type: Data.self),
-                  let decoded = SafeMediaImageDecoder.decode(data, maxPixelSize: 4_096) else {
+            guard let data = try await item.loadTransferable(type: Data.self) else {
                 throw PickerError.unreadable
             }
             try Task.checkCancellation()
-            let thumbnail = makeThumbnail(decoded.image)
-            let type = item.supportedContentTypes.first
+            try await prepareAndSendPhoto(data)
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func loadPhoto(_ asset: PHAsset) async {
+        working = true
+        defer { working = false }
+        do {
+            let data = try await MediaAssetDataLoader.imageData(for: asset)
+            try Task.checkCancellation()
+            try await prepareAndSendPhoto(data)
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func prepareAndSendPhoto(_ data: Data) async throws {
+        guard let prepared = await Task.detached(priority: .userInitiated, operation: {
+            SafeMediaImageDecoder.preparePhotoUpload(data)
+        }).value else { throw PickerError.unreadable }
+        try Task.checkCancellation()
+        working = false
+        selectionTask = nil
+        Task {
             await model.sendMedia(
-                data: data, kind: "photo", contentType: type?.preferredMIMEType ?? "image/jpeg",
-                fileName: "Photo.\(type?.preferredFilenameExtension ?? "jpg")",
-                width: decoded.pixelWidth, height: decoded.pixelHeight,
-                thumbnail: thumbnail
+                data: prepared.data, kind: "photo", contentType: prepared.contentType,
+                fileName: "Photo.\(prepared.filenameExtension)",
+                width: prepared.pixelWidth, height: prepared.pixelHeight,
+                thumbnail: prepared.thumbnail
             )
-            onDone()
-        } catch { self.error = error.localizedDescription }
+        }
+        onDone()
     }
 
     private func loadVideo(_ item: PhotosPickerItem) async {
         working = true
         defer { working = false }
         do {
-            guard let data = try await item.loadTransferable(type: Data.self) else { throw PickerError.unreadable }
+            guard let source = try await item.loadTransferable(type: Data.self) else { throw PickerError.unreadable }
             try Task.checkCancellation()
-            let url = FileManager.default.temporaryDirectory.appending(path: "toj-picker-\(UUID().uuidString).mov")
-            try data.write(to: url, options: [.atomic, .completeFileProtection])
-            defer { try? FileManager.default.removeItem(at: url) }
-            let asset = AVURLAsset(url: url)
-            let duration = try await asset.load(.duration)
-            var dimensions: (Int, Int)?
-            if let track = try await asset.loadTracks(withMediaType: .video).first {
-                let naturalSize = try await track.load(.naturalSize)
-                let transform = try await track.load(.preferredTransform)
-                let size = naturalSize.applying(transform)
-                dimensions = (Int(abs(size.width)), Int(abs(size.height)))
-            }
-            let generator = AVAssetImageGenerator(asset: asset)
-            generator.appliesPreferredTrackTransform = true
-            let image = try? await generator.image(at: .zero).image
-            let thumbnail = image.map(UIImage.init(cgImage:)).flatMap(makeThumbnail)
-            let type = item.supportedContentTypes.first
+            let data = try await MediaAssetDataLoader.fittedVideoData(source)
+            try Task.checkCancellation()
+            try await prepareAndSendVideo(data)
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func loadVideo(_ asset: PHAsset) async {
+        working = true
+        defer { working = false }
+        do {
+            let data = try await MediaAssetDataLoader.videoData(for: asset)
+            try Task.checkCancellation()
+            try await prepareAndSendVideo(data)
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func prepareAndSendVideo(_ data: Data) async throws {
+        guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
+        guard let container = SafeMediaVideoInspector.container(for: data) else {
+            throw PickerError.unsupportedVideo
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "toj-video-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "source.\(container.filenameExtension)")
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
+
+        let videoAsset = AVURLAsset(url: url)
+        let duration = try await videoAsset.load(.duration)
+        guard duration.seconds.isFinite, duration.seconds > 0 else { throw PickerError.unsupportedVideo }
+        guard let track = try await videoAsset.loadTracks(withMediaType: .video).first else {
+            throw PickerError.unsupportedVideo
+        }
+        let naturalSize = try await track.load(.naturalSize)
+        let transform = try await track.load(.preferredTransform)
+        let size = naturalSize.applying(transform)
+        let dimensions = (Int(abs(size.width)), Int(abs(size.height)))
+        guard dimensions.0 > 0, dimensions.1 > 0 else { throw PickerError.unsupportedVideo }
+
+        let generator = AVAssetImageGenerator(asset: videoAsset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 640, height: 640)
+        let image = try await generator.image(at: .zero).image
+        let thumbnail = SafeMediaImageDecoder.thumbnailData(UIImage(cgImage: image))
+        try Task.checkCancellation()
+        working = false
+        selectionTask = nil
+        Task {
             await model.sendMedia(
-                data: data, kind: "video", contentType: type?.preferredMIMEType ?? "video/quicktime",
-                fileName: "Video.\(type?.preferredFilenameExtension ?? "mov")",
-                durationMs: Int64(max(0, duration.seconds) * 1_000),
-                width: dimensions?.0, height: dimensions?.1, thumbnail: thumbnail
+                data: data, kind: "video", contentType: container.contentType,
+                fileName: "Video.\(container.filenameExtension)",
+                durationMs: Int64(duration.seconds * 1_000),
+                width: dimensions.0, height: dimensions.1, thumbnail: thumbnail
             )
-            onDone()
-        } catch { self.error = error.localizedDescription }
+        }
+        onDone()
     }
 
     private func loadFile(_ result: Result<URL, Error>) async {
@@ -1112,29 +1754,48 @@ private struct ProductionAttachmentPicker: View {
             let url = try result.get()
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-            let values = try url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey])
-            if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 { throw PickerError.tooLarge }
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            let values = try url.resourceValues(forKeys: [
+                .contentTypeKey, .fileSizeKey, .isDirectoryKey, .isRegularFileKey,
+            ])
+            guard values.isDirectory != true else { throw PickerError.unreadable }
+            if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 {
+                throw PickerError.tooLarge
+            }
+            let data = try Data(contentsOf: url)
+            guard !data.isEmpty else { throw PickerError.emptyFile }
+            guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
+            guard let fileName = SafeMediaFileMetadata.sanitizedFileName(url.lastPathComponent) else {
+                throw PickerError.invalidFileName
+            }
             try Task.checkCancellation()
-            await model.sendMedia(
-                data: data, kind: "file",
-                contentType: values.contentType?.preferredMIMEType ?? "application/octet-stream",
-                fileName: url.lastPathComponent
+            selectedAsset = nil
+            selectedFile = PreparedFileSelection(
+                data: data,
+                fileName: fileName,
+                contentType: values.contentType?.preferredMIMEType ?? "application/octet-stream"
             )
-            onDone()
-        } catch { self.error = error.localizedDescription }
+            working = false
+            selectionTask = nil
+            error = nil
+            TojFeedback.selection()
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 
-    private func makeThumbnail(_ image: UIImage) -> Data? {
-        for dimension in [640.0, 480.0, 320.0] {
-            guard let resized = image.preparingThumbnail(of: CGSize(width: dimension, height: dimension)) else { continue }
-            for quality in [0.72, 0.55, 0.4] {
-                if let data = resized.jpegData(compressionQuality: quality), data.count <= 256 * 1024 {
-                    return data
-                }
-            }
+    private func sendFile(_ file: PreparedFileSelection) {
+        selectedFile = nil
+        selectionTask = nil
+        Task {
+            await model.sendMedia(
+                data: file.data, kind: "file",
+                contentType: file.contentType,
+                fileName: file.fileName
+            )
         }
-        return nil
+        onDone()
     }
 
     private func cancelSelection() {
@@ -1146,12 +1807,413 @@ private struct ProductionAttachmentPicker: View {
     }
 }
 
+private struct AttachmentLibraryTitle: View {
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 5) {
+                Text("Recent media")
+                    .font(TojTheme.heading(.headline, weight: .bold))
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(TojTheme.secondaryText)
+            }
+            Text("Encrypted before upload")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(TojTheme.secure)
+        }
+    }
+}
+
+private struct AttachmentFileTitle: View {
+    var body: some View {
+        VStack(spacing: 2) {
+            Text("File ready")
+                .font(TojTheme.heading(.headline, weight: .bold))
+            Text("Encrypted before upload")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(TojTheme.secure)
+        }
+    }
+}
+
+nonisolated private struct PreparedFileSelection: Sendable {
+    let data: Data
+    let fileName: String
+    let contentType: String
+
+    var byteSize: Int64 { Int64(data.count) }
+}
+
+private struct SelectedFilePreview: View {
+    let file: PreparedFileSelection
+    let onReplace: () -> Void
+    let onRemove: () -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [TojTheme.strong, TojTheme.raised],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .stroke(TojTheme.gold.opacity(0.22), lineWidth: 1)
+                    )
+                Image(systemName: FileAttachmentPresentation.icon(for: file.contentType))
+                    .font(.system(size: 48, weight: .medium))
+                    .foregroundStyle(TojTheme.gold)
+                Text(FileAttachmentPresentation.extensionLabel(file.fileName))
+                    .font(.caption2.weight(.black))
+                    .foregroundStyle(TojTheme.onAccent)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 5)
+                    .background(TojTheme.gold, in: Capsule())
+                    .padding(12)
+            }
+            .frame(width: 136, height: 136)
+
+            VStack(spacing: 5) {
+                Text(file.fileName)
+                    .font(TojTheme.heading(.headline, weight: .bold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                Text(ByteCountFormatter.string(fromByteCount: file.byteSize, countStyle: .file))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(TojTheme.secondaryText)
+                Label("Ready for encrypted upload", systemImage: "lock.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(TojTheme.secure)
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onReplace) {
+                    Label("Replace", systemImage: "arrow.triangle.2.circlepath")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(TojTheme.text)
+                Button(role: .destructive, action: onRemove) {
+                    Label("Remove", systemImage: "trash")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+            .font(.subheadline.weight(.semibold))
+            .frame(maxWidth: 340)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+}
+
+nonisolated private enum FileAttachmentPresentation {
+    static func icon(for contentType: String) -> String {
+        if contentType == "application/pdf" { return "doc.richtext.fill" }
+        if contentType.hasPrefix("image/") { return "photo.fill" }
+        if contentType.hasPrefix("video/") { return "film.fill" }
+        if contentType.hasPrefix("audio/") { return "waveform" }
+        if contentType.hasPrefix("text/") { return "doc.text.fill" }
+        if contentType.contains("zip") || contentType.contains("archive") || contentType.contains("compressed") {
+            return "archivebox.fill"
+        }
+        return "doc.fill"
+    }
+
+    static func extensionLabel(_ fileName: String) -> String {
+        let value = URL(fileURLWithPath: fileName).pathExtension
+        return value.isEmpty ? "FILE" : String(value.prefix(5)).uppercased()
+    }
+}
+
+private struct AttachmentActionLabel: View {
+    nonisolated let title: String
+    nonisolated let icon: String
+    nonisolated let selected: Bool
+
+    nonisolated init(title: String, icon: String, selected: Bool = false) {
+        self.title = title
+        self.icon = icon
+        self.selected = selected
+    }
+
+    var body: some View {
+        VStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(height: 24)
+            Text(LocalizedStringKey(title))
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(selected ? TojTheme.gold : TojTheme.text)
+        .frame(maxWidth: .infinity)
+        .frame(height: 58)
+        .background(
+            selected ? TojTheme.gold.opacity(0.13) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 19, style: .continuous)
+        )
+    }
+}
+
+@MainActor
+private final class RecentMediaLibrary: ObservableObject {
+    @Published private(set) var authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    @Published private(set) var assets: [PHAsset] = []
+
+    func load() async {
+        var status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status == .notDetermined {
+            status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        }
+        authorizationStatus = status
+        guard status == .authorized || status == .limited else {
+            assets = []
+            return
+        }
+
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.fetchLimit = 90
+        let result = PHAsset.fetchAssets(with: options)
+        var recent: [PHAsset] = []
+        recent.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in
+            if asset.mediaType == .image || asset.mediaType == .video {
+                recent.append(asset)
+            }
+        }
+        assets = recent
+    }
+}
+
+private struct RecentMediaTile: View {
+    let asset: PHAsset
+    let selected: Bool
+    let disabled: Bool
+    let action: () -> Void
+    @State private var image: UIImage?
+    @State private var requestID = PHInvalidImageRequestID
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Group {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Rectangle()
+                        .fill(TojTheme.strong)
+                        .overlay(ProgressView().tint(TojTheme.secondaryText))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+
+            ZStack {
+                Circle()
+                    .fill(selected ? TojTheme.gold : Color.black.opacity(0.28))
+                Circle()
+                    .stroke(selected ? TojTheme.gold : Color.white.opacity(0.88), lineWidth: 2)
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.caption2.weight(.black))
+                        .foregroundStyle(TojTheme.onAccent)
+                }
+            }
+            .frame(width: 27, height: 27)
+            .padding(8)
+
+            if asset.mediaType == .video {
+                HStack(spacing: 4) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 9, weight: .bold))
+                    Text(Self.durationText(asset.duration))
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.62), in: Capsule())
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                .padding(7)
+            }
+
+            if disabled {
+                Color.black.opacity(0.24)
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
+        .overlay(
+            Rectangle()
+                .stroke(selected ? TojTheme.gold : Color.clear, lineWidth: 3)
+        )
+        .onAppear(perform: requestThumbnail)
+        .onDisappear {
+            if requestID != PHInvalidImageRequestID {
+                PHImageManager.default().cancelImageRequest(requestID)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(asset.mediaType == .video ? "Recent video" : "Recent photo")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func requestThumbnail() {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        requestID = PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: CGSize(width: 420, height: 420),
+            contentMode: .aspectFill,
+            options: options
+        ) { result, info in
+            guard let result, (info?[PHImageCancelledKey] as? Bool) != true else { return }
+            image = result
+        }
+    }
+
+    nonisolated private static func durationText(_ duration: TimeInterval) -> String {
+        let total = max(0, Int(duration.rounded()))
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+private enum MediaAssetDataLoader {
+    private static let maxBytes = 25 * 1024 * 1024
+
+    static func imageData(for asset: PHAsset) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let options = PHImageRequestOptions()
+            options.deliveryMode = .highQualityFormat
+            options.version = .current
+            options.isNetworkAccessAllowed = true
+            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) {
+                data, _, _, info in
+                if (info?[PHImageCancelledKey] as? Bool) == true {
+                    continuation.resume(throwing: CancellationError())
+                } else if let error = info?[PHImageErrorKey] as? Error {
+                    continuation.resume(throwing: error)
+                } else if let data {
+                    continuation.resume(returning: data)
+                } else {
+                    continuation.resume(throwing: PickerError.unreadable)
+                }
+            }
+        }
+    }
+
+    static func videoData(for asset: PHAsset) async throws -> Data {
+        let source = try await videoAsset(for: asset).asset
+        if let sourceURL = (source as? AVURLAsset)?.url,
+           let size = try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           size <= maxBytes {
+            return try Data(contentsOf: sourceURL)
+        }
+
+        return try await exportForUpload(source)
+    }
+
+    static func fittedVideoData(_ data: Data) async throws -> Data {
+        guard data.count > maxBytes else { return data }
+        guard let container = SafeMediaVideoInspector.container(for: data) else {
+            throw PickerError.unsupportedVideo
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "toj-video-source-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appending(path: "source.\(container.filenameExtension)")
+        try data.write(to: sourceURL, options: [.atomic, .completeFileProtection])
+        return try await exportForUpload(AVURLAsset(url: sourceURL))
+    }
+
+    private static func exportForUpload(_ source: AVAsset) async throws -> Data {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "toj-video-export-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outputURL = directory.appending(path: "video.mp4")
+
+        let duration = try await source.load(.duration)
+        _ = try await source.load(.tracks)
+        let preferredPreset = duration.seconds.isFinite && duration.seconds <= 60
+            ? AVAssetExportPreset1280x720 : AVAssetExportPresetMediumQuality
+        let preferredCompatible = await AVAssetExportSession.compatibility(
+            ofExportPreset: preferredPreset, with: source, outputFileType: .mp4
+        )
+        let preset: String
+        if preferredCompatible {
+            preset = preferredPreset
+        } else if await AVAssetExportSession.compatibility(
+            ofExportPreset: AVAssetExportPresetMediumQuality, with: source, outputFileType: .mp4
+        ) {
+            preset = AVAssetExportPresetMediumQuality
+        } else {
+            throw PickerError.unsupportedVideo
+        }
+        guard let exporter = AVAssetExportSession(asset: source, presetName: preset) else {
+            throw PickerError.unsupportedVideo
+        }
+        exporter.shouldOptimizeForNetworkUse = true
+        try await exporter.export(to: outputURL, as: .mp4)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: outputURL.path)
+        let data = try Data(contentsOf: outputURL)
+        guard data.count <= maxBytes else { throw PickerError.tooLarge }
+        return data
+    }
+
+    private static func videoAsset(for asset: PHAsset) async throws -> VideoAssetReference {
+        try await withCheckedThrowingContinuation { continuation in
+            let options = PHVideoRequestOptions()
+            options.deliveryMode = .highQualityFormat
+            options.version = .current
+            options.isNetworkAccessAllowed = true
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) {
+                result, _, info in
+                if (info?[PHImageCancelledKey] as? Bool) == true {
+                    continuation.resume(throwing: CancellationError())
+                } else if let error = info?[PHImageErrorKey] as? Error {
+                    continuation.resume(throwing: error)
+                } else if let result {
+                    continuation.resume(returning: VideoAssetReference(asset: result))
+                } else {
+                    continuation.resume(throwing: PickerError.unreadable)
+                }
+            }
+        }
+    }
+}
+
+private final class VideoAssetReference: @unchecked Sendable {
+    let asset: AVAsset
+
+    init(asset: AVAsset) {
+        self.asset = asset
+    }
+}
+
 private enum PickerError: LocalizedError {
-    case unreadable, tooLarge
+    case unreadable, emptyFile, tooLarge, unsupportedVideo, invalidFileName
     var errorDescription: String? {
         switch self {
         case .unreadable: String(localized: "That item could not be read")
+        case .emptyFile: String(localized: "Empty files cannot be sent")
         case .tooLarge: String(localized: "That file is larger than 25 MB")
+        case .unsupportedVideo: String(localized: "That video format could not be prepared")
+        case .invalidFileName: String(localized: "That file name is not supported")
         }
     }
 }

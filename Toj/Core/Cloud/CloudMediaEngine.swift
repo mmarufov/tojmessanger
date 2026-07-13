@@ -4,18 +4,61 @@ import Foundation
 import ImageIO
 import Observation
 import UIKit
+import UniformTypeIdentifiers
 
-struct SafeDecodedImage {
+nonisolated struct SafeDecodedImage {
     let image: UIImage
     let pixelWidth: Int
     let pixelHeight: Int
 }
 
-enum SafeMediaImageDecoder {
-    private static let maxDimension = 8_192
-    private static let maxPixels = 40_000_000
+nonisolated struct PreparedPhotoUpload: Sendable {
+    let data: Data
+    let thumbnail: Data?
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let contentType: String
+    let filenameExtension: String
+}
 
-    static func decode(_ data: Data, maxPixelSize: Int) -> SafeDecodedImage? {
+nonisolated struct DetectedVideoContainer: Equatable, Sendable {
+    let contentType: String
+    let filenameExtension: String
+}
+
+enum SafeMediaVideoInspector {
+    nonisolated static func container(for data: Data) -> DetectedVideoContainer? {
+        guard data.count >= 12 else { return nil }
+        let bytes = [UInt8](data.prefix(12))
+        if bytes[0...3].elementsEqual([0x1a, 0x45, 0xdf, 0xa3]) {
+            return DetectedVideoContainer(contentType: "video/webm", filenameExtension: "webm")
+        }
+        guard bytes[4...7].elementsEqual([0x66, 0x74, 0x79, 0x70]) else { return nil }
+        let brand = String(bytes: bytes[8...11], encoding: .ascii)
+        if brand == "qt  " {
+            return DetectedVideoContainer(contentType: "video/quicktime", filenameExtension: "mov")
+        }
+        return DetectedVideoContainer(contentType: "video/mp4", filenameExtension: "mp4")
+    }
+}
+
+enum SafeMediaFileMetadata {
+    nonisolated static func sanitizedFileName(_ rawValue: String) -> String? {
+        let normalized = rawValue.replacingOccurrences(of: "\\", with: "/")
+        guard let leaf = normalized.split(separator: "/").last.map(String.init) else { return nil }
+        let trimmed = leaf.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.lengthOfBytes(using: .utf8) <= 255,
+              trimmed.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return trimmed
+    }
+}
+
+enum SafeMediaImageDecoder {
+    nonisolated private static let maxDimension = 8_192
+    nonisolated private static let maxPixels = 40_000_000
+
+    nonisolated static func decode(_ data: Data, maxPixelSize: Int) -> SafeDecodedImage? {
         guard !data.isEmpty, maxPixelSize > 0,
               let source = CGImageSourceCreateWithData(
                 data as CFData,
@@ -38,6 +81,48 @@ enum SafeMediaImageDecoder {
             return nil
         }
         return SafeDecodedImage(image: UIImage(cgImage: cgImage), pixelWidth: width, pixelHeight: height)
+    }
+
+    nonisolated static func preparePhotoUpload(_ data: Data) -> PreparedPhotoUpload? {
+        guard
+            let source = CGImageSourceCreateWithData(
+                data as CFData,
+                [kCGImageSourceShouldCache: false] as CFDictionary
+            ),
+            CGImageSourceGetType(source) != nil,
+            let decoded = decode(data, maxPixelSize: 2_560),
+            let cgImage = decoded.image.cgImage
+        else { return nil }
+        let image = UIImage(cgImage: cgImage)
+        var encoded: Data?
+        for quality in [0.86, 0.78, 0.68] {
+            guard let candidate = image.jpegData(compressionQuality: quality) else { continue }
+            encoded = candidate
+            if candidate.count <= 3 * 1024 * 1024 { break }
+        }
+        guard let encoded, !encoded.isEmpty else { return nil }
+        return PreparedPhotoUpload(
+            data: encoded,
+            thumbnail: thumbnailData(image),
+            pixelWidth: cgImage.width,
+            pixelHeight: cgImage.height,
+            contentType: "image/jpeg",
+            filenameExtension: "jpg"
+        )
+    }
+
+    nonisolated static func thumbnailData(_ image: UIImage) -> Data? {
+        for dimension in [640.0, 480.0, 320.0] {
+            guard let resized = image.preparingThumbnail(
+                of: CGSize(width: dimension, height: dimension)
+            ) else { continue }
+            for quality in [0.72, 0.55, 0.4] {
+                if let data = resized.jpegData(compressionQuality: quality), data.count <= 256 * 1024 {
+                    return data
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -94,6 +179,10 @@ nonisolated struct MediaUploadCreation: Codable, Sendable {
     let chunkSize: Int
     let expiresAt: String
     let quota: Quota
+    let uploadProtocol: String?
+    let partSize: Int?
+    let totalParts: Int?
+    let receivedParts: [Int]?
 }
 
 nonisolated struct MediaUploadState: Codable, Sendable {
@@ -103,11 +192,23 @@ nonisolated struct MediaUploadState: Codable, Sendable {
     let status: String
     let expiresAt: String
     let chunkSize: Int
+    let uploadProtocol: String?
+    let partSize: Int?
+    let totalParts: Int?
+    let receivedParts: [Int]?
 }
 
 nonisolated struct MediaChunkResponse: Codable, Sendable {
     let mediaId: String
     let uploadOffset: Int64
+    let complete: Bool
+    let duplicate: Bool
+}
+
+nonisolated struct MediaPartResponse: Codable, Sendable {
+    let mediaId: String
+    let partIndex: Int
+    let receivedBytes: Int64
     let complete: Bool
     let duplicate: Bool
 }
@@ -127,6 +228,7 @@ nonisolated struct MediaUploadRequest: Codable, Sendable {
     let durationMs: Int64?
     let width: Int?
     let height: Int?
+    let uploadProtocol: String?
 }
 
 nonisolated struct PreparedMediaUpload: Sendable {
@@ -163,6 +265,20 @@ struct CloudMediaAPI: Sendable {
         request.setValue(String(offset), forHTTPHeaderField: "Upload-Offset")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return try await runJSON(request)
+    }
+
+    func uploadPart(
+        mediaId: String, partIndex: Int, bytes: Data, token: String,
+        progress: @escaping @Sendable (Int64, Int64) async -> Void
+    ) async throws -> MediaPartResponse {
+        var request = URLRequest(url: config.httpURL(path: "v1/media/uploads/\(mediaId)/parts/\(partIndex)"))
+        request.httpMethod = "PUT"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let delegate = MediaUploadTaskDelegate(progress: progress)
+        let (data, response) = try await session.upload(for: request, from: bytes, delegate: delegate)
+        _ = try validate(data: data, response: response)
+        return try JSONDecoder().decode(MediaPartResponse.self, from: data)
     }
 
     func uploadThumbnail(mediaId: String, bytes: Data, token: String) async throws {
@@ -243,11 +359,12 @@ struct CloudMediaAPI: Sendable {
             throw CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil)
         }
         guard (200..<300).contains(http.statusCode) else {
-            let message = (try? JSONDecoder().decode(MediaServerError.self, from: data).error)
-                ?? "HTTP \(http.statusCode)"
+            let payload = try? JSONDecoder().decode(MediaServerError.self, from: data)
+            let message = payload?.error ?? "HTTP \(http.statusCode)"
             throw CloudAPIError(
                 status: http.statusCode, message: message,
-                retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
+                retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init),
+                code: payload?.code
             )
         }
         return http
@@ -257,8 +374,23 @@ struct CloudMediaAPI: Sendable {
 private struct EmptyMediaBody: Codable {}
 private struct MediaThumbnailResponse: Codable { let mediaId: String; let uploaded: Bool }
 private struct MediaCancelResponse: Codable { let mediaId: String; let cancelled: Bool }
-private struct MediaServerError: Codable { let error: String }
+private struct MediaServerError: Codable { let error: String; let code: String? }
 nonisolated struct MediaDownloadChunk: Sendable { let data: Data; let nextOffset: Int64; let totalSize: Int64 }
+
+private final class MediaUploadTaskDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let progress: @Sendable (Int64, Int64) async -> Void
+
+    init(progress: @escaping @Sendable (Int64, Int64) async -> Void) {
+        self.progress = progress
+    }
+
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64, totalBytesExpectedToSend: Int64
+    ) {
+        Task { await progress(totalBytesSent, totalBytesExpectedToSend) }
+    }
+}
 
 actor EncryptedMediaCache {
     static let defaultLimitBytes: Int64 = 200 * 1024 * 1024
@@ -563,6 +695,106 @@ actor EncryptedMediaCache {
     }
 }
 
+nonisolated struct MediaMultipartPlan: Equatable, Sendable {
+    let partSize: Int
+    let totalParts: Int
+    let receivedParts: Set<Int>
+
+    init?(byteSize: Int64, partSize: Int?, totalParts: Int?, receivedParts: [Int]?) {
+        guard byteSize > 0, let partSize, let totalParts,
+              (256 * 1024...512 * 1024).contains(partSize),
+              totalParts == Int((byteSize + Int64(partSize) - 1) / Int64(partSize))
+        else { return nil }
+        let received = Set(receivedParts ?? [])
+        guard received.count == (receivedParts ?? []).count,
+              received.allSatisfy({ (0..<totalParts).contains($0) })
+        else { return nil }
+        self.partSize = partSize
+        self.totalParts = totalParts
+        self.receivedParts = received
+    }
+
+    var missingParts: [Int] { (0..<totalParts).filter { !receivedParts.contains($0) } }
+
+    func range(for partIndex: Int, byteSize: Int64) -> Range<Int> {
+        let start = partIndex * partSize
+        let end = min(Int(byteSize), start + partSize)
+        return start..<end
+    }
+}
+
+private actor MediaMultipartProgressTracker {
+    private let totalBytes: Int64
+    private let partSizes: [Int: Int64]
+    private var acknowledged: Set<Int>
+    private var sentByPart: [Int: Int64] = [:]
+    private var maximumReported = 0.0
+
+    init(totalBytes: Int64, partSizes: [Int: Int64], acknowledged: Set<Int>) {
+        self.totalBytes = totalBytes
+        self.partSizes = partSizes
+        self.acknowledged = acknowledged
+    }
+
+    func reset(partIndex: Int) { sentByPart[partIndex] = 0 }
+
+    func currentProgress() -> Double { nextProgress() }
+
+    func sent(partIndex: Int, bytes: Int64) -> Double {
+        guard !acknowledged.contains(partIndex) else { return maximumReported }
+        sentByPart[partIndex] = min(max(0, bytes), partSizes[partIndex] ?? 0)
+        return nextProgress()
+    }
+
+    func acknowledge(partIndex: Int) -> (progress: Double, acknowledgedBytes: Int64) {
+        acknowledged.insert(partIndex)
+        sentByPart[partIndex] = nil
+        return (nextProgress(), acknowledged.reduce(0) { $0 + (partSizes[$1] ?? 0) })
+    }
+
+    private func nextProgress() -> Double {
+        let acknowledgedBytes = acknowledged.reduce(Int64(0)) { $0 + (partSizes[$1] ?? 0) }
+        let inFlightBytes = sentByPart.reduce(Int64(0)) { partial, entry in
+            acknowledged.contains(entry.key) ? partial : partial + entry.value
+        }
+        let measured = Double(acknowledgedBytes + inFlightBytes) / Double(max(1, totalBytes))
+        maximumReported = max(maximumReported, min(0.97, measured * 0.97))
+        return maximumReported
+    }
+}
+
+nonisolated enum MediaPartScheduler {
+    static func run(
+        partIndexes: [Int],
+        maximumConcurrent: Int = 3,
+        upload: @escaping @Sendable (Int) async throws -> Int64,
+        didAcknowledge: @escaping @Sendable (Int, Int64) async throws -> Void
+    ) async throws {
+        guard !partIndexes.isEmpty else { return }
+        let concurrency = max(1, min(maximumConcurrent, partIndexes.count))
+        var nextIndex = 0
+        try await withThrowingTaskGroup(of: (Int, Int64).self) { group in
+            func enqueue(_ partIndex: Int) {
+                group.addTask {
+                    (partIndex, try await upload(partIndex))
+                }
+            }
+
+            while nextIndex < concurrency {
+                enqueue(partIndexes[nextIndex])
+                nextIndex += 1
+            }
+            while let (partIndex, acknowledgedBytes) = try await group.next() {
+                try await didAcknowledge(partIndex, acknowledgedBytes)
+                if nextIndex < partIndexes.count {
+                    enqueue(partIndexes[nextIndex])
+                    nextIndex += 1
+                }
+            }
+        }
+    }
+}
+
 actor CloudMediaTransferEngine {
     private let api: CloudMediaAPI
     private let cache: EncryptedMediaCache?
@@ -570,10 +802,20 @@ actor CloudMediaTransferEngine {
     init(
         config: CloudConfig = .current,
         cache: EncryptedMediaCache? = nil,
-        session: URLSession = .shared
+        session: URLSession? = nil
     ) {
-        self.api = CloudMediaAPI(config: config, session: session)
+        self.api = CloudMediaAPI(config: config, session: session ?? Self.makeMediaSession())
         self.cache = cache ?? (try? EncryptedMediaCache())
+    }
+
+    nonisolated private static func makeMediaSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 15 * 60
+        configuration.httpMaximumConnectionsPerHost = 3
+        return URLSession(configuration: configuration)
     }
 
     func prepare(
@@ -590,17 +832,26 @@ actor CloudMediaTransferEngine {
 
     func upload(
         transfer: MediaTransferRecord, token: String, localStore: CloudLocalStore,
-        progress: @Sendable (Double) async -> Void
+        useMultipartV2: Bool = false,
+        progress: @escaping @Sendable (Double) async -> Void
     ) async throws -> String {
         guard let cache else { throw MediaCacheError.encryptionFailed }
         let data = try await cache.uploadData(for: transfer)
         var mediaId = transfer.mediaId
         var offset = transfer.uploadOffset
         var chunkSize = 256 * 1024
+        var multipartPlan: MediaMultipartPlan?
         if let existingId = mediaId {
             do {
                 let remote = try await api.uploadState(mediaId: existingId, token: token)
-                guard remote.status == "uploading" || remote.status == "ready" else { throw MediaCacheError.uploadExpired }
+                if remote.status == "rejected" || remote.status == "deleted" {
+                    try await localStore.resetMediaUpload(transferId: transfer.transferId)
+                    mediaId = nil
+                    offset = 0
+                } else {
+                    guard remote.status == "uploading" || remote.status == "ready" else {
+                        throw MediaCacheError.uploadExpired
+                    }
                 guard
                     remote.mediaId == existingId, remote.byteSize == transfer.byteSize,
                     remote.uploadOffset >= 0, remote.uploadOffset <= transfer.byteSize,
@@ -610,6 +861,14 @@ actor CloudMediaTransferEngine {
                 offset = remote.uploadOffset
                 chunkSize = remote.chunkSize
                 if remote.status == "ready" { return existingId }
+                    if remote.uploadProtocol == "parts_v2" {
+                        guard let plan = MediaMultipartPlan(
+                            byteSize: transfer.byteSize, partSize: remote.partSize,
+                            totalParts: remote.totalParts, receivedParts: remote.receivedParts
+                        ) else { throw MediaCacheError.invalidState }
+                        multipartPlan = plan
+                    }
+                }
             } catch let error as CloudAPIError where error.status == 404 || error.status == 410 {
                 try await localStore.resetMediaUpload(transferId: transfer.transferId)
                 mediaId = nil
@@ -622,7 +881,8 @@ actor CloudMediaTransferEngine {
                     kind: transfer.kind, contentType: transfer.contentType,
                     fileName: transfer.fileName, byteSize: transfer.byteSize,
                     sha256: transfer.sha256, durationMs: transfer.durationMs,
-                    width: transfer.width, height: transfer.height
+                    width: transfer.width, height: transfer.height,
+                    uploadProtocol: useMultipartV2 ? "parts_v2" : nil
                 ), token: token
             )
             guard
@@ -633,37 +893,133 @@ actor CloudMediaTransferEngine {
             mediaId = created.mediaId
             offset = created.uploadOffset
             chunkSize = created.chunkSize
+            if created.uploadProtocol == "parts_v2" {
+                guard let plan = MediaMultipartPlan(
+                    byteSize: transfer.byteSize, partSize: created.partSize,
+                    totalParts: created.totalParts, receivedParts: created.receivedParts
+                ) else { throw MediaCacheError.invalidState }
+                multipartPlan = plan
+            }
             try await localStore.updateMediaTransfer(
                 transferId: transfer.transferId, mediaId: created.mediaId,
                 uploadOffset: offset, state: "uploading", error: nil
             )
         }
         guard let mediaId else { throw MediaCacheError.invalidState }
-        if let thumbnail = try await cache.uploadThumbnail(for: transfer) {
-            try await api.uploadThumbnail(mediaId: mediaId, bytes: thumbnail, token: token)
-        }
-        while offset < Int64(data.count) {
-            try Task.checkCancellation()
-            let end = min(data.count, Int(offset) + chunkSize)
-            let response = try await api.uploadChunk(
-                mediaId: mediaId, offset: offset, bytes: Data(data[Int(offset)..<end]), token: token
+        let thumbnail = try await cache.uploadThumbnail(for: transfer)
+        if let multipartPlan {
+            async let thumbnailUpload: Void = uploadThumbnailIfPresent(
+                thumbnail, mediaId: mediaId, token: token
             )
-            guard response.mediaId == mediaId, response.uploadOffset == Int64(end) else {
-                throw MediaCacheError.invalidState
+            try await uploadMultipart(
+                data: data, transfer: transfer, mediaId: mediaId, token: token,
+                plan: multipartPlan, localStore: localStore, progress: progress
+            )
+            try await thumbnailUpload
+        } else {
+            try await uploadThumbnailIfPresent(thumbnail, mediaId: mediaId, token: token)
+            while offset < Int64(data.count) {
+                try Task.checkCancellation()
+                let end = min(data.count, Int(offset) + chunkSize)
+                let response = try await api.uploadChunk(
+                    mediaId: mediaId, offset: offset, bytes: Data(data[Int(offset)..<end]), token: token
+                )
+                guard response.mediaId == mediaId, response.uploadOffset == Int64(end) else {
+                    throw MediaCacheError.invalidState
+                }
+                offset = response.uploadOffset
+                try await localStore.updateMediaTransfer(
+                    transferId: transfer.transferId, mediaId: mediaId,
+                    uploadOffset: offset, state: "uploading", error: nil
+                )
+                await progress(min(0.97, Double(offset) / Double(max(1, data.count)) * 0.97))
             }
-            offset = response.uploadOffset
-            try await localStore.updateMediaTransfer(
-                transferId: transfer.transferId, mediaId: mediaId,
-                uploadOffset: offset, state: "uploading", error: nil
-            )
-            await progress(Double(offset) / Double(max(1, data.count)))
         }
         let completed = try await api.completeUpload(mediaId: mediaId, token: token)
         guard completed.mediaId == mediaId, completed.ready else { throw MediaCacheError.invalidState }
+        await progress(1)
         return mediaId
     }
 
+    private func uploadThumbnailIfPresent(_ thumbnail: Data?, mediaId: String, token: String) async throws {
+        if let thumbnail { try await api.uploadThumbnail(mediaId: mediaId, bytes: thumbnail, token: token) }
+    }
+
+    private func uploadMultipart(
+        data: Data, transfer: MediaTransferRecord, mediaId: String, token: String,
+        plan: MediaMultipartPlan, localStore: CloudLocalStore,
+        progress: @escaping @Sendable (Double) async -> Void
+    ) async throws {
+        let partSizes = Dictionary(uniqueKeysWithValues: (0..<plan.totalParts).map { index in
+            (index, Int64(plan.range(for: index, byteSize: transfer.byteSize).count))
+        })
+        let tracker = MediaMultipartProgressTracker(
+            totalBytes: transfer.byteSize, partSizes: partSizes, acknowledged: plan.receivedParts
+        )
+        if !plan.receivedParts.isEmpty {
+            let initial = await tracker.currentProgress()
+            await progress(initial)
+        }
+        let missing = plan.missingParts
+        let api = self.api
+        try await MediaPartScheduler.run(
+            partIndexes: missing,
+            upload: { partIndex in
+                let range = plan.range(for: partIndex, byteSize: transfer.byteSize)
+                let bytes = Data(data[range])
+                let response = try await Self.uploadPartWithRetry(
+                    api: api, mediaId: mediaId, partIndex: partIndex,
+                    bytes: bytes, token: token, tracker: tracker, progress: progress
+                )
+                guard response.mediaId == mediaId, response.partIndex == partIndex else {
+                    throw MediaCacheError.invalidState
+                }
+                let acknowledged = await tracker.acknowledge(partIndex: partIndex)
+                await progress(acknowledged.progress)
+                return acknowledged.acknowledgedBytes
+            },
+            didAcknowledge: { _, acknowledgedBytes in
+                try await localStore.updateMediaTransfer(
+                    transferId: transfer.transferId, mediaId: mediaId,
+                    uploadOffset: acknowledgedBytes, state: "uploading", error: nil
+                )
+            }
+        )
+    }
+
+    nonisolated private static func uploadPartWithRetry(
+        api: CloudMediaAPI, mediaId: String, partIndex: Int, bytes: Data, token: String,
+        tracker: MediaMultipartProgressTracker,
+        progress: @escaping @Sendable (Double) async -> Void
+    ) async throws -> MediaPartResponse {
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+            await tracker.reset(partIndex: partIndex)
+            do {
+                return try await api.uploadPart(
+                    mediaId: mediaId, partIndex: partIndex, bytes: bytes, token: token,
+                    progress: { sent, _ in
+                        let value = await tracker.sent(partIndex: partIndex, bytes: sent)
+                        await progress(value)
+                    }
+                )
+            } catch {
+                attempt += 1
+                guard case let .transient(retryAfter) = cloudFailureDisposition(error), attempt < 3 else {
+                    throw error
+                }
+                let delay = retryAfter ?? pow(2, Double(attempt - 1))
+                try await Task.sleep(for: .seconds(delay))
+            }
+        }
+    }
+
     func finishUpload(_ transfer: MediaTransferRecord) async {
+        try? await cache?.finishUpload(transfer)
+    }
+
+    func discardTransfer(_ transfer: MediaTransferRecord) async {
         try? await cache?.finishUpload(transfer)
     }
 
@@ -755,10 +1111,15 @@ enum MediaCacheError: LocalizedError {
 final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
     private(set) var isRecording = false
     private(set) var elapsedSeconds = 0
+    private(set) var level: Float = 0
+    var onUnexpectedStop: (() -> Void)?
     private var recorder: AVAudioRecorder?
     private var timer: Timer?
     private var recordingURL: URL?
     private let recordingsDirectory: URL
+    private var previousCategory: AVAudioSession.Category?
+    private var previousMode: AVAudioSession.Mode?
+    private var previousOptions: AVAudioSession.CategoryOptions = []
 
     override init() {
         let fileManager = FileManager.default
@@ -785,19 +1146,40 @@ final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
             self, selector: #selector(stopForInterruption),
             name: UIApplication.didEnterBackgroundNotification, object: nil
         )
+        center.addObserver(
+            self, selector: #selector(routeChanged(_:)),
+            name: AVAudioSession.routeChangeNotification, object: nil
+        )
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
 
-    @objc private func stopForInterruption() { cancel() }
+    @objc private func stopForInterruption() {
+        guard isRecording else { return }
+        cancel()
+        onUnexpectedStop?()
+    }
+
+    @objc private func routeChanged(_ notification: Notification) {
+        guard isRecording,
+              let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+              let reason = AVAudioSession.RouteChangeReason(rawValue: raw),
+              reason == .oldDeviceUnavailable || AVAudioSession.sharedInstance().availableInputs?.isEmpty == true
+        else { return }
+        cancel()
+        onUnexpectedStop?()
+    }
 
     func start() async throws {
         if isRecording { cancel() }
         let permission = await AVAudioApplication.requestRecordPermission()
         guard permission else { throw VoiceRecorderError.permissionDenied }
         let session = AVAudioSession.sharedInstance()
+        previousCategory = session.category
+        previousMode = session.mode
+        previousOptions = session.categoryOptions
         try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .allowBluetoothHFP])
         try session.setActive(true)
         let url = recordingsDirectory.appending(path: "toj-voice-\(UUID().uuidString).m4a")
@@ -807,11 +1189,10 @@ final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
         do {
+            try Self.createProtectedRecordingFile(at: url)
             let recorder = try AVAudioRecorder(url: url, settings: settings)
-            try FileManager.default.setAttributes(
-                [.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path
-            )
             recorder.delegate = self
+            recorder.isMeteringEnabled = true
             guard recorder.prepareToRecord(), recorder.record() else {
                 recorder.stop()
                 throw VoiceRecorderError.couldNotStart
@@ -819,14 +1200,34 @@ final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
             self.recorder = recorder
             recordingURL = url
             elapsedSeconds = 0
+            level = 0
             isRecording = true
-            timer = .scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.elapsedSeconds += 1 }
+            timer = .scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, let recorder = self.recorder else { return }
+                    recorder.updateMeters()
+                    let decibels = recorder.averagePower(forChannel: 0)
+                    self.level = max(0.03, min(1, pow(10, decibels / 32)))
+                    self.elapsedSeconds = Int(recorder.currentTime)
+                }
             }
         } catch {
             try? FileManager.default.removeItem(at: url)
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             throw error
+        }
+    }
+
+    nonisolated static func createProtectedRecordingFile(
+        at url: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard fileManager.createFile(
+            atPath: url.path,
+            contents: Data(),
+            attributes: [.protectionKey: FileProtectionType.complete]
+        ) else {
+            throw VoiceRecorderError.couldNotStart
         }
     }
 
@@ -854,11 +1255,19 @@ final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
         recordingURL = nil
         isRecording = false
         elapsedSeconds = 0
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        level = 0
+        let session = AVAudioSession.sharedInstance()
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        if let previousCategory, let previousMode {
+            try? session.setCategory(previousCategory, mode: previousMode, options: previousOptions)
+        }
+        previousCategory = nil
+        previousMode = nil
+        previousOptions = []
     }
 }
 
-enum VoiceRecorderError: LocalizedError {
+enum VoiceRecorderError: LocalizedError, Equatable {
     case permissionDenied, couldNotStart, notRecording, tooShort
     var errorDescription: String? {
         switch self {

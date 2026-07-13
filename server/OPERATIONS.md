@@ -29,7 +29,7 @@ Media works without an Apple Developer account or a third-party storage provider
 and thumbnails are AEAD-encrypted before PostgreSQL persistence. Deploy the schema before deploying
 clients that send media. These optional server settings are byte counts and are bounded to safe ranges:
 
-- `TOJ_MEDIA_CHUNK_BYTES` (default 262144)
+- `TOJ_MEDIA_CHUNK_BYTES` (legacy offset-v1 only; default 1048576)
 - `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 26214400)
 - `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000)
 - `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
@@ -37,6 +37,12 @@ clients that send media. These optional server settings are byte counts and are 
 
 The iOS client additionally keeps an encrypted, automatically evicted 200 MB download cache. Pending
 uploads are never evicted; new selections fail cleanly when the local quota cannot accommodate them.
+
+API version 3 adds `media_multipart_v2`. Clients using it upload numbered, idempotent parts out of
+order with up to three concurrent requests: 256 KiB parts through 10 MiB and 512 KiB parts above
+10 MiB. Completion checks the exact part layout, declared byte count, SHA-256, media signature, and
+photo dimensions before making an object usable. The offset-v1 route remains available for older
+clients and cannot write into a multipart upload.
 
 ## Encrypted backups
 

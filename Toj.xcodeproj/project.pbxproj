@@ -49,8 +49,6 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		65F781762FF68D07000D35EE /* Toj */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
 			path = Toj;
 			sourceTree = "<group>";
 		};
@@ -87,7 +85,6 @@
 				C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */,
 				9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */,
 			);
-			name = TojTests;
 			path = TojTests;
 			sourceTree = "<group>";
 		};
@@ -109,7 +106,6 @@
 				C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */,
 				13415778815A010ACF1EC8F6 /* Pods-TojTests.debug.xcconfig */,
 			);
-			name = Pods;
 			path = Pods;
 			sourceTree = "<group>";
 		};
@@ -292,9 +288,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-Toj/Pods-Toj-frameworks-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Embed Pods Frameworks";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-Toj/Pods-Toj-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -504,6 +504,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8F69C3FG49;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -551,6 +552,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8F69C3FG49;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;

@@ -304,10 +304,63 @@ nonisolated struct CloudAPIError: Error, LocalizedError {
     let status: Int
     let message: String
     let retryAfter: Int?
+    var code: String? = nil
 
     var errorDescription: String? {
         message
     }
+}
+
+nonisolated struct CloudCapabilitiesResponse: Codable, Equatable, Sendable {
+    let apiVersion: Int
+    let capabilities: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case apiVersion = "api_version"
+        case capabilities
+    }
+}
+
+nonisolated enum CloudFailureDisposition: Equatable, Sendable {
+    case transient(retryAfter: TimeInterval?)
+    case authenticationRequired
+    case unsupportedServer
+    case permanent
+}
+
+nonisolated func cloudFailureDisposition(_ error: Error) -> CloudFailureDisposition {
+    if let urlError = error as? URLError {
+        switch urlError.code {
+        case .timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost,
+             .cannotFindHost, .dnsLookupFailed, .internationalRoamingOff, .dataNotAllowed:
+            return .transient(retryAfter: nil)
+        default:
+            return .permanent
+        }
+    }
+    guard let apiError = error as? CloudAPIError else { return .permanent }
+    switch apiError.status {
+    case 401, 403:
+        return .authenticationRequired
+    case 404:
+        return .unsupportedServer
+    case 408, 425, 429, 500...599:
+        return .transient(retryAfter: apiError.retryAfter.map(TimeInterval.init))
+    default:
+        return .permanent
+    }
+}
+
+nonisolated func cloudOperationFailureDisposition(
+    _ error: Error,
+    serverAdvertisesFeature: Bool
+) -> CloudFailureDisposition {
+    if serverAdvertisesFeature, let apiError = error as? CloudAPIError, apiError.status == 404 {
+        // Once the capability contract confirms a route family exists, a 404 is a missing/expired
+        // resource rather than deployment drift. Retrying it forever would hide a permanent error.
+        return .permanent
+    }
+    return cloudFailureDisposition(error)
 }
 
 struct CloudAPI: Sendable {
@@ -326,6 +379,10 @@ struct CloudAPI: Sendable {
 
     func startAuth(phone: String) async throws -> AuthStartResponse {
         try await post("v1/auth/start", body: ["phone": phone], token: nil)
+    }
+
+    func capabilities() async throws -> CloudCapabilitiesResponse {
+        try await get("v1/capabilities", token: nil)
     }
 
     func checkAuth(phone: String, code: String, displayName: String, deviceName: String) async throws -> CloudSession {
