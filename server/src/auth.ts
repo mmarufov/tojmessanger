@@ -301,6 +301,23 @@ export async function resolveDevice(sql: SQL, token: string): Promise<{ accountI
   return { accountId: rows[0].account_id, deviceId: rows[0].id };
 }
 
+/**
+ * Revalidates a device while holding a row lock for the lifetime of a mutation transaction.
+ * This closes the gap between HTTP authentication and a slow request body finishing after the
+ * device was revoked.
+ */
+export async function requireActiveDevice(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+): Promise<void> {
+  const rows = await sql`
+    SELECT id FROM devices
+    WHERE id = ${deviceId} AND account_id = ${accountId} AND revoked_at IS NULL
+    FOR SHARE`;
+  if (!rows.length) throw new AuthError("device is no longer active", 401);
+}
+
 export async function revokeDevice(
   sql: SQL,
   accountId: string,

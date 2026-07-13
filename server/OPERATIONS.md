@@ -20,8 +20,8 @@ gitignored notes.
 The server runs an hourly, bounded cleanup. Each table deletes at most 1,000 eligible rows per run:
 expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal push deliveries
 older than seven days. Incomplete media uploads are resumable for 24 hours and are then removed with
-their encrypted chunks. Message history, completed media, and the account event log are never deleted
-by this worker.
+their encrypted chunks; expired upload-attempt rate records and unattached completed media are also
+removed. Message history, attached media, and the account event log are never deleted by this worker.
 
 ## Media storage
 
@@ -32,6 +32,8 @@ clients that send media. These optional server settings are byte counts and are 
 - `TOJ_MEDIA_CHUNK_BYTES` (default 262144)
 - `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 26214400)
 - `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000)
+- `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
+- `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
 
 The iOS client additionally keeps an encrypted, automatically evicted 200 MB download cache. Pending
 uploads are never evicted; new selections fail cleanly when the local quota cannot accommodate them.

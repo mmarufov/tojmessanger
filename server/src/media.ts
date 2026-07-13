@@ -3,6 +3,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   mediaChunkAAD, mediaDigestHMAC, mediaFileNameAAD, mediaThumbnailAAD, open, seal,
 } from "./crypto";
+import { requireActiveDevice } from "./auth";
 
 export class MediaError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -28,12 +29,27 @@ const DEFAULT_CHUNK_BYTES = 256 * 1024;
 const DEFAULT_MAX_OBJECT_BYTES = 25 * 1024 * 1024;
 const DEFAULT_ACCOUNT_QUOTA_BYTES = 250 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES = 256 * 1024;
+const DEFAULT_MAX_ACTIVE_UPLOADS = 10;
+const DEFAULT_MAX_DAILY_UPLOADS = 100;
+const MAX_IMAGE_DIMENSION = 8_192;
+const MAX_IMAGE_PIXELS = 40_000_000;
+const MAX_THUMBNAIL_DIMENSION = 2_048;
+const MAX_THUMBNAIL_PIXELS = 4_000_000;
+const MAX_IMAGE_HEADER_BYTES = 256 * 1024;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 const CONTENT_TYPE_PATTERN = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
 const KINDS = new Set<MediaKind>(["photo", "video", "file", "voice"]);
 
 const n = (value: unknown) => Number(value as any);
 const buf = (value: unknown) => Buffer.from(value as Uint8Array);
+
+async function requireActiveMediaAccount(sql: SQL, accountId: string): Promise<void> {
+  const rows = await sql`
+    SELECT id FROM accounts
+    WHERE id = ${accountId} AND status IN ('active','limited')
+    FOR SHARE`;
+  if (!rows.length) throw new MediaError("account unavailable", 403);
+}
 
 function boundedEnv(name: string, fallback: number, lower: number, upper: number): number {
   const parsed = Number(process.env[name] ?? fallback);
@@ -45,6 +61,8 @@ export function mediaLimits() {
     chunkBytes: boundedEnv("TOJ_MEDIA_CHUNK_BYTES", DEFAULT_CHUNK_BYTES, 64 * 1024, 1024 * 1024),
     maxObjectBytes: boundedEnv("TOJ_MEDIA_MAX_OBJECT_BYTES", DEFAULT_MAX_OBJECT_BYTES, 1024, 100 * 1024 * 1024),
     accountQuotaBytes: boundedEnv("TOJ_MEDIA_ACCOUNT_QUOTA_BYTES", DEFAULT_ACCOUNT_QUOTA_BYTES, 1024, 10 * 1024 * 1024 * 1024),
+    maxActiveUploads: boundedEnv("TOJ_MEDIA_MAX_ACTIVE_UPLOADS", DEFAULT_MAX_ACTIVE_UPLOADS, 1, 100),
+    maxDailyUploads: boundedEnv("TOJ_MEDIA_MAX_DAILY_UPLOADS", DEFAULT_MAX_DAILY_UPLOADS, 1, 10_000),
     thumbnailBytes: MAX_THUMBNAIL_BYTES,
   };
 }
@@ -99,7 +117,7 @@ export async function loadMediaDTO(sql: SQL, mediaId: string | null): Promise<Me
   return row ? toDTO(row) : null;
 }
 
-export async function createMediaUpload(sql: SQL, accountId: string, input: {
+export async function createMediaUpload(sql: SQL, accountId: string, deviceId: string, input: {
   kind?: unknown; contentType?: unknown; fileName?: unknown; byteSize?: unknown;
   sha256?: unknown; durationMs?: unknown; width?: unknown; height?: unknown;
 }) {
@@ -113,7 +131,7 @@ export async function createMediaUpload(sql: SQL, accountId: string, input: {
   if (kind === "video" && !contentType.startsWith("video/")) throw new MediaError("video content type required");
   if (kind === "voice" && !contentType.startsWith("audio/")) throw new MediaError("audio content type required");
   const byteSize = Number(input.byteSize);
-  const { chunkBytes, maxObjectBytes, accountQuotaBytes } = mediaLimits();
+  const { chunkBytes, maxObjectBytes, accountQuotaBytes, maxActiveUploads, maxDailyUploads } = mediaLimits();
   if (!Number.isSafeInteger(byteSize) || byteSize <= 0) throw new MediaError("invalid media size");
   if (byteSize > maxObjectBytes) throw new MediaError("media exceeds the upload limit", 413);
   const sha256 = String(input.sha256 ?? "");
@@ -123,16 +141,47 @@ export async function createMediaUpload(sql: SQL, accountId: string, input: {
   const width = optionalPositiveInt(input.width, "width");
   const height = optionalPositiveInt(input.height, "height");
   if (width === 0 || height === 0) throw new MediaError("invalid media dimensions");
+  if ((width != null || height != null) && (width == null || height == null)) {
+    throw new MediaError("both media dimensions are required");
+  }
+  if (width != null && height != null &&
+      (width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION || width * height > MAX_IMAGE_PIXELS)) {
+    throw new MediaError("media dimensions exceed the limit", 413);
+  }
+  if (kind === "photo" && (width == null || height == null)) {
+    throw new MediaError("photo dimensions are required");
+  }
+  if (kind === "video" && (width == null || height == null || durationMs == null || durationMs <= 0)) {
+    throw new MediaError("video dimensions and duration are required");
+  }
+  if (kind === "voice" && (durationMs == null || durationMs <= 0)) {
+    throw new MediaError("voice duration is required");
+  }
+  if (durationMs != null && durationMs > 3_600_000) throw new MediaError("media duration exceeds the limit", 413);
 
   return await sql.begin(async (tx) => {
     const owner = await tx`SELECT id FROM accounts WHERE id = ${accountId} AND status IN ('active','limited') FOR UPDATE`;
     if (!owner.length) throw new MediaError("account unavailable", 403);
+    await requireActiveDevice(tx, accountId, deviceId);
+    const counts = (await tx`
+      SELECT
+        (SELECT count(*) FROM media_objects
+         WHERE owner_account_id = ${accountId} AND status = 'uploading' AND expires_at > now()) AS active,
+        (SELECT count(*) FROM media_upload_attempts
+         WHERE account_id = ${accountId} AND created_at > now() - interval '24 hours') AS daily`)[0];
+    if (n(counts.active) >= maxActiveUploads) {
+      throw new MediaError("too many active uploads; finish or cancel one first", 429);
+    }
+    if (n(counts.daily) >= maxDailyUploads) {
+      throw new MediaError("daily media upload limit reached", 429);
+    }
     const usage = (await tx`
       SELECT COALESCE(sum(byte_size), 0) AS bytes
       FROM media_objects
       WHERE owner_account_id = ${accountId}
         AND status IN ('uploading','ready') AND (status = 'ready' OR expires_at > now())`)[0];
     if (n(usage.bytes) + byteSize > accountQuotaBytes) throw new MediaError("media storage quota exceeded", 413);
+    await tx`INSERT INTO media_upload_attempts (account_id) VALUES (${accountId})`;
     const mediaId = randomUUID();
     const sealedFileName = fileName == null ? null : seal(fileName, mediaFileNameAAD(mediaId));
     const row = (await tx`
@@ -169,13 +218,15 @@ export async function getMediaUpload(sql: SQL, accountId: string, mediaId: strin
 }
 
 export async function uploadMediaChunk(
-  sql: SQL, accountId: string, mediaId: string, offset: number, bytes: Buffer,
+  sql: SQL, accountId: string, deviceId: string, mediaId: string, offset: number, bytes: Buffer,
 ) {
   const { chunkBytes } = mediaLimits();
   if (!Number.isSafeInteger(offset) || offset < 0) throw new MediaError("invalid upload offset");
   if (bytes.length === 0 || bytes.length > chunkBytes) throw new MediaError("invalid media chunk size", 413);
   const digest = mediaDigestHMAC(createHash("sha256").update(bytes).digest());
   return await sql.begin(async (tx) => {
+    await requireActiveMediaAccount(tx, accountId);
+    await requireActiveDevice(tx, accountId, deviceId);
     const row = (await tx`
       SELECT owner_account_id, byte_size, uploaded_bytes, status, expires_at
       FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
@@ -208,25 +259,40 @@ export async function uploadMediaChunk(
 }
 
 export async function uploadMediaThumbnail(
-  sql: SQL, accountId: string, mediaId: string, contentType: string, bytes: Buffer,
+  sql: SQL, accountId: string, deviceId: string, mediaId: string, contentType: string, bytes: Buffer,
 ) {
   if (!/^image\/(jpeg|png|webp)$/i.test(contentType)) throw new MediaError("unsupported thumbnail type");
   if (bytes.length === 0 || bytes.length > MAX_THUMBNAIL_BYTES) throw new MediaError("thumbnail too large", 413);
-  if (!validImageSignature(bytes, contentType)) throw new MediaError("thumbnail content does not match its type");
+  validateImage(bytes, contentType, MAX_THUMBNAIL_DIMENSION, MAX_THUMBNAIL_PIXELS);
   const sealed = seal(bytes, mediaThumbnailAAD(mediaId));
-  const rows = await sql`
-    UPDATE media_objects
-    SET thumbnail_key_id = ${sealed.keyId}, thumbnail_nonce = ${sealed.nonce},
-        thumbnail_ciphertext = ${sealed.ciphertext}, thumbnail_byte_size = ${bytes.length},
-        thumbnail_content_type = ${contentType.toLowerCase()}
-    WHERE id = ${mediaId} AND owner_account_id = ${accountId} AND status = 'uploading'
-    RETURNING id`;
-  if (!rows.length) throw new MediaError("upload not found", 404);
+  await sql.begin(async (tx) => {
+    await requireActiveMediaAccount(tx, accountId);
+    await requireActiveDevice(tx, accountId, deviceId);
+    const rows = await tx`
+      UPDATE media_objects
+      SET thumbnail_key_id = ${sealed.keyId}, thumbnail_nonce = ${sealed.nonce},
+          thumbnail_ciphertext = ${sealed.ciphertext}, thumbnail_byte_size = ${bytes.length},
+          thumbnail_content_type = ${contentType.toLowerCase()}
+      WHERE id = ${mediaId} AND owner_account_id = ${accountId} AND status = 'uploading'
+      RETURNING id`;
+    if (!rows.length) throw new MediaError("upload not found", 404);
+  });
   return { mediaId, uploaded: true };
 }
 
-export async function completeMediaUpload(sql: SQL, accountId: string, mediaId: string) {
-  return await sql.begin(async (tx) => {
+async function rejectUpload(sql: SQL, mediaId: string): Promise<void> {
+  await sql`DELETE FROM media_chunks WHERE media_id = ${mediaId}`;
+  await sql`
+    UPDATE media_objects SET status = 'rejected', uploaded_bytes = 0,
+      thumbnail_key_id = NULL, thumbnail_nonce = NULL, thumbnail_ciphertext = NULL,
+      thumbnail_byte_size = NULL, thumbnail_content_type = NULL
+    WHERE id = ${mediaId}`;
+}
+
+export async function completeMediaUpload(sql: SQL, accountId: string, deviceId: string, mediaId: string) {
+  const result = await sql.begin(async (tx) => {
+    await requireActiveMediaAccount(tx, accountId);
+    await requireActiveDevice(tx, accountId, deviceId);
     const row = (await tx`
       SELECT owner_account_id, kind, content_type, byte_size, uploaded_bytes, expected_sha256, status, expires_at
       FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
@@ -248,20 +314,30 @@ export async function completeMediaUpload(sql: SQL, accountId: string, mediaId: 
         mediaChunkAAD(mediaId, expectedOffset),
       );
       if (plaintext.length !== n(chunk.plain_size)) throw new MediaError("upload chunk is corrupt", 409);
-      if (header.length < 64) header = Buffer.concat([header, plaintext.subarray(0, 64 - header.length)]);
+      if (header.length < MAX_IMAGE_HEADER_BYTES) {
+        header = Buffer.concat([header, plaintext.subarray(0, MAX_IMAGE_HEADER_BYTES - header.length)]);
+      }
       hash.update(plaintext);
       expectedOffset += plaintext.length;
     }
     const digest = mediaDigestHMAC(hash.digest());
     if (expectedOffset !== n(row.byte_size) || !timingSafeEqual(digest, buf(row.expected_sha256))) {
-      throw new MediaError("media checksum mismatch", 409);
+      await rejectUpload(tx, mediaId);
+      return { error: new MediaError("media checksum mismatch", 409) } as const;
     }
-    validateMediaSignature(row.kind, row.content_type, header);
+    try {
+      validateMediaSignature(row.kind, row.content_type, header, row.width, row.height);
+    } catch (error) {
+      await rejectUpload(tx, mediaId);
+      return { error: error instanceof MediaError ? error : new MediaError("invalid media", 415) } as const;
+    }
     await tx`
       UPDATE media_objects SET status = 'ready', completed_at = now(), expires_at = 'infinity'
       WHERE id = ${mediaId}`;
-    return { mediaId, ready: true, duplicate: false };
+    return { mediaId, ready: true, duplicate: false } as const;
   });
+  if ("error" in result) throw result.error;
+  return result;
 }
 
 async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) {
@@ -276,7 +352,7 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
       WHERE m.media_id = mo.id AND m.state = 'visible'
         AND dm.account_id = ${accountId} AND dm.left_at IS NULL
     )
-    FOR SHARE OF mo`)[0];
+    FOR KEY SHARE OF mo`)[0];
   if (!row || row.status !== "ready") throw new MediaError("media not found", 404);
   return row;
 }
@@ -319,8 +395,10 @@ export async function downloadMediaThumbnail(sql: SQL, accountId: string, mediaI
 }
 
 /** Deletes an abandoned upload immediately. Ready objects are cancellable only before first send. */
-export async function cancelMediaUpload(sql: SQL, accountId: string, mediaId: string) {
+export async function cancelMediaUpload(sql: SQL, accountId: string, deviceId: string, mediaId: string) {
   return await sql.begin(async (tx) => {
+    await requireActiveMediaAccount(tx, accountId);
+    await requireActiveDevice(tx, accountId, deviceId);
     const row = (await tx`
       SELECT owner_account_id, status FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
     if (!row || row.owner_account_id !== accountId) throw new MediaError("upload not found", 404);
@@ -331,23 +409,100 @@ export async function cancelMediaUpload(sql: SQL, accountId: string, mediaId: st
   });
 }
 
-function validImageSignature(bytes: Buffer, contentType: string): boolean {
-  const jpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-  const png = bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  const webp = bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
-  if (contentType === "image/jpeg") return jpeg;
-  if (contentType === "image/png") return png;
-  if (contentType === "image/webp") return webp;
-  return jpeg || png || webp || isISOBaseMedia(bytes);
+type ImageDimensions = { width: number; height: number };
+
+function jpegDimensions(bytes: Buffer): ImageDimensions | null {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  const sof = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+  let offset = 2;
+  while (offset + 4 <= bytes.length) {
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    if (offset >= bytes.length) return null;
+    const marker = bytes[offset++];
+    if (marker === 0xd9 || marker === 0xda) return null;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length) return null;
+    const length = bytes.readUInt16BE(offset);
+    if (length < 2 || offset + length > bytes.length) return null;
+    if (sof.has(marker)) {
+      if (length < 7) return null;
+      return { height: bytes.readUInt16BE(offset + 3), width: bytes.readUInt16BE(offset + 5) };
+    }
+    offset += length;
+  }
+  return null;
+}
+
+function pngDimensions(bytes: Buffer): ImageDimensions | null {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(signature) ||
+      bytes.readUInt32BE(8) !== 13 || bytes.subarray(12, 16).toString("ascii") !== "IHDR") return null;
+  return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+function webpDimensions(bytes: Buffer): ImageDimensions | null {
+  if (bytes.length < 30 || bytes.subarray(0, 4).toString("ascii") !== "RIFF" ||
+      bytes.subarray(8, 12).toString("ascii") !== "WEBP") return null;
+  const kind = bytes.subarray(12, 16).toString("ascii");
+  if (kind === "VP8X") {
+    return {
+      width: 1 + bytes.readUIntLE(24, 3),
+      height: 1 + bytes.readUIntLE(27, 3),
+    };
+  }
+  if (kind === "VP8 " && bytes.subarray(23, 26).equals(Buffer.from([0x9d, 0x01, 0x2a]))) {
+    return { width: bytes.readUInt16LE(26) & 0x3fff, height: bytes.readUInt16LE(28) & 0x3fff };
+  }
+  if (kind === "VP8L" && bytes[20] === 0x2f) {
+    const bits = bytes.readUInt32LE(21);
+    return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+  }
+  return null;
+}
+
+function isoImageDimensions(bytes: Buffer): ImageDimensions | null {
+  if (!isISOBaseMedia(bytes)) return null;
+  for (let offset = 8; offset + 12 <= bytes.length; offset += 1) {
+    if (bytes.subarray(offset, offset + 4).toString("ascii") === "ispe") {
+      return { width: bytes.readUInt32BE(offset + 4), height: bytes.readUInt32BE(offset + 8) };
+    }
+  }
+  return null;
+}
+
+function validateImage(
+  bytes: Buffer, contentType: string, maxDimension: number, maxPixels: number,
+): ImageDimensions {
+  const normalized = contentType.toLowerCase().split(";", 1)[0];
+  const dimensions = normalized === "image/jpeg" ? jpegDimensions(bytes)
+    : normalized === "image/png" ? pngDimensions(bytes)
+    : normalized === "image/webp" ? webpDimensions(bytes)
+    : normalized === "image/heic" || normalized === "image/heif" ? isoImageDimensions(bytes)
+    : null;
+  if (!dimensions) throw new MediaError("image is truncated, malformed, or unsupported", 415);
+  if (dimensions.width <= 0 || dimensions.height <= 0 ||
+      dimensions.width > maxDimension || dimensions.height > maxDimension ||
+      dimensions.width * dimensions.height > maxPixels) {
+    throw new MediaError("image dimensions exceed the limit", 413);
+  }
+  return dimensions;
 }
 
 function isISOBaseMedia(bytes: Buffer): boolean {
   return bytes.length >= 12 && bytes.subarray(4, 8).toString("ascii") === "ftyp";
 }
 
-function validateMediaSignature(kind: MediaKind, contentType: string, header: Buffer): void {
+function validateMediaSignature(
+  kind: MediaKind, contentType: string, header: Buffer, declaredWidth: unknown, declaredHeight: unknown,
+): void {
   if (kind === "file") return;
-  if (kind === "photo" && validImageSignature(header, contentType)) return;
+  if (kind === "photo") {
+    const actual = validateImage(header, contentType, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS);
+    if (actual.width !== n(declaredWidth) || actual.height !== n(declaredHeight)) {
+      throw new MediaError("photo dimensions do not match the upload", 415);
+    }
+    return;
+  }
   const webm = header.length >= 4 && header.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
   if (kind === "video" && (isISOBaseMedia(header) || webm)) return;
   const mp3 = header.length >= 3 && (header.subarray(0, 3).toString("ascii") === "ID3" || (header[0] === 0xff && (header[1] & 0xe0) === 0xe0));

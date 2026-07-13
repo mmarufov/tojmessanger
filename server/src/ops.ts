@@ -23,7 +23,8 @@ export function safeRoute(pathname: string): string {
     "/v1/devices", "/v1/devices/push", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
-    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/history", "/v1/read",
+    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/messages/react",
+    "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
@@ -131,10 +132,18 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const media = await sql`
     WITH doomed AS (
       SELECT id FROM media_objects
-      WHERE status = 'uploading' AND expires_at < now()
+      WHERE status IN ('uploading', 'rejected') AND expires_at < now()
       ORDER BY expires_at LIMIT ${batchSize}
     )
     DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const mediaAttempts = await sql`
+    WITH doomed AS (
+      SELECT id FROM media_upload_attempts
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM media_upload_attempts WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
   const mediaOrphans = await sql`
     WITH doomed AS (
@@ -151,6 +160,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     pushDeliveries: deliveries.length,
     contactLookups: contactLookups.length,
     mediaUploads: media.length,
+    mediaAttempts: mediaAttempts.length,
     mediaOrphans: mediaOrphans.length,
   };
 }
@@ -167,7 +177,7 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
     try {
       const deleted = await cleanupExpiredData(sql);
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
-          deleted.mediaUploads || deleted.mediaOrphans) {
+          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }
     } catch (error) {

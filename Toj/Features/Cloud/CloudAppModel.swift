@@ -1158,7 +1158,7 @@ final class CloudAppModel {
             }
         } else {
             for update in difference.updates ?? [] {
-                guard ["message.new", "message.edited", "message.deleted"].contains(update.type),
+                guard ["message.new", "message.edited", "message.deleted", "reaction.updated"].contains(update.type),
                       let message = update.message else { continue }
                 upsert(message)
             }

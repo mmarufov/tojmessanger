@@ -64,6 +64,7 @@ async function resetDb() {
       messages,
       media_chunks,
       media_objects,
+      media_upload_attempts,
       contact_lookup_attempts,
       dialog_members,
       direct_dialog_pairs,
@@ -82,6 +83,17 @@ async function makeAccount(phone: string, name: string) {
 
 function testPhone(suffix: number): string {
   return ["+", "1650", "555", String(suffix).padStart(4, "0")].join("");
+}
+
+function tinyJpeg(width = 1, height = 1): Buffer {
+  return Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x11, 0x08,
+    (height >>> 8) & 0xff, height & 0xff,
+    (width >>> 8) & 0xff, width & 0xff,
+    0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xd9,
+  ]);
 }
 
 async function addIOSDevice(accountId: string): Promise<{ deviceId: string }> {
@@ -485,7 +497,7 @@ describe("M3 cloud sync", () => {
     const account = await makeAccount(testPhone(126), "Cleanup");
     await startBootstrap(db, account.accountId);
     await db`UPDATE bootstrap_snapshots SET expires_at = now() - interval '1 minute'`;
-    await createMediaUpload(db, account.accountId, {
+    await createMediaUpload(db, account.accountId, account.deviceId, {
       kind: "file", contentType: "application/octet-stream", fileName: "expired.bin",
       byteSize: 4, sha256: createHash("sha256").update("test").digest("hex"),
     });
@@ -848,6 +860,15 @@ describe("M3 cloud sync", () => {
       emoji: null,
     });
     expect(removed.message.reactions).toEqual([]);
+    await revokeDevice(db, bob.accountId, bob.deviceId);
+    await expect(setReaction(db, {
+      actorAccountId: bob.accountId,
+      actorDeviceId: bob.deviceId,
+      dialogId,
+      msgId: sent.msgId,
+      clientMutationId: crypto.randomUUID(),
+      emoji: "🔥",
+    })).rejects.toMatchObject({ status: 401 });
   });
 
   test("reactions require membership and a visible message", async () => {
@@ -1219,25 +1240,28 @@ describe("M3 cloud sync", () => {
     const { alice, bob, dialogId } = await makePair();
     const outsider = await makeAccount(testPhone(901), "Outsider");
     const bytes = Buffer.from("private-media-payload-that-must-not-be-visible-on-disk");
-    const created = await createMediaUpload(db, alice.accountId, {
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "file", contentType: "application/octet-stream", fileName: "safe.bin",
       byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     });
     const first = bytes.subarray(0, 20);
     const second = bytes.subarray(20);
-    expect((await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, first)).uploadOffset).toBe(20);
-    const retry = await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, first);
+    expect((await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, first)).uploadOffset).toBe(20);
+    const retry = await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, first);
     expect(retry).toMatchObject({ uploadOffset: 20, duplicate: true });
-    await uploadMediaChunk(db, alice.accountId, created.mediaId, 20, second);
-    await uploadMediaThumbnail(db, alice.accountId, created.mediaId, "image/jpeg", Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 20, second);
+    await expect(uploadMediaThumbnail(
+      db, alice.accountId, alice.deviceId, created.mediaId, "image/jpeg", tinyJpeg(3_000, 3_000),
+    )).rejects.toMatchObject({ status: 413 });
+    await uploadMediaThumbnail(db, alice.accountId, alice.deviceId, created.mediaId, "image/jpeg", tinyJpeg());
 
     const stored = await db`SELECT ciphertext, plain_sha256 FROM media_chunks WHERE media_id = ${created.mediaId}`;
     expect(Buffer.concat(stored.map((row) => Buffer.from(row.ciphertext))).includes(bytes)).toBe(false);
     expect(Buffer.from(stored[0].plain_sha256).equals(createHash("sha256").update(first).digest())).toBe(false);
     const fingerprint = (await db`SELECT expected_sha256 FROM media_objects WHERE id = ${created.mediaId}`)[0];
     expect(Buffer.from(fingerprint.expected_sha256).equals(createHash("sha256").update(bytes).digest())).toBe(false);
-    expect(await completeMediaUpload(db, alice.accountId, created.mediaId)).toMatchObject({ ready: true, duplicate: false });
-    expect(await completeMediaUpload(db, alice.accountId, created.mediaId)).toMatchObject({ ready: true, duplicate: true });
+    expect(await completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId)).toMatchObject({ ready: true, duplicate: false });
+    expect(await completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId)).toMatchObject({ ready: true, duplicate: true });
 
     const sent = await sendMessage(db, {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
@@ -1248,6 +1272,12 @@ describe("M3 cloud sync", () => {
       id: created.mediaId, kind: "file", byte_size: bytes.length, has_thumbnail: true,
     });
     const downloaded = await downloadMediaChunk(db, bob.accountId, created.mediaId, 0);
+    const [parallelA, parallelB] = await Promise.all([
+      downloadMediaChunk(db, bob.accountId, created.mediaId, 0),
+      downloadMediaChunk(db, bob.accountId, created.mediaId, 0),
+    ]);
+    expect(parallelA.bytes).toEqual(first);
+    expect(parallelB.bytes).toEqual(first);
     const downloadedSecond = await downloadMediaChunk(db, bob.accountId, created.mediaId, downloaded.nextOffset);
     expect(Buffer.concat([downloaded.bytes, downloadedSecond.bytes])).toEqual(bytes);
     await expect(downloadMediaChunk(db, outsider.accountId, created.mediaId, 0))
@@ -1347,66 +1377,70 @@ describe("M3 cloud sync", () => {
   test("media completion rejects gaps and checksum mismatches without publishing a message", async () => {
     const { alice, dialogId } = await makePair();
     const bytes = Buffer.from("checksum-test");
-    const created = await createMediaUpload(db, alice.accountId, {
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "voice", contentType: "audio/mp4", byteSize: bytes.length,
       sha256: "00".repeat(32), durationMs: 850,
     });
-    await expect(uploadMediaChunk(db, alice.accountId, created.mediaId, 4, bytes))
+    await expect(uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 4, bytes))
       .rejects.toMatchObject({ status: 409 });
-    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
-    await expect(completeMediaUpload(db, alice.accountId, created.mediaId))
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, bytes);
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
       .rejects.toThrow("checksum mismatch");
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
+      .rejects.toThrow("upload unavailable");
+    expect(await db`SELECT media_id FROM media_chunks WHERE media_id = ${created.mediaId}`).toHaveLength(0);
+    expect((await db`SELECT status FROM media_objects WHERE id = ${created.mediaId}`)[0].status).toBe("rejected");
     await expect(sendMessage(db, {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
       clientMsgId: crypto.randomUUID(), body: "", mediaId: created.mediaId,
     })).rejects.toThrow("media upload is incomplete");
 
-    const expired = await createMediaUpload(db, alice.accountId, {
+    const expired = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "file", contentType: "application/octet-stream", byteSize: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     });
-    await uploadMediaChunk(db, alice.accountId, expired.mediaId, 0, bytes);
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, expired.mediaId, 0, bytes);
     await db`UPDATE media_objects SET expires_at = now() - interval '1 second' WHERE id = ${expired.mediaId}`;
-    await expect(completeMediaUpload(db, alice.accountId, expired.mediaId))
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, expired.mediaId))
       .rejects.toMatchObject({ status: 410 });
   });
 
   test("media completion rejects content that does not match its declared type", async () => {
     const { alice } = await makePair();
     const bytes = Buffer.from("this is not an image");
-    const created = await createMediaUpload(db, alice.accountId, {
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "photo", contentType: "image/jpeg", fileName: "fake.jpg",
-      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), width: 1, height: 1,
     });
-    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
-    await expect(completeMediaUpload(db, alice.accountId, created.mediaId))
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, bytes);
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
       .rejects.toMatchObject({ status: 415 });
   });
 
   test("owners can cancel abandoned uploads but cannot cancel delivered media", async () => {
     const { alice, bob, dialogId } = await makePair();
     const bytes = Buffer.from("abandoned encrypted upload");
-    const abandoned = await createMediaUpload(db, alice.accountId, {
+    const abandoned = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "file", contentType: "application/octet-stream", fileName: "private.txt",
       byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     });
-    await uploadMediaChunk(db, alice.accountId, abandoned.mediaId, 0, bytes);
-    await expect(cancelMediaUpload(db, bob.accountId, abandoned.mediaId)).rejects.toMatchObject({ status: 404 });
-    expect(await cancelMediaUpload(db, alice.accountId, abandoned.mediaId)).toEqual({
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, abandoned.mediaId, 0, bytes);
+    await expect(cancelMediaUpload(db, bob.accountId, bob.deviceId, abandoned.mediaId)).rejects.toMatchObject({ status: 404 });
+    expect(await cancelMediaUpload(db, alice.accountId, alice.deviceId, abandoned.mediaId)).toEqual({
       mediaId: abandoned.mediaId, cancelled: true,
     });
 
-    const delivered = await createMediaUpload(db, alice.accountId, {
+    const delivered = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "file", contentType: "application/octet-stream", fileName: "delivered.txt",
       byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     });
-    await uploadMediaChunk(db, alice.accountId, delivered.mediaId, 0, bytes);
-    await completeMediaUpload(db, alice.accountId, delivered.mediaId);
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, delivered.mediaId, 0, bytes);
+    await completeMediaUpload(db, alice.accountId, alice.deviceId, delivered.mediaId);
     await sendMessage(db, {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
       clientMsgId: crypto.randomUUID(), body: "", mediaId: delivered.mediaId,
     });
-    await expect(cancelMediaUpload(db, alice.accountId, delivered.mediaId)).rejects.toMatchObject({ status: 409 });
+    await expect(cancelMediaUpload(db, alice.accountId, alice.deviceId, delivered.mediaId)).rejects.toMatchObject({ status: 409 });
   });
 
   test("deleting a source keeps forwarded media until the final visible copy is deleted", async () => {
@@ -1414,12 +1448,12 @@ describe("M3 cloud sync", () => {
     const charlie = await makeAccount(testPhone(902), "Charlie");
     const destination = await getOrCreateDirectDialog(db, bob.accountId, charlie.accountId);
     const bytes = Buffer.from("forwarded encrypted media");
-    const created = await createMediaUpload(db, alice.accountId, {
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "file", contentType: "application/octet-stream", fileName: "forward.bin",
       byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     });
-    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
-    await completeMediaUpload(db, alice.accountId, created.mediaId);
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, bytes);
+    await completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId);
     const source = await sendMessage(db, {
       senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
       dialogId: sourceDialogId, clientMsgId: crypto.randomUUID(), body: "", mediaId: created.mediaId,
@@ -1445,17 +1479,17 @@ describe("M3 cloud sync", () => {
 
   test("media creation reserves quota atomically and sanitizes file names", async () => {
     const { alice } = await makePair();
-    await expect(createMediaUpload(db, alice.accountId, {
+    await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "voice", contentType: "image/jpeg", byteSize: 4, sha256: "11".repeat(32),
     })).rejects.toThrow("audio content type required");
-    await expect(createMediaUpload(db, alice.accountId, {
+    await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
       kind: "photo", contentType: "image/jpeg", byteSize: 4, sha256: "11".repeat(32), width: 0,
     })).rejects.toThrow("invalid media dimensions");
     const oldQuota = process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES;
     process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES = "1024";
     try {
       const bytes = Buffer.alloc(700, 1);
-      const first = await createMediaUpload(db, alice.accountId, {
+      const first = await createMediaUpload(db, alice.accountId, alice.deviceId, {
         kind: "file", contentType: "application/pdf", fileName: "folder/statement.pdf",
         byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
       });
@@ -1469,12 +1503,38 @@ describe("M3 cloud sync", () => {
         nonce: Buffer.from(metadata.file_name_nonce),
         ciphertext: Buffer.from(metadata.file_name_ciphertext),
       }, mediaFileNameAAD(first.mediaId)).toString("utf8")).toBe("statement.pdf");
-      await expect(createMediaUpload(db, alice.accountId, {
+      await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
         kind: "file", contentType: "application/pdf", byteSize: 400, sha256: "11".repeat(32),
       })).rejects.toEqual(expect.objectContaining<Partial<MediaError>>({ status: 413 }));
     } finally {
       if (oldQuota == null) delete process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES;
       else process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES = oldQuota;
+    }
+  });
+
+  test("media mutations revalidate the device and cap active upload rows", async () => {
+    const { alice } = await makePair();
+    const oldActiveLimit = process.env.TOJ_MEDIA_MAX_ACTIVE_UPLOADS;
+    process.env.TOJ_MEDIA_MAX_ACTIVE_UPLOADS = "2";
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        await createMediaUpload(db, alice.accountId, alice.deviceId, {
+          kind: "file", contentType: "application/octet-stream", byteSize: 1,
+          sha256: createHash("sha256").update(Buffer.from([index])).digest("hex"),
+        });
+      }
+      await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
+        kind: "file", contentType: "application/octet-stream", byteSize: 1,
+        sha256: createHash("sha256").update(Buffer.from([2])).digest("hex"),
+      })).rejects.toMatchObject({ status: 429 });
+      await revokeDevice(db, alice.accountId, alice.deviceId);
+      await expect(createMediaUpload(db, alice.accountId, alice.deviceId, {
+        kind: "file", contentType: "application/octet-stream", byteSize: 1,
+        sha256: createHash("sha256").update(Buffer.from([3])).digest("hex"),
+      })).rejects.toMatchObject({ status: 401 });
+    } finally {
+      if (oldActiveLimit == null) delete process.env.TOJ_MEDIA_MAX_ACTIVE_UPLOADS;
+      else process.env.TOJ_MEDIA_MAX_ACTIVE_UPLOADS = oldActiveLimit;
     }
   });
 

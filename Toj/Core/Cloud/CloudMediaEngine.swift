@@ -1,8 +1,45 @@
 import AVFoundation
 import CryptoKit
 import Foundation
+import ImageIO
 import Observation
 import UIKit
+
+struct SafeDecodedImage {
+    let image: UIImage
+    let pixelWidth: Int
+    let pixelHeight: Int
+}
+
+enum SafeMediaImageDecoder {
+    private static let maxDimension = 8_192
+    private static let maxPixels = 40_000_000
+
+    static func decode(_ data: Data, maxPixelSize: Int) -> SafeDecodedImage? {
+        guard !data.isEmpty, maxPixelSize > 0,
+              let source = CGImageSourceCreateWithData(
+                data as CFData,
+                [kCGImageSourceShouldCache: false] as CFDictionary
+              ),
+              CGImageSourceGetCount(source) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0, width <= maxDimension, height <= maxDimension,
+              Int64(width) * Int64(height) <= Int64(maxPixels)
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: min(maxPixelSize, maxDimension),
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return SafeDecodedImage(image: UIImage(cgImage: cgImage), pixelWidth: width, pixelHeight: height)
+    }
+}
 
 nonisolated struct CloudMedia: Codable, Equatable, Sendable, Identifiable {
     let id: String
@@ -721,29 +758,75 @@ final class VoiceNoteRecorder: NSObject, AVAudioRecorderDelegate {
     private var recorder: AVAudioRecorder?
     private var timer: Timer?
     private var recordingURL: URL?
+    private let recordingsDirectory: URL
+
+    override init() {
+        let fileManager = FileManager.default
+        var directory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "TojVoiceRecordings", directoryHint: .isDirectory)
+        try? fileManager.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        )
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? directory.setResourceValues(values)
+        if let stale = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+            for url in stale { try? fileManager.removeItem(at: url) }
+        }
+        recordingsDirectory = directory
+        super.init()
+        let center = NotificationCenter.default
+        center.addObserver(
+            self, selector: #selector(stopForInterruption),
+            name: AVAudioSession.interruptionNotification, object: nil
+        )
+        center.addObserver(
+            self, selector: #selector(stopForInterruption),
+            name: UIApplication.didEnterBackgroundNotification, object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func stopForInterruption() { cancel() }
 
     func start() async throws {
+        if isRecording { cancel() }
         let permission = await AVAudioApplication.requestRecordPermission()
         guard permission else { throw VoiceRecorderError.permissionDenied }
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.defaultToSpeaker, .allowBluetoothHFP])
         try session.setActive(true)
-        let url = FileManager.default.temporaryDirectory.appending(path: "toj-voice-\(UUID().uuidString).m4a")
+        let url = recordingsDirectory.appending(path: "toj-voice-\(UUID().uuidString).m4a")
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC), AVSampleRateKey: 44_100,
             AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 64_000,
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
-        let recorder = try AVAudioRecorder(url: url, settings: settings)
-        recorder.delegate = self
-        recorder.prepareToRecord()
-        guard recorder.record() else { throw VoiceRecorderError.couldNotStart }
-        self.recorder = recorder
-        recordingURL = url
-        elapsedSeconds = 0
-        isRecording = true
-        timer = .scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.elapsedSeconds += 1 }
+        do {
+            let recorder = try AVAudioRecorder(url: url, settings: settings)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path
+            )
+            recorder.delegate = self
+            guard recorder.prepareToRecord(), recorder.record() else {
+                recorder.stop()
+                throw VoiceRecorderError.couldNotStart
+            }
+            self.recorder = recorder
+            recordingURL = url
+            elapsedSeconds = 0
+            isRecording = true
+            timer = .scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.elapsedSeconds += 1 }
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            throw error
         }
     }
 

@@ -2,13 +2,14 @@ import type { SQL } from "bun";
 import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
 import { loadMediaDTO, type MediaDTO } from "./media";
+import { requireActiveDevice } from "./auth";
 
 export class SyncError extends Error {}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
-//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 direct_dialog_pairs
-//   → 4 dialogs row → 5 dialog_members → 6 messages → 7 account_sync_states (ascending account_id)
-//   → 8 account_events insert → 9 push_deliveries insert
+//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 acting device
+//   → 4 direct_dialog_pairs → 5 dialogs row → 6 dialog_members → 7 messages
+//   → 8 account_sync_states (ascending account_id) → 9 account_events insert → 10 push_deliveries insert
 
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
@@ -23,6 +24,10 @@ const n = (v: unknown) => Number(v as any);
 const buf = (v: unknown) => Buffer.from(v as Uint8Array);
 const iso = (v: unknown) => v instanceof Date ? v.toISOString() : String(v);
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const boundedInteger = (value: unknown, fallback: number, min: number, max: number) => {
+  const parsed = Number(value ?? fallback);
+  return Number.isSafeInteger(parsed) ? clamp(parsed, min, max) : fallback;
+};
 
 function eventData(v: unknown): Record<string, unknown> {
   if (!v) return {};
@@ -106,12 +111,15 @@ function optionalMessageId(value: unknown): number | null {
 }
 
 /** Idempotent 1:1 dialog creation (review I5: conflict-safe on the pair). Emits dialog.created. */
-export async function getOrCreateDirectDialog(sql: SQL, aId: string, bId: string): Promise<{ dialogId: string; created: boolean }> {
+export async function getOrCreateDirectDialog(
+  sql: SQL, aId: string, bId: string, actorDeviceId?: string,
+): Promise<{ dialogId: string; created: boolean }> {
   if (aId === bId) throw new SyncError("cannot open a direct dialog with yourself");
   const [low, high] = aId < bId ? [aId, bId] : [bId, aId];
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, low);
     await requireActiveAccount(tx, high);
+    if (actorDeviceId) await requireActiveDevice(tx, aId, actorDeviceId);
     // Serialize the unordered pair before creating a dialog row. This preserves the B4 lock order
     // even though the FK means the direct_dialog_pairs row cannot exist before dialogs.id exists.
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`direct:${low}:${high}`}, 0))`;
@@ -274,7 +282,7 @@ export type MessageMutationResult = {
 };
 
 async function mutateMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; operation: "edit" | "delete"; body?: string;
   expectedEditVersion?: number;
 }): Promise<MessageMutationResult> {
@@ -308,6 +316,7 @@ async function mutateMessage(sql: SQL, p: {
     }
 
     await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
     await requireActiveMember(tx, p.actorAccountId, p.dialogId);
     const members = await tx`
       SELECT account_id FROM dialog_members
@@ -381,21 +390,21 @@ async function mutateMessage(sql: SQL, p: {
 }
 
 export async function editMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; body: string; expectedEditVersion: number;
 }): Promise<MessageMutationResult> {
   return mutateMessage(sql, { ...p, operation: "edit" });
 }
 
 export async function deleteMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string;
 }): Promise<MessageMutationResult> {
   return mutateMessage(sql, { ...p, operation: "delete" });
 }
 
 export async function setReaction(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; emoji: string | null;
 }): Promise<MessageMutationResult> {
   return await sql.begin(async (tx) => {
@@ -424,6 +433,7 @@ export async function setReaction(sql: SQL, p: {
     }
 
     await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
     await requireActiveMember(tx, p.actorAccountId, p.dialogId);
     const members = await tx`
       SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
@@ -482,8 +492,8 @@ export async function getDifference(
   sql: SQL, accountId: string, sincePts: number,
   opts: { maxEvents?: number; maxBytes?: number } = {},
 ): Promise<Difference> {
-  const maxEvents = opts.maxEvents ?? 200;
-  const maxBytes = opts.maxBytes ?? 256 * 1024;
+  const maxEvents = boundedInteger(opts.maxEvents, 200, 1, 200);
+  const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
   const st = (await sql`SELECT pts, pruned_through_pts FROM account_sync_states WHERE account_id = ${accountId}`)[0];
   if (!st) throw new SyncError("unknown account");
   const statePts = n(st.pts);
@@ -587,8 +597,10 @@ export async function getBootstrapDialogsPage(
   token: string,
   opts: { cursor?: string; limit?: number; previewMessages?: number } = {},
 ): Promise<BootstrapPage> {
-  const limit = clamp(opts.limit ?? 20, 1, 100);
-  const previewMessages = clamp(opts.previewMessages ?? 1, 0, 25);
+  // Keep worst-case hydration bounded. The client pages dialogs and history separately, so a
+  // bootstrap response never needs thousands of per-message lookups in one request.
+  const limit = boundedInteger(opts.limit, 20, 1, 20);
+  const previewMessages = boundedInteger(opts.previewMessages, 1, 0, 5);
   const cursor = decodeCursor<{ updatedAt: string; dialogId: string }>(opts.cursor);
 
   const snap = (await sql`
@@ -705,10 +717,11 @@ export async function getHistory(
 }
 
 export async function readHistory(sql: SQL, p: {
-  accountId: string; dialogId: string; maxReadMsgId: number;
+  accountId: string; deviceId?: string; dialogId: string; maxReadMsgId: number;
 }): Promise<{ dialogId: string; maxReadMsgId: number; pushes: Push[] }> {
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, p.accountId);
+    if (p.deviceId) await requireActiveDevice(tx, p.accountId, p.deviceId);
     await requireActiveMember(tx, p.accountId, p.dialogId);
     const member = (await tx`
       UPDATE dialog_members SET last_read_msg_id = ${p.maxReadMsgId}

@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS media_objects (
   width                 INT CHECK (width IS NULL OR width > 0),
   height                INT CHECK (height IS NULL OR height > 0),
   status                TEXT NOT NULL DEFAULT 'uploading'
-                          CHECK (status IN ('uploading','ready','deleted')),
+                          CHECK (status IN ('uploading','ready','rejected','deleted')),
   thumbnail_key_id      TEXT,
   thumbnail_nonce       BYTEA,
   thumbnail_ciphertext  BYTEA,
@@ -167,8 +167,20 @@ CREATE TABLE IF NOT EXISTS media_objects (
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_key_id TEXT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_nonce BYTEA;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_ciphertext BYTEA;
+ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_status_check;
+ALTER TABLE media_objects ADD CONSTRAINT media_objects_status_check
+  CHECK (status IN ('uploading','ready','rejected','deleted'));
 CREATE INDEX IF NOT EXISTS media_objects_owner_quota_idx
   ON media_objects(owner_account_id, status, created_at);
+
+-- Kept separately from media_objects so create/cancel loops cannot evade per-account rate limits.
+CREATE TABLE IF NOT EXISTS media_upload_attempts (
+  id         BIGSERIAL PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS media_upload_attempts_account_created_idx
+  ON media_upload_attempts(account_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS media_chunks (
   media_id       UUID NOT NULL REFERENCES media_objects(id) ON DELETE CASCADE,

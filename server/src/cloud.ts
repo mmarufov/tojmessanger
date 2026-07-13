@@ -236,7 +236,9 @@ export function startCloudServer(
             if (offsetHeader == null) throw new MediaError("upload offset required");
             const offset = Number(offsetHeader);
             const bytes = await readBinary(req, mediaLimits().chunkBytes);
-            const result = await uploadMediaChunk(db, session.accountId, uploadChunkMatch[1], offset, bytes);
+            const result = await uploadMediaChunk(
+              db, session.accountId, session.deviceId, uploadChunkMatch[1], offset, bytes,
+            );
             response = json(result, 200, {
               "upload-offset": String(result.uploadOffset),
             });
@@ -244,7 +246,7 @@ export function startCloudServer(
             const contentType = req.headers.get("content-type") ?? "";
             const bytes = await readBinary(req, mediaLimits().thumbnailBytes);
             response = json(await uploadMediaThumbnail(
-              db, session.accountId, uploadThumbnailMatch[1], contentType, bytes,
+              db, session.accountId, session.deviceId, uploadThumbnailMatch[1], contentType, bytes,
             ));
           } else if (downloadChunkMatch && req.method === "GET") {
             const result = await downloadMediaChunk(
@@ -342,7 +344,9 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
           if (!body.peerAccountId) throw new SyncError("peerAccountId required");
-          response = json(await getOrCreateDirectDialog(db, session.accountId, body.peerAccountId));
+          response = json(await getOrCreateDirectDialog(
+            db, session.accountId, body.peerAccountId, session.deviceId,
+          ));
         }
 
         if (url.pathname === "/v1/messages/send" && req.method === "POST") {
@@ -414,6 +418,7 @@ export function startCloudServer(
         if (url.pathname === "/v1/read" && req.method === "POST") {
           const result = await readHistory(db, {
             accountId: session.accountId,
+            deviceId: session.deviceId,
             dialogId: body.dialogId,
             maxReadMsgId: Number(body.maxReadMsgId ?? 0),
           });
@@ -422,7 +427,7 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/media/uploads" && req.method === "POST") {
-          response = json(await createMediaUpload(db, session.accountId, body), 201);
+          response = json(await createMediaUpload(db, session.accountId, session.deviceId, body), 201);
         }
 
         const mediaUploadMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)$/i);
@@ -430,12 +435,12 @@ export function startCloudServer(
           response = json(await getMediaUpload(db, session.accountId, mediaUploadMatch[1]));
         }
         if (mediaUploadMatch && req.method === "DELETE") {
-          response = json(await cancelMediaUpload(db, session.accountId, mediaUploadMatch[1]));
+          response = json(await cancelMediaUpload(db, session.accountId, session.deviceId, mediaUploadMatch[1]));
         }
 
         const mediaCompleteMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/complete$/i);
         if (mediaCompleteMatch && req.method === "POST") {
-          response = json(await completeMediaUpload(db, session.accountId, mediaCompleteMatch[1]));
+          response = json(await completeMediaUpload(db, session.accountId, session.deviceId, mediaCompleteMatch[1]));
         }
 
         if (!response) response = new Response("not found", { status: 404 });

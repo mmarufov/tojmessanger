@@ -688,7 +688,7 @@ private struct ProductionMediaBubble: View {
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .task(id: media.id) {
                     guard thumbnail == nil, let data = await model.thumbnailData(for: media) else { return }
-                    thumbnail = UIImage(data: data)
+                    thumbnail = SafeMediaImageDecoder.decode(data, maxPixelSize: 720)?.image
                 }
             case "voice":
                 VoiceNotePlaybackView(model: model, media: media)
@@ -828,7 +828,7 @@ private struct ProductionMediaViewer: View {
     @Environment(\.dismiss) private var dismiss
     let model: CloudAppModel
     let media: CloudMedia
-    @State private var data: Data?
+    @State private var photoImage: UIImage?
     @State private var player: AVPlayer?
     @State private var temporaryURL: URL?
     @State private var error: String?
@@ -847,8 +847,8 @@ private struct ProductionMediaViewer: View {
                         Button("Try again") { Task { await load() } }
                             .buttonStyle(.borderedProminent)
                     }
-                } else if media.kind == "photo", let data, let image = UIImage(data: data) {
-                    Image(uiImage: image).resizable().scaledToFit().padding()
+                } else if media.kind == "photo", let photoImage {
+                    Image(uiImage: photoImage).resizable().scaledToFit().padding()
                 } else if media.kind == "video", let player {
                     VideoPlayer(player: player).onAppear { player.play() }
                 } else if media.kind == "file", let temporaryURL {
@@ -882,7 +882,7 @@ private struct ProductionMediaViewer: View {
 
     private func load() async {
         error = nil
-        data = nil
+        photoImage = nil
         player?.pause()
         player = nil
         if let temporaryURL { await model.removeTemporaryMediaURL(temporaryURL) }
@@ -893,15 +893,33 @@ private struct ProductionMediaViewer: View {
                 await MainActor.run { downloadProgress = value }
             }
             if media.kind == "photo" {
-                guard UIImage(data: downloaded) != nil else { throw MediaPresentationError.unreadable }
-                data = downloaded
+                guard let decoded = SafeMediaImageDecoder.decode(downloaded, maxPixelSize: 4_096) else {
+                    throw MediaPresentationError.unreadable
+                }
+                photoImage = decoded.image
                 return
             }
             let ext = media.fileName.flatMap { URL(filePath: $0).pathExtension }.flatMap { $0.isEmpty ? nil : $0 }
                 ?? (media.kind == "video" ? "mp4" : "bin")
             let url = try await model.temporaryMediaURL(data: downloaded, fileExtension: ext)
             temporaryURL = url
-            if media.kind == "video" { player = AVPlayer(url: url) }
+            if media.kind == "video" {
+                let asset = AVURLAsset(url: url)
+                let playable = try await asset.load(.isPlayable)
+                let duration = try await asset.load(.duration).seconds
+                guard playable, duration.isFinite, duration > 0, duration <= 3_600,
+                      let track = try await asset.loadTracks(withMediaType: .video).first
+                else { throw MediaPresentationError.unreadable }
+                let naturalSize = try await track.load(.naturalSize)
+                let transform = try await track.load(.preferredTransform)
+                let transformed = naturalSize.applying(transform)
+                let width = Int64(abs(transformed.width).rounded(.up))
+                let height = Int64(abs(transformed.height).rounded(.up))
+                guard width > 0, height > 0, width <= 8_192, height <= 8_192,
+                      width * height <= 40_000_000
+                else { throw MediaPresentationError.unreadable }
+                player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -1037,16 +1055,17 @@ private struct ProductionAttachmentPicker: View {
         working = true
         defer { working = false }
         do {
-            guard let data = try await item.loadTransferable(type: Data.self), let image = UIImage(data: data) else {
+            guard let data = try await item.loadTransferable(type: Data.self),
+                  let decoded = SafeMediaImageDecoder.decode(data, maxPixelSize: 4_096) else {
                 throw PickerError.unreadable
             }
             try Task.checkCancellation()
-            let thumbnail = makeThumbnail(image)
+            let thumbnail = makeThumbnail(decoded.image)
             let type = item.supportedContentTypes.first
             await model.sendMedia(
                 data: data, kind: "photo", contentType: type?.preferredMIMEType ?? "image/jpeg",
                 fileName: "Photo.\(type?.preferredFilenameExtension ?? "jpg")",
-                width: Int(image.size.width), height: Int(image.size.height),
+                width: decoded.pixelWidth, height: decoded.pixelHeight,
                 thumbnail: thumbnail
             )
             onDone()
