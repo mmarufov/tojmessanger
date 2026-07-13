@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import Toj
 
 final class MessagingPresentationTests: XCTestCase {
@@ -6,7 +7,8 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.replies))
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.editing))
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.deletion))
-        XCTAssertFalse(MessagingCapabilities.productionText.contains(.reactions))
+        XCTAssertTrue(MessagingCapabilities.productionText.contains(.reactions))
+        XCTAssertTrue(MessagingCapabilities.productionText.contains(.forwarding))
         XCTAssertFalse(MessagingCapabilities.productionText.contains(.media))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.media))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.voiceNotes))
@@ -21,6 +23,23 @@ final class MessagingPresentationTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testSafeImageDecoderRejectsMalformedDataAndBoundsDecodedPixels() throws {
+        XCTAssertNil(SafeMediaImageDecoder.decode(Data([0xff, 0xd8, 0xff]), maxPixelSize: 512))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 32, height: 24), format: format).image { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 32, height: 24))
+        }
+        let data = try XCTUnwrap(image.jpegData(compressionQuality: 0.8))
+        let decoded = try XCTUnwrap(SafeMediaImageDecoder.decode(data, maxPixelSize: 16))
+        XCTAssertEqual(decoded.pixelWidth, 32)
+        XCTAssertEqual(decoded.pixelHeight, 24)
+        XCTAssertLessThanOrEqual(decoded.image.size.width, 16)
+        XCTAssertLessThanOrEqual(decoded.image.size.height, 16)
+    }
+
     func testPresentationStatesAreValueTypes() {
         XCTAssertEqual(
             ComposerViewState(mode: .text, text: "Hello", canSend: true),
@@ -33,9 +52,9 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testDemoEnablesRichCapabilitiesAndProductionModelDoesNot() async {
+    func testDemoAndProductionExposeTheirRealCapabilities() async {
         let model = CloudAppModel(useDefaultLocalStore: false)
-        XCTAssertEqual(model.capabilities, .productionText)
+        XCTAssertEqual(model.capabilities, [.productionText, .media, .voiceNotes])
 
         model.enterDemoMode()
 

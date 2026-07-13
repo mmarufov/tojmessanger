@@ -86,6 +86,19 @@ CREATE INDEX IF NOT EXISTS otp_phone_requests_idx ON otp_challenges(phone_lookup
 CREATE INDEX IF NOT EXISTS otp_network_requests_idx ON otp_challenges(network_hash, created_at DESC)
   WHERE network_hash IS NOT NULL;
 
+-- Persisted, per-account discovery budget. This makes phone enumeration expensive even across
+-- server restarts and multiple app processes; repeated lookups of the same contact are idempotent
+-- within the window so normal retries do not consume the budget.
+CREATE TABLE IF NOT EXISTS contact_lookup_attempts (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  requester_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  target_phone_hash    BYTEA NOT NULL,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE contact_lookup_attempts DROP COLUMN IF EXISTS found;
+CREATE INDEX IF NOT EXISTS contact_lookup_attempts_requester_idx
+  ON contact_lookup_attempts(requester_account_id, created_at DESC);
+
 -- ============ conversations ============
 CREATE TABLE IF NOT EXISTS dialogs (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -117,6 +130,70 @@ CREATE TABLE IF NOT EXISTS dialog_members (
 );
 CREATE INDEX IF NOT EXISTS dialog_members_account_active_idx ON dialog_members(account_id) WHERE left_at IS NULL;
 
+-- ============ encrypted resumable media ============
+-- Private-beta storage is provider-free: each independently resumable chunk is AEAD encrypted
+-- before PostgreSQL persists it. The API is deliberately storage-adapter shaped so object storage
+-- can replace this table later without changing clients or message history.
+CREATE TABLE IF NOT EXISTS media_objects (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  kind                  TEXT NOT NULL CHECK (kind IN ('photo','video','file','voice')),
+  content_type          TEXT NOT NULL,
+  file_name             TEXT,                           -- legacy only; new writes keep this NULL
+  file_name_key_id      TEXT,
+  file_name_nonce       BYTEA,
+  file_name_ciphertext  BYTEA,
+  byte_size             BIGINT NOT NULL CHECK (byte_size > 0),
+  expected_sha256       BYTEA NOT NULL CHECK (octet_length(expected_sha256) = 32), -- HMAC(raw SHA-256)
+  uploaded_bytes        BIGINT NOT NULL DEFAULT 0 CHECK (uploaded_bytes >= 0),
+  duration_ms           BIGINT CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  width                 INT CHECK (width IS NULL OR width > 0),
+  height                INT CHECK (height IS NULL OR height > 0),
+  status                TEXT NOT NULL DEFAULT 'uploading'
+                          CHECK (status IN ('uploading','ready','rejected','deleted')),
+  thumbnail_key_id      TEXT,
+  thumbnail_nonce       BYTEA,
+  thumbnail_ciphertext  BYTEA,
+  thumbnail_byte_size   INT CHECK (thumbnail_byte_size IS NULL OR thumbnail_byte_size > 0),
+  thumbnail_content_type TEXT,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at          TIMESTAMPTZ,
+  expires_at            TIMESTAMPTZ NOT NULL DEFAULT now() + interval '24 hours',
+  last_accessed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (uploaded_bytes <= byte_size),
+  CHECK ((thumbnail_ciphertext IS NULL) = (thumbnail_nonce IS NULL)),
+  CHECK ((file_name_ciphertext IS NULL) = (file_name_nonce IS NULL))
+);
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_key_id TEXT;
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_nonce BYTEA;
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_ciphertext BYTEA;
+ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_status_check;
+ALTER TABLE media_objects ADD CONSTRAINT media_objects_status_check
+  CHECK (status IN ('uploading','ready','rejected','deleted'));
+CREATE INDEX IF NOT EXISTS media_objects_owner_quota_idx
+  ON media_objects(owner_account_id, status, created_at);
+
+-- Kept separately from media_objects so create/cancel loops cannot evade per-account rate limits.
+CREATE TABLE IF NOT EXISTS media_upload_attempts (
+  id         BIGSERIAL PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS media_upload_attempts_account_created_idx
+  ON media_upload_attempts(account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS media_chunks (
+  media_id       UUID NOT NULL REFERENCES media_objects(id) ON DELETE CASCADE,
+  chunk_offset   BIGINT NOT NULL CHECK (chunk_offset >= 0),
+  plain_size     INT NOT NULL CHECK (plain_size > 0),
+  plain_sha256   BYTEA NOT NULL CHECK (octet_length(plain_sha256) = 32),
+  key_id         TEXT NOT NULL,
+  nonce          BYTEA NOT NULL,
+  ciphertext     BYTEA NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (media_id, chunk_offset)
+);
+
 -- ============ messages (encrypted-at-rest) ============
 CREATE TABLE IF NOT EXISTS messages (
   dialog_id         UUID NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
@@ -124,11 +201,15 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_account_id UUID NOT NULL REFERENCES accounts(id),
   sender_device_id  UUID REFERENCES devices(id),
   client_msg_id     UUID NOT NULL,
-  kind              TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text','photo','video','file','service')),
+  kind              TEXT NOT NULL DEFAULT 'text' CHECK (kind IN ('text','photo','video','file','voice','service')),
   body_key_id       TEXT  NOT NULL,
   body_nonce        BYTEA NOT NULL,
   body_ciphertext   BYTEA NOT NULL,                   -- AEAD; AAD binds dialog_id‖msg_id‖sender (S1)
   reply_to_msg_id   BIGINT,
+  forwarded_from_account_id UUID REFERENCES accounts(id),
+  forwarded_from_dialog_id UUID,
+  forwarded_from_msg_id BIGINT,
+  media_id          UUID REFERENCES media_objects(id),
   edit_version      INT NOT NULL DEFAULT 0,
   state             TEXT NOT NULL DEFAULT 'visible' CHECK (state IN ('visible','deleted_for_all')),
   server_ts         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -137,11 +218,34 @@ CREATE TABLE IF NOT EXISTS messages (
   PRIMARY KEY (dialog_id, msg_id),
   UNIQUE (sender_account_id, client_msg_id)           -- belt-and-suspenders vs send_requests
 );
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_account_id UUID REFERENCES accounts(id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_dialog_id UUID;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_msg_id BIGINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_objects(id);
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;
+ALTER TABLE messages ADD CONSTRAINT messages_kind_check
+  CHECK (kind IN ('text','photo','video','file','voice','service'));
+CREATE INDEX IF NOT EXISTS messages_media_idx ON messages(media_id) WHERE media_id IS NOT NULL;
 DO $$ BEGIN
   ALTER TABLE messages ADD CONSTRAINT messages_reply_target_fk
     FOREIGN KEY (dialog_id, reply_to_msg_id) REFERENCES messages(dialog_id, msg_id);
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+DO $$ BEGIN
+  ALTER TABLE messages ADD CONSTRAINT messages_forward_source_fk
+    FOREIGN KEY (forwarded_from_dialog_id, forwarded_from_msg_id) REFERENCES messages(dialog_id, msg_id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE TABLE IF NOT EXISTS message_reactions (
+  dialog_id  UUID NOT NULL,
+  msg_id     BIGINT NOT NULL,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  emoji      TEXT NOT NULL CHECK (char_length(emoji) BETWEEN 1 AND 16),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (dialog_id, msg_id, account_id),
+  FOREIGN KEY (dialog_id, msg_id) REFERENCES messages(dialog_id, msg_id) ON DELETE CASCADE
+);
 -- No separate DESC index (C1): the PK (dialog_id, msg_id) serves ORDER BY msg_id DESC via reverse scan.
 
 -- ============ the sync log (crown jewel) ============
@@ -149,7 +253,7 @@ CREATE TABLE IF NOT EXISTS account_events (
   account_id        UUID   NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
-                       ('message.new','message.edited','message.deleted','read.updated',
+                       ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
                         'dialog.created','member.added','member.removed')),
   dialog_id         UUID,
   msg_id            BIGINT,
@@ -158,6 +262,10 @@ CREATE TABLE IF NOT EXISTS account_events (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, pts)                            -- serves get_difference: WHERE account_id=? AND pts>? ORDER BY pts
 );
+ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
+ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
+  ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+   'dialog.created','member.added','member.removed'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -176,7 +284,7 @@ CREATE TABLE IF NOT EXISTS send_requests (
 CREATE TABLE IF NOT EXISTS message_mutation_requests (
   actor_account_id  UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   client_mutation_id UUID NOT NULL,
-  operation         TEXT NOT NULL CHECK (operation IN ('edit','delete')),
+  operation         TEXT NOT NULL CHECK (operation IN ('edit','delete','reaction')),
   dialog_id         UUID NOT NULL,
   msg_id            BIGINT NOT NULL,
   status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
@@ -188,6 +296,9 @@ CREATE TABLE IF NOT EXISTS message_mutation_requests (
 -- the message row is locked (global lock order), so validation happens transactionally in sync.ts.
 ALTER TABLE message_mutation_requests
   DROP CONSTRAINT IF EXISTS message_mutation_requests_dialog_id_msg_id_fkey;
+ALTER TABLE message_mutation_requests DROP CONSTRAINT IF EXISTS message_mutation_requests_operation_check;
+ALTER TABLE message_mutation_requests ADD CONSTRAINT message_mutation_requests_operation_check
+  CHECK (operation IN ('edit','delete','reaction'));
 
 -- ============ APNs durable outbox (M4.1) ============
 -- APNs is only a wake-up hint. The authoritative update remains account_events + get_difference.

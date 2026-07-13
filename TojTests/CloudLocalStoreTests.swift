@@ -25,7 +25,8 @@ final class CloudLocalStoreTests: XCTestCase {
         defer { CloudAPIMockURLProtocol.handler = nil }
 
         let response = try await api.deleteAccount(code: "123456", token: "session-token")
-        XCTAssertTrue(response.deleted)
+        let deleted = response.deleted
+        XCTAssertTrue(deleted)
     }
 
     func testAPNsDeviceTokenUsesLowercaseTwoDigitHex() {
@@ -87,6 +88,58 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(requests[0].1["expectedEditVersion"] as? Int, 0)
         XCTAssertEqual(requests[0].1["clientMutationId"] as? String, "22222222-2222-2222-2222-222222222222")
         XCTAssertEqual(requests[1].1["msgId"] as? Int, 7)
+    }
+
+    @MainActor
+    func testReactionAndForwardRequestsCarryStableSourceAndMutationIdentifiers() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        var requests: [(String, [String: Any])] = []
+        CloudAPIMockURLProtocol.handler = { request in
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            requests.append((request.url!.path, try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])))
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            ))
+            if request.url!.path.hasSuffix("react") {
+                return (response, Data("""
+                {"dialogId":"dialog-1","msgId":7,"actorPts":9,"duplicate":false,"message":{
+                  "dialog_id":"dialog-1","msg_id":7,"sender_account_id":"account-a",
+                  "client_msg_id":"11111111-1111-1111-1111-111111111111","kind":"text",
+                  "text":"hello","reply_to_msg_id":null,"reactions":[{"account_id":"account-b","emoji":"❤️"}],
+                  "edit_version":0,"state":"visible","server_ts":"2026-07-12T00:00:00Z"}}
+                """.utf8))
+            }
+            return (response, Data("""
+            {"dialogId":"dialog-2","clientMsgId":"33333333-3333-3333-3333-333333333333",
+             "msgId":8,"senderPts":10,"duplicate":false,"serverTs":"2026-07-12T00:00:01Z","text":"hello"}
+            """.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        _ = try await api.setReaction(
+            dialogId: "dialog-1", msgId: 7,
+            clientMutationId: "22222222-2222-2222-2222-222222222222",
+            emoji: "❤️", token: "session-token"
+        )
+        _ = try await api.forwardMessage(
+            dialogId: "dialog-2",
+            clientMsgId: "33333333-3333-3333-3333-333333333333",
+            sourceDialogId: "dialog-1", sourceMsgId: 7, token: "session-token"
+        )
+
+        XCTAssertEqual(requests.map(\.0), ["/cloud/v1/messages/react", "/cloud/v1/messages/send"])
+        XCTAssertEqual(requests[0].1["clientMutationId"] as? String, "22222222-2222-2222-2222-222222222222")
+        XCTAssertEqual(requests[0].1["emoji"] as? String, "❤️")
+        let source = try XCTUnwrap(requests[1].1["forwardedFrom"] as? [String: Any])
+        XCTAssertEqual(source["dialogId"] as? String, "dialog-1")
+        XCTAssertEqual(source["msgId"] as? Int, 7)
+        XCTAssertNil(requests[1].1["body"])
     }
 
     func testPendingSessionRevocationTokenPersistsSeparately() async throws {
@@ -516,6 +569,79 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testReactionsForwardProvenanceAndForwardOutboxPersistInEncryptedReplica() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let dialogId = "dialog-source"
+        let targetDialogId = "dialog-target"
+        let message = CloudMessage(
+            dialogId: dialogId,
+            msgId: 4,
+            senderAccountId: "account-peer",
+            clientMsgId: UUID().uuidString,
+            kind: "text",
+            text: "forward me",
+            forwardedFromAccountId: "account-original",
+            forwardedFromDialogId: "dialog-original",
+            forwardedFromMsgId: 2,
+            isForwarded: true,
+            reactions: [
+                CloudReaction(accountId: accountId, emoji: "❤️"),
+                CloudReaction(accountId: "account-peer", emoji: "❤️"),
+            ],
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-12T12:00:00Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: DifferenceResponse.State(pts: 5),
+                updates: [CloudUpdate(
+                    pts: 5,
+                    ptsCount: 1,
+                    type: "reaction.updated",
+                    dialogId: dialogId,
+                    dialogTitle: "Peer",
+                    message: message,
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let storedMessages = try await store.messages(dialogId: dialogId)
+        let stored = try XCTUnwrap(storedMessages.first)
+        XCTAssertEqual(stored.forwardedFromAccountId, "account-original")
+        XCTAssertEqual(stored.forwardedFromDialogId, "dialog-original")
+        XCTAssertEqual(stored.forwardedFromMsgId, 2)
+        XCTAssertTrue(stored.isForwarded)
+        XCTAssertEqual(stored.reactions, message.reactions)
+
+        let clientMsgId = UUID().uuidString.lowercased()
+        _ = try await store.insertSending(
+            dialogId: targetDialogId,
+            clientMsgId: clientMsgId,
+            text: stored.text,
+            senderAccountId: accountId,
+            forwardedFromAccountId: stored.senderAccountId,
+            forwardedFromDialogId: dialogId,
+            forwardedFromMsgId: stored.msgId
+        )
+        let pendingItems = try await store.pendingOutboxReady()
+        let pending = try XCTUnwrap(pendingItems.first)
+        XCTAssertEqual(pending.forwardedFromDialogId, dialogId)
+        XCTAssertEqual(pending.forwardedFromMsgId, 4)
+        let optimisticMessages = try await store.messages(dialogId: targetDialogId)
+        let optimistic = try XCTUnwrap(optimisticMessages.first)
+        XCTAssertEqual(optimistic.text, "forward me")
+        XCTAssertEqual(optimistic.forwardedFromDialogId, dialogId)
+        XCTAssertEqual(optimistic.forwardedFromMsgId, 4)
+    }
+
+    @MainActor
     func testExistingSQLCipherReplicaMigratesReplyAndEditColumnsWithoutDataLoss() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -581,6 +707,288 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(outbox.first?.replyToMsgId, 1)
     }
 
+    func testMediaCacheEncryptsPendingFilesAndSurvivesCacheReset() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory,
+            keyData: Data(repeating: 0x2a, count: 32),
+            limitBytes: 2 * 1024 * 1024
+        )
+        let plaintext = Data("a private media payload that must never appear on disk".utf8)
+        let thumbnail = Data("private thumbnail".utf8)
+
+        let prepared = try await cache.prepareUpload(
+            data: plaintext, kind: "file", contentType: "application/octet-stream",
+            fileName: "notes.bin", thumbnail: thumbnail
+        )
+        let encrypted = try Data(contentsOf: URL(filePath: prepared.encryptedSourcePath))
+        XCTAssertNotEqual(encrypted, plaintext)
+        XCTAssertNil(encrypted.range(of: plaintext))
+        let decrypted = try await cache.preparedData(transferId: prepared.transferId)
+        let decryptedThumbnail = try await cache.preparedThumbnail(transferId: prepared.transferId)
+        XCTAssertEqual(decrypted, plaintext)
+        XCTAssertEqual(decryptedThumbnail, thumbnail)
+
+        let downloadedMediaId = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(plaintext, mediaId: downloadedMediaId, offset: 0)
+        try await cache.storeThumbnail(thumbnail, mediaId: downloadedMediaId)
+        let preview = try await cache.createTemporaryPreview(plaintext, fileExtension: "../../unsafe")
+        XCTAssertEqual(preview.pathExtension, "bin")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: preview.path))
+        let usageBeforeClear = try await cache.downloadedUsageBytes()
+        XCTAssertGreaterThan(usageBeforeClear, 0)
+        try await cache.clearDownloaded()
+        let retainedUpload = try await cache.preparedData(transferId: prepared.transferId)
+        let clearedOffset = try await cache.contiguousDownloadOffset(mediaId: downloadedMediaId)
+        let usageAfterClear = try await cache.downloadedUsageBytes()
+        XCTAssertEqual(retainedUpload, plaintext)
+        XCTAssertEqual(clearedOffset, 0)
+        XCTAssertEqual(usageAfterClear, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: preview.path))
+
+        try await cache.clearAll()
+        let second = try await cache.prepareUpload(
+            data: plaintext, kind: "voice", contentType: "audio/mp4",
+            fileName: "voice.m4a", durationMs: 900
+        )
+        let decryptedAfterReset = try await cache.preparedData(transferId: second.transferId)
+        XCTAssertEqual(decryptedAfterReset, plaintext)
+    }
+
+    func testMediaCacheRefusesToEvictPendingUploadsForNewSelections() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory,
+            keyData: Data(repeating: 0x31, count: 32),
+            limitBytes: 300
+        )
+        _ = try await cache.prepareUpload(
+            data: Data(repeating: 0x11, count: 100), kind: "file",
+            contentType: "application/octet-stream", fileName: "first.bin"
+        )
+
+        do {
+            _ = try await cache.prepareUpload(
+                data: Data(repeating: 0x22, count: 100), kind: "file",
+                contentType: "application/octet-stream", fileName: "second.bin"
+            )
+            XCTFail("Expected the protected pending upload to consume the local quota")
+        } catch let error as MediaCacheError {
+            guard case .localQuotaExceeded = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testMediaCacheInvalidatesCorruptDownloadsAndRestartsFromZero() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x52, count: 32), limitBytes: 1_000_000
+        )
+        let mediaId = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(Data("valid chunk".utf8), mediaId: mediaId, offset: 0)
+        let encryptedChunk = directory.appending(path: "downloads/\(mediaId)/0.tojchunk")
+        try Data("corrupt".utf8).write(to: encryptedChunk, options: .atomic)
+
+        let restartedOffset = try await cache.contiguousDownloadOffset(mediaId: mediaId)
+        XCTAssertEqual(restartedOffset, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: encryptedChunk.path))
+    }
+
+    func testMediaDownloadRejectsInconsistentServerOffsets() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let mediaId = "11111111-1111-1111-1111-111111111111"
+        CloudAPIMockURLProtocol.handler = { request in
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "content-type": "application/octet-stream",
+                    "x-media-next-offset": "999",
+                    "x-media-total-size": "999",
+                ]
+            ))
+            return (response, Data("tiny".utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let api = CloudMediaAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+
+        do {
+            _ = try await api.downloadChunk(mediaId: mediaId, offset: 0, token: "session-token")
+            XCTFail("A malformed offset contract must not be cached")
+        } catch let error as CloudAPIError {
+            XCTAssertEqual(error.status, -1)
+        }
+    }
+
+    func testMediaTransferPersistsAcrossBootstrapAndUsesProvisionalMedia() async throws {
+        let store = try makeStore()
+        let transferId = UUID().uuidString.lowercased()
+        let clientMsgId = UUID().uuidString.lowercased()
+        let prepared = PreparedMediaUpload(
+            transferId: transferId, kind: "photo", contentType: "image/jpeg",
+            fileName: "photo.jpg", byteSize: 123, sha256: String(repeating: "a", count: 64),
+            durationMs: nil, width: 20, height: 10,
+            encryptedSourcePath: "/private/pending.tojmedia",
+            encryptedThumbnailPath: "/private/pending.thumb"
+        )
+        try await store.insertMediaTransfer(
+            prepared: prepared, dialogId: "dialog-media", clientMsgId: clientMsgId,
+            caption: "caption", replyToMsgId: nil
+        )
+        let storedTransfer = try await store.mediaTransfer(id: transferId)
+        let transfer = try XCTUnwrap(storedTransfer)
+        XCTAssertEqual(transfer.media.id, "pending:\(transferId)")
+        try await store.insertSendingMedia(transfer, senderAccountId: "account-me")
+        let optimisticMessages = try await store.messages(dialogId: "dialog-media")
+        let optimisticMedia = optimisticMessages.first?.media
+        let expectedMedia = transfer.media
+        XCTAssertEqual(optimisticMedia, expectedMedia)
+
+        try await store.beginBootstrap(accountId: "account-me")
+        let retained = try await store.mediaTransfer(id: transferId)
+        XCTAssertNotNil(retained)
+        try await store.markMediaRetrying(clientMsgId: clientMsgId)
+        try await store.updateMediaTransfer(
+            transferId: transferId, mediaId: "11111111-1111-1111-1111-111111111111",
+            uploadOffset: 123, state: "ready_to_send", error: nil
+        )
+        let storedReady = try await store.mediaTransfer(id: transferId)
+        let ready = try XCTUnwrap(storedReady)
+        XCTAssertEqual(ready.media.id, "11111111-1111-1111-1111-111111111111")
+        try await store.resetMediaUpload(transferId: transferId)
+        let reset = try await store.mediaTransfer(id: transferId)
+        XCTAssertEqual(reset?.media.id, "pending:\(transferId)")
+        XCTAssertEqual(reset?.uploadOffset, 0)
+        try await store.completeMediaTransfer(transferId: transferId)
+        let completed = try await store.mediaTransfer(id: transferId)
+        XCTAssertNil(completed)
+    }
+
+    func testCancellingMediaTransferRemovesDurableRetryAndOptimisticBubble() async throws {
+        let store = try makeStore()
+        let transferId = UUID().uuidString.lowercased()
+        let clientMsgId = UUID().uuidString.lowercased()
+        let prepared = PreparedMediaUpload(
+            transferId: transferId, kind: "file", contentType: "application/octet-stream",
+            fileName: "cancel.bin", byteSize: 12, sha256: String(repeating: "b", count: 64),
+            durationMs: nil, width: nil, height: nil,
+            encryptedSourcePath: "/private/cancel.tojmedia", encryptedThumbnailPath: nil
+        )
+        try await store.insertMediaTransfer(
+            prepared: prepared, dialogId: "dialog-cancel", clientMsgId: clientMsgId,
+            caption: "wrong file", replyToMsgId: nil
+        )
+        let storedTransfer = try await store.mediaTransfer(id: transferId)
+        let transfer = try XCTUnwrap(storedTransfer)
+        try await store.insertSendingMedia(transfer, senderAccountId: "account-me")
+
+        try await store.cancelMediaTransfer(transferId: transferId, clientMsgId: clientMsgId)
+
+        let cancelledTransfer = try await store.mediaTransfer(id: transferId)
+        let remainingMessages = try await store.messages(dialogId: "dialog-cancel")
+        let nextRetry = try await store.nextMediaTransferDelay()
+        XCTAssertNil(cancelledTransfer)
+        XCTAssertTrue(remainingMessages.isEmpty)
+        XCTAssertNil(nextRetry)
+    }
+
+    func testMediaTransferEngineResumesFromServerOffsetAndPersistsEveryChunk() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory.appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x42, count: 32), limitBytes: 1_000_000
+        )
+        let payload = Data("abcdef".utf8)
+        let prepared = try await cache.prepareUpload(
+            data: payload, kind: "file", contentType: "application/octet-stream", fileName: "resume.bin"
+        )
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("media-transfer-test-key".utf8)
+        )
+        let clientMsgId = UUID().uuidString.lowercased()
+        let mediaId = "11111111-1111-1111-1111-111111111111"
+        try await store.insertMediaTransfer(
+            prepared: prepared, dialogId: "dialog-resume", clientMsgId: clientMsgId,
+            caption: "", replyToMsgId: nil
+        )
+        try await store.updateMediaTransfer(
+            transferId: prepared.transferId, mediaId: mediaId,
+            uploadOffset: 0, state: "uploading", error: nil
+        )
+        let stored = try await store.mediaTransfer(id: prepared.transferId)
+        let transfer = try XCTUnwrap(stored)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let recorder = LockedMediaRequests()
+        CloudAPIMockURLProtocol.handler = { request in
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            ))
+            if request.httpMethod == "GET" {
+                return (response, Data("""
+                {"mediaId":"\(mediaId)","uploadOffset":2,"byteSize":6,"status":"uploading",
+                 "expiresAt":"2026-07-14T00:00:00Z","chunkSize":2}
+                """.utf8))
+            }
+            if request.url?.path.hasSuffix("/chunks") == true {
+                let offset = try XCTUnwrap(request.value(forHTTPHeaderField: "Upload-Offset").flatMap(Int64.init))
+                let bytes = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+                recorder.append(offset: offset, bytes: bytes)
+                return (response, Data("""
+                {"mediaId":"\(mediaId)","uploadOffset":\(offset + Int64(bytes.count)),
+                 "complete":\(offset + Int64(bytes.count) == 6),"duplicate":false}
+                """.utf8))
+            }
+            if request.httpMethod == "DELETE" {
+                return (response, Data("""
+                {"mediaId":"\(mediaId)","cancelled":true}
+                """.utf8))
+            }
+            return (response, Data("""
+            {"mediaId":"\(mediaId)","ready":true,"duplicate":false}
+            """.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            cache: cache, session: URLSession(configuration: configuration)
+        )
+
+        let uploadedId = try await engine.upload(
+            transfer: transfer, token: "session-token", localStore: store, progress: { _ in }
+        )
+        XCTAssertEqual(uploadedId, mediaId)
+        let recorded = recorder.snapshot()
+        XCTAssertEqual(recorded.map(\.offset), [2, 4])
+        XCTAssertEqual(recorded.map(\.bytes), [Data("cd".utf8), Data("ef".utf8)])
+        let updated = try await store.mediaTransfer(id: prepared.transferId)
+        XCTAssertEqual(updated?.uploadOffset, 6)
+        await engine.cancelUpload(transfer, token: "session-token")
+        do {
+            _ = try await cache.preparedData(transferId: prepared.transferId)
+            XCTFail("Cancelled upload plaintext must be removed from the encrypted outbox")
+        } catch {
+            // Expected: the encrypted source file was removed.
+        }
+    }
+
     private func makeStore() throws -> CloudLocalStore {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -631,4 +1039,21 @@ private final class CloudAPIMockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private final class LockedMediaRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [(offset: Int64, bytes: Data)] = []
+
+    func append(offset: Int64, bytes: Data) {
+        lock.lock()
+        requests.append((offset, bytes))
+        lock.unlock()
+    }
+
+    func snapshot() -> [(offset: Int64, bytes: Data)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
 }

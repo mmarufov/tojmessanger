@@ -10,6 +10,7 @@ import {
   listDevices,
   startAccountDeletion,
   deleteAccount,
+  privateBetaOTPConfigured,
   AuthError,
   type OTPDelivery,
 } from "./auth";
@@ -31,6 +32,7 @@ import {
   sendMessage,
   editMessage,
   deleteMessage,
+  setReaction,
   startBootstrap,
   SyncError,
   type Push,
@@ -43,6 +45,18 @@ import {
   safeRoute,
   startMaintenanceWorker,
 } from "./ops";
+import {
+  cancelMediaUpload,
+  completeMediaUpload,
+  createMediaUpload,
+  downloadMediaChunk,
+  downloadMediaThumbnail,
+  getMediaUpload,
+  mediaLimits,
+  MediaError,
+  uploadMediaChunk,
+  uploadMediaThumbnail,
+} from "./media";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -69,6 +83,34 @@ async function readJson(req: Request): Promise<any> {
   } catch {
     throw new SyncError("invalid JSON body");
   }
+}
+
+async function readBinary(req: Request, maxBytes: number): Promise<Buffer> {
+  const declaredHeader = req.headers.get("content-length");
+  if (declaredHeader !== null) {
+    const declared = Number(declaredHeader);
+    if (!Number.isSafeInteger(declared) || declared < 0) throw new MediaError("invalid content length");
+    if (declared > maxBytes) throw new MediaError("request body too large", 413);
+  }
+  if (!req.body) return Buffer.alloc(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("request body too large");
+        throw new MediaError("request body too large", 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total);
 }
 
 function bearer(req: Request): string | null {
@@ -143,7 +185,7 @@ export function startCloudServer(
 
         else if (url.pathname === "/ready") {
           response = json(await readiness(db, {
-            sms: otpDelivery ? "configured" : process.env.TOJ_RETURN_OTP === "1" ? "development" : "disabled",
+            sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
             push: pushSender ? "configured" : "disabled",
           }));
         }
@@ -184,6 +226,48 @@ export function startCloudServer(
 
         else {
           const session = await authed(db, req);
+          const uploadChunkMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/chunks$/i);
+          const uploadThumbnailMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/thumbnail$/i);
+          const downloadChunkMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/chunks$/i);
+          const downloadThumbnailMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/thumbnail$/i);
+
+          if (uploadChunkMatch && req.method === "PUT") {
+            const offsetHeader = req.headers.get("upload-offset");
+            if (offsetHeader == null) throw new MediaError("upload offset required");
+            const offset = Number(offsetHeader);
+            const bytes = await readBinary(req, mediaLimits().chunkBytes);
+            const result = await uploadMediaChunk(
+              db, session.accountId, session.deviceId, uploadChunkMatch[1], offset, bytes,
+            );
+            response = json(result, 200, {
+              "upload-offset": String(result.uploadOffset),
+            });
+          } else if (uploadThumbnailMatch && req.method === "PUT") {
+            const contentType = req.headers.get("content-type") ?? "";
+            const bytes = await readBinary(req, mediaLimits().thumbnailBytes);
+            response = json(await uploadMediaThumbnail(
+              db, session.accountId, session.deviceId, uploadThumbnailMatch[1], contentType, bytes,
+            ));
+          } else if (downloadChunkMatch && req.method === "GET") {
+            const result = await downloadMediaChunk(
+              db, session.accountId, downloadChunkMatch[1], Number(url.searchParams.get("offset") ?? 0),
+            );
+            response = new Response(result.bytes, {
+              headers: {
+                "content-type": result.contentType,
+                "content-length": String(result.bytes.length),
+                "cache-control": "private, no-store",
+                "x-media-total-size": String(result.totalSize),
+                "x-media-next-offset": String(result.nextOffset),
+                "accept-ranges": "bytes",
+              },
+            });
+          } else if (downloadThumbnailMatch && req.method === "GET") {
+            const result = await downloadMediaThumbnail(db, session.accountId, downloadThumbnailMatch[1]);
+            response = new Response(result.bytes, {
+              headers: { "content-type": result.contentType, "cache-control": "private, no-store" },
+            });
+          } else {
           const body = await readJson(req);
 
         if (url.pathname === "/v1/devices/push" && req.method === "POST") {
@@ -254,13 +338,15 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/contacts/lookup" && req.method === "POST") {
           if (!body.phone) throw new SyncError("phone required");
-          const found = await lookupAccountByPhone(db, body.phone);
+          const found = await lookupAccountByPhone(db, session.accountId, body.phone);
           response = json(found ?? { found: false });
         }
 
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
           if (!body.peerAccountId) throw new SyncError("peerAccountId required");
-          response = json(await getOrCreateDirectDialog(db, session.accountId, body.peerAccountId));
+          response = json(await getOrCreateDirectDialog(
+            db, session.accountId, body.peerAccountId, session.deviceId,
+          ));
         }
 
         if (url.pathname === "/v1/messages/send" && req.method === "POST") {
@@ -271,7 +357,23 @@ export function startCloudServer(
             clientMsgId: body.clientMsgId,
             kind: body.kind,
             body: body.body ?? "",
+            mediaId: body.mediaId,
             replyToMsgId: body.replyToMsgId,
+            forwardedFrom: body.forwardedFrom,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+
+        if (url.pathname === "/v1/messages/react" && req.method === "POST") {
+          if (!body.dialogId || !body.msgId || !body.clientMutationId) throw new SyncError("reaction fields required");
+          const result = await setReaction(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: body.dialogId,
+            msgId: Number(body.msgId),
+            clientMutationId: body.clientMutationId,
+            emoji: body.emoji ?? null,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -316,6 +418,7 @@ export function startCloudServer(
         if (url.pathname === "/v1/read" && req.method === "POST") {
           const result = await readHistory(db, {
             accountId: session.accountId,
+            deviceId: session.deviceId,
             dialogId: body.dialogId,
             maxReadMsgId: Number(body.maxReadMsgId ?? 0),
           });
@@ -323,11 +426,30 @@ export function startCloudServer(
           response = json(result);
         }
 
+        if (url.pathname === "/v1/media/uploads" && req.method === "POST") {
+          response = json(await createMediaUpload(db, session.accountId, session.deviceId, body), 201);
+        }
+
+        const mediaUploadMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)$/i);
+        if (mediaUploadMatch && req.method === "GET") {
+          response = json(await getMediaUpload(db, session.accountId, mediaUploadMatch[1]));
+        }
+        if (mediaUploadMatch && req.method === "DELETE") {
+          response = json(await cancelMediaUpload(db, session.accountId, session.deviceId, mediaUploadMatch[1]));
+        }
+
+        const mediaCompleteMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/complete$/i);
+        if (mediaCompleteMatch && req.method === "POST") {
+          response = json(await completeMediaUpload(db, session.accountId, session.deviceId, mediaCompleteMatch[1]));
+        }
+
         if (!response) response = new Response("not found", { status: 404 });
+          }
         }
       } catch (err) {
         const status = err instanceof AuthError
           ? err.status
+          : err instanceof MediaError ? err.status
           : err instanceof SyncError || err instanceof PushError ? 400 : 500;
         if (status === 500) {
           console.error(JSON.stringify({

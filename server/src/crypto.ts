@@ -53,6 +53,29 @@ export function pushTokenAAD(deviceId: string): Buffer {
   return Buffer.from(`toj/apns-token|${deviceId}`, "utf8");
 }
 
+/** Binds an encrypted media chunk to its upload and exact plaintext offset. */
+export function mediaChunkAAD(mediaId: string, offset: number | bigint): Buffer {
+  return Buffer.from(`toj/media|${mediaId}|${offset}`, "utf8");
+}
+
+/** Thumbnail bytes use a separate AAD namespace from the original media. */
+export function mediaThumbnailAAD(mediaId: string): Buffer {
+  return Buffer.from(`toj/media-thumbnail|${mediaId}`, "utf8");
+}
+
+/** File names are presentation data, but can contain highly sensitive user information. */
+export function mediaFileNameAAD(mediaId: string): Buffer {
+  return Buffer.from(`toj/media-filename|${mediaId}`, "utf8");
+}
+
+/**
+ * Hides raw whole-file and chunk SHA-256 fingerprints from a database-only compromise while
+ * preserving constant-time integrity and resumable-upload comparisons.
+ */
+export function mediaDigestHMAC(digest: Uint8Array): Buffer {
+  return createHmac("sha256", HMAC_KEY).update("toj/media-digest/v1|").update(digest).digest();
+}
+
 export function normalizePhone(p: string): string {
   return p.replace(/[^\d+]/g, "");
 }

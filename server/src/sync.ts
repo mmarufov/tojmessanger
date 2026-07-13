@@ -1,17 +1,21 @@
 import type { SQL } from "bun";
 import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
+import { loadMediaDTO, type MediaDTO } from "./media";
+import { requireActiveDevice } from "./auth";
 
 export class SyncError extends Error {}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
-//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 direct_dialog_pairs
-//   → 4 dialogs row → 5 dialog_members → 6 messages → 7 account_sync_states (ascending account_id)
-//   → 8 account_events insert → 9 push_deliveries insert
+//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 acting device
+//   → 4 direct_dialog_pairs → 5 dialogs row → 6 dialog_members → 7 messages
+//   → 8 account_sync_states (ascending account_id) → 9 account_events insert → 10 push_deliveries insert
 
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
   kind: string; text: string; reply_to_msg_id: number | null; edit_version: number;
+  forwarded: boolean; reactions: { account_id: string; emoji: string }[];
+  media: MediaDTO | null;
   state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
@@ -20,6 +24,10 @@ const n = (v: unknown) => Number(v as any);
 const buf = (v: unknown) => Buffer.from(v as Uint8Array);
 const iso = (v: unknown) => v instanceof Date ? v.toISOString() : String(v);
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+const boundedInteger = (value: unknown, fallback: number, min: number, max: number) => {
+  const parsed = Number(value ?? fallback);
+  return Number.isSafeInteger(parsed) ? clamp(parsed, min, max) : fallback;
+};
 
 function eventData(v: unknown): Record<string, unknown> {
   if (!v) return {};
@@ -58,7 +66,9 @@ async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> 
 async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
   const r = (await sql`
     SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
-           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id, edit_version, state, server_ts
+           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
+           forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
+           media_id, edit_version, state, server_ts
     FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0];
   if (!r) return null;
   const text = r.state === "deleted_for_all"
@@ -67,10 +77,19 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
         { keyId: r.body_key_id, nonce: buf(r.body_nonce), ciphertext: buf(r.body_ciphertext) },
         bodyAAD(dialogId, n(r.msg_id), r.sender_account_id),
       ).toString("utf8");
+  const reactions = await sql`
+    SELECT account_id, emoji FROM message_reactions
+    WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}
+    ORDER BY created_at, account_id`;
   return {
     dialog_id: dialogId, msg_id: n(r.msg_id), sender_account_id: r.sender_account_id,
     client_msg_id: r.client_msg_id, kind: r.kind, text,
     reply_to_msg_id: r.reply_to_msg_id == null ? null : n(r.reply_to_msg_id), edit_version: r.edit_version,
+    // Source identifiers stay server-side. Recipients only need the presentation marker; exposing
+    // source dialog/account ids would create a cross-dialog privacy leak.
+    forwarded: r.forwarded_from_dialog_id != null && r.forwarded_from_msg_id != null,
+    reactions: reactions.map((reaction) => ({ account_id: reaction.account_id, emoji: reaction.emoji })),
+    media: r.state === "deleted_for_all" ? null : await loadMediaDTO(sql, r.media_id),
     state: r.state, server_ts: iso(r.server_ts),
   };
 }
@@ -92,12 +111,15 @@ function optionalMessageId(value: unknown): number | null {
 }
 
 /** Idempotent 1:1 dialog creation (review I5: conflict-safe on the pair). Emits dialog.created. */
-export async function getOrCreateDirectDialog(sql: SQL, aId: string, bId: string): Promise<{ dialogId: string; created: boolean }> {
+export async function getOrCreateDirectDialog(
+  sql: SQL, aId: string, bId: string, actorDeviceId?: string,
+): Promise<{ dialogId: string; created: boolean }> {
   if (aId === bId) throw new SyncError("cannot open a direct dialog with yourself");
   const [low, high] = aId < bId ? [aId, bId] : [bId, aId];
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, low);
     await requireActiveAccount(tx, high);
+    if (actorDeviceId) await requireActiveDevice(tx, aId, actorDeviceId);
     // Serialize the unordered pair before creating a dialog row. This preserves the B4 lock order
     // even though the FK means the direct_dialog_pairs row cannot exist before dialogs.id exists.
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`direct:${low}:${high}`}, 0))`;
@@ -132,10 +154,16 @@ export type SendResult = {
 /** review B2: claim the idempotency row BEFORE allocating a msg_id; a retry echoes the original result. */
 export async function sendMessage(sql: SQL, p: {
   senderAccountId: string; senderDeviceId?: string | null; dialogId: string;
-  clientMsgId: string; kind?: string; body: string; replyToMsgId?: number | null;
+  clientMsgId: string; kind?: string; body?: string; replyToMsgId?: number | null;
+  mediaId?: string | null;
+  forwardedFrom?: { dialogId: string; msgId: number } | null;
 }): Promise<SendResult> {
   return await sql.begin(async (tx) => {
-    const body = requireTextBody(p.body);
+    let body = p.forwardedFrom || p.mediaId ? String(p.body ?? "") : requireTextBody(p.body);
+    if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
+    let kind = p.kind ?? "text";
+    let forwardedFromAccountId: string | null = null;
+    let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
@@ -158,7 +186,42 @@ export async function sendMessage(sql: SQL, p: {
     }
 
     await requireActiveAccount(tx, p.senderAccountId);
+    if (p.senderDeviceId) {
+      const device = await tx`
+        SELECT id FROM devices
+        WHERE id = ${p.senderDeviceId} AND account_id = ${p.senderAccountId} AND revoked_at IS NULL
+        FOR SHARE`;
+      if (!device.length) throw new SyncError("sending device is no longer active");
+    }
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
+
+    if (p.forwardedFrom) {
+      const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
+      await requireActiveMember(tx, p.senderAccountId, p.forwardedFrom.dialogId);
+      const source = (await tx`
+        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext, media_id
+        FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}
+        FOR SHARE`)[0];
+      if (!source || source.state !== "visible") throw new SyncError("forward source not found");
+      body = open(
+        { keyId: source.body_key_id, nonce: buf(source.body_nonce), ciphertext: buf(source.body_ciphertext) },
+        bodyAAD(p.forwardedFrom.dialogId, sourceMsgId, source.sender_account_id),
+      ).toString("utf8");
+      kind = source.kind;
+      mediaId = source.media_id;
+      forwardedFromAccountId = source.sender_account_id;
+    }
+
+    if (mediaId && !p.forwardedFrom) {
+      const media = (await tx`
+        SELECT owner_account_id, kind, status FROM media_objects
+        WHERE id = ${mediaId} FOR UPDATE`)[0];
+      if (!media || media.owner_account_id !== p.senderAccountId) throw new SyncError("media upload not found");
+      if (media.status !== "ready") throw new SyncError("media upload is incomplete");
+      kind = media.kind;
+    } else if (!mediaId && !p.forwardedFrom && kind !== "text") {
+      throw new SyncError("media upload required");
+    }
 
     if (replyToMsgId != null) {
       const target = await tx`
@@ -176,9 +239,13 @@ export async function sendMessage(sql: SQL, p: {
     const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
     const inserted = await tx`
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
-                            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id)
+                            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
+                            forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
+                            media_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
-              ${p.kind ?? "text"}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId})
+              ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
+              ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
+              ${mediaId})
       RETURNING server_ts`;
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
@@ -215,7 +282,7 @@ export type MessageMutationResult = {
 };
 
 async function mutateMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; operation: "edit" | "delete"; body?: string;
   expectedEditVersion?: number;
 }): Promise<MessageMutationResult> {
@@ -249,13 +316,14 @@ async function mutateMessage(sql: SQL, p: {
     }
 
     await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
     await requireActiveMember(tx, p.actorAccountId, p.dialogId);
     const members = await tx`
       SELECT account_id FROM dialog_members
       WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
       ORDER BY account_id FOR UPDATE`;
     const row = (await tx`
-      SELECT sender_account_id, kind, state, edit_version
+      SELECT sender_account_id, kind, state, edit_version, media_id
       FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}
       FOR UPDATE`)[0];
     if (!row) throw new SyncError("message not found");
@@ -279,8 +347,19 @@ async function mutateMessage(sql: SQL, p: {
       const sealed = seal("", bodyAAD(p.dialogId, msgId, p.actorAccountId));
       await tx`
         UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
-          body_ciphertext = ${sealed.ciphertext}, state = 'deleted_for_all', deleted_at = now()
+          body_ciphertext = ${sealed.ciphertext}, media_id = NULL,
+          state = 'deleted_for_all', deleted_at = now()
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      if (row.media_id) {
+        // A forwarded copy owns a live reference of its own. Delete the encrypted object only when
+        // this was the final visible reference, otherwise that forwarded message must keep working.
+        await tx`
+          DELETE FROM media_objects mo
+          WHERE mo.id = ${row.media_id}
+            AND NOT EXISTS (
+              SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible'
+            )`;
+      }
     }
 
     let actorPts = 0;
@@ -311,17 +390,91 @@ async function mutateMessage(sql: SQL, p: {
 }
 
 export async function editMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; body: string; expectedEditVersion: number;
 }): Promise<MessageMutationResult> {
   return mutateMessage(sql, { ...p, operation: "edit" });
 }
 
 export async function deleteMessage(sql: SQL, p: {
-  actorAccountId: string; actorDeviceId?: string | null; dialogId: string; msgId: number;
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string;
 }): Promise<MessageMutationResult> {
   return mutateMessage(sql, { ...p, operation: "delete" });
+}
+
+export async function setReaction(sql: SQL, p: {
+  actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
+  clientMutationId: string; emoji: string | null;
+}): Promise<MessageMutationResult> {
+  return await sql.begin(async (tx) => {
+    const msgId = optionalMessageId(p.msgId)!;
+    if (!UUID_PATTERN.test(p.clientMutationId)) throw new SyncError("invalid client mutation id");
+    const emoji = p.emoji == null ? null : String(p.emoji).trim();
+    if (emoji != null && (emoji.length < 1 || [...emoji].length > 8)) throw new SyncError("invalid reaction");
+
+    const claim = await tx`
+      INSERT INTO message_mutation_requests
+        (actor_account_id, client_mutation_id, operation, dialog_id, msg_id, status)
+      VALUES (${p.actorAccountId}, ${p.clientMutationId}, 'reaction', ${p.dialogId}, ${msgId}, 'pending')
+      ON CONFLICT (actor_account_id, client_mutation_id) DO NOTHING RETURNING status`;
+    if (claim.length === 0) {
+      const existing = (await tx`
+        SELECT operation, dialog_id, msg_id, status, actor_pts FROM message_mutation_requests
+        WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}
+        FOR UPDATE`)[0];
+      if (existing.operation !== "reaction" || existing.dialog_id !== p.dialogId || n(existing.msg_id) !== msgId) {
+        throw new SyncError("client mutation id already used");
+      }
+      if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
+      const message = await loadMessage(tx, p.dialogId, msgId);
+      if (!message) throw new SyncError("message not found");
+      return { dialogId: p.dialogId, msgId, actorPts: n(existing.actor_pts), duplicate: true, message, pushes: [] };
+    }
+
+    await requireActiveAccount(tx, p.actorAccountId);
+    await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
+    await requireActiveMember(tx, p.actorAccountId, p.dialogId);
+    const members = await tx`
+      SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
+      ORDER BY account_id FOR UPDATE`;
+    const messageRow = (await tx`
+      SELECT state FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} FOR UPDATE`)[0];
+    if (!messageRow || messageRow.state !== "visible") throw new SyncError("message not found");
+    if (emoji == null) {
+      await tx`DELETE FROM message_reactions WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} AND account_id = ${p.actorAccountId}`;
+    } else {
+      await tx`
+        INSERT INTO message_reactions (dialog_id, msg_id, account_id, emoji)
+        VALUES (${p.dialogId}, ${msgId}, ${p.actorAccountId}, ${emoji})
+        ON CONFLICT (dialog_id, msg_id, account_id) DO UPDATE SET emoji = excluded.emoji, created_at = now()`;
+    }
+
+    let actorPts = 0;
+    const pushes: Push[] = [];
+    for (const member of members) {
+      const upd = await tx`
+        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
+        WHERE account_id = ${member.account_id} RETURNING pts`;
+      const pts = n(upd[0].pts);
+      await tx`
+        INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id, data)
+        VALUES (${member.account_id}, ${pts}, 'reaction.updated', ${p.dialogId}, ${msgId}, ${p.actorAccountId},
+                ${JSON.stringify({ reactor_account_id: p.actorAccountId, emoji })}::jsonb)`;
+      await enqueuePushDeliveries(tx, {
+        accountId: member.account_id, pts, senderAccountId: p.actorAccountId,
+        sourceDeviceId: p.actorDeviceId, alertRecipients: false,
+      });
+      if (member.account_id === p.actorAccountId) actorPts = pts;
+      pushes.push({ accountId: member.account_id, pts, ptsCount: 1 });
+    }
+    await tx`
+      UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
+      WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}`;
+    const message = await loadMessage(tx, p.dialogId, msgId);
+    if (!message) throw new SyncError("message not found");
+    return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
+  });
 }
 
 export async function getState(sql: SQL, accountId: string): Promise<{ pts: number }> {
@@ -339,8 +492,8 @@ export async function getDifference(
   sql: SQL, accountId: string, sincePts: number,
   opts: { maxEvents?: number; maxBytes?: number } = {},
 ): Promise<Difference> {
-  const maxEvents = opts.maxEvents ?? 200;
-  const maxBytes = opts.maxBytes ?? 256 * 1024;
+  const maxEvents = boundedInteger(opts.maxEvents, 200, 1, 200);
+  const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
   const st = (await sql`SELECT pts, pruned_through_pts FROM account_sync_states WHERE account_id = ${accountId}`)[0];
   if (!st) throw new SyncError("unknown account");
   const statePts = n(st.pts);
@@ -365,7 +518,7 @@ export async function getDifference(
   for (const ev of rows) {
     const pts = n(ev.pts);
     let update: any;
-    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted") {
+    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
       const message = await loadMessage(sql, ev.dialog_id, n(ev.msg_id));
       if (!message) {
         update = {
@@ -444,8 +597,10 @@ export async function getBootstrapDialogsPage(
   token: string,
   opts: { cursor?: string; limit?: number; previewMessages?: number } = {},
 ): Promise<BootstrapPage> {
-  const limit = clamp(opts.limit ?? 20, 1, 100);
-  const previewMessages = clamp(opts.previewMessages ?? 1, 0, 25);
+  // Keep worst-case hydration bounded. The client pages dialogs and history separately, so a
+  // bootstrap response never needs thousands of per-message lookups in one request.
+  const limit = boundedInteger(opts.limit, 20, 1, 20);
+  const previewMessages = boundedInteger(opts.previewMessages, 1, 0, 5);
   const cursor = decodeCursor<{ updatedAt: string; dialogId: string }>(opts.cursor);
 
   const snap = (await sql`
@@ -562,10 +717,11 @@ export async function getHistory(
 }
 
 export async function readHistory(sql: SQL, p: {
-  accountId: string; dialogId: string; maxReadMsgId: number;
+  accountId: string; deviceId?: string; dialogId: string; maxReadMsgId: number;
 }): Promise<{ dialogId: string; maxReadMsgId: number; pushes: Push[] }> {
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, p.accountId);
+    if (p.deviceId) await requireActiveDevice(tx, p.accountId, p.deviceId);
     await requireActiveMember(tx, p.accountId, p.dialogId);
     const member = (await tx`
       UPDATE dialog_members SET last_read_msg_id = ${p.maxReadMsgId}

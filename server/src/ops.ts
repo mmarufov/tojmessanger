@@ -12,12 +12,20 @@ export function requestIdFrom(req: Request): string {
 
 export function safeRoute(pathname: string): string {
   if (/^\/v1\/devices\/[0-9a-f-]+$/i.test(pathname)) return "/v1/devices/:id";
+  if (/^\/v1\/media\/uploads\/[0-9a-f-]+\/chunks$/i.test(pathname)) return "/v1/media/uploads/:id/chunks";
+  if (/^\/v1\/media\/uploads\/[0-9a-f-]+\/thumbnail$/i.test(pathname)) return "/v1/media/uploads/:id/thumbnail";
+  if (/^\/v1\/media\/uploads\/[0-9a-f-]+\/complete$/i.test(pathname)) return "/v1/media/uploads/:id/complete";
+  if (/^\/v1\/media\/uploads\/[0-9a-f-]+$/i.test(pathname)) return "/v1/media/uploads/:id";
+  if (/^\/v1\/media\/[0-9a-f-]+\/chunks$/i.test(pathname)) return "/v1/media/:id/chunks";
+  if (/^\/v1\/media\/[0-9a-f-]+\/thumbnail$/i.test(pathname)) return "/v1/media/:id/thumbnail";
   const known = new Set([
     "/health", "/ready", "/metrics", "/v1/ws", "/v1/auth/start", "/v1/auth/check",
     "/v1/devices", "/v1/devices/push", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
-    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/history", "/v1/read",
+    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/messages/react",
+    "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
+    "/v1/media/uploads",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -113,7 +121,48 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     )
     DELETE FROM push_deliveries WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
-  return { otp: otp.length, snapshots: snapshots.length, pushDeliveries: deliveries.length };
+  const contactLookups = await sql`
+    WITH doomed AS (
+      SELECT id FROM contact_lookup_attempts
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM contact_lookup_attempts WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const media = await sql`
+    WITH doomed AS (
+      SELECT id FROM media_objects
+      WHERE status IN ('uploading', 'rejected') AND expires_at < now()
+      ORDER BY expires_at LIMIT ${batchSize}
+    )
+    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const mediaAttempts = await sql`
+    WITH doomed AS (
+      SELECT id FROM media_upload_attempts
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM media_upload_attempts WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const mediaOrphans = await sql`
+    WITH doomed AS (
+      SELECT mo.id FROM media_objects mo
+      WHERE mo.status = 'ready' AND mo.completed_at < now() - interval '24 hours'
+        AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+      ORDER BY mo.completed_at LIMIT ${batchSize}
+    )
+    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  return {
+    otp: otp.length,
+    snapshots: snapshots.length,
+    pushDeliveries: deliveries.length,
+    contactLookups: contactLookups.length,
+    mediaUploads: media.length,
+    mediaAttempts: mediaAttempts.length,
+    mediaOrphans: mediaOrphans.length,
+  };
 }
 
 function cleanError(value: unknown): string {
@@ -127,7 +176,8 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
     running = true;
     try {
       const deleted = await cleanupExpiredData(sql);
-      if (deleted.otp || deleted.snapshots || deleted.pushDeliveries) {
+      if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
+          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }
     } catch (error) {

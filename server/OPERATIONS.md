@@ -19,7 +19,24 @@ gitignored notes.
 
 The server runs an hourly, bounded cleanup. Each table deletes at most 1,000 eligible rows per run:
 expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal push deliveries
-older than seven days. Message history and the account event log are never deleted by this worker.
+older than seven days. Incomplete media uploads are resumable for 24 hours and are then removed with
+their encrypted chunks; expired upload-attempt rate records and unattached completed media are also
+removed. Message history, attached media, and the account event log are never deleted by this worker.
+
+## Media storage
+
+Media works without an Apple Developer account or a third-party storage provider. Resumable chunks
+and thumbnails are AEAD-encrypted before PostgreSQL persistence. Deploy the schema before deploying
+clients that send media. These optional server settings are byte counts and are bounded to safe ranges:
+
+- `TOJ_MEDIA_CHUNK_BYTES` (default 262144)
+- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 26214400)
+- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000)
+- `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
+- `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
+
+The iOS client additionally keeps an encrypted, automatically evicted 200 MB download cache. Pending
+uploads are never evicted; new selections fail cleanly when the local quota cannot accommodate them.
 
 ## Encrypted backups
 
@@ -60,9 +77,12 @@ upgrade because URLs can appear in proxy and access logs. After all active test 
 remove the variable from the private service environment and restart the service. The secure default
 is off; an unset variable rejects query tokens.
 
-`TOJ_RETURN_OTP=1` is a separate private-development switch that returns the OTP in the auth response
-when no SMS provider exists. Production fails closed without either an SMS adapter or this explicit
-switch. Readiness labels this mode `development`. Remove it as soon as real SMS delivery is configured.
+`TOJ_RETURN_OTP=1` is a separate private-development switch that can return the OTP in the auth
+response when no SMS provider exists. In production it also requires `TOJ_DEV_OTP_ALLOWLIST`, a
+comma-separated server-secret list of the exact international phone numbers permitted to receive a
+code in the response. All other numbers fail closed without an SMS adapter. Readiness labels this
+mode `development` without exposing the allowlist. Remove both variables as soon as real SMS delivery
+is configured.
 
 ## Account deletion
 
