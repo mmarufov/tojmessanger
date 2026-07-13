@@ -241,10 +241,10 @@ struct TojConversationExperience: View {
                             if initialUnreadCount > 0 {
                                 Text(initialUnreadCount > 99 ? "99+" : "\(initialUnreadCount)")
                                     .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(TojTheme.canvas)
+                                    .foregroundStyle(TojTheme.onAccent)
                                     .padding(.horizontal, 5)
                                     .frame(minWidth: 18, minHeight: 18)
-                                    .background(TojTheme.text, in: Capsule())
+                                    .background(TojTheme.accent, in: Capsule())
                                     .offset(x: 5, y: -4)
                             }
                         }
@@ -288,7 +288,7 @@ struct TojConversationExperience: View {
                             .font(.system(size: 17, weight: .semibold))
                             .frame(width: 42, height: 42)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.tojPressable)
                     .foregroundStyle(TojTheme.secondaryText)
                     .disabled(model.composerMode.isRecording)
                     .accessibilityLabel("Add attachment")
@@ -310,11 +310,11 @@ struct TojConversationExperience: View {
                     Button(action: send) {
                         Image(systemName: "arrow.up")
                             .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(TojTheme.canvas)
+                            .foregroundStyle(TojTheme.onAccent)
                             .frame(width: 44, height: 44)
-                            .background(TojTheme.text, in: Circle())
+                            .background(TojTheme.accent, in: Circle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.tojPressable)
                     .accessibilityLabel(model.composerMode.isEditing ? "Save edited message" : "Send")
                 } else if model.capabilities.contains(.voiceNotes) {
                     Button {
@@ -332,11 +332,11 @@ struct TojConversationExperience: View {
                     } label: {
                         Image(systemName: model.composerMode.isRecording ? "arrow.up" : "mic.fill")
                             .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(model.composerMode.isRecording ? TojTheme.canvas : TojTheme.text)
+                            .foregroundStyle(model.composerMode.isRecording ? TojTheme.onAccent : TojTheme.text)
                             .frame(width: 44, height: 44)
-                            .background(model.composerMode.isRecording ? TojTheme.text : TojTheme.strong, in: Circle())
+                            .background(model.composerMode.isRecording ? TojTheme.accent : TojTheme.strong, in: Circle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.tojPressable)
                     .accessibilityLabel(model.composerMode.isRecording ? "Send voice message" : "Record voice message")
                 } else {
                     Image(systemName: "arrow.up")
@@ -359,7 +359,7 @@ struct TojConversationExperience: View {
     private var composerContext: some View {
         HStack(spacing: 10) {
             Rectangle()
-                .fill(model.composerMode.isRecording ? Color.red : TojTheme.secure)
+                .fill(model.composerMode.isRecording ? TojTheme.danger : TojTheme.accent)
                 .frame(width: 3, height: 34)
                 .clipShape(Capsule())
             Image(systemName: model.composerMode.contextIcon)
@@ -451,7 +451,7 @@ private struct TojMessageBubble: View {
                 }
                 if let replyPreview = line.replyPreview {
                     HStack(spacing: 7) {
-                        Rectangle().fill(TojTheme.secure).frame(width: 2, height: 28)
+                        Rectangle().fill(TojTheme.accent).frame(width: 2, height: 28)
                         Text(replyPreview)
                             .font(.caption)
                             .foregroundStyle(TojTheme.secondaryText)
@@ -507,9 +507,9 @@ private struct TojMessageBubble: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
-            .background(line.mine ? Color(hex: 0x17191D) : TojTheme.strong)
+            .background(line.mine ? TojTheme.bubbleMine : TojTheme.strong)
             .clipShape(bubbleShape)
-            .overlay(bubbleShape.stroke(Color.white.opacity(line.mine ? 0.07 : 0.05), lineWidth: 0.5))
+            .overlay(bubbleShape.stroke(line.mine ? TojTheme.gold.opacity(0.16) : TojTheme.hairline, lineWidth: 0.5))
             .offset(x: replyOffset)
             .background(alignment: line.mine ? .trailing : .leading) {
                 Image(systemName: "arrowshape.turn.up.left.fill")
@@ -563,10 +563,10 @@ private struct TojMessageBubble: View {
 
     private var bubbleShape: UnevenRoundedRectangle {
         UnevenRoundedRectangle(
-            topLeadingRadius: 20,
-            bottomLeadingRadius: line.mine ? 20 : 6,
-            bottomTrailingRadius: line.mine ? 6 : 20,
-            topTrailingRadius: 20,
+            topLeadingRadius: TojRadius.bubble,
+            bottomLeadingRadius: line.mine ? TojRadius.bubble : TojRadius.bubbleTail,
+            bottomTrailingRadius: line.mine ? TojRadius.bubbleTail : TojRadius.bubble,
+            topTrailingRadius: TojRadius.bubble,
             style: .continuous
         )
     }
@@ -618,7 +618,7 @@ private struct DemoAttachmentBubble: View {
                     .padding(10)
             }
             .frame(width: 230, height: 145)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: TojRadius.tile, style: .continuous))
         case let .video(name, duration):
             attachmentTile(icon: "play.fill", title: name, detail: duration)
         case let .file(name, size):
@@ -1186,9 +1186,9 @@ private struct DemoAttachmentPicker: View {
                 Spacer()
             }
             .padding(13)
-            .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: TojRadius.field, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tojPressable)
     }
 }
 

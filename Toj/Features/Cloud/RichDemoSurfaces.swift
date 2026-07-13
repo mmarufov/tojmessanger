@@ -32,7 +32,7 @@ struct TojPeerProfileView: View {
                     }
 
                     profileSection("Privacy") {
-                        profileRow("Connection", detail: "Protected", icon: "lock.fill", detailColor: TojTheme.secure)
+                        profileRow("Connection", detail: "Protected", icon: "lock.fill", iconTint: TojTheme.secure, detailColor: TojTheme.secure)
                         profileRow("Devices", detail: "Tap to inspect", icon: "checkmark.shield.fill")
                         profileRow("Verification", detail: "Available when connected", icon: "person.badge.shield.checkmark")
                     }
@@ -90,26 +90,17 @@ struct TojPeerProfileView: View {
             }
             .frame(maxWidth: .infinity)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tojPressable)
         .foregroundStyle(TojTheme.text)
     }
 
     private func profileSection<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(TojTheme.secondaryText)
-                .textCase(.uppercase)
-                .padding(.leading, 5)
-            VStack(spacing: 0) { content() }
-                .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        }
+        TojSectionCard(title) { content() }
     }
 
-    private func profileRow(_ title: LocalizedStringKey, detail: LocalizedStringKey, icon: String, detailColor: Color = TojTheme.secondaryText) -> some View {
+    private func profileRow(_ title: LocalizedStringKey, detail: LocalizedStringKey, icon: String, iconTint: Color? = nil, detailColor: Color = TojTheme.secondaryText) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: icon).frame(width: 28).foregroundStyle(TojTheme.secondaryText)
+            TojIconTile(systemImage: icon, tint: iconTint)
             Text(title)
             Spacer()
             Text(detail).font(.caption).foregroundStyle(detailColor)
@@ -117,8 +108,8 @@ struct TojPeerProfileView: View {
         }
         .font(.subheadline.weight(.medium))
         .padding(.horizontal, 15)
-        .frame(minHeight: 54)
-        .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.05)).frame(height: 0.5).padding(.leading, 55) }
+        .frame(minHeight: 56)
+        .overlay(alignment: .bottom) { Rectangle().fill(TojTheme.hairline).frame(height: 0.5).padding(.leading, 57) }
     }
 }
 
@@ -186,9 +177,9 @@ struct TojDemoCallView: View {
                     Image(systemName: "phone.down.fill")
                         .font(.system(size: 22, weight: .bold))
                         .frame(width: 68, height: 68)
-                        .background(Color.red, in: Circle())
+                        .background(TojTheme.danger, in: Circle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.tojPressable)
                 .padding(.top, 34)
                 .padding(.bottom, 46)
                 .accessibilityLabel("End call")
@@ -224,7 +215,7 @@ struct TojDemoCallView: View {
                 Text(title).font(.caption)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tojPressable)
         .foregroundStyle(TojTheme.text)
     }
 }
@@ -383,16 +374,7 @@ struct PresentationStateGallery: View {
     }
 
     private func gallerySection<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(TojTheme.secondaryText)
-                .textCase(.uppercase)
-                .padding(.leading, 5)
-            VStack(spacing: 0) { content() }
-                .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        }
+        TojSectionCard(title) { content() }
     }
 
     private func stateRow(_ title: String, detail: String, icon: String, color: Color) -> some View {
@@ -406,7 +388,7 @@ struct PresentationStateGallery: View {
         }
         .padding(.horizontal, 15)
         .frame(minHeight: 52)
-        .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.05)).frame(height: 0.5).padding(.leading, 55) }
+        .overlay(alignment: .bottom) { Rectangle().fill(TojTheme.hairline).frame(height: 0.5).padding(.leading, 55) }
         .accessibilityElement(children: .combine)
     }
 }
@@ -416,9 +398,7 @@ private struct DemoGalleryAttachment: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .frame(width: 42, height: 42)
-                .background(TojTheme.strong, in: Circle())
+            TojIconTile(systemImage: icon)
             Text(attachment.title).font(.subheadline.weight(.medium))
             Spacer()
             Image(systemName: "chevron.right").font(.caption2).foregroundStyle(TojTheme.secondaryText)
