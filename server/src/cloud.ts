@@ -52,9 +52,11 @@ import {
   downloadMediaChunk,
   downloadMediaThumbnail,
   getMediaUpload,
+  LARGE_MEDIA_PART_SIZE,
   mediaLimits,
   MediaError,
   uploadMediaChunk,
+  uploadMediaPart,
   uploadMediaThumbnail,
 } from "./media";
 
@@ -63,6 +65,20 @@ type Db = typeof defaultSql;
 
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
 const MAX_JSON_BYTES = 64 * 1024;
+
+export const CLOUD_CAPABILITIES = {
+  api_version: 3,
+  capabilities: [
+    "core_text",
+    "replies",
+    "message_mutations",
+    "reactions",
+    "forwarding",
+    "media_uploads",
+    "media_multipart_v2",
+    "voice_notes",
+  ],
+} as const;
 
 function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
   return new Response(JSON.stringify(value), {
@@ -190,6 +206,10 @@ export function startCloudServer(
           }));
         }
 
+        else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
+          response = json(CLOUD_CAPABILITIES);
+        }
+
         else if (url.pathname === "/metrics") {
           const metricsToken = process.env.TOJ_METRICS_TOKEN;
           if (!metricsToken) response = new Response("not found", { status: 404 });
@@ -227,11 +247,17 @@ export function startCloudServer(
         else {
           const session = await authed(db, req);
           const uploadChunkMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/chunks$/i);
+          const uploadPartMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/parts\/(\d+)$/i);
           const uploadThumbnailMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/thumbnail$/i);
           const downloadChunkMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/chunks$/i);
           const downloadThumbnailMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/thumbnail$/i);
 
-          if (uploadChunkMatch && req.method === "PUT") {
+          if (uploadPartMatch && req.method === "PUT") {
+            const bytes = await readBinary(req, LARGE_MEDIA_PART_SIZE);
+            response = json(await uploadMediaPart(
+              db, session.accountId, session.deviceId, uploadPartMatch[1], Number(uploadPartMatch[2]), bytes,
+            ));
+          } else if (uploadChunkMatch && req.method === "PUT") {
             const offsetHeader = req.headers.get("upload-offset");
             if (offsetHeader == null) throw new MediaError("upload offset required");
             const offset = Number(offsetHeader);
@@ -462,8 +488,12 @@ export function startCloudServer(
           : err instanceof Error ? err.message : String(err);
         const headers: Record<string, string> = {};
         if (err instanceof AuthError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (status === 401) headers["www-authenticate"] = "Bearer";
-        response = json({ error: message }, status, headers);
+        response = json({
+          error: message,
+          ...(err instanceof MediaError ? { code: err.code } : {}),
+        }, status, headers);
       }
       const status = response?.status ?? 101;
       const durationMs = performance.now() - started;

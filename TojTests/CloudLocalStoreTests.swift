@@ -4,6 +4,88 @@ import Security
 @testable import Toj
 
 final class CloudLocalStoreTests: XCTestCase {
+    func testCapabilitiesEndpointIsPublicAndDecodesContract() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/capabilities")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("{\"api_version\":2,\"capabilities\":[\"media_uploads\",\"voice_notes\"]}".utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let response = try await api.capabilities()
+        XCTAssertEqual(response.apiVersion, 2)
+        XCTAssertEqual(response.capabilities, ["media_uploads", "voice_notes"])
+    }
+
+    func testCloudFailureClassificationRetriesOnlyRecoverableFailures() {
+        XCTAssertEqual(cloudFailureDisposition(URLError(.notConnectedToInternet)), .transient(retryAfter: nil))
+        XCTAssertEqual(
+            cloudFailureDisposition(CloudAPIError(status: 429, message: "slow", retryAfter: 17)),
+            .transient(retryAfter: 17)
+        )
+        XCTAssertEqual(
+            cloudFailureDisposition(CloudAPIError(status: 401, message: "expired", retryAfter: nil)),
+            .authenticationRequired
+        )
+        XCTAssertEqual(
+            cloudFailureDisposition(CloudAPIError(status: 404, message: "missing", retryAfter: nil)),
+            .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudFailureDisposition(CloudAPIError(status: 413, message: "too large", retryAfter: nil)),
+            .permanent
+        )
+        let missing = CloudAPIError(status: 404, message: "message missing", retryAfter: nil)
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(missing, serverAdvertisesFeature: false),
+            .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(missing, serverAdvertisesFeature: true),
+            .permanent
+        )
+    }
+
+    func testPendingMutationsPersistAndTerminalFailuresDoNotLoop() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("durable-mutation-key".utf8)
+        let first = try CloudLocalStore(path: path, key: key)
+        try await first.enqueueMessageMutation(
+            clientMutationId: "mutation-1", operation: "edit", dialogId: "dialog-1",
+            msgId: 9, body: "corrected", expectedEditVersion: 2
+        )
+
+        let reopened = try CloudLocalStore(path: path, key: key)
+        var ready = try await reopened.pendingMessageMutationsReady()
+        XCTAssertEqual(ready.map(\.clientMutationId), ["mutation-1"])
+        XCTAssertEqual(ready.first?.body, "corrected")
+        try await reopened.markMessageMutationFailed(
+            clientMutationId: "mutation-1", error: "invalid", retryAfter: nil, terminal: true
+        )
+        let terminalReady = try await reopened.pendingMessageMutationsReady()
+        XCTAssertTrue(terminalReady.isEmpty)
+        try await reopened.retryMessageMutation(clientMutationId: "mutation-1")
+        ready = try await reopened.pendingMessageMutationsReady()
+        XCTAssertEqual(ready.first?.retryCount, 1)
+    }
+
     func testAccountDeletionRequestUsesBearerAndPurposeCodeBody() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
@@ -221,6 +303,15 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.markRetrying(clientMsgId: clientMsgId)
         dueOutbox = try await store.pendingOutboxReady()
         XCTAssertEqual(dueOutbox.map(\.clientMsgId), [clientMsgId])
+
+        try await store.markFailed(clientMsgId: clientMsgId, terminal: true)
+        dueOutbox = try await store.pendingOutboxReady()
+        XCTAssertTrue(dueOutbox.isEmpty, "Permanent failures must not loop")
+        let terminalOutboxDelay = try await store.nextPendingOutboxDelay()
+        XCTAssertNil(terminalOutboxDelay)
+        try await store.markRetrying(clientMsgId: clientMsgId)
+        dueOutbox = try await store.pendingOutboxReady()
+        XCTAssertEqual(dueOutbox.map(\.clientMsgId), [clientMsgId], "Manual retry clears terminal state")
 
         try await store.markSent(
             SendMessageResponse(
@@ -550,12 +641,24 @@ final class CloudLocalStoreTests: XCTestCase {
         )
         try await store.applyDifference(update(3, type: "message.edited", message: edited), accountId: accountId)
 
+        let deleteMutationId = UUID().uuidString
+        try await store.enqueueMessageMutation(
+            clientMutationId: deleteMutationId,
+            operation: "delete",
+            dialogId: dialogId,
+            msgId: 2
+        )
+        var dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(dialogs.first?.lastText, "after", "Pending deletion hides the latest message preview")
+        XCTAssertEqual(dialogs.first?.lastState, "visible")
+
         let deletedReply = CloudMessage(
             dialogId: dialogId, msgId: 2, senderAccountId: accountId,
             clientMsgId: replyClientId, kind: "text", text: "",
             replyToMsgId: 1, editVersion: 0, state: "deleted_for_all", serverTs: "2026-07-12T10:00:01Z"
         )
         try await store.applyDifference(update(4, type: "message.deleted", message: deletedReply), accountId: accountId)
+        try await store.completeMessageMutation(clientMutationId: deleteMutationId)
 
         let messages = try await store.messages(dialogId: dialogId)
         XCTAssertEqual(messages.map(\.text), ["after", ""])
@@ -563,9 +666,10 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(messages[1].replyToMsgId, 1)
         XCTAssertEqual(messages[1].state, "deleted_for_all")
         let savedPts = try await store.loadPts(accountId: accountId)
-        let dialogs = try await store.dialogs(accountId: accountId)
+        dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(savedPts, 4)
-        XCTAssertEqual(dialogs.first?.lastState, "deleted_for_all")
+        XCTAssertEqual(dialogs.first?.lastText, "after")
+        XCTAssertEqual(dialogs.first?.lastState, "visible")
     }
 
     @MainActor
@@ -855,6 +959,17 @@ final class CloudLocalStoreTests: XCTestCase {
         let expectedMedia = transfer.media
         XCTAssertEqual(optimisticMedia, expectedMedia)
 
+        try await store.markMediaTerminal(clientMsgId: clientMsgId, error: "File is too large")
+        let terminalTransfers = try await store.mediaTransfers(dialogId: "dialog-media")
+        let terminalTransfer = try XCTUnwrap(terminalTransfers.first)
+        XCTAssertTrue(terminalTransfer.terminal)
+        XCTAssertEqual(terminalTransfer.lastError, "File is too large")
+        let terminalMediaDelay = try await store.nextMediaTransferDelay()
+        XCTAssertNil(terminalMediaDelay)
+        try await store.markMediaRetrying(clientMsgId: clientMsgId)
+        let retriedTransfer = try await store.mediaTransfer(id: transferId)
+        XCTAssertFalse(try XCTUnwrap(retriedTransfer).terminal)
+
         try await store.beginBootstrap(accountId: "account-me")
         let retained = try await store.mediaTransfer(id: transferId)
         XCTAssertNotNil(retained)
@@ -989,6 +1104,87 @@ final class CloudLocalStoreTests: XCTestCase {
         }
     }
 
+    func testMultipartMediaResumesOnlyMissingParts() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let partSize = 256 * 1024
+        let payload = Data((0..<(partSize * 3 + 19)).map { UInt8($0 % 251) })
+        let cache = try EncryptedMediaCache(
+            root: directory.appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x52, count: 32), limitBytes: 3_000_000
+        )
+        let prepared = try await cache.prepareUpload(
+            data: payload, kind: "file", contentType: "application/octet-stream", fileName: "parallel.bin"
+        )
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("multipart-transfer-test-key".utf8)
+        )
+        let mediaId = "22222222-2222-2222-2222-222222222222"
+        try await store.insertMediaTransfer(
+            prepared: prepared, dialogId: "dialog-parallel", clientMsgId: UUID().uuidString,
+            caption: "", replyToMsgId: nil
+        )
+        try await store.updateMediaTransfer(
+            transferId: prepared.transferId, mediaId: mediaId,
+            uploadOffset: Int64(partSize), state: "uploading", error: nil
+        )
+        let storedTransfer = try await store.mediaTransfer(id: prepared.transferId)
+        let transfer = try XCTUnwrap(storedTransfer)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        configuration.httpMaximumConnectionsPerHost = 3
+        let recorder = LockedMultipartRequests()
+        CloudAPIMockURLProtocol.handler = { request in
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/2",
+                headerFields: ["content-type": "application/json"]
+            ))
+            if request.httpMethod == "GET" {
+                return (response, Data("""
+                {"mediaId":"\(mediaId)","uploadOffset":\(partSize),"byteSize":\(payload.count),
+                 "status":"uploading","expiresAt":"2026-07-15T00:00:00Z","chunkSize":1048576,
+                 "uploadProtocol":"parts_v2","partSize":\(partSize),"totalParts":4,"receivedParts":[1]}
+                """.utf8))
+            }
+            if request.url?.path.contains("/parts/") == true {
+                let component = try XCTUnwrap(request.url?.lastPathComponent)
+                let partIndex = try XCTUnwrap(Int(component))
+                let bytes = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+                recorder.begin(partIndex: partIndex, bytes: bytes)
+                Thread.sleep(forTimeInterval: 0.05)
+                recorder.end()
+                return (response, Data("""
+                {"mediaId":"\(mediaId)","partIndex":\(partIndex),"receivedBytes":\(payload.count),
+                 "complete":false,"duplicate":false}
+                """.utf8))
+            }
+            return (response, Data("""
+            {"mediaId":"\(mediaId)","ready":true,"duplicate":false}
+            """.utf8))
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            cache: cache, session: URLSession(configuration: configuration)
+        )
+        let progress = LockedProgressValues()
+        let uploaded = try await engine.upload(
+            transfer: transfer, token: "session-token", localStore: store,
+            useMultipartV2: true, progress: { progress.append($0) }
+        )
+
+        XCTAssertEqual(uploaded, mediaId)
+        XCTAssertEqual(Set(recorder.snapshot().map(\.partIndex)), Set([0, 2, 3]))
+        let completedTransfer = try await store.mediaTransfer(id: prepared.transferId)
+        XCTAssertEqual(completedTransfer?.uploadOffset, Int64(payload.count))
+        XCTAssertEqual(progress.snapshot().last, 1)
+        XCTAssertTrue(progress.snapshot().allSatisfy { (0...1).contains($0) })
+    }
+
     private func makeStore() throws -> CloudLocalStore {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -1055,5 +1251,49 @@ private final class LockedMediaRequests: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return requests
+    }
+}
+
+private final class LockedMultipartRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [(partIndex: Int, bytes: Data)] = []
+    private var active = 0
+    private(set) var maximumConcurrent = 0
+
+    func begin(partIndex: Int, bytes: Data) {
+        lock.lock()
+        requests.append((partIndex, bytes))
+        active += 1
+        maximumConcurrent = max(maximumConcurrent, active)
+        lock.unlock()
+    }
+
+    func end() {
+        lock.lock()
+        active -= 1
+        lock.unlock()
+    }
+
+    func snapshot() -> [(partIndex: Int, bytes: Data)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+}
+
+private final class LockedProgressValues: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Double] = []
+
+    func append(_ value: Double) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }

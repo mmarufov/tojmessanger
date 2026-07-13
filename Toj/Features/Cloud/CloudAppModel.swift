@@ -5,6 +5,17 @@ import UIKit
 @MainActor
 @Observable
 final class CloudAppModel {
+    struct Notice: Identifiable, Equatable {
+        let id = UUID()
+        let title: String
+        let message: String
+        var opensSettings = false
+
+        static func == (lhs: Notice, rhs: Notice) -> Bool {
+            lhs.id == rhs.id
+        }
+    }
+
     struct Dialog: Identifiable, Equatable {
         let id: String
         let title: String
@@ -26,6 +37,13 @@ final class CloudAppModel {
             case sent
             case seen
             case failed(String)
+        }
+
+        enum TransferStage: Equatable {
+            case preparing
+            case uploading
+            case finalizing
+            case retrying
         }
 
         let id: String
@@ -51,10 +69,15 @@ final class CloudAppModel {
         var attachment: DemoAttachment? = nil
         var media: CloudMedia? = nil
         var transferProgress: Double? = nil
+        var transferStage: TransferStage? = nil
+        var transferError: String? = nil
+        var pendingMutation: PendingMessageMutation? = nil
     }
 
     private(set) var storedSession: StoredCloudSession?
     private(set) var status = "Starting"
+    private(set) var operationNotice: Notice?
+    private(set) var connectionViewState: ConnectionViewState = .connecting
     private(set) var requestedCode = false
     private(set) var authRequestInFlight = false
     private(set) var authVerifyInFlight = false
@@ -96,6 +119,9 @@ final class CloudAppModel {
     private let localStore: CloudLocalStore?
     private let pushCenter: PushRegistrationCenter
     private let mediaEngine: CloudMediaTransferEngine
+    private let capabilityDefaults: UserDefaults
+    private let capabilityCacheKey: String
+    private var negotiatedCapabilities: MessagingCapabilities
     private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
@@ -112,6 +138,8 @@ final class CloudAppModel {
     private var syncAgain = false
     private var retryInFlight = false
     private var mediaTransfersInFlight: Set<String> = []
+    private var messageMutationsInFlight: Set<String> = []
+    private var mutationTargetsBeingQueued: Set<String> = []
     private var uploadedPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftsByDialog: [String: String] = [:]
@@ -123,19 +151,10 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return .demo }
         #endif
-        return [.productionText, .media, .voiceNotes]
+        return negotiatedCapabilities
     }
 
-    var connectionViewState: ConnectionViewState {
-        let normalized = status.lowercased()
-        if normalized.contains("failed") || normalized.contains("network") || normalized.contains("offline") {
-            return .offline
-        }
-        if normalized.contains("starting") || normalized.contains("looking") || normalized.contains("rebuild") {
-            return .connecting
-        }
-        return .connected
-    }
+    var voiceRecordingLevel: Float { voiceRecorder.level }
 
     var canRequestCode: Bool {
         let digits = phone.filter(\.isNumber)
@@ -156,13 +175,32 @@ final class CloudAppModel {
         tokenStore: TokenStore = TokenStore(),
         pushCenter: PushRegistrationCenter = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
-        useDefaultLocalStore: Bool = true
+        useDefaultLocalStore: Bool = true,
+        capabilityDefaults: UserDefaults = .standard
     ) {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
         self.mediaEngine = CloudMediaTransferEngine(config: config)
+        self.capabilityDefaults = capabilityDefaults
+        self.capabilityCacheKey = "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
+        let cached = capabilityDefaults.object(
+            forKey: "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
+        ) as? NSNumber
+        self.negotiatedCapabilities = cached.map {
+            MessagingCapabilities(rawValue: $0.uint16Value)
+        } ?? [.replies]
         self.localStore = injectedLocalStore ?? (useDefaultLocalStore ? try? CloudLocalStore.default() : nil)
+        voiceRecorder.onUnexpectedStop = { [weak self] in
+            guard let self else { return }
+            self.recordingTask?.cancel()
+            self.recordingTask = nil
+            self.composerMode = .text
+            self.presentNotice(
+                "Recording canceled",
+                message: "The microphone or audio route became unavailable. Nothing was sent."
+            )
+        }
         pushCenter.bind(
             tokenHandler: { [weak self] token, environment in
                 await self?.uploadPushToken(token, environment: environment)
@@ -192,12 +230,14 @@ final class CloudAppModel {
                 phone = saved.phone
                 displayName = saved.displayName
                 status = "Signed in"
+                connectionViewState = .connecting
                 await afterSignIn()
             } else {
                 status = "Signed out"
             }
         } catch {
             status = "Session restore failed: \(error.localizedDescription)"
+            connectionViewState = .offline
         }
     }
 
@@ -246,10 +286,15 @@ final class CloudAppModel {
             resendTask = nil
             resendSeconds = 0
             status = "Signed in"
+            connectionViewState = .connecting
             await afterSignIn()
         } catch {
             status = "Sign in failed: \(error.localizedDescription)"
         }
+    }
+
+    func dismissOperationNotice() {
+        operationNotice = nil
     }
 
     func resetAuthCode() {
@@ -423,6 +468,8 @@ final class CloudAppModel {
         activeComposerTransferId = nil
         mediaTransferTasks.removeAll()
         mediaTransfersInFlight.removeAll()
+        messageMutationsInFlight.removeAll()
+        mutationTargetsBeingQueued.removeAll()
         var cleanupFailure: String?
         do {
             if let accountId = storedSession?.session.accountId {
@@ -741,6 +788,7 @@ final class CloudAppModel {
 
     func actions(for line: Line) -> [MessageAction] {
         if line.isDeleted { return [.inspect] }
+        if line.pendingMutation != nil { return [.inspect] }
         var actions: [MessageAction] = line.text.isEmpty ? [] : [.copy]
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
@@ -764,6 +812,29 @@ final class CloudAppModel {
                 }
             }
             self.scheduleOutboxRetry()
+        }
+    }
+
+    func removeFailedMedia(_ line: Line) {
+        guard line.media != nil else { return }
+        Task { [weak self] in
+            guard let self, let localStore,
+                  let transfer = try? await localStore.mediaTransfer(clientMsgId: line.clientMsgId)
+            else { return }
+            if let activeTask = mediaTransferTasks[transfer.transferId] {
+                activeTask.cancel()
+                await activeTask.value
+                return
+            }
+            if let token = storedSession?.session.token {
+                await cancelMediaTransfer(transfer, token: token)
+            } else {
+                try? await localStore.cancelMediaTransfer(
+                    transferId: transfer.transferId, clientMsgId: transfer.clientMsgId
+                )
+                await mediaEngine.discardTransfer(transfer)
+                if activeDialogId == transfer.dialogId { await loadLocalLines(dialogId: transfer.dialogId) }
+            }
         }
     }
 
@@ -843,10 +914,20 @@ final class CloudAppModel {
             )
         } catch {
             if let localStore {
-                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: retryDelay(forRetryCount: 1))
+                let disposition = cloudOperationFailureDisposition(
+                    error, serverAdvertisesFeature: capabilities.contains(.replies)
+                )
+                if case let .transient(retryAfter) = disposition {
+                    let delay = retryAfter ?? retryDelay(forRetryCount: 1)
+                    try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: delay)
+                    scheduleOutboxRetry(after: delay)
+                    if error is URLError { connectionViewState = .offline }
+                } else {
+                    try? await localStore.markFailed(clientMsgId: clientMsgId, terminal: true)
+                    presentNotice("Message was not sent", message: error.localizedDescription)
+                }
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
-                scheduleOutboxRetry(after: retryDelay(forRetryCount: 1))
             } else {
                 if let index = lines.firstIndex(where: { $0.clientMsgId == clientMsgId }) {
                     lines[index].delivery = .failed(error.localizedDescription)
@@ -925,7 +1006,7 @@ final class CloudAppModel {
                 id: "transfer:\(prepared.transferId)", dialogId: dialogId, msgId: nil,
                 clientMsgId: clientMsgId, senderAccountId: accountId, text: caption,
                 mine: true, delivery: .sending, timestamp: nil,
-                media: transfer.media, transferProgress: 0
+                media: transfer.media, transferProgress: 0, transferStage: .preparing
             ))
             draft = ""
             await runMediaTransfer(transfer)
@@ -940,6 +1021,7 @@ final class CloudAppModel {
             if transferPersisted { scheduleOutboxRetry() }
             composerMode = .text
             status = "Media send failed: \(error.localizedDescription)"
+            presentNotice("Could not prepare attachment", message: error.localizedDescription)
         }
     }
 
@@ -960,6 +1042,12 @@ final class CloudAppModel {
         } catch {
             status = error.localizedDescription
             composerMode = .text
+            let denied = (error as? VoiceRecorderError) == .permissionDenied
+            presentNotice(
+                denied ? "Microphone access is off" : "Could not record",
+                message: error.localizedDescription,
+                opensSettings: denied
+            )
         }
     }
 
@@ -976,9 +1064,13 @@ final class CloudAppModel {
                 data: result.data, kind: "voice", contentType: "audio/mp4",
                 fileName: "Voice message.m4a", durationMs: result.durationMs
             )
+        } catch VoiceRecorderError.tooShort {
+            status = "Recording canceled"
+            composerMode = .text
         } catch {
             status = error.localizedDescription
             composerMode = .text
+            presentNotice("Voice message was not sent", message: error.localizedDescription)
         }
     }
 
@@ -1014,6 +1106,7 @@ final class CloudAppModel {
 
     private func afterSignIn() async {
         guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
+        await refreshServerCapabilities()
         await refreshMediaCacheUsage()
         do {
             pts = try await localStore?.loadPts(accountId: accountId) ?? 0
@@ -1026,7 +1119,42 @@ final class CloudAppModel {
         }
         await pushCenter.requestAuthorization()
         await resume()
+        await retryPendingMessageMutations()
         await retryMediaTransfers()
+    }
+
+    private func refreshServerCapabilities() async {
+        do {
+            let response = try await api.capabilities()
+            var resolved: MessagingCapabilities = []
+            let advertised = Set(response.capabilities)
+            if advertised.contains("core_text") || advertised.contains("replies") {
+                resolved.insert(.replies)
+            }
+            if advertised.contains("message_mutations") {
+                resolved.formUnion([.editing, .deletion])
+            }
+            if advertised.contains("reactions") { resolved.insert(.reactions) }
+            if advertised.contains("forwarding") { resolved.insert(.forwarding) }
+            if advertised.contains("media_uploads") { resolved.insert(.media) }
+            if advertised.contains("media_multipart_v2"), resolved.contains(.media) {
+                resolved.insert(.multipartMedia)
+            }
+            if advertised.contains("voice_notes"), resolved.contains(.media) {
+                resolved.insert(.voiceNotes)
+            }
+            negotiatedCapabilities = resolved
+            capabilityDefaults.set(Int(resolved.rawValue), forKey: capabilityCacheKey)
+        } catch let error as CloudAPIError where error.status == 404 {
+            negotiatedCapabilities = [.replies]
+            capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
+        } catch {
+            // Keep the last successfully negotiated set when the server cannot be reached.
+        }
+    }
+
+    private func presentNotice(_ title: String, message: String, opensSettings: Bool = false) {
+        operationNotice = Notice(title: title, message: message, opensSettings: opensSettings)
     }
 
     private func uploadPushToken(_ deviceToken: String, environment: String) async {
@@ -1059,6 +1187,7 @@ final class CloudAppModel {
         if isDemoMode { return }
         #endif
         guard let token = storedSession?.session.token else { return }
+        connectionViewState = .connecting
         pushCenter.refreshRegistration()
         await startHints(token: token)
         scheduleSync()
@@ -1137,9 +1266,13 @@ final class CloudAppModel {
                     response = try await api.getDifference(sincePts: pts, token: token)
                 }
                 status = "Synced"
+                connectionViewState = .connected
                 scheduleOutboxRetry()
             } catch {
                 status = "Sync failed: \(error.localizedDescription)"
+                if case .transient = cloudFailureDisposition(error) {
+                    connectionViewState = .offline
+                }
                 return
             }
         } while syncAgain
@@ -1212,6 +1345,16 @@ final class CloudAppModel {
         guard let localStore else { return }
         do {
             let messages = try await localStore.messages(dialogId: dialogId)
+            let mutations = try await localStore.messageMutations(dialogId: dialogId)
+            let transfers = try await localStore.mediaTransfers(dialogId: dialogId)
+            let transfersByClientMessage = Dictionary(
+                transfers.map { ($0.clientMsgId, $0) },
+                uniquingKeysWith: { _, newer in newer }
+            )
+            let mutationsByMessage = Dictionary(
+                mutations.map { ($0.msgId, $0) },
+                uniquingKeysWith: { _, newer in newer }
+            )
             let accountId = storedSession?.session.accountId
             let peerReadMsgId: Int64
             if let accountId {
@@ -1222,12 +1365,23 @@ final class CloudAppModel {
             let messagesById = Dictionary(uniqueKeysWithValues: messages.compactMap { message in
                 message.msgId.map { ($0, message) }
             })
-            lines = messages.map { message in
+            lines = messages.compactMap { message -> Line? in
+                let mutation = message.msgId.flatMap { mutationsByMessage[$0] }
+                guard Self.shouldDisplayInTimeline(
+                    messageState: message.state,
+                    pendingMutationOperation: mutation?.operation
+                ) else { return nil }
                 let replyPreview = message.replyToMsgId.map { targetId in
                     guard let target = messagesById[targetId] else { return String(localized: "Earlier message") }
-                    return target.state == "deleted_for_all" ? String(localized: "Deleted message") : target.text
+                    return target.state == "deleted_for_all" ? String(localized: "Earlier message") : target.text
                 }
-                return line(from: message, peerReadMsgId: peerReadMsgId, replyPreview: replyPreview)
+                return line(
+                    from: message,
+                    peerReadMsgId: peerReadMsgId,
+                    replyPreview: replyPreview,
+                    mutation: mutation,
+                    mediaTransfer: transfersByClientMessage[message.clientMsgId]
+                )
             }
             let hasServerMessage = try await localStore.oldestServerMsgId(dialogId: dialogId) != nil
             canLoadEarlier = hasServerMessage && (historyHasMoreByDialog[dialogId] ?? true)
@@ -1237,13 +1391,43 @@ final class CloudAppModel {
         }
     }
 
-    private func line(from message: LocalMessage, peerReadMsgId: Int64, replyPreview: String?) -> Line {
+    nonisolated static func shouldDisplayInTimeline(
+        messageState: String,
+        pendingMutationOperation: String?
+    ) -> Bool {
+        messageState != "deleted_for_all" && pendingMutationOperation != "delete"
+    }
+
+    private func line(
+        from message: LocalMessage,
+        peerReadMsgId: Int64,
+        replyPreview: String?,
+        mutation: PendingMessageMutation? = nil,
+        mediaTransfer: MediaTransferRecord? = nil
+    ) -> Line {
         let mine = message.senderAccountId == storedSession?.session.accountId
         let deliveryState: Line.Delivery
-        if mine, let msgId = message.msgId, msgId <= peerReadMsgId {
+        if let mediaTransfer, mediaTransfer.terminal {
+            deliveryState = .failed(mediaTransfer.lastError ?? String(localized: "Attachment failed"))
+        } else if mutation != nil {
+            deliveryState = .sending
+        } else if mine, let msgId = message.msgId, msgId <= peerReadMsgId {
             deliveryState = .seen
         } else {
             deliveryState = delivery(from: message.localState)
+        }
+        var reactions = message.reactions
+        if mutation?.operation == "reaction", let accountId = storedSession?.session.accountId {
+            reactions.removeAll { $0.accountId == accountId }
+            if let emoji = mutation?.emoji {
+                reactions.append(CloudReaction(accountId: accountId, emoji: emoji))
+            }
+        }
+        let presentedText: String
+        if mutation?.operation == "edit", let body = mutation?.body {
+            presentedText = body
+        } else {
+            presentedText = message.text
         }
         return Line(
             id: message.localId,
@@ -1251,22 +1435,33 @@ final class CloudAppModel {
             msgId: message.msgId,
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
-            text: message.state == "deleted_for_all" ? String(localized: "Message deleted") : message.text,
+            text: presentedText,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
             replyToMsgId: message.replyToMsgId,
             replyPreview: replyPreview,
-            reactions: Self.reactionBadges(message.reactions),
-            myReaction: message.reactions.first(where: { $0.accountId == storedSession?.session.accountId })?.emoji,
+            reactions: Self.reactionBadges(reactions),
+            myReaction: reactions.first(where: { $0.accountId == storedSession?.session.accountId })?.emoji,
             forwardedFromAccountId: message.forwardedFromAccountId,
             forwardedFromDialogId: message.forwardedFromDialogId,
             forwardedFromMsgId: message.forwardedFromMsgId,
             isForwarded: message.isForwarded,
             editVersion: message.editVersion,
-            isEdited: message.editVersion > 0 && message.state == "visible",
+            isEdited: (message.editVersion > 0 || mutation?.operation == "edit") && message.state == "visible",
             isDeleted: message.state == "deleted_for_all",
-            media: message.media
+            media: message.media,
+            transferProgress: mediaTransfer.map {
+                $0.state == "ready_to_send" ? 1 : Double($0.uploadOffset) / Double(max(1, $0.byteSize))
+            },
+            transferStage: mediaTransfer.map {
+                if $0.state == "ready_to_send" { return .finalizing }
+                if $0.retryCount > 0 || $0.lastError != nil { return .retrying }
+                if $0.uploadOffset == 0 { return .preparing }
+                return .uploading
+            },
+            transferError: mediaTransfer?.lastError,
+            pendingMutation: mutation
         )
     }
 
@@ -1274,9 +1469,7 @@ final class CloudAppModel {
         let title = displayTitle(local.title, fallback: shortDialogId(local.dialogId))
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let subtitle: String
-        if local.lastState == "deleted_for_all" {
-            subtitle = String(localized: "Message deleted")
-        } else if let lastText, !lastText.isEmpty {
+        if let lastText, !lastText.isEmpty {
             subtitle = lastText
         } else if local.lastState == "visible" {
             subtitle = String(localized: "Attachment")
@@ -1346,9 +1539,17 @@ final class CloudAppModel {
                 do {
                     try await sendOutboxItem(item, token: token)
                 } catch {
-                    let nextRetryCount = item.retryCount + 1
-                    let delay = retryDelay(forRetryCount: nextRetryCount)
-                    try? await localStore.markFailed(clientMsgId: item.clientMsgId, retryAfter: delay)
+                    let disposition = cloudOperationFailureDisposition(
+                        error, serverAdvertisesFeature: capabilities.contains(.replies)
+                    )
+                    if case let .transient(retryAfter) = disposition {
+                        let delay = retryAfter ?? retryDelay(forRetryCount: item.retryCount + 1)
+                        try? await localStore.markFailed(clientMsgId: item.clientMsgId, retryAfter: delay)
+                        if error is URLError { connectionViewState = .offline }
+                    } else {
+                        try? await localStore.markFailed(clientMsgId: item.clientMsgId, terminal: true)
+                        presentNotice("Message was not sent", message: error.localizedDescription)
+                    }
                     if activeDialogId == item.dialogId {
                         await loadLocalLines(dialogId: item.dialogId)
                     }
@@ -1410,11 +1611,13 @@ final class CloudAppModel {
             } else {
                 mediaId = try await mediaEngine.upload(
                     transfer: initial, token: token, localStore: localStore,
+                    useMultipartV2: capabilities.contains(.multipartMedia),
                     progress: { [weak self] progress in
                         await MainActor.run {
                             guard let self else { return }
                             if let index = self.lines.firstIndex(where: { $0.clientMsgId == initial.clientMsgId }) {
                                 self.lines[index].transferProgress = progress
+                                self.lines[index].transferStage = progress >= 0.97 ? .finalizing : .uploading
                             }
                             if self.activeDialogId == initial.dialogId {
                                 self.composerMode = .uploading(
@@ -1466,20 +1669,41 @@ final class CloudAppModel {
             await cancelMediaTransfer(current, token: token)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
         } catch {
-            let delay = retryDelay(forRetryCount: initial.retryCount + 1)
             let current = try? await localStore.mediaTransfer(id: initial.transferId)
-            try? await localStore.updateMediaTransfer(
-                transferId: initial.transferId, mediaId: current?.mediaId,
-                uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
-                state: current?.mediaId == nil ? "pending" : "uploading",
-                error: error.localizedDescription, retryAfter: delay
-            )
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
-            if let index = lines.firstIndex(where: { $0.clientMsgId == initial.clientMsgId }) {
-                lines[index].delivery = .failed(error.localizedDescription)
+            switch cloudOperationFailureDisposition(
+                error, serverAdvertisesFeature: capabilities.contains(.media)
+            ) {
+            case let .transient(retryAfter):
+                let delay = retryAfter ?? retryDelay(forRetryCount: initial.retryCount + 1)
+                try? await localStore.updateMediaTransfer(
+                    transferId: initial.transferId, mediaId: current?.mediaId,
+                    uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
+                    state: current?.mediaId == nil ? "pending" : "uploading",
+                    error: error.localizedDescription, retryAfter: delay
+                )
+                if error is URLError { connectionViewState = .offline }
+                status = "Attachment queued for retry"
+                scheduleOutboxRetry(after: delay)
+            case .unsupportedServer:
+                try? await localStore.markMediaTerminal(
+                    clientMsgId: initial.clientMsgId, error: "Server upgrade required"
+                )
+                await refreshServerCapabilities()
+                presentNotice("Server upgrade required", message: "This server does not support attachments yet.")
+            case .authenticationRequired:
+                try? await localStore.markMediaTerminal(
+                    clientMsgId: initial.clientMsgId, error: "Sign in required"
+                )
+                presentNotice("Sign in again", message: "Your session ended before the attachment was sent.")
+            case .permanent:
+                try? await localStore.markMediaTerminal(
+                    clientMsgId: initial.clientMsgId, error: error.localizedDescription
+                )
+                presentNotice("Attachment was not sent", message: error.localizedDescription)
             }
-            status = "Media waiting to retry: \(error.localizedDescription)"
-            scheduleOutboxRetry(after: delay)
+            if activeDialogId == initial.dialogId { await loadLocalLines(dialogId: initial.dialogId) }
+            await refreshDialogs()
         }
     }
 
@@ -1551,7 +1775,8 @@ final class CloudAppModel {
         guard let localStore else { return nil }
         let textDelay = try? await localStore.nextPendingOutboxDelay()
         let mediaDelay = try? await localStore.nextMediaTransferDelay()
-        return [textDelay, mediaDelay].compactMap { $0 }.min()
+        let mutationDelay = try? await localStore.nextMessageMutationDelay()
+        return [textDelay, mediaDelay, mutationDelay].compactMap { $0 }.min()
     }
 
     private func retryDelay(forRetryCount retryCount: Int) -> TimeInterval {
@@ -1559,6 +1784,13 @@ final class CloudAppModel {
     }
 
     private func upsert(_ message: CloudMessage) {
+        if message.state == "deleted_for_all" {
+            lines.removeAll {
+                $0.clientMsgId == message.clientMsgId
+                    || ($0.dialogId == message.dialogId && $0.msgId == message.msgId)
+            }
+            return
+        }
         let mine = message.senderAccountId == storedSession?.session.accountId
         if let index = lines.firstIndex(where: { $0.clientMsgId == message.clientMsgId }) {
             lines[index].dialogId = message.dialogId
@@ -1615,31 +1847,34 @@ final class CloudAppModel {
 
     private func edit(_ line: Line, text: String) async {
         guard
-            let token = storedSession?.session.token,
+            let localStore,
             let dialogId = line.dialogId,
             let msgId = line.msgId
         else { return }
+        let targetKey = "\(dialogId):\(msgId)"
+        guard mutationTargetsBeingQueued.insert(targetKey).inserted else { return }
+        defer { mutationTargetsBeingQueued.remove(targetKey) }
         do {
             let mutationId = UUID().uuidString.lowercased()
-            let response = try await retryTransientMutation {
-                try await self.api.editMessage(
-                    dialogId: dialogId,
-                    msgId: msgId,
-                    clientMutationId: mutationId,
-                    expectedEditVersion: line.editVersion,
-                    body: text,
-                    token: token
-                )
-            }
-            try await localStore?.applyMessageMutation(response)
+            try await localStore.enqueueMessageMutation(
+                clientMutationId: mutationId,
+                operation: "edit",
+                dialogId: dialogId,
+                msgId: msgId,
+                body: text,
+                expectedEditVersion: line.editVersion
+            )
             draft = ""
             composerMode = .text
             await loadLocalLines(dialogId: dialogId)
-            await refreshDialogs()
-            status = response.duplicate ? "Edit confirmed" : "Edited"
-            scheduleSync()
+            await processMessageMutation(PendingMessageMutation(
+                clientMutationId: mutationId, operation: "edit", dialogId: dialogId,
+                msgId: msgId, body: text, expectedEditVersion: line.editVersion,
+                emoji: nil, retryCount: 0, nextRetryAt: nil, lastError: nil
+            ))
         } catch {
             status = "Edit failed: \(error.localizedDescription)"
+            presentNotice("Could not edit message", message: error.localizedDescription)
         }
     }
 
@@ -1651,29 +1886,30 @@ final class CloudAppModel {
         }
         #endif
         guard
+            let localStore,
             line.mine,
             !line.isDeleted,
-            let token = storedSession?.session.token,
             let dialogId = line.dialogId,
             let msgId = line.msgId
         else { return }
+        let targetKey = "\(dialogId):\(msgId)"
+        guard mutationTargetsBeingQueued.insert(targetKey).inserted else { return }
+        defer { mutationTargetsBeingQueued.remove(targetKey) }
         do {
             let mutationId = UUID().uuidString.lowercased()
-            let response = try await retryTransientMutation {
-                try await self.api.deleteMessage(
-                    dialogId: dialogId,
-                    msgId: msgId,
-                    clientMutationId: mutationId,
-                    token: token
-                )
-            }
-            try await localStore?.applyMessageMutation(response)
+            try await localStore.enqueueMessageMutation(
+                clientMutationId: mutationId, operation: "delete",
+                dialogId: dialogId, msgId: msgId
+            )
             await loadLocalLines(dialogId: dialogId)
-            await refreshDialogs()
-            status = response.duplicate ? "Deletion confirmed" : "Message deleted"
-            scheduleSync()
+            await processMessageMutation(PendingMessageMutation(
+                clientMutationId: mutationId, operation: "delete", dialogId: dialogId,
+                msgId: msgId, body: nil, expectedEditVersion: nil, emoji: nil,
+                retryCount: 0, nextRetryAt: nil, lastError: nil
+            ))
         } catch {
             status = "Delete failed: \(error.localizedDescription)"
+            presentNotice("Could not delete message", message: error.localizedDescription)
         }
     }
 
@@ -1685,29 +1921,30 @@ final class CloudAppModel {
         }
         #endif
         guard
+            let localStore,
             !line.isDeleted,
-            let token = storedSession?.session.token,
             let dialogId = line.dialogId,
             let msgId = line.msgId
         else { return }
-        let mutationId = UUID().uuidString.lowercased()
+        let targetKey = "\(dialogId):\(msgId)"
+        guard mutationTargetsBeingQueued.insert(targetKey).inserted else { return }
+        defer { mutationTargetsBeingQueued.remove(targetKey) }
         let desiredReaction: String? = line.myReaction == reaction ? nil : reaction
         do {
-            let response = try await retryTransientMutation {
-                try await self.api.setReaction(
-                    dialogId: dialogId,
-                    msgId: msgId,
-                    clientMutationId: mutationId,
-                    emoji: desiredReaction,
-                    token: token
-                )
-            }
-            try await localStore?.applyMessageMutation(response)
+            let mutationId = UUID().uuidString.lowercased()
+            try await localStore.enqueueMessageMutation(
+                clientMutationId: mutationId, operation: "reaction",
+                dialogId: dialogId, msgId: msgId, emoji: desiredReaction
+            )
             await loadLocalLines(dialogId: dialogId)
-            status = desiredReaction == nil ? "Reaction removed" : "Reacted"
-            scheduleSync()
+            await processMessageMutation(PendingMessageMutation(
+                clientMutationId: mutationId, operation: "reaction", dialogId: dialogId,
+                msgId: msgId, body: nil, expectedEditVersion: nil, emoji: desiredReaction,
+                retryCount: 0, nextRetryAt: nil, lastError: nil
+            ))
         } catch {
             status = "Reaction failed: \(error.localizedDescription)"
+            presentNotice("Could not update reaction", message: error.localizedDescription)
         }
     }
 
@@ -1771,12 +2008,118 @@ final class CloudAppModel {
         }
     }
 
-    private func retryTransientMutation<T>(_ operation: () async throws -> T) async throws -> T {
+    private func retryPendingMessageMutations() async {
+        guard let localStore else { return }
         do {
-            return try await operation()
-        } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
-            try await Task.sleep(for: .milliseconds(250))
-            return try await operation()
+            for mutation in try await localStore.pendingMessageMutationsReady() {
+                try Task.checkCancellation()
+                await processMessageMutation(mutation)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            presentNotice("Could not resume message changes", message: error.localizedDescription)
+        }
+    }
+
+    private func processMessageMutation(_ mutation: PendingMessageMutation) async {
+        guard !messageMutationsInFlight.contains(mutation.clientMutationId) else { return }
+        guard let token = storedSession?.session.token, let localStore else { return }
+        messageMutationsInFlight.insert(mutation.clientMutationId)
+        defer { messageMutationsInFlight.remove(mutation.clientMutationId) }
+
+        do {
+            let response: MessageMutationResponse
+            switch mutation.operation {
+            case "edit":
+                guard let body = mutation.body, let expected = mutation.expectedEditVersion else {
+                    throw CloudAppModelError.localStoreUnavailable
+                }
+                response = try await api.editMessage(
+                    dialogId: mutation.dialogId,
+                    msgId: mutation.msgId,
+                    clientMutationId: mutation.clientMutationId,
+                    expectedEditVersion: expected,
+                    body: body,
+                    token: token
+                )
+            case "delete":
+                response = try await api.deleteMessage(
+                    dialogId: mutation.dialogId,
+                    msgId: mutation.msgId,
+                    clientMutationId: mutation.clientMutationId,
+                    token: token
+                )
+            case "reaction":
+                response = try await api.setReaction(
+                    dialogId: mutation.dialogId,
+                    msgId: mutation.msgId,
+                    clientMutationId: mutation.clientMutationId,
+                    emoji: mutation.emoji,
+                    token: token
+                )
+            default:
+                throw CloudAppModelError.localStoreUnavailable
+            }
+
+            try await localStore.applyMessageMutation(response)
+            try await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
+            if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
+            await refreshDialogs()
+            connectionViewState = .connected
+            status = response.duplicate ? "Change confirmed" : "Updated"
+            scheduleSync()
+        } catch {
+            if let apiError = error as? CloudAPIError, apiError.status == 409 {
+                try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
+                await syncNow()
+                if mutation.operation == "edit", let body = mutation.body {
+                    draft = body
+                    if let current = lines.first(where: { $0.msgId == mutation.msgId }) {
+                        composerMode = .editing(messageId: current.id, original: current.text)
+                    }
+                }
+                presentNotice(
+                    "Message changed on another device",
+                    message: mutation.operation == "edit"
+                        ? "The latest message was loaded and your edit was restored. Review it and send again."
+                        : "The latest message state has been loaded."
+                )
+                return
+            }
+
+            let featureIsAdvertised: Bool = switch mutation.operation {
+            case "reaction": capabilities.contains(.reactions)
+            default: capabilities.contains(.editing) || capabilities.contains(.deletion)
+            }
+            switch cloudOperationFailureDisposition(
+                error, serverAdvertisesFeature: featureIsAdvertised
+            ) {
+            case let .transient(retryAfter):
+                let delay = retryAfter ?? retryDelay(forRetryCount: mutation.retryCount + 1)
+                try? await localStore.markMessageMutationFailed(
+                    clientMutationId: mutation.clientMutationId,
+                    error: error.localizedDescription,
+                    retryAfter: delay,
+                    terminal: false
+                )
+                if error is URLError { connectionViewState = .offline }
+                if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
+                scheduleOutboxRetry(after: delay)
+            case .unsupportedServer:
+                try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
+                await refreshServerCapabilities()
+                if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
+                presentNotice("Server upgrade required", message: "This server does not support that message action yet.")
+            case .authenticationRequired:
+                try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
+                if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
+                presentNotice("Sign in again", message: "Your session ended before the message could be changed.")
+            case .permanent:
+                try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
+                if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
+                presentNotice("Message was not changed", message: error.localizedDescription)
+            }
         }
     }
 

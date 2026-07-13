@@ -1,11 +1,12 @@
 import { $ } from "bun";
 import { DEFAULT_URL } from "./db";
 
-// Applies schema.sql (idempotent DDL) via psql, which reliably handles multi-statement DDL.
+// Applies schema.sql atomically. The DDL is idempotent, and --single-transaction prevents a
+// partially-applied contract if psql encounters a later failure.
 const url = process.env.DATABASE_URL ?? DEFAULT_URL;
 const schema = new URL("./schema.sql", import.meta.url).pathname;
 
-await $`psql ${url} -v ON_ERROR_STOP=1 -f ${schema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -f ${schema}`.quiet();
 
 function redactUrl(value: string): string {
   try {

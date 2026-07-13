@@ -146,6 +146,10 @@ CREATE TABLE IF NOT EXISTS media_objects (
   byte_size             BIGINT NOT NULL CHECK (byte_size > 0),
   expected_sha256       BYTEA NOT NULL CHECK (octet_length(expected_sha256) = 32), -- HMAC(raw SHA-256)
   uploaded_bytes        BIGINT NOT NULL DEFAULT 0 CHECK (uploaded_bytes >= 0),
+  upload_protocol       TEXT NOT NULL DEFAULT 'offset_v1'
+                          CHECK (upload_protocol IN ('offset_v1','parts_v2')),
+  part_size             INT CHECK (part_size IS NULL OR part_size > 0),
+  total_parts           INT CHECK (total_parts IS NULL OR total_parts > 0),
   duration_ms           BIGINT CHECK (duration_ms IS NULL OR duration_ms >= 0),
   width                 INT CHECK (width IS NULL OR width > 0),
   height                INT CHECK (height IS NULL OR height > 0),
@@ -167,6 +171,14 @@ CREATE TABLE IF NOT EXISTS media_objects (
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_key_id TEXT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_nonce BYTEA;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS file_name_ciphertext BYTEA;
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS upload_protocol TEXT NOT NULL DEFAULT 'offset_v1';
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS part_size INT;
+ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS total_parts INT;
+ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_upload_protocol_check;
+ALTER TABLE media_objects ADD CONSTRAINT media_objects_upload_protocol_check CHECK (
+  (upload_protocol = 'offset_v1' AND part_size IS NULL AND total_parts IS NULL) OR
+  (upload_protocol = 'parts_v2' AND part_size > 0 AND total_parts > 0)
+);
 ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_status_check;
 ALTER TABLE media_objects ADD CONSTRAINT media_objects_status_check
   CHECK (status IN ('uploading','ready','rejected','deleted'));

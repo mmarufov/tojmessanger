@@ -51,6 +51,20 @@ nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let nextRetryAt: String?
 }
 
+nonisolated struct PendingMessageMutation: Identifiable, Equatable, Sendable {
+    let clientMutationId: String
+    var id: String { clientMutationId }
+    let operation: String
+    let dialogId: String
+    let msgId: Int64
+    let body: String?
+    let expectedEditVersion: Int?
+    let emoji: String?
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+}
+
 nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
     let transferId: String
     var id: String { transferId }
@@ -74,6 +88,7 @@ nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
     let retryCount: Int
     let nextRetryAt: String?
     let lastError: String?
+    let terminal: Bool
 
     var media: CloudMedia {
         return CloudMedia(
@@ -312,7 +327,7 @@ actor CloudLocalStore {
             try db.execute(
                 sql: """
                 UPDATE pending_outbox
-                SET next_retry_at = NULL
+                SET next_retry_at = NULL, terminal = 0
                 WHERE client_msg_id = ?
                 """,
                 arguments: [clientMsgId]
@@ -320,17 +335,21 @@ actor CloudLocalStore {
         }
     }
 
-    func markFailed(clientMsgId: String, retryAfter: TimeInterval? = nil) throws {
+    func markFailed(
+        clientMsgId: String,
+        retryAfter: TimeInterval? = nil,
+        terminal: Bool = false
+    ) throws {
         let nextRetryAt = retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) }
         try dbQueue.write { db in
             try db.execute(sql: "UPDATE messages SET local_state = 'failed' WHERE client_msg_id = ?", arguments: [clientMsgId])
             try db.execute(
                 sql: """
                 UPDATE pending_outbox
-                SET retry_count = retry_count + 1, next_retry_at = ?
+                SET retry_count = retry_count + 1, next_retry_at = ?, terminal = ?
                 WHERE client_msg_id = ?
                 """,
-                arguments: [nextRetryAt, clientMsgId]
+                arguments: [nextRetryAt, terminal, clientMsgId]
             )
         }
     }
@@ -404,7 +423,7 @@ actor CloudLocalStore {
     func markMediaRetrying(clientMsgId: String) throws {
         try dbQueue.write { db in
             try db.execute(
-                sql: "UPDATE media_transfers SET next_retry_at = NULL, last_error = NULL WHERE client_msg_id = ?",
+                sql: "UPDATE media_transfers SET next_retry_at = NULL, last_error = NULL, terminal = 0 WHERE client_msg_id = ?",
                 arguments: [clientMsgId]
             )
             try db.execute(
@@ -434,7 +453,7 @@ actor CloudLocalStore {
                 db,
                 sql: """
                 SELECT * FROM media_transfers
-                WHERE state != 'complete' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY created_at, transfer_id LIMIT ?
                 """,
                 arguments: [Self.sqliteTimestamp(now), limit]
@@ -448,13 +467,13 @@ actor CloudLocalStore {
         return try dbQueue.read { db in
             let due = try Int.fetchOne(
                 db,
-                sql: "SELECT COUNT(*) FROM media_transfers WHERE next_retry_at IS NULL OR next_retry_at <= ?",
+                sql: "SELECT COUNT(*) FROM media_transfers WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)",
                 arguments: [nowText]
             ) ?? 0
             if due > 0 { return 0 }
             guard let next = try String.fetchOne(
                 db,
-                sql: "SELECT MIN(next_retry_at) FROM media_transfers WHERE next_retry_at > ?",
+                sql: "SELECT MIN(next_retry_at) FROM media_transfers WHERE terminal = 0 AND next_retry_at > ?",
                 arguments: [nowText]
             ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
             return max(0, date.timeIntervalSince(now))
@@ -465,6 +484,26 @@ actor CloudLocalStore {
         try dbQueue.read { db in
             try Row.fetchOne(db, sql: "SELECT * FROM media_transfers WHERE transfer_id = ?", arguments: [id])
                 .map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func mediaTransfer(clientMsgId: String) throws -> MediaTransferRecord? {
+        try dbQueue.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM media_transfers WHERE client_msg_id = ? LIMIT 1",
+                arguments: [clientMsgId]
+            ).map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func mediaTransfers(dialogId: String) throws -> [MediaTransferRecord] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM media_transfers WHERE dialog_id = ? ORDER BY created_at, transfer_id",
+                arguments: [dialogId]
+            ).map(Self.mediaTransfer(from:))
         }
     }
 
@@ -511,6 +550,143 @@ actor CloudLocalStore {
     func applyMessageMutation(_ response: MessageMutationResponse) throws {
         try dbQueue.write { db in
             try upsertMessage(db, message: response.message, localState: "sent")
+        }
+    }
+
+    func enqueueMessageMutation(
+        clientMutationId: String,
+        operation: String,
+        dialogId: String,
+        msgId: Int64,
+        body: String? = nil,
+        expectedEditVersion: Int? = nil,
+        emoji: String? = nil
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO pending_message_mutations (
+                  client_mutation_id, operation, dialog_id, msg_id, body,
+                  expected_edit_version, emoji, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(client_mutation_id) DO NOTHING
+                """,
+                arguments: [
+                    clientMutationId, operation, dialogId, msgId, body,
+                    expectedEditVersion, emoji
+                ]
+            )
+        }
+    }
+
+    func messageMutations(dialogId: String) throws -> [PendingMessageMutation] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM pending_message_mutations
+                WHERE dialog_id = ?
+                ORDER BY created_at, client_mutation_id
+                """,
+                arguments: [dialogId]
+            ).map(Self.messageMutation(from:))
+        }
+    }
+
+    func pendingMessageMutationsReady(now: Date = Date(), limit: Int = 20) throws -> [PendingMessageMutation] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM pending_message_mutations
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY created_at, client_mutation_id
+                LIMIT ?
+                """,
+                arguments: [Self.sqliteTimestamp(now), limit]
+            ).map(Self.messageMutation(from:))
+        }
+    }
+
+    func markMessageMutationFailed(
+        clientMutationId: String,
+        error: String,
+        retryAfter: TimeInterval?,
+        terminal: Bool
+    ) throws {
+        let next = retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) }
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_message_mutations
+                SET retry_count = retry_count + 1, next_retry_at = ?, last_error = ?, terminal = ?
+                WHERE client_mutation_id = ?
+                """,
+                arguments: [next, error, terminal, clientMutationId]
+            )
+        }
+    }
+
+    func retryMessageMutation(clientMutationId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_message_mutations
+                SET next_retry_at = NULL, last_error = NULL, terminal = 0
+                WHERE client_mutation_id = ?
+                """,
+                arguments: [clientMutationId]
+            )
+        }
+    }
+
+    func completeMessageMutation(clientMutationId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM pending_message_mutations WHERE client_mutation_id = ?",
+                arguments: [clientMutationId]
+            )
+        }
+    }
+
+    func nextMessageMutationDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM pending_message_mutations
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                """,
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: """
+                SELECT MIN(next_retry_at) FROM pending_message_mutations
+                WHERE terminal = 0 AND next_retry_at > ?
+                """,
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
+        }
+    }
+
+    func markMediaTerminal(clientMsgId: String, error: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE media_transfers
+                SET terminal = 1, next_retry_at = NULL, last_error = ?
+                WHERE client_msg_id = ?
+                """,
+                arguments: [error, clientMsgId]
+            )
+            try db.execute(
+                sql: "UPDATE messages SET local_state = 'failed' WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
         }
     }
 
@@ -659,7 +835,7 @@ actor CloudLocalStore {
                 SELECT client_msg_id, dialog_id, body, reply_to_msg_id,
                        forwarded_from_dialog_id, forwarded_from_msg_id, retry_count, next_retry_at
                 FROM pending_outbox
-                WHERE next_retry_at IS NULL OR next_retry_at <= ?
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 ORDER BY created_at ASC, client_msg_id ASC
                 LIMIT ?
                 """,
@@ -677,7 +853,7 @@ actor CloudLocalStore {
                 sql: """
                 SELECT COUNT(*)
                 FROM pending_outbox
-                WHERE next_retry_at IS NULL OR next_retry_at <= ?
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 """,
                 arguments: [nowText]
             ) ?? 0
@@ -690,7 +866,7 @@ actor CloudLocalStore {
                 sql: """
                 SELECT MIN(next_retry_at)
                 FROM pending_outbox
-                WHERE next_retry_at > ?
+                WHERE terminal = 0 AND next_retry_at > ?
                 """,
                 arguments: [nowText]
             ), let nextDate = Self.makeSQLiteDateFormatter().date(from: next) else {
@@ -732,10 +908,18 @@ actor CloudLocalStore {
                   ) AS unread_count
                 FROM dialogs d
                 LEFT JOIN messages m ON m.rowid = (
-                  SELECT rowid
-                  FROM messages
-                  WHERE dialog_id = d.dialog_id
-                  ORDER BY COALESCE(msg_id, 9223372036854775807) DESC, rowid DESC
+                  SELECT candidate.rowid
+                  FROM messages candidate
+                  WHERE candidate.dialog_id = d.dialog_id
+                    AND candidate.state = 'visible'
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM pending_message_mutations pending_delete
+                      WHERE pending_delete.dialog_id = candidate.dialog_id
+                        AND pending_delete.msg_id = candidate.msg_id
+                        AND pending_delete.operation = 'delete'
+                    )
+                  ORDER BY COALESCE(candidate.msg_id, 9223372036854775807) DESC, candidate.rowid DESC
                   LIMIT 1
                 )
                 ORDER BY d.updated_at DESC, d.dialog_id DESC
@@ -821,6 +1005,7 @@ actor CloudLocalStore {
               forwarded_from_msg_id INTEGER,
               retry_count INTEGER NOT NULL DEFAULT 0,
               next_retry_at TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -854,10 +1039,28 @@ actor CloudLocalStore {
               retry_count INTEGER NOT NULL DEFAULT 0,
               next_retry_at TEXT,
               last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS media_transfers_retry_idx
               ON media_transfers(state, next_retry_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS pending_message_mutations (
+              client_mutation_id TEXT PRIMARY KEY,
+              operation TEXT NOT NULL CHECK (operation IN ('edit','delete','reaction')),
+              dialog_id TEXT NOT NULL,
+              msg_id INTEGER NOT NULL,
+              body TEXT,
+              expected_edit_version INTEGER,
+              emoji TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_message_mutations_retry_idx
+              ON pending_message_mutations(terminal, next_retry_at, created_at);
             """)
 
             let messageColumns = try db.columns(in: "messages").map(\.name)
@@ -891,6 +1094,13 @@ actor CloudLocalStore {
             }
             if !outboxColumns.contains("forwarded_from_msg_id") {
                 try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN forwarded_from_msg_id INTEGER")
+            }
+            if !outboxColumns.contains("terminal") {
+                try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0")
+            }
+            let mediaColumns = try db.columns(in: "media_transfers").map(\.name)
+            if !mediaColumns.contains("terminal") {
+                try db.execute(sql: "ALTER TABLE media_transfers ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0")
             }
         }
     }
@@ -1040,6 +1250,16 @@ actor CloudLocalStore {
             encryptedThumbnailPath: row["encrypted_thumbnail_path"], mediaId: row["media_id"],
             uploadOffset: row["upload_offset"], state: row["state"],
             retryCount: row["retry_count"], nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"], terminal: (row["terminal"] as Int) != 0
+        )
+    }
+
+    private static func messageMutation(from row: Row) -> PendingMessageMutation {
+        PendingMessageMutation(
+            clientMutationId: row["client_mutation_id"], operation: row["operation"],
+            dialogId: row["dialog_id"], msgId: row["msg_id"], body: row["body"],
+            expectedEditVersion: row["expected_edit_version"], emoji: row["emoji"],
+            retryCount: row["retry_count"], nextRetryAt: row["next_retry_at"],
             lastError: row["last_error"]
         )
     }
@@ -1102,7 +1322,10 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM dialog_members")
         try db.execute(sql: "DELETE FROM dialogs")
         try db.execute(sql: "DELETE FROM pending_outbox")
-        if includeMediaTransfers { try db.execute(sql: "DELETE FROM media_transfers") }
+        if includeMediaTransfers {
+            try db.execute(sql: "DELETE FROM pending_message_mutations")
+            try db.execute(sql: "DELETE FROM media_transfers")
+        }
     }
 }
 

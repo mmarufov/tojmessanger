@@ -12,7 +12,7 @@ import {
   type OTPDelivery,
 } from "./auth";
 import { bodyAAD, hashToken, mediaFileNameAAD, open, pushTokenAAD } from "./crypto";
-import { startCloudServer } from "./cloud";
+import { CLOUD_CAPABILITIES, startCloudServer } from "./cloud";
 import { cleanupExpiredData, OperationalMetrics, requestIdFrom, safeRoute } from "./ops";
 import {
   buildAPNsPayload,
@@ -39,9 +39,13 @@ import {
   completeMediaUpload,
   createMediaUpload,
   downloadMediaChunk,
+  DEFAULT_MEDIA_CHUNK_BYTES,
+  getMediaUpload,
+  MEDIA_PART_SIZE,
   mediaLimits,
   MediaError,
   uploadMediaChunk,
+  uploadMediaPart,
   uploadMediaThumbnail,
 } from "./media";
 import { createHash } from "node:crypto";
@@ -96,6 +100,16 @@ function tinyJpeg(width = 1, height = 1): Buffer {
   ]);
 }
 
+function tinyPng(width = 1, height = 1): Buffer {
+  const bytes = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return bytes;
+}
+
 async function addIOSDevice(accountId: string): Promise<{ deviceId: string }> {
   const authTokenHash = hashToken(crypto.randomUUID());
   const row = (await db`
@@ -142,6 +156,10 @@ async function makePair() {
 }
 
 describe("M3 cloud sync", () => {
+  test("media uploads default to one-megabyte WAN chunks", () => {
+    expect(DEFAULT_MEDIA_CHUNK_BYTES).toBe(1024 * 1024);
+  });
+
   beforeEach(resetDb);
 
   test("phone OTP creates an account, device, and sync state", async () => {
@@ -1292,6 +1310,49 @@ describe("M3 cloud sync", () => {
     expect(await db`SELECT id FROM media_objects WHERE id = ${created.mediaId}`).toHaveLength(0);
   });
 
+  test("multipart v2 accepts encrypted out-of-order parts and resumes only missing parts", async () => {
+    const { alice } = await makePair();
+    const bytes = Buffer.alloc(MEDIA_PART_SIZE * 2 + 31);
+    bytes.fill(0x41, 0, MEDIA_PART_SIZE);
+    bytes.fill(0x42, MEDIA_PART_SIZE, MEDIA_PART_SIZE * 2);
+    bytes.fill(0x43, MEDIA_PART_SIZE * 2);
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "multipart.bin",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      uploadProtocol: "parts_v2",
+    });
+    expect(created).toMatchObject({
+      uploadProtocol: "parts_v2", partSize: MEDIA_PART_SIZE, totalParts: 3, receivedParts: [],
+    });
+
+    const part0 = bytes.subarray(0, MEDIA_PART_SIZE);
+    const part1 = bytes.subarray(MEDIA_PART_SIZE, MEDIA_PART_SIZE * 2);
+    const part2 = bytes.subarray(MEDIA_PART_SIZE * 2);
+    await expect(uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, part0))
+      .rejects.toMatchObject({ status: 409, code: "media_protocol_mismatch" });
+    await uploadMediaPart(db, alice.accountId, alice.deviceId, created.mediaId, 2, part2);
+    await uploadMediaPart(db, alice.accountId, alice.deviceId, created.mediaId, 0, part0);
+    expect(await uploadMediaPart(db, alice.accountId, alice.deviceId, created.mediaId, 0, part0))
+      .toMatchObject({ duplicate: true, partIndex: 0 });
+    const conflicting = Buffer.from(part0);
+    conflicting[0] ^= 0xff;
+    await expect(uploadMediaPart(db, alice.accountId, alice.deviceId, created.mediaId, 0, conflicting))
+      .rejects.toMatchObject({ status: 409, code: "media_part_conflict" });
+
+    expect(await getMediaUpload(db, alice.accountId, created.mediaId)).toMatchObject({
+      uploadProtocol: "parts_v2", receivedParts: [0, 2], uploadOffset: MEDIA_PART_SIZE + 31,
+    });
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
+      .rejects.toMatchObject({ status: 409 });
+    await uploadMediaPart(db, alice.accountId, alice.deviceId, created.mediaId, 1, part1);
+    expect(await completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
+      .toMatchObject({ ready: true, duplicate: false });
+
+    const stored = await db`
+      SELECT ciphertext FROM media_chunks WHERE media_id = ${created.mediaId} ORDER BY chunk_offset`;
+    expect(Buffer.concat(stored.map((row) => Buffer.from(row.ciphertext))).includes(part0)).toBe(false);
+  });
+
   test("media HTTP routes bound binary bodies and round-trip authorized chunks", async () => {
     const { alice, bob, dialogId } = await makePair();
     const server = startCloudServer(0, db, null, null);
@@ -1374,6 +1435,56 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("multipart v2 HTTP route reports capabilities, acknowledgements, and stable errors", async () => {
+    const { alice } = await makePair();
+    const server = startCloudServer(0, db, null, null);
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const bytes = tinyJpeg(7, 9);
+      const createdResponse = await fetch(`${base}/v1/media/uploads`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "photo", contentType: "image/jpeg", fileName: "photo.jpg",
+          byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+          width: 7, height: 9, uploadProtocol: "parts_v2",
+        }),
+      });
+      expect(createdResponse.status).toBe(201);
+      const created = await createdResponse.json() as {
+        mediaId: string; uploadProtocol: string; partSize: number; totalParts: number;
+      };
+      expect(created).toMatchObject({ uploadProtocol: "parts_v2", partSize: MEDIA_PART_SIZE, totalParts: 1 });
+
+      const part = await fetch(`${base}/v1/media/uploads/${created.mediaId}/parts/0`, {
+        method: "PUT", headers: { authorization: `Bearer ${alice.token}` }, body: bytes,
+      });
+      expect(part.status).toBe(200);
+      expect(await part.json()).toMatchObject({ partIndex: 0, complete: true, duplicate: false });
+      expect(safeRoute(`/v1/media/uploads/${created.mediaId}/parts/0`))
+        .toBe("/v1/media/uploads/:id/parts/:part");
+
+      const completed = await fetch(`${base}/v1/media/uploads/${created.mediaId}/complete`, {
+        method: "POST", headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(completed.status).toBe(200);
+
+      const invalid = await fetch(`${base}/v1/media/uploads`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "file", contentType: "application/octet-stream", byteSize: 1,
+          sha256: createHash("sha256").update(Buffer.from([1])).digest("hex"),
+          uploadProtocol: "unknown",
+        }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ code: "unsupported_upload_protocol" });
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("media completion rejects gaps and checksum mismatches without publishing a message", async () => {
     const { alice, dialogId } = await makePair();
     const bytes = Buffer.from("checksum-test");
@@ -1415,6 +1526,21 @@ describe("M3 cloud sync", () => {
     await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, bytes);
     await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
       .rejects.toMatchObject({ status: 415 });
+  });
+
+  test.each([
+    ["image/jpeg", tinyJpeg(1_284, 2_778)],
+    ["image/png", tinyPng(1_284, 2_778)],
+  ])("media completion accepts a valid %s photo with matching dimensions", async (contentType, bytes) => {
+    const { alice } = await makePair();
+    const created = await createMediaUpload(db, alice.accountId, alice.deviceId, {
+      kind: "photo", contentType, fileName: "valid-photo",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      width: 1_284, height: 2_778,
+    });
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, created.mediaId, 0, bytes);
+    await expect(completeMediaUpload(db, alice.accountId, alice.deviceId, created.mediaId))
+      .resolves.toMatchObject({ ready: true, duplicate: false });
   });
 
   test("owners can cancel abandoned uploads but cannot cancel delivered media", async () => {
@@ -1573,3 +1699,16 @@ describe("M3 cloud sync", () => {
     expect(await lookupAccountByPhone(db, requester.accountId, testPhone(2_000))).toBeNull();
   });
 });
+  test("capability contract is public, cache-safe, and advertises shipped messaging features", async () => {
+    const port = 53_000 + Math.floor(Math.random() * 1_000);
+    const server = startCloudServer(port, db, null, null);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/capabilities`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.json()).toEqual(CLOUD_CAPABILITIES);
+      expect(safeRoute("/v1/capabilities")).toBe("/v1/capabilities");
+    } finally {
+      server.stop(true);
+    }
+  });
