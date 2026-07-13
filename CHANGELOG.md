@@ -5,6 +5,33 @@ All notable changes to Toj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to a `MAJOR.MINOR.PATCH.BUILD` version scheme.
 
+## [0.1.1.0] — 2026-07-13
+
+Premium-black design pass. Keeps Toj's black identity (X/Grok-grade minimalism)
+while borrowing how Telegram executes iOS 26 Liquid Glass, and elevates gold into
+the signature interactive accent.
+
+### Added
+- **Design tokens** in `TojTheme.swift`: semantic accent colors
+  (`accent`, `onAccent`, `danger`, `hairline`, `bubbleMine`), a `TojSpacing` scale,
+  and a `TojRadius` scale.
+- **Reusable components**: `TojPressableStyle` (`.buttonStyle(.tojPressable)` reactive
+  press feedback), `TojGlassIconButton`, `TojNavHeader`, `TojIconTile`, `TojSectionCard`,
+  and `TojPillFilter`.
+- **Chat folder filter** (All / Unread / Pinned) on the chat list.
+
+### Changed
+- Gold is now the signature interactive accent: send button, primary CTAs, active
+  unread badges, and selected pills. White stays neutral, green stays encryption.
+- Chat list, conversation, settings, profile, and auth restyled onto the shared header,
+  section-card, icon-tile, and pill components with consistent tokens and press feedback.
+- Outgoing message bubbles use a premium graphite fill with a faint gold hairline;
+  muted chats show a gray unread badge instead of gold.
+
+### Removed
+- Dead `CloudConversationView` / `CloudBubble`, superseded by
+  `TojConversationExperience` / `TojMessageBubble`.
+
 ## [0.1.0.0] — 2026-07-12
 
 First versioned release. Establishes the visual identity, design system, and
