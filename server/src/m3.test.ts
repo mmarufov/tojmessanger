@@ -7,10 +7,11 @@ import {
   startAccountDeletion,
   deleteAccount,
   resolveDevice,
+  revokeDevice,
   AuthError,
   type OTPDelivery,
 } from "./auth";
-import { bodyAAD, hashToken, open, pushTokenAAD } from "./crypto";
+import { bodyAAD, hashToken, mediaFileNameAAD, open, pushTokenAAD } from "./crypto";
 import { startCloudServer } from "./cloud";
 import { cleanupExpiredData, OperationalMetrics, requestIdFrom, safeRoute } from "./ops";
 import {
@@ -33,6 +34,17 @@ import {
   setReaction,
   startBootstrap,
 } from "./sync";
+import {
+  cancelMediaUpload,
+  completeMediaUpload,
+  createMediaUpload,
+  downloadMediaChunk,
+  mediaLimits,
+  MediaError,
+  uploadMediaChunk,
+  uploadMediaThumbnail,
+} from "./media";
+import { createHash } from "node:crypto";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
@@ -50,6 +62,9 @@ async function resetDb() {
       push_deliveries,
       account_events,
       messages,
+      media_chunks,
+      media_objects,
+      contact_lookup_attempts,
       dialog_members,
       direct_dialog_pairs,
       dialogs,
@@ -193,13 +208,18 @@ describe("M3 cloud sync", () => {
     expect(await db`SELECT id FROM otp_challenges`).toHaveLength(0);
   });
 
-  test("private-beta OTP return requires the explicit server switch", async () => {
+  test("private-beta OTP return requires the explicit switch and production phone allowlist", async () => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
+    const previousAllowlist = process.env.TOJ_DEV_OTP_ALLOWLIST;
     process.env.NODE_ENV = "production";
     process.env.TOJ_RETURN_OTP = "1";
+    delete process.env.TOJ_DEV_OTP_ALLOWLIST;
+    const phone = testPhone(132);
     try {
-      const issued = await startVerification(db, testPhone(132));
+      await expect(startVerification(db, phone)).rejects.toMatchObject({ status: 503 });
+      process.env.TOJ_DEV_OTP_ALLOWLIST = phone;
+      const issued = await startVerification(db, phone);
       expect(issued.code).toMatch(/^\d{6}$/);
       expect(issued.retryAfter).toBe(30);
     } finally {
@@ -207,6 +227,8 @@ describe("M3 cloud sync", () => {
       else process.env.NODE_ENV = previousNodeEnv;
       if (previousReturnOTP === undefined) delete process.env.TOJ_RETURN_OTP;
       else process.env.TOJ_RETURN_OTP = previousReturnOTP;
+      if (previousAllowlist === undefined) delete process.env.TOJ_DEV_OTP_ALLOWLIST;
+      else process.env.TOJ_DEV_OTP_ALLOWLIST = previousAllowlist;
     }
   });
 
@@ -282,7 +304,7 @@ describe("M3 cloud sync", () => {
     expect(erasedDevice.device_name).toBeNull();
     expect(await db`SELECT id FROM otp_challenges WHERE phone_lookup_hash = ${Buffer.from(original.phone_lookup_hash)}`)
       .toHaveLength(0);
-    expect(await lookupAccountByPhone(db, phone)).toBeNull();
+    expect(await lookupAccountByPhone(db, bob.accountId, phone)).toBeNull();
     await expect(resolveDevice(db, alice.token)).rejects.toBeInstanceOf(AuthError);
     await expect(sendMessage(db, {
       senderAccountId: alice.accountId,
@@ -463,10 +485,16 @@ describe("M3 cloud sync", () => {
     const account = await makeAccount(testPhone(126), "Cleanup");
     await startBootstrap(db, account.accountId);
     await db`UPDATE bootstrap_snapshots SET expires_at = now() - interval '1 minute'`;
+    await createMediaUpload(db, account.accountId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "expired.bin",
+      byteSize: 4, sha256: createHash("sha256").update("test").digest("hex"),
+    });
+    await db`UPDATE media_objects SET expires_at = now() - interval '1 minute' WHERE status = 'uploading'`;
 
     const deleted = await cleanupExpiredData(db, 1);
-    expect(deleted).toMatchObject({ otp: 1, snapshots: 1, pushDeliveries: 0 });
+    expect(deleted).toMatchObject({ otp: 1, snapshots: 1, pushDeliveries: 0, mediaUploads: 1 });
     expect(await db`SELECT id FROM bootstrap_snapshots`).toHaveLength(0);
+    expect(await db`SELECT id FROM media_objects WHERE status = 'uploading'`).toHaveLength(0);
   });
 
   test("failed OTP delivery consumes the unusable challenge", async () => {
@@ -573,6 +601,16 @@ describe("M3 cloud sync", () => {
     expect(deliveries.find((row) => row.device_id === aliceSecond.deviceId)?.alert).toBe(false);
     expect(deliveries.find((row) => row.device_id === bob.deviceId)?.alert).toBe(true);
     expect(deliveries.every((row) => row.status === "pending")).toBe(true);
+  });
+
+  test("a revoked device cannot commit a message after sign-out", async () => {
+    const { alice, dialogId } = await makePair();
+    await revokeDevice(db, alice.accountId, alice.deviceId);
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId, clientMsgId: crypto.randomUUID(), body: "must not send",
+    })).rejects.toThrow("sending device is no longer active");
+    expect(await db`SELECT msg_id FROM messages WHERE dialog_id = ${dialogId}`).toHaveLength(0);
   });
 
   test("push worker marks success and removes an unregistered device token", async () => {
@@ -1177,6 +1215,269 @@ describe("M3 cloud sync", () => {
     expect(String(row.ciphertext)).not.toContain(body);
   });
 
+  test("resumable media is encrypted at rest, idempotent, and downloadable only by members", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const outsider = await makeAccount(testPhone(901), "Outsider");
+    const bytes = Buffer.from("private-media-payload-that-must-not-be-visible-on-disk");
+    const created = await createMediaUpload(db, alice.accountId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "safe.bin",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    const first = bytes.subarray(0, 20);
+    const second = bytes.subarray(20);
+    expect((await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, first)).uploadOffset).toBe(20);
+    const retry = await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, first);
+    expect(retry).toMatchObject({ uploadOffset: 20, duplicate: true });
+    await uploadMediaChunk(db, alice.accountId, created.mediaId, 20, second);
+    await uploadMediaThumbnail(db, alice.accountId, created.mediaId, "image/jpeg", Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+
+    const stored = await db`SELECT ciphertext, plain_sha256 FROM media_chunks WHERE media_id = ${created.mediaId}`;
+    expect(Buffer.concat(stored.map((row) => Buffer.from(row.ciphertext))).includes(bytes)).toBe(false);
+    expect(Buffer.from(stored[0].plain_sha256).equals(createHash("sha256").update(first).digest())).toBe(false);
+    const fingerprint = (await db`SELECT expected_sha256 FROM media_objects WHERE id = ${created.mediaId}`)[0];
+    expect(Buffer.from(fingerprint.expected_sha256).equals(createHash("sha256").update(bytes).digest())).toBe(false);
+    expect(await completeMediaUpload(db, alice.accountId, created.mediaId)).toMatchObject({ ready: true, duplicate: false });
+    expect(await completeMediaUpload(db, alice.accountId, created.mediaId)).toMatchObject({ ready: true, duplicate: true });
+
+    const sent = await sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
+      clientMsgId: crypto.randomUUID(), body: "attached", mediaId: created.mediaId,
+    });
+    const history = await getHistory(db, bob.accountId, dialogId);
+    expect(history.messages[0].media).toMatchObject({
+      id: created.mediaId, kind: "file", byte_size: bytes.length, has_thumbnail: true,
+    });
+    const downloaded = await downloadMediaChunk(db, bob.accountId, created.mediaId, 0);
+    const downloadedSecond = await downloadMediaChunk(db, bob.accountId, created.mediaId, downloaded.nextOffset);
+    expect(Buffer.concat([downloaded.bytes, downloadedSecond.bytes])).toEqual(bytes);
+    await expect(downloadMediaChunk(db, outsider.accountId, created.mediaId, 0))
+      .rejects.toMatchObject({ status: 404 });
+
+    await deleteMessage(db, {
+      actorAccountId: alice.accountId, actorDeviceId: alice.deviceId, dialogId,
+      msgId: sent.msgId, clientMutationId: crypto.randomUUID(),
+    });
+    await expect(downloadMediaChunk(db, bob.accountId, created.mediaId, 0))
+      .rejects.toMatchObject({ status: 404 });
+    expect(await db`SELECT id FROM media_objects WHERE id = ${created.mediaId}`).toHaveLength(0);
+  });
+
+  test("media HTTP routes bound binary bodies and round-trip authorized chunks", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const server = startCloudServer(0, db, null, null);
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const bytes = Buffer.from("http-media-round-trip");
+      const createdResponse = await fetch(`${base}/v1/media/uploads`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "file", contentType: "application/octet-stream", fileName: "round-trip.bin",
+          byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+        }),
+      });
+      expect(createdResponse.status).toBe(201);
+      const created = await createdResponse.json() as { mediaId: string };
+
+      const missingOffset = await fetch(`${base}/v1/media/uploads/${created.mediaId}/chunks`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${alice.token}` },
+        body: bytes,
+      });
+      expect(missingOffset.status).toBe(400);
+
+      const oversized = await fetch(`${base}/v1/media/uploads/${created.mediaId}/chunks`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${alice.token}`, "upload-offset": "0" },
+        body: Buffer.alloc(mediaLimits().chunkBytes + 1),
+      });
+      expect(oversized.status).toBe(413);
+      expect(Number((await db`SELECT uploaded_bytes FROM media_objects WHERE id = ${created.mediaId}`)[0].uploaded_bytes))
+        .toBe(0);
+
+      const chunk = await fetch(`${base}/v1/media/uploads/${created.mediaId}/chunks`, {
+        method: "PUT",
+        headers: { authorization: `Bearer ${alice.token}`, "upload-offset": "0" },
+        body: bytes,
+      });
+      expect(chunk.status).toBe(200);
+      expect(chunk.headers.get("upload-offset")).toBe(String(bytes.length));
+      const completed = await fetch(`${base}/v1/media/uploads/${created.mediaId}/complete`, {
+        method: "POST", headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(completed.status).toBe(200);
+      await sendMessage(db, {
+        senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
+        clientMsgId: crypto.randomUUID(), mediaId: created.mediaId, body: "",
+      });
+
+      const downloaded = await fetch(`${base}/v1/media/${created.mediaId}/chunks?offset=0`, {
+        headers: { authorization: `Bearer ${bob.token}` },
+      });
+      expect(downloaded.status).toBe(200);
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
+      expect(downloaded.headers.get("x-media-next-offset")).toBe(String(bytes.length));
+
+      const abandonedBytes = Buffer.from("abandoned route upload");
+      const abandonedResponse = await fetch(`${base}/v1/media/uploads`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "file", contentType: "application/octet-stream", fileName: "cancel.bin",
+          byteSize: abandonedBytes.length,
+          sha256: createHash("sha256").update(abandonedBytes).digest("hex"),
+        }),
+      });
+      expect(abandonedResponse.status).toBe(201);
+      const abandoned = await abandonedResponse.json() as { mediaId: string };
+      const cancelled = await fetch(`${base}/v1/media/uploads/${abandoned.mediaId}`, {
+        method: "DELETE", headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(cancelled.status).toBe(200);
+      expect(await cancelled.json()).toEqual({ mediaId: abandoned.mediaId, cancelled: true });
+      const cancelledState = await fetch(`${base}/v1/media/uploads/${abandoned.mediaId}`, {
+        headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(cancelledState.status).toBe(404);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("media completion rejects gaps and checksum mismatches without publishing a message", async () => {
+    const { alice, dialogId } = await makePair();
+    const bytes = Buffer.from("checksum-test");
+    const created = await createMediaUpload(db, alice.accountId, {
+      kind: "voice", contentType: "audio/mp4", byteSize: bytes.length,
+      sha256: "00".repeat(32), durationMs: 850,
+    });
+    await expect(uploadMediaChunk(db, alice.accountId, created.mediaId, 4, bytes))
+      .rejects.toMatchObject({ status: 409 });
+    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
+    await expect(completeMediaUpload(db, alice.accountId, created.mediaId))
+      .rejects.toThrow("checksum mismatch");
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
+      clientMsgId: crypto.randomUUID(), body: "", mediaId: created.mediaId,
+    })).rejects.toThrow("media upload is incomplete");
+
+    const expired = await createMediaUpload(db, alice.accountId, {
+      kind: "file", contentType: "application/octet-stream", byteSize: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    await uploadMediaChunk(db, alice.accountId, expired.mediaId, 0, bytes);
+    await db`UPDATE media_objects SET expires_at = now() - interval '1 second' WHERE id = ${expired.mediaId}`;
+    await expect(completeMediaUpload(db, alice.accountId, expired.mediaId))
+      .rejects.toMatchObject({ status: 410 });
+  });
+
+  test("media completion rejects content that does not match its declared type", async () => {
+    const { alice } = await makePair();
+    const bytes = Buffer.from("this is not an image");
+    const created = await createMediaUpload(db, alice.accountId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "fake.jpg",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
+    await expect(completeMediaUpload(db, alice.accountId, created.mediaId))
+      .rejects.toMatchObject({ status: 415 });
+  });
+
+  test("owners can cancel abandoned uploads but cannot cancel delivered media", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    const bytes = Buffer.from("abandoned encrypted upload");
+    const abandoned = await createMediaUpload(db, alice.accountId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "private.txt",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    await uploadMediaChunk(db, alice.accountId, abandoned.mediaId, 0, bytes);
+    await expect(cancelMediaUpload(db, bob.accountId, abandoned.mediaId)).rejects.toMatchObject({ status: 404 });
+    expect(await cancelMediaUpload(db, alice.accountId, abandoned.mediaId)).toEqual({
+      mediaId: abandoned.mediaId, cancelled: true,
+    });
+
+    const delivered = await createMediaUpload(db, alice.accountId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "delivered.txt",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    await uploadMediaChunk(db, alice.accountId, delivered.mediaId, 0, bytes);
+    await completeMediaUpload(db, alice.accountId, delivered.mediaId);
+    await sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId, dialogId,
+      clientMsgId: crypto.randomUUID(), body: "", mediaId: delivered.mediaId,
+    });
+    await expect(cancelMediaUpload(db, alice.accountId, delivered.mediaId)).rejects.toMatchObject({ status: 409 });
+  });
+
+  test("deleting a source keeps forwarded media until the final visible copy is deleted", async () => {
+    const { alice, bob, dialogId: sourceDialogId } = await makePair();
+    const charlie = await makeAccount(testPhone(902), "Charlie");
+    const destination = await getOrCreateDirectDialog(db, bob.accountId, charlie.accountId);
+    const bytes = Buffer.from("forwarded encrypted media");
+    const created = await createMediaUpload(db, alice.accountId, {
+      kind: "file", contentType: "application/octet-stream", fileName: "forward.bin",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+    });
+    await uploadMediaChunk(db, alice.accountId, created.mediaId, 0, bytes);
+    await completeMediaUpload(db, alice.accountId, created.mediaId);
+    const source = await sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId: sourceDialogId, clientMsgId: crypto.randomUUID(), body: "", mediaId: created.mediaId,
+    });
+    const forwarded = await sendMessage(db, {
+      senderAccountId: bob.accountId, senderDeviceId: bob.deviceId,
+      dialogId: destination.dialogId, clientMsgId: crypto.randomUUID(),
+      forwardedFrom: { dialogId: sourceDialogId, msgId: source.msgId },
+    });
+    await deleteMessage(db, {
+      actorAccountId: alice.accountId, actorDeviceId: alice.deviceId,
+      dialogId: sourceDialogId, msgId: source.msgId, clientMutationId: crypto.randomUUID(),
+    });
+    expect((await downloadMediaChunk(db, charlie.accountId, created.mediaId, 0)).bytes).toEqual(bytes);
+    await deleteMessage(db, {
+      actorAccountId: bob.accountId, actorDeviceId: bob.deviceId,
+      dialogId: destination.dialogId, msgId: forwarded.msgId, clientMutationId: crypto.randomUUID(),
+    });
+    await expect(downloadMediaChunk(db, charlie.accountId, created.mediaId, 0))
+      .rejects.toMatchObject({ status: 404 });
+    expect(await db`SELECT id FROM media_objects WHERE id = ${created.mediaId}`).toHaveLength(0);
+  });
+
+  test("media creation reserves quota atomically and sanitizes file names", async () => {
+    const { alice } = await makePair();
+    await expect(createMediaUpload(db, alice.accountId, {
+      kind: "voice", contentType: "image/jpeg", byteSize: 4, sha256: "11".repeat(32),
+    })).rejects.toThrow("audio content type required");
+    await expect(createMediaUpload(db, alice.accountId, {
+      kind: "photo", contentType: "image/jpeg", byteSize: 4, sha256: "11".repeat(32), width: 0,
+    })).rejects.toThrow("invalid media dimensions");
+    const oldQuota = process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES;
+    process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES = "1024";
+    try {
+      const bytes = Buffer.alloc(700, 1);
+      const first = await createMediaUpload(db, alice.accountId, {
+        kind: "file", contentType: "application/pdf", fileName: "folder/statement.pdf",
+        byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      });
+      const metadata = (await db`
+        SELECT file_name, file_name_key_id, file_name_nonce, file_name_ciphertext
+        FROM media_objects WHERE id = ${first.mediaId}`)[0];
+      expect(metadata.file_name).toBeNull();
+      expect(Buffer.from(metadata.file_name_ciphertext).includes(Buffer.from("statement.pdf"))).toBe(false);
+      expect(open({
+        keyId: metadata.file_name_key_id,
+        nonce: Buffer.from(metadata.file_name_nonce),
+        ciphertext: Buffer.from(metadata.file_name_ciphertext),
+      }, mediaFileNameAAD(first.mediaId)).toString("utf8")).toBe("statement.pdf");
+      await expect(createMediaUpload(db, alice.accountId, {
+        kind: "file", contentType: "application/pdf", byteSize: 400, sha256: "11".repeat(32),
+      })).rejects.toEqual(expect.objectContaining<Partial<MediaError>>({ status: 413 }));
+    } finally {
+      if (oldQuota == null) delete process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES;
+      else process.env.TOJ_MEDIA_ACCOUNT_QUOTA_BYTES = oldQuota;
+    }
+  });
+
   test("concurrent sends with the same client_msg_id collapse to one message (B2 race)", async () => {
     const { alice, dialogId } = await makePair();
     const params = {
@@ -1194,9 +1495,21 @@ describe("M3 cloud sync", () => {
   test("contact lookup resolves a phone to an account and null for unknown", async () => {
     const { code } = await startVerification(db, "+16505550140");
     const session = await checkVerification(db, "+16505550140", code, "ios", "iPhone", "Muhammad");
-    const found = await lookupAccountByPhone(db, "+16505550140");
+    const requester = await makeAccount(testPhone(141), "Requester");
+    const found = await lookupAccountByPhone(db, requester.accountId, "+16505550140");
     expect(found?.accountId).toBe(session.accountId);
     expect(found?.displayName).toBe("Muhammad");
-    expect(await lookupAccountByPhone(db, "+16505559999")).toBeNull();
+    expect(await lookupAccountByPhone(db, requester.accountId, "+16505559999")).toBeNull();
+  });
+
+  test("contact discovery is persistently bounded per authenticated account", async () => {
+    const requester = await makeAccount(testPhone(142), "Requester");
+    for (let index = 0; index < 20; index += 1) {
+      expect(await lookupAccountByPhone(db, requester.accountId, testPhone(2_000 + index))).toBeNull();
+    }
+    await expect(lookupAccountByPhone(db, requester.accountId, testPhone(2_100)))
+      .rejects.toMatchObject({ status: 429 });
+    // A retry for an already-budgeted number remains usable and does not consume another slot.
+    expect(await lookupAccountByPhone(db, requester.accountId, testPhone(2_000))).toBeNull();
   });
 });

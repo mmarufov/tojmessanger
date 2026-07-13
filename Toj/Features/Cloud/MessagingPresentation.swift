@@ -1,6 +1,6 @@
 import Foundation
 
-struct MessagingCapabilities: OptionSet, Sendable, Equatable {
+nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     let rawValue: UInt16
 
     static let chatOrganization = Self(rawValue: 1 << 0)
@@ -23,7 +23,7 @@ struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     ]
 }
 
-enum MessageAction: String, CaseIterable, Identifiable, Sendable {
+nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     case reply
     case react
     case copy
@@ -62,7 +62,7 @@ enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum ComposerMode: Equatable, Sendable {
+nonisolated enum ComposerMode: Equatable, Sendable {
     case text
     case replying(messageId: String, preview: String)
     case editing(messageId: String, original: String)
@@ -72,7 +72,7 @@ enum ComposerMode: Equatable, Sendable {
     case disabled(reason: String)
 }
 
-enum ConnectionViewState: Equatable, Sendable {
+nonisolated enum ConnectionViewState: Equatable, Sendable {
     case connected
     case connecting
     case offline
@@ -94,7 +94,7 @@ enum ConnectionViewState: Equatable, Sendable {
     }
 }
 
-enum SearchScope: String, CaseIterable, Identifiable, Sendable {
+nonisolated enum SearchScope: String, CaseIterable, Identifiable, Sendable {
     case chats
     case people
     case messages
@@ -116,7 +116,7 @@ enum SearchScope: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum DemoAttachment: Equatable, Sendable {
+nonisolated enum DemoAttachment: Equatable, Sendable {
     case photo(name: String)
     case video(name: String, duration: String)
     case file(name: String, size: String)
@@ -132,7 +132,7 @@ enum DemoAttachment: Equatable, Sendable {
     }
 }
 
-struct ChatListViewState: Equatable, Sendable {
+nonisolated struct ChatListViewState: Equatable, Sendable {
     enum Phase: Equatable, Sendable {
         case loading
         case empty
@@ -146,7 +146,7 @@ struct ChatListViewState: Equatable, Sendable {
     let scope: SearchScope
 }
 
-struct ConversationViewState: Equatable, Sendable {
+nonisolated struct ConversationViewState: Equatable, Sendable {
     enum Phase: Equatable, Sendable {
         case loading
         case empty
@@ -160,20 +160,20 @@ struct ConversationViewState: Equatable, Sendable {
     let unreadBelow: Int
 }
 
-struct ComposerViewState: Equatable, Sendable {
+nonisolated struct ComposerViewState: Equatable, Sendable {
     let mode: ComposerMode
     let text: String
     let canSend: Bool
 }
 
-struct MessageViewState: Equatable, Identifiable, Sendable {
+nonisolated struct MessageViewState: Equatable, Identifiable, Sendable {
     let id: String
     let text: String
     let isMine: Bool
     let availableActions: [MessageAction]
 }
 
-struct ProfileViewState: Equatable, Sendable {
+nonisolated struct ProfileViewState: Equatable, Sendable {
     let title: String
     let subtitle: String
     let sharedMediaCount: Int
@@ -181,7 +181,7 @@ struct ProfileViewState: Equatable, Sendable {
     let sharedLinkCount: Int
 }
 
-struct CallViewState: Equatable, Sendable {
+nonisolated struct CallViewState: Equatable, Sendable {
     enum Phase: Equatable, Sendable {
         case ringing
         case connecting

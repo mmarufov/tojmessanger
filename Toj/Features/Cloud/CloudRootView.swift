@@ -937,6 +937,7 @@ private struct CloudSettingsView: View {
     @State private var showingSignOut = false
     @State private var showingDeletionWarning = false
     @State private var showingDeletionCode = false
+    @State private var showingClearMedia = false
 
     var body: some View {
         NavigationStack {
@@ -984,6 +985,17 @@ private struct CloudSettingsView: View {
                         }
                     }
 
+                    settingsSection(title: "Storage") {
+                        SettingsAction(
+                            title: model.clearingMediaCache
+                                ? "Clearing downloaded media…"
+                                : "Clear downloaded media (\(ByteCountFormatter.string(fromByteCount: model.mediaCacheBytes, countStyle: .file)))",
+                            systemImage: "externaldrive.badge.xmark"
+                        ) {
+                            showingClearMedia = true
+                        }
+                    }
+
                     #if DEBUG
                     if model.isDemoMode {
                         settingsSection(title: "Design preview") {
@@ -1019,7 +1031,10 @@ private struct CloudSettingsView: View {
             .refreshable { await model.loadDevices() }
             .background(TojTheme.canvas)
             .navigationTitle("Settings")
-            .task { await model.loadDevices() }
+            .task {
+                await model.loadDevices()
+                await model.refreshMediaCacheUsage()
+            }
             .confirmationDialog("Sign out of Toj?", isPresented: $showingSignOut, titleVisibility: .visible) {
                 Button("Sign out", role: .destructive) { Task { await model.signOut() } }
                 Button("Cancel", role: .cancel) {}
@@ -1033,6 +1048,12 @@ private struct CloudSettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Your identifying account data will be erased. Delivered messages remain in other participants’ chat history.")
+            }
+            .confirmationDialog("Clear downloaded media?", isPresented: $showingClearMedia, titleVisibility: .visible) {
+                Button("Clear media", role: .destructive) { Task { await model.clearMediaCache() } }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Pending uploads stay protected. Sent photos, videos, files and voice notes download again when opened.")
             }
             .sheet(isPresented: $showingDeletionCode) {
                 AccountDeletionView(model: model)
@@ -1085,7 +1106,7 @@ private struct DeviceRow: View {
 }
 
 private struct SettingsAction: View {
-    let title: LocalizedStringKey
+    let title: String
     let systemImage: String
     var destructive = false
     let action: () -> Void

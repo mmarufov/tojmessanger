@@ -2,7 +2,7 @@ import Foundation
 import GRDB
 import Security
 
-struct LocalMessage: Identifiable, Equatable, Sendable {
+nonisolated struct LocalMessage: Identifiable, Equatable, Sendable {
     let localId: String
     var id: String { localId }
     let dialogId: String
@@ -17,13 +17,14 @@ struct LocalMessage: Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     let isForwarded: Bool
     let reactions: [CloudReaction]
+    let media: CloudMedia?
     let editVersion: Int
     let state: String
     let serverTs: String?
     let localState: String
 }
 
-struct LocalDialog: Identifiable, Equatable, Sendable {
+nonisolated struct LocalDialog: Identifiable, Equatable, Sendable {
     let dialogId: String
     var id: String { dialogId }
     let type: String
@@ -38,7 +39,7 @@ struct LocalDialog: Identifiable, Equatable, Sendable {
     let unreadCount: Int
 }
 
-struct PendingOutboxItem: Identifiable, Equatable, Sendable {
+nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let clientMsgId: String
     var id: String { clientMsgId }
     let dialogId: String
@@ -48,6 +49,39 @@ struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     let retryCount: Int
     let nextRetryAt: String?
+}
+
+nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
+    let transferId: String
+    var id: String { transferId }
+    let dialogId: String
+    let clientMsgId: String
+    let caption: String
+    let replyToMsgId: Int64?
+    let kind: String
+    let contentType: String
+    let fileName: String?
+    let byteSize: Int64
+    let sha256: String
+    let durationMs: Int64?
+    let width: Int?
+    let height: Int?
+    let encryptedSourcePath: String
+    let encryptedThumbnailPath: String?
+    let mediaId: String?
+    let uploadOffset: Int64
+    let state: String
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+
+    var media: CloudMedia {
+        return CloudMedia(
+            id: mediaId ?? "pending:\(transferId)", kind: kind, contentType: contentType, fileName: fileName,
+            byteSize: byteSize, durationMs: durationMs, width: width, height: height,
+            hasThumbnail: encryptedThumbnailPath != nil
+        )
+    }
 }
 
 actor CloudLocalStore {
@@ -105,13 +139,15 @@ actor CloudLocalStore {
     func clearAccount(accountId: String) throws {
         try dbQueue.write { db in
             try db.execute(sql: "DELETE FROM sync_state WHERE account_id = ?", arguments: [accountId])
-            try deleteReplicaData(db)
+            try deleteReplicaData(db, includeMediaTransfers: true)
         }
     }
 
     func beginBootstrap(accountId: String) throws {
         try dbQueue.write { db in
-            try deleteReplicaData(db)
+            // Upload rows point to encrypted source files and are the durable media outbox.
+            // A server snapshot rebuild must not discard them.
+            try deleteReplicaData(db, includeMediaTransfers: false)
             try db.execute(
                 sql: """
                 INSERT INTO sync_state (account_id, pts, updated_at)
@@ -255,6 +291,7 @@ actor CloudLocalStore {
             forwardedFromMsgId: forwardedFromMsgId,
             isForwarded: forwardedFromMsgId != nil,
             reactions: [],
+            media: nil,
             editVersion: 0,
             state: "visible",
             serverTs: nil,
@@ -318,6 +355,156 @@ actor CloudLocalStore {
                 ]
             )
             try db.execute(sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?", arguments: [response.clientMsgId])
+        }
+    }
+
+    func insertMediaTransfer(
+        prepared: PreparedMediaUpload, dialogId: String, clientMsgId: String,
+        caption: String, replyToMsgId: Int64?
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO media_transfers (
+                  transfer_id, dialog_id, client_msg_id, caption, reply_to_msg_id,
+                  kind, content_type, file_name, byte_size, sha256, duration_ms, width, height,
+                  encrypted_source_path, encrypted_thumbnail_path, state, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))
+                ON CONFLICT(transfer_id) DO NOTHING
+                """,
+                arguments: [
+                    prepared.transferId, dialogId, clientMsgId, caption, replyToMsgId,
+                    prepared.kind, prepared.contentType, prepared.fileName, prepared.byteSize,
+                    prepared.sha256, prepared.durationMs, prepared.width, prepared.height,
+                    prepared.encryptedSourcePath, prepared.encryptedThumbnailPath
+                ]
+            )
+        }
+    }
+
+    func updateMediaTransfer(
+        transferId: String, mediaId: String?, uploadOffset: Int64,
+        state: String, error: String?, retryAfter: TimeInterval? = nil
+    ) throws {
+        let next = retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) }
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE media_transfers
+                SET media_id = COALESCE(?, media_id), upload_offset = ?, state = ?,
+                    last_error = ?, next_retry_at = ?,
+                    retry_count = retry_count + CASE WHEN ? IS NULL THEN 0 ELSE 1 END
+                WHERE transfer_id = ?
+                """,
+                arguments: [mediaId, uploadOffset, state, error, next, retryAfter, transferId]
+            )
+        }
+    }
+
+    func markMediaRetrying(clientMsgId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE media_transfers SET next_retry_at = NULL, last_error = NULL WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
+            try db.execute(
+                sql: "UPDATE messages SET local_state = 'sending' WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
+        }
+    }
+
+    func resetMediaUpload(transferId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE media_transfers
+                SET media_id = NULL, upload_offset = 0, state = 'pending',
+                    next_retry_at = NULL, last_error = NULL
+                WHERE transfer_id = ?
+                """,
+                arguments: [transferId]
+            )
+        }
+    }
+
+    func mediaTransfersReady(now: Date = Date(), limit: Int = 10) throws -> [MediaTransferRecord] {
+        try dbQueue.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM media_transfers
+                WHERE state != 'complete' AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY created_at, transfer_id LIMIT ?
+                """,
+                arguments: [Self.sqliteTimestamp(now), limit]
+            )
+            return rows.map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func nextMediaTransferDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM media_transfers WHERE next_retry_at IS NULL OR next_retry_at <= ?",
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: "SELECT MIN(next_retry_at) FROM media_transfers WHERE next_retry_at > ?",
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
+        }
+    }
+
+    func mediaTransfer(id: String) throws -> MediaTransferRecord? {
+        try dbQueue.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM media_transfers WHERE transfer_id = ?", arguments: [id])
+                .map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func completeMediaTransfer(transferId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM media_transfers WHERE transfer_id = ?", arguments: [transferId])
+        }
+    }
+
+    func cancelMediaTransfer(transferId: String, clientMsgId: String) throws {
+        try dbQueue.write { db in
+            // Remove the durable outbox row and its optimistic bubble atomically. A later retry can
+            // therefore never resurrect a transfer the user explicitly cancelled.
+            try db.execute(sql: "DELETE FROM media_transfers WHERE transfer_id = ?", arguments: [transferId])
+            try db.execute(
+                sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
+                arguments: [clientMsgId]
+            )
+        }
+    }
+
+    func insertSendingMedia(_ transfer: MediaTransferRecord, senderAccountId: String) throws {
+        let mediaJSON = String(data: try JSONEncoder().encode(transfer.media), encoding: .utf8)
+        try dbQueue.write { db in
+            try upsertDialog(db, dialogId: transfer.dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
+            try db.execute(
+                sql: """
+                INSERT INTO messages (
+                  local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+                  reply_to_msg_id, is_forwarded, media_json, edit_version, state, server_ts, local_state
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, 0, 'visible', NULL, 'sending')
+                ON CONFLICT(client_msg_id) DO UPDATE SET
+                  kind = excluded.kind, text = excluded.text, media_json = excluded.media_json,
+                  local_state = 'sending'
+                """,
+                arguments: [
+                    "pending:\(transfer.clientMsgId)", transfer.dialogId, transfer.clientMsgId,
+                    senderAccountId, transfer.kind, transfer.caption, transfer.replyToMsgId, mediaJSON
+                ]
+            )
         }
     }
 
@@ -435,7 +622,7 @@ actor CloudLocalStore {
                 sql: """
                 SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
                        reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
-                       forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
+                       forwarded_from_msg_id, is_forwarded, media_json, edit_version, state, server_ts, local_state
                 FROM messages
                 WHERE dialog_id = ?
                 ORDER BY COALESCE(msg_id, 9223372036854775807), rowid
@@ -611,6 +798,7 @@ actor CloudLocalStore {
               forwarded_from_dialog_id TEXT,
               forwarded_from_msg_id INTEGER,
               is_forwarded INTEGER NOT NULL DEFAULT 0,
+              media_json TEXT,
               edit_version INTEGER NOT NULL DEFAULT 0,
               state TEXT NOT NULL,
               server_ts TEXT,
@@ -643,6 +831,33 @@ actor CloudLocalStore {
               emoji TEXT NOT NULL,
               PRIMARY KEY (dialog_id, msg_id, account_id)
             );
+
+            CREATE TABLE IF NOT EXISTS media_transfers (
+              transfer_id TEXT PRIMARY KEY,
+              dialog_id TEXT NOT NULL,
+              client_msg_id TEXT NOT NULL UNIQUE,
+              caption TEXT NOT NULL DEFAULT '',
+              reply_to_msg_id INTEGER,
+              kind TEXT NOT NULL,
+              content_type TEXT NOT NULL,
+              file_name TEXT,
+              byte_size INTEGER NOT NULL,
+              sha256 TEXT NOT NULL,
+              duration_ms INTEGER,
+              width INTEGER,
+              height INTEGER,
+              encrypted_source_path TEXT NOT NULL,
+              encrypted_thumbnail_path TEXT,
+              media_id TEXT,
+              upload_offset INTEGER NOT NULL DEFAULT 0,
+              state TEXT NOT NULL CHECK (state IN ('pending','uploading','ready_to_send')),
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS media_transfers_retry_idx
+              ON media_transfers(state, next_retry_at, created_at);
             """)
 
             let messageColumns = try db.columns(in: "messages").map(\.name)
@@ -663,6 +878,9 @@ actor CloudLocalStore {
             }
             if !messageColumns.contains("is_forwarded") {
                 try db.execute(sql: "ALTER TABLE messages ADD COLUMN is_forwarded INTEGER NOT NULL DEFAULT 0")
+            }
+            if !messageColumns.contains("media_json") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN media_json TEXT")
             }
             let outboxColumns = try db.columns(in: "pending_outbox").map(\.name)
             if !outboxColumns.contains("reply_to_msg_id") {
@@ -730,9 +948,10 @@ actor CloudLocalStore {
             INSERT INTO messages (
               local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
               reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
-              forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
+              forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state,
+              media_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -745,6 +964,7 @@ actor CloudLocalStore {
               forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
               forwarded_from_msg_id = excluded.forwarded_from_msg_id,
               is_forwarded = excluded.is_forwarded,
+              media_json = excluded.media_json,
               edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
@@ -766,7 +986,8 @@ actor CloudLocalStore {
                 message.editVersion,
                 message.state,
                 message.serverTs,
-                localState
+                localState,
+                message.media.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
             ]
         )
         try db.execute(
@@ -799,10 +1020,27 @@ actor CloudLocalStore {
             forwardedFromMsgId: row["forwarded_from_msg_id"],
             isForwarded: row["is_forwarded"],
             reactions: reactions,
+            media: (row["media_json"] as String?).flatMap { $0.data(using: .utf8) }.flatMap { try? JSONDecoder().decode(CloudMedia.self, from: $0) },
             editVersion: row["edit_version"],
             state: row["state"],
             serverTs: row["server_ts"],
             localState: row["local_state"]
+        )
+    }
+
+    private static func mediaTransfer(from row: Row) -> MediaTransferRecord {
+        MediaTransferRecord(
+            transferId: row["transfer_id"], dialogId: row["dialog_id"],
+            clientMsgId: row["client_msg_id"], caption: row["caption"],
+            replyToMsgId: row["reply_to_msg_id"], kind: row["kind"],
+            contentType: row["content_type"], fileName: row["file_name"],
+            byteSize: row["byte_size"], sha256: row["sha256"], durationMs: row["duration_ms"],
+            width: row["width"], height: row["height"],
+            encryptedSourcePath: row["encrypted_source_path"],
+            encryptedThumbnailPath: row["encrypted_thumbnail_path"], mediaId: row["media_id"],
+            uploadOffset: row["upload_offset"], state: row["state"],
+            retryCount: row["retry_count"], nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"]
         )
     }
 
@@ -858,12 +1096,13 @@ actor CloudLocalStore {
         }
     }
 
-    private func deleteReplicaData(_ db: Database) throws {
+    private func deleteReplicaData(_ db: Database, includeMediaTransfers: Bool) throws {
         try db.execute(sql: "DELETE FROM message_reactions")
         try db.execute(sql: "DELETE FROM messages")
         try db.execute(sql: "DELETE FROM dialog_members")
         try db.execute(sql: "DELETE FROM dialogs")
         try db.execute(sql: "DELETE FROM pending_outbox")
+        if includeMediaTransfers { try db.execute(sql: "DELETE FROM media_transfers") }
     }
 }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-struct CloudReaction: Codable, Equatable, Sendable {
+nonisolated struct CloudReaction: Codable, Equatable, Sendable {
     let accountId: String
     let emoji: String
 
@@ -10,7 +10,7 @@ struct CloudReaction: Codable, Equatable, Sendable {
     }
 }
 
-struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
+nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     nonisolated var id: String { "\(dialogId):\(msgId)" }
     let dialogId: String
     let msgId: Int64
@@ -24,6 +24,7 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     let isForwarded: Bool
     let reactions: [CloudReaction]
+    let media: CloudMedia?
     let editVersion: Int
     let state: String
     let serverTs: String
@@ -41,6 +42,7 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         forwardedFromMsgId: Int64? = nil,
         isForwarded: Bool = false,
         reactions: [CloudReaction] = [],
+        media: CloudMedia? = nil,
         editVersion: Int,
         state: String,
         serverTs: String
@@ -57,6 +59,7 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         self.forwardedFromMsgId = forwardedFromMsgId
         self.isForwarded = isForwarded
         self.reactions = reactions
+        self.media = media
         self.editVersion = editVersion
         self.state = state
         self.serverTs = serverTs
@@ -75,6 +78,7 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case forwardedFromMsgId = "forwarded_from_msg_id"
         case isForwarded = "forwarded"
         case reactions
+        case media
         case editVersion = "edit_version"
         case state
         case serverTs = "server_ts"
@@ -94,13 +98,14 @@ struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         forwardedFromMsgId = try values.decodeIfPresent(Int64.self, forKey: .forwardedFromMsgId)
         isForwarded = try values.decodeIfPresent(Bool.self, forKey: .isForwarded) ?? false
         reactions = try values.decodeIfPresent([CloudReaction].self, forKey: .reactions) ?? []
+        media = try values.decodeIfPresent(CloudMedia.self, forKey: .media)
         editVersion = try values.decode(Int.self, forKey: .editVersion)
         state = try values.decode(String.self, forKey: .state)
         serverTs = try values.decode(String.self, forKey: .serverTs)
     }
 }
 
-struct CloudUpdate: Codable, Sendable {
+nonisolated struct CloudUpdate: Codable, Sendable {
     let pts: Int64
     let ptsCount: Int64
     let type: String
@@ -122,7 +127,7 @@ struct CloudUpdate: Codable, Sendable {
     }
 }
 
-struct CloudSession: Codable, Equatable, Sendable {
+nonisolated struct CloudSession: Codable, Equatable, Sendable {
     let accountId: String
     let deviceId: String
     let token: String
@@ -134,29 +139,29 @@ struct CloudSession: Codable, Equatable, Sendable {
     }
 }
 
-struct StoredCloudSession: Codable, Equatable, Sendable {
+nonisolated struct StoredCloudSession: Codable, Equatable, Sendable {
     let session: CloudSession
     let phone: String
     let displayName: String
 }
 
-struct AuthStartResponse: Codable, Sendable {
+nonisolated struct AuthStartResponse: Codable, Sendable {
     let code: String?
     let retryAfter: Int?
 }
 
-struct ContactLookupResponse: Codable, Sendable {
+nonisolated struct ContactLookupResponse: Codable, Sendable {
     let accountId: String?
     let displayName: String?
     let found: Bool?
 }
 
-struct DirectDialogResponse: Codable, Sendable {
+nonisolated struct DirectDialogResponse: Codable, Sendable {
     let dialogId: String
     let created: Bool
 }
 
-struct SendMessageResponse: Codable, Sendable {
+nonisolated struct SendMessageResponse: Codable, Sendable {
     let dialogId: String
     let clientMsgId: String
     let msgId: Int64
@@ -166,7 +171,7 @@ struct SendMessageResponse: Codable, Sendable {
     let text: String?
 }
 
-struct MessageMutationResponse: Codable, Sendable {
+nonisolated struct MessageMutationResponse: Codable, Sendable {
     let dialogId: String
     let msgId: Int64
     let actorPts: Int64
@@ -174,11 +179,11 @@ struct MessageMutationResponse: Codable, Sendable {
     let message: CloudMessage
 }
 
-struct SyncStateResponse: Codable, Sendable {
+nonisolated struct SyncStateResponse: Codable, Sendable {
     let pts: Int64
 }
 
-struct DifferenceResponse: Codable, Sendable {
+nonisolated struct DifferenceResponse: Codable, Sendable {
     struct State: Codable, Sendable {
         let pts: Int64
     }
@@ -189,7 +194,7 @@ struct DifferenceResponse: Codable, Sendable {
     let hasMore: Bool?
 }
 
-struct BootstrapStartResponse: Codable, Sendable {
+nonisolated struct BootstrapStartResponse: Codable, Sendable {
     struct State: Codable, Sendable {
         let pts: Int64
     }
@@ -207,7 +212,7 @@ struct BootstrapStartResponse: Codable, Sendable {
     }
 }
 
-struct BootstrapDialogMember: Codable, Equatable, Sendable {
+nonisolated struct BootstrapDialogMember: Codable, Equatable, Sendable {
     let accountId: String
     let role: String
     let lastReadMsgId: Int64
@@ -219,7 +224,7 @@ struct BootstrapDialogMember: Codable, Equatable, Sendable {
     }
 }
 
-struct BootstrapDialog: Codable, Equatable, Sendable {
+nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
     let dialogId: String
     let type: String
     let title: String?
@@ -239,7 +244,7 @@ struct BootstrapDialog: Codable, Equatable, Sendable {
     }
 }
 
-struct BootstrapDialogsPage: Codable, Sendable {
+nonisolated struct BootstrapDialogsPage: Codable, Sendable {
     struct State: Codable, Sendable {
         let pts: Int64
     }
@@ -251,7 +256,7 @@ struct BootstrapDialogsPage: Codable, Sendable {
     let hasMore: Bool
 }
 
-struct HistoryPageResponse: Codable, Sendable {
+nonisolated struct HistoryPageResponse: Codable, Sendable {
     let dialogId: String
     let messages: [CloudMessage]
     let nextBeforeMsgId: Int64?
@@ -265,24 +270,24 @@ struct HistoryPageResponse: Codable, Sendable {
     }
 }
 
-struct ReadResponse: Codable, Sendable {
+nonisolated struct ReadResponse: Codable, Sendable {
     let dialogId: String
     let maxReadMsgId: Int64
 }
 
-struct PushRegistrationResponse: Codable, Sendable {
+nonisolated struct PushRegistrationResponse: Codable, Sendable {
     let registered: Bool
 }
 
-struct SessionRevocationResponse: Codable, Sendable {
+nonisolated struct SessionRevocationResponse: Codable, Sendable {
     let revoked: Bool
 }
 
-struct AccountDeletionResponse: Codable, Sendable {
+nonisolated struct AccountDeletionResponse: Codable, Sendable {
     let deleted: Bool
 }
 
-struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
+nonisolated struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
     let id: String
     let platform: String
     let deviceName: String?
@@ -295,7 +300,7 @@ private struct DeviceListResponse: Codable, Sendable {
     let devices: [CloudDevice]
 }
 
-struct CloudAPIError: Error, LocalizedError {
+nonisolated struct CloudAPIError: Error, LocalizedError {
     let status: Int
     let message: String
     let retryAfter: Int?
@@ -391,6 +396,26 @@ struct CloudAPI: Sendable {
                 kind: "text",
                 body: body,
                 replyToMsgId: replyToMsgId,
+                mediaId: nil,
+                forwardedFrom: nil
+            ),
+            token: token
+        )
+    }
+
+    func sendMediaMessage(
+        dialogId: String,
+        clientMsgId: String,
+        body: String,
+        mediaId: String,
+        replyToMsgId: Int64? = nil,
+        token: String
+    ) async throws -> SendMessageResponse {
+        try await post(
+            "v1/messages/send",
+            body: SendMessageRequest(
+                dialogId: dialogId, clientMsgId: clientMsgId, kind: nil,
+                body: body, replyToMsgId: replyToMsgId, mediaId: mediaId,
                 forwardedFrom: nil
             ),
             token: token
@@ -412,6 +437,7 @@ struct CloudAPI: Sendable {
                 kind: "text",
                 body: nil,
                 replyToMsgId: nil,
+                mediaId: nil,
                 forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId)
             ),
             token: token
@@ -606,9 +632,10 @@ private struct HistoryRequest: Encodable {
 private struct SendMessageRequest: Encodable {
     let dialogId: String
     let clientMsgId: String
-    let kind: String
+    let kind: String?
     let body: String?
     let replyToMsgId: Int64?
+    let mediaId: String?
     let forwardedFrom: ForwardedFromRequest?
 }
 

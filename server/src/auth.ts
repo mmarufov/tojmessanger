@@ -10,6 +10,9 @@ const OTP_PHONE_WINDOW_LIMIT = 5;
 const OTP_NETWORK_WINDOW_LIMIT = 20;
 const OTP_WINDOW_MINUTES = 15;
 const OTP_MAX_ATTEMPTS = 5;
+const CONTACT_LOOKUP_WINDOW_MINUTES = 15;
+const CONTACT_LOOKUP_WINDOW_LIMIT = 20;
+const CONTACT_LOOKUP_DAILY_LIMIT = 100;
 const ALLOWED_PLATFORMS = new Set(["ios", "android", "web", "desktop"]);
 type OTPPurpose = "login" | "account_deletion";
 
@@ -60,6 +63,25 @@ type StartVerificationOptions = {
   purpose?: OTPPurpose;
 };
 
+function privateBetaOTPAllowed(normalizedPhone: string): boolean {
+  if (process.env.TOJ_RETURN_OTP !== "1") return false;
+  if (process.env.NODE_ENV !== "production") return true;
+  return (process.env.TOJ_DEV_OTP_ALLOWLIST ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => /^\+[1-9]\d{7,14}$/.test(value))
+    .includes(normalizedPhone);
+}
+
+/** Used only for provider-readiness reporting; it never exposes the allowlisted values. */
+export function privateBetaOTPConfigured(): boolean {
+  if (process.env.TOJ_RETURN_OTP !== "1") return false;
+  if (process.env.NODE_ENV !== "production") return true;
+  return (process.env.TOJ_DEV_OTP_ALLOWLIST ?? "")
+    .split(",")
+    .some((value) => /^\+[1-9]\d{7,14}$/.test(value.trim()));
+}
+
 function validPhone(phone: string): string {
   if (/[A-Za-z]/.test(phone)) {
     throw new AuthError("enter a valid international phone number", 400);
@@ -77,7 +99,7 @@ function cleanLabel(value: string | undefined, maxLength: number): string | null
   return trimmed.slice(0, maxLength);
 }
 
-/** Issues a short-lived OTP. Development returns the code; production requires a delivery adapter. */
+/** Issues a short-lived OTP. Production returns codes only for explicitly allowlisted beta phones. */
 export async function startVerification(
   sql: SQL,
   phone: string,
@@ -88,7 +110,7 @@ export async function startVerification(
   const lookup = phoneLookupHash(normalizedPhone);
   const networkHash = options.networkKey ? hashToken(`otp-network|${options.networkKey}`) : null;
   const production = process.env.NODE_ENV === "production";
-  const returnOTP = process.env.TOJ_RETURN_OTP === "1";
+  const returnOTP = !production || privateBetaOTPAllowed(normalizedPhone);
   const delivery = options.delivery ?? null;
   if (production && !delivery && !returnOTP) {
     throw new AuthError("verification service temporarily unavailable", 503);
@@ -228,13 +250,43 @@ export async function checkVerification(
 
 /** Contact discovery: resolve a phone number to an account so the client can open a direct dialog. */
 export async function lookupAccountByPhone(
-  sql: SQL, phone: string,
+  sql: SQL, requesterAccountId: string, phone: string,
 ): Promise<{ accountId: string; displayName: string } | null> {
   const normalizedPhone = validPhone(phone);
-  const row = (await sql`
-    SELECT id, display_name FROM accounts
-    WHERE phone_lookup_hash = ${phoneLookupHash(normalizedPhone)} AND status IN ('active','limited')`)[0];
-  return row ? { accountId: row.id, displayName: row.display_name } : null;
+  const targetHash = phoneLookupHash(normalizedPhone);
+  return await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`contact-lookup:${requesterAccountId}`}, 0))`;
+    const requester = await tx`
+      SELECT id FROM accounts WHERE id = ${requesterAccountId} AND status IN ('active','limited')`;
+    if (!requester.length) throw new AuthError("account unavailable", 403);
+
+    // Network retries and reopening the same contact do not burn more discovery budget.
+    const repeated = await tx`
+      SELECT 1 FROM contact_lookup_attempts
+      WHERE requester_account_id = ${requesterAccountId} AND target_phone_hash = ${targetHash}
+        AND created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute')
+      LIMIT 1`;
+    if (!repeated.length) {
+      const counts = (await tx`
+        SELECT
+          count(*) FILTER (WHERE created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute')) AS recent,
+          count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS daily
+        FROM contact_lookup_attempts WHERE requester_account_id = ${requesterAccountId}`)[0];
+      if (Number(counts.recent) >= CONTACT_LOOKUP_WINDOW_LIMIT || Number(counts.daily) >= CONTACT_LOOKUP_DAILY_LIMIT) {
+        throw new AuthError("contact discovery limit reached; try again later", 429, CONTACT_LOOKUP_WINDOW_MINUTES * 60);
+      }
+    }
+
+    const row = (await tx`
+      SELECT id, display_name FROM accounts
+      WHERE phone_lookup_hash = ${targetHash} AND status IN ('active','limited')`)[0];
+    if (!repeated.length) {
+      await tx`
+        INSERT INTO contact_lookup_attempts (requester_account_id, target_phone_hash)
+        VALUES (${requesterAccountId}, ${targetHash})`;
+    }
+    return row ? { accountId: row.id, displayName: row.display_name } : null;
+  });
 }
 
 export async function resolveDevice(sql: SQL, token: string): Promise<{ accountId: string; deviceId: string }> {

@@ -1,6 +1,7 @@
 import type { SQL } from "bun";
 import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
+import { loadMediaDTO, type MediaDTO } from "./media";
 
 export class SyncError extends Error {}
 
@@ -13,6 +14,7 @@ export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
   kind: string; text: string; reply_to_msg_id: number | null; edit_version: number;
   forwarded: boolean; reactions: { account_id: string; emoji: string }[];
+  media: MediaDTO | null;
   state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
@@ -61,7 +63,7 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
     SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
            body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
            forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-           edit_version, state, server_ts
+           media_id, edit_version, state, server_ts
     FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0];
   if (!r) return null;
   const text = r.state === "deleted_for_all"
@@ -82,6 +84,7 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
     // source dialog/account ids would create a cross-dialog privacy leak.
     forwarded: r.forwarded_from_dialog_id != null && r.forwarded_from_msg_id != null,
     reactions: reactions.map((reaction) => ({ account_id: reaction.account_id, emoji: reaction.emoji })),
+    media: r.state === "deleted_for_all" ? null : await loadMediaDTO(sql, r.media_id),
     state: r.state, server_ts: iso(r.server_ts),
   };
 }
@@ -144,12 +147,15 @@ export type SendResult = {
 export async function sendMessage(sql: SQL, p: {
   senderAccountId: string; senderDeviceId?: string | null; dialogId: string;
   clientMsgId: string; kind?: string; body?: string; replyToMsgId?: number | null;
+  mediaId?: string | null;
   forwardedFrom?: { dialogId: string; msgId: number } | null;
 }): Promise<SendResult> {
   return await sql.begin(async (tx) => {
-    let body = p.forwardedFrom ? "" : requireTextBody(p.body);
+    let body = p.forwardedFrom || p.mediaId ? String(p.body ?? "") : requireTextBody(p.body);
+    if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
     let kind = p.kind ?? "text";
     let forwardedFromAccountId: string | null = null;
+    let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
@@ -172,22 +178,41 @@ export async function sendMessage(sql: SQL, p: {
     }
 
     await requireActiveAccount(tx, p.senderAccountId);
+    if (p.senderDeviceId) {
+      const device = await tx`
+        SELECT id FROM devices
+        WHERE id = ${p.senderDeviceId} AND account_id = ${p.senderAccountId} AND revoked_at IS NULL
+        FOR SHARE`;
+      if (!device.length) throw new SyncError("sending device is no longer active");
+    }
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
 
     if (p.forwardedFrom) {
       const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
       await requireActiveMember(tx, p.senderAccountId, p.forwardedFrom.dialogId);
       const source = (await tx`
-        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext
-        FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}`)[0];
+        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext, media_id
+        FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}
+        FOR SHARE`)[0];
       if (!source || source.state !== "visible") throw new SyncError("forward source not found");
-      if (source.kind !== "text") throw new SyncError("this message type cannot be forwarded yet");
       body = open(
         { keyId: source.body_key_id, nonce: buf(source.body_nonce), ciphertext: buf(source.body_ciphertext) },
         bodyAAD(p.forwardedFrom.dialogId, sourceMsgId, source.sender_account_id),
       ).toString("utf8");
       kind = source.kind;
+      mediaId = source.media_id;
       forwardedFromAccountId = source.sender_account_id;
+    }
+
+    if (mediaId && !p.forwardedFrom) {
+      const media = (await tx`
+        SELECT owner_account_id, kind, status FROM media_objects
+        WHERE id = ${mediaId} FOR UPDATE`)[0];
+      if (!media || media.owner_account_id !== p.senderAccountId) throw new SyncError("media upload not found");
+      if (media.status !== "ready") throw new SyncError("media upload is incomplete");
+      kind = media.kind;
+    } else if (!mediaId && !p.forwardedFrom && kind !== "text") {
+      throw new SyncError("media upload required");
     }
 
     if (replyToMsgId != null) {
@@ -207,10 +232,12 @@ export async function sendMessage(sql: SQL, p: {
     const inserted = await tx`
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
-                            forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id)
+                            forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
+                            media_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
-              ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null})
+              ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
+              ${mediaId})
       RETURNING server_ts`;
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
@@ -287,7 +314,7 @@ async function mutateMessage(sql: SQL, p: {
       WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
       ORDER BY account_id FOR UPDATE`;
     const row = (await tx`
-      SELECT sender_account_id, kind, state, edit_version
+      SELECT sender_account_id, kind, state, edit_version, media_id
       FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}
       FOR UPDATE`)[0];
     if (!row) throw new SyncError("message not found");
@@ -311,8 +338,19 @@ async function mutateMessage(sql: SQL, p: {
       const sealed = seal("", bodyAAD(p.dialogId, msgId, p.actorAccountId));
       await tx`
         UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
-          body_ciphertext = ${sealed.ciphertext}, state = 'deleted_for_all', deleted_at = now()
+          body_ciphertext = ${sealed.ciphertext}, media_id = NULL,
+          state = 'deleted_for_all', deleted_at = now()
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      if (row.media_id) {
+        // A forwarded copy owns a live reference of its own. Delete the encrypted object only when
+        // this was the final visible reference, otherwise that forwarded message must keep working.
+        await tx`
+          DELETE FROM media_objects mo
+          WHERE mo.id = ${row.media_id}
+            AND NOT EXISTS (
+              SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible'
+            )`;
+      }
     }
 
     let actorPts = 0;

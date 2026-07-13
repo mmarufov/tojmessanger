@@ -1,6 +1,6 @@
 import Foundation
 
-struct SyncHint: Codable, Equatable, Sendable {
+nonisolated struct SyncHint: Codable, Equatable, Sendable {
     let type: String
     let pts: Int64
     let ptsCount: Int64

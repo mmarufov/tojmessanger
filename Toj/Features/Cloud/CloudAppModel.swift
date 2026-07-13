@@ -49,6 +49,8 @@ final class CloudAppModel {
         var isEdited = false
         var isDeleted = false
         var attachment: DemoAttachment? = nil
+        var media: CloudMedia? = nil
+        var transferProgress: Double? = nil
     }
 
     private(set) var storedSession: StoredCloudSession?
@@ -66,6 +68,8 @@ final class CloudAppModel {
     private(set) var loadingDevices = false
     private(set) var accountDeletionRequested = false
     private(set) var accountDeletionInFlight = false
+    private(set) var mediaCacheBytes: Int64 = 0
+    private(set) var clearingMediaCache = false
     private(set) var composerMode: ComposerMode = .text
     #if DEBUG
     private(set) var isDemoMode = false
@@ -91,15 +95,23 @@ final class CloudAppModel {
     private let tokenStore: TokenStore
     private let localStore: CloudLocalStore?
     private let pushCenter: PushRegistrationCenter
+    private let mediaEngine: CloudMediaTransferEngine
+    private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
     private var hintTask: Task<Void, Never>?
     private var syncTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
     private var resendTask: Task<Void, Never>?
+    private var recordingTask: Task<Void, Never>?
+    private var composerMediaTask: Task<Void, Never>?
+    private var composerMediaOperationId: UUID?
+    private var activeComposerTransferId: String?
+    private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
+    private var mediaTransfersInFlight: Set<String> = []
     private var uploadedPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftsByDialog: [String: String] = [:]
@@ -111,7 +123,7 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return .demo }
         #endif
-        return .productionText
+        return [.productionText, .media, .voiceNotes]
     }
 
     var connectionViewState: ConnectionViewState {
@@ -149,6 +161,7 @@ final class CloudAppModel {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
+        self.mediaEngine = CloudMediaTransferEngine(config: config)
         self.localStore = injectedLocalStore ?? (useDefaultLocalStore ? try? CloudLocalStore.default() : nil)
         pushCenter.bind(
             tokenHandler: { [weak self] token, environment in
@@ -388,18 +401,35 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        let composerTask = composerMediaTask
+        let transferTasks = Array(mediaTransferTasks.values)
+        let pendingRetryTask = retryTask
         hintTask?.cancel()
         syncTask?.cancel()
-        retryTask?.cancel()
+        pendingRetryTask?.cancel()
+        composerTask?.cancel()
+        transferTasks.forEach { $0.cancel() }
+        recordingTask?.cancel()
+        voiceRecorder.cancel()
         resendTask?.cancel()
         resendTask = nil
         await hintSocket?.stop()
         hintSocket = nil
+        await composerTask?.value
+        await pendingRetryTask?.value
+        for task in transferTasks { await task.value }
+        composerMediaTask = nil
+        composerMediaOperationId = nil
+        activeComposerTransferId = nil
+        mediaTransferTasks.removeAll()
+        mediaTransfersInFlight.removeAll()
         var cleanupFailure: String?
         do {
             if let accountId = storedSession?.session.accountId {
                 try await localStore?.clearAccount(accountId: accountId)
             }
+            await mediaEngine.clearCache()
+            mediaCacheBytes = 0
             try await tokenStore.clear()
         } catch {
             cleanupFailure = error.localizedDescription
@@ -423,6 +453,19 @@ final class CloudAppModel {
         accountDeletionRequested = false
         accountDeletionCode = ""
         status = cleanupFailure.map { "Local cleanup failed: \($0)" } ?? finalStatus
+    }
+
+    func refreshMediaCacheUsage() async {
+        mediaCacheBytes = await mediaEngine.cacheUsageBytes()
+    }
+
+    func clearMediaCache() async {
+        guard !clearingMediaCache else { return }
+        clearingMediaCache = true
+        defer { clearingMediaCache = false }
+        await mediaEngine.clearDownloadedCache()
+        await refreshMediaCacheUsage()
+        status = "Downloaded media cleared"
     }
 
     private func startResendCountdown(_ seconds: Int) {
@@ -678,6 +721,18 @@ final class CloudAppModel {
     }
 
     func cancelComposerMode() {
+        if case .recording = composerMode {
+            cancelVoiceRecording()
+            return
+        }
+        if case .uploading = composerMode {
+            if let transferId = activeComposerTransferId {
+                mediaTransferTasks[transferId]?.cancel()
+            }
+            composerMediaTask?.cancel()
+            composerMode = .text
+            return
+        }
         if case let .editing(_, original) = composerMode, draft == original {
             draft = ""
         }
@@ -686,10 +741,10 @@ final class CloudAppModel {
 
     func actions(for line: Line) -> [MessageAction] {
         if line.isDeleted { return [.inspect] }
-        var actions: [MessageAction] = [.copy]
+        var actions: [MessageAction] = line.text.isEmpty ? [] : [.copy]
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
-        if line.mine, capabilities.contains(.editing) { actions.append(.edit) }
+        if line.mine, line.media == nil, capabilities.contains(.editing) { actions.append(.edit) }
         if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
         if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
         if case .failed = line.delivery { actions.append(.retry) }
@@ -703,6 +758,7 @@ final class CloudAppModel {
             guard let self else { return }
             if let localStore = self.localStore {
                 try? await localStore.markRetrying(clientMsgId: line.clientMsgId)
+                try? await localStore.markMediaRetrying(clientMsgId: line.clientMsgId)
                 if let dialogId = line.dialogId, self.activeDialogId == dialogId {
                     await self.loadLocalLines(dialogId: dialogId)
                 }
@@ -800,8 +856,165 @@ final class CloudAppModel {
         }
     }
 
+    func sendMedia(
+        data: Data, kind: String, contentType: String, fileName: String?,
+        durationMs: Int64? = nil, width: Int? = nil, height: Int? = nil,
+        thumbnail: Data? = nil
+    ) async {
+        composerMediaTask?.cancel()
+        await composerMediaTask?.value
+        let operationId = UUID()
+        composerMediaOperationId = operationId
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performMediaSend(
+                data: data, kind: kind, contentType: contentType, fileName: fileName,
+                durationMs: durationMs, width: width, height: height, thumbnail: thumbnail
+            )
+        }
+        composerMediaTask = task
+        await task.value
+        if composerMediaOperationId == operationId {
+            composerMediaTask = nil
+            composerMediaOperationId = nil
+            activeComposerTransferId = nil
+        }
+    }
+
+    private func performMediaSend(
+        data: Data, kind: String, contentType: String, fileName: String?,
+        durationMs: Int64?, width: Int?, height: Int?, thumbnail: Data?
+    ) async {
+        guard
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let replyToMsgId: Int64?
+        if case let .replying(messageId, _) = composerMode {
+            replyToMsgId = lines.first(where: { $0.id == messageId })?.msgId
+        } else { replyToMsgId = nil }
+        let clientMsgId = UUID().uuidString.lowercased()
+        let presentation = Self.demoAttachment(
+            kind: kind, fileName: fileName, byteSize: Int64(data.count), durationMs: durationMs
+        )
+        var unpersistedPreparation: PreparedMediaUpload?
+        var persistedTransfer: MediaTransferRecord?
+        var transferPersisted = false
+        do {
+            composerMode = .uploading(presentation, progress: 0)
+            let prepared = try await mediaEngine.prepare(
+                data: data, kind: kind, contentType: contentType, fileName: fileName,
+                durationMs: durationMs, width: width, height: height, thumbnail: thumbnail
+            )
+            unpersistedPreparation = prepared
+            try await localStore.insertMediaTransfer(
+                prepared: prepared, dialogId: dialogId, clientMsgId: clientMsgId,
+                caption: caption, replyToMsgId: replyToMsgId
+            )
+            transferPersisted = true
+            unpersistedPreparation = nil
+            guard let transfer = try await localStore.mediaTransfer(id: prepared.transferId) else {
+                throw CloudAppModelError.localStoreUnavailable
+            }
+            persistedTransfer = transfer
+            activeComposerTransferId = transfer.transferId
+            try await localStore.insertSendingMedia(transfer, senderAccountId: accountId)
+            lines.append(Line(
+                id: "transfer:\(prepared.transferId)", dialogId: dialogId, msgId: nil,
+                clientMsgId: clientMsgId, senderAccountId: accountId, text: caption,
+                mine: true, delivery: .sending, timestamp: nil,
+                media: transfer.media, transferProgress: 0
+            ))
+            draft = ""
+            await runMediaTransfer(transfer)
+        } catch is CancellationError {
+            if let unpersistedPreparation { await mediaEngine.discardPrepared(unpersistedPreparation) }
+            if let persistedTransfer, let token = storedSession?.session.token {
+                await cancelMediaTransfer(persistedTransfer, token: token)
+            }
+            composerMode = .text
+        } catch {
+            if let unpersistedPreparation { await mediaEngine.discardPrepared(unpersistedPreparation) }
+            if transferPersisted { scheduleOutboxRetry() }
+            composerMode = .text
+            status = "Media send failed: \(error.localizedDescription)"
+        }
+    }
+
+    func beginVoiceRecording() async {
+        #if DEBUG
+        if isDemoMode { beginDemoRecording(); return }
+        #endif
+        do {
+            try await voiceRecorder.start()
+            composerMode = .recording(elapsedSeconds: 0)
+            recordingTask?.cancel()
+            recordingTask = Task { [weak self] in
+                while let self, !Task.isCancelled, self.voiceRecorder.isRecording {
+                    self.composerMode = .recording(elapsedSeconds: self.voiceRecorder.elapsedSeconds)
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
+        } catch {
+            status = error.localizedDescription
+            composerMode = .text
+        }
+    }
+
+    func finishVoiceRecording() async {
+        #if DEBUG
+        if isDemoMode { finishDemoRecording(); return }
+        #endif
+        recordingTask?.cancel()
+        recordingTask = nil
+        do {
+            let result = try voiceRecorder.finish()
+            composerMode = .text
+            await sendMedia(
+                data: result.data, kind: "voice", contentType: "audio/mp4",
+                fileName: "Voice message.m4a", durationMs: result.durationMs
+            )
+        } catch {
+            status = error.localizedDescription
+            composerMode = .text
+        }
+    }
+
+    func cancelVoiceRecording() {
+        recordingTask?.cancel()
+        recordingTask = nil
+        voiceRecorder.cancel()
+        composerMode = .text
+    }
+
+    func thumbnailData(for media: CloudMedia) async -> Data? {
+        guard let token = storedSession?.session.token else { return nil }
+        return try? await mediaEngine.thumbnail(media: media, token: token)
+    }
+
+    func mediaData(
+        for media: CloudMedia,
+        progress: @Sendable (Double) async -> Void = { _ in }
+    ) async throws -> Data {
+        guard let token = storedSession?.session.token else {
+            throw CloudAPIError(status: 401, message: "Sign in required", retryAfter: nil)
+        }
+        return try await mediaEngine.data(media: media, token: token, progress: progress)
+    }
+
+    func temporaryMediaURL(data: Data, fileExtension: String?) async throws -> URL {
+        try await mediaEngine.temporaryPreview(data: data, fileExtension: fileExtension)
+    }
+
+    func removeTemporaryMediaURL(_ url: URL) async {
+        await mediaEngine.removeTemporaryPreview(url)
+    }
+
     private func afterSignIn() async {
         guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
+        await refreshMediaCacheUsage()
         do {
             pts = try await localStore?.loadPts(accountId: accountId) ?? 0
             await refreshDialogs()
@@ -813,6 +1026,7 @@ final class CloudAppModel {
         }
         await pushCenter.requestAuthorization()
         await resume()
+        await retryMediaTransfers()
     }
 
     private func uploadPushToken(_ deviceToken: String, environment: String) async {
@@ -1051,7 +1265,8 @@ final class CloudAppModel {
             isForwarded: message.isForwarded,
             editVersion: message.editVersion,
             isEdited: message.editVersion > 0 && message.state == "visible",
-            isDeleted: message.state == "deleted_for_all"
+            isDeleted: message.state == "deleted_for_all",
+            media: message.media
         )
     }
 
@@ -1063,6 +1278,8 @@ final class CloudAppModel {
             subtitle = String(localized: "Message deleted")
         } else if let lastText, !lastText.isEmpty {
             subtitle = lastText
+        } else if local.lastState == "visible" {
+            subtitle = String(localized: "Attachment")
         } else {
             subtitle = "No messages yet"
         }
@@ -1118,8 +1335,6 @@ final class CloudAppModel {
 
         do {
             let items = try await localStore.pendingOutboxReady()
-            guard !items.isEmpty else { return }
-
             for item in items {
                 try Task.checkCancellation()
                 try await localStore.markRetrying(clientMsgId: item.clientMsgId)
@@ -1142,6 +1357,157 @@ final class CloudAppModel {
             }
         } catch {
             status = "Outbox retry failed: \(error.localizedDescription)"
+        }
+        await retryMediaTransfers()
+    }
+
+    private func retryMediaTransfers() async {
+        guard let localStore else { return }
+        do {
+            for transfer in try await localStore.mediaTransfersReady() {
+                try Task.checkCancellation()
+                await runMediaTransfer(transfer)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            status = "Media retry failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func runMediaTransfer(_ transfer: MediaTransferRecord) async {
+        if let existing = mediaTransferTasks[transfer.transferId] {
+            await existing.value
+            return
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.processMediaTransfer(transfer)
+        }
+        mediaTransferTasks[transfer.transferId] = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        mediaTransferTasks.removeValue(forKey: transfer.transferId)
+    }
+
+    private func processMediaTransfer(_ initial: MediaTransferRecord) async {
+        guard !mediaTransfersInFlight.contains(initial.transferId) else { return }
+        guard
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        mediaTransfersInFlight.insert(initial.transferId)
+        defer { mediaTransfersInFlight.remove(initial.transferId) }
+        do {
+            try Task.checkCancellation()
+            let mediaId: String
+            if initial.state == "ready_to_send", let existing = initial.mediaId {
+                mediaId = existing
+            } else {
+                mediaId = try await mediaEngine.upload(
+                    transfer: initial, token: token, localStore: localStore,
+                    progress: { [weak self] progress in
+                        await MainActor.run {
+                            guard let self else { return }
+                            if let index = self.lines.firstIndex(where: { $0.clientMsgId == initial.clientMsgId }) {
+                                self.lines[index].transferProgress = progress
+                            }
+                            if self.activeDialogId == initial.dialogId {
+                                self.composerMode = .uploading(
+                                    Self.demoAttachment(
+                                        kind: initial.kind, fileName: initial.fileName,
+                                        byteSize: initial.byteSize, durationMs: initial.durationMs
+                                    ), progress: progress
+                                )
+                            }
+                        }
+                    }
+                )
+                try await localStore.updateMediaTransfer(
+                    transferId: initial.transferId, mediaId: mediaId,
+                    uploadOffset: initial.byteSize, state: "ready_to_send", error: nil
+                )
+            }
+            guard let ready = try await localStore.mediaTransfer(id: initial.transferId) else {
+                throw CloudAppModelError.localStoreUnavailable
+            }
+            try await localStore.insertSendingMedia(ready, senderAccountId: accountId)
+            if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
+            try Task.checkCancellation()
+            guard
+                storedSession?.session.token == token,
+                storedSession?.session.accountId == accountId
+            else { throw CancellationError() }
+            // Once the idempotent send request begins it is the commit point. Hide the upload cancel
+            // control so the UI never promises cancellation after the server may have committed.
+            if activeComposerTransferId == ready.transferId {
+                activeComposerTransferId = nil
+                if case .uploading = composerMode { composerMode = .text }
+            }
+            let response = try await api.sendMediaMessage(
+                dialogId: ready.dialogId, clientMsgId: ready.clientMsgId,
+                body: ready.caption, mediaId: mediaId, replyToMsgId: ready.replyToMsgId,
+                token: token
+            )
+            try await localStore.markSent(response, senderAccountId: accountId)
+            try await localStore.completeMediaTransfer(transferId: ready.transferId)
+            await mediaEngine.finishUpload(ready)
+            if activeDialogId == ready.dialogId, case .uploading = composerMode { composerMode = .text }
+            if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
+            await refreshDialogs()
+            scheduleSync()
+            status = "Sent"
+        } catch is CancellationError {
+            let current = (try? await localStore.mediaTransfer(id: initial.transferId)) ?? initial
+            await cancelMediaTransfer(current, token: token)
+            if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
+        } catch {
+            let delay = retryDelay(forRetryCount: initial.retryCount + 1)
+            let current = try? await localStore.mediaTransfer(id: initial.transferId)
+            try? await localStore.updateMediaTransfer(
+                transferId: initial.transferId, mediaId: current?.mediaId,
+                uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
+                state: current?.mediaId == nil ? "pending" : "uploading",
+                error: error.localizedDescription, retryAfter: delay
+            )
+            if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
+            if let index = lines.firstIndex(where: { $0.clientMsgId == initial.clientMsgId }) {
+                lines[index].delivery = .failed(error.localizedDescription)
+            }
+            status = "Media waiting to retry: \(error.localizedDescription)"
+            scheduleOutboxRetry(after: delay)
+        }
+    }
+
+    private func cancelMediaTransfer(_ transfer: MediaTransferRecord, token: String) async {
+        await mediaEngine.cancelUpload(transfer, token: token)
+        try? await localStore?.cancelMediaTransfer(
+            transferId: transfer.transferId, clientMsgId: transfer.clientMsgId
+        )
+        lines.removeAll { $0.clientMsgId == transfer.clientMsgId }
+        if activeDialogId == transfer.dialogId { await loadLocalLines(dialogId: transfer.dialogId) }
+        await refreshDialogs()
+    }
+
+    private static func demoAttachment(
+        kind: String, fileName: String?, byteSize: Int64, durationMs: Int64?
+    ) -> DemoAttachment {
+        let duration = durationMs.map {
+            let seconds = max(0, $0 / 1_000)
+            return String(format: "%lld:%02lld", seconds / 60, seconds % 60)
+        } ?? ""
+        switch kind {
+        case "photo": return .photo(name: fileName ?? String(localized: "Photo"))
+        case "video": return .video(name: fileName ?? String(localized: "Video"), duration: duration)
+        case "voice": return .voice(duration: duration.isEmpty ? "0:00" : duration)
+        default: return .file(
+            name: fileName ?? String(localized: "File"),
+            size: ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file)
+        )
         }
     }
 
@@ -1183,7 +1549,9 @@ final class CloudAppModel {
 
     private func nextOutboxRetryDelay() async -> TimeInterval? {
         guard let localStore else { return nil }
-        return try? await localStore.nextPendingOutboxDelay()
+        let textDelay = try? await localStore.nextPendingOutboxDelay()
+        let mediaDelay = try? await localStore.nextMediaTransferDelay()
+        return [textDelay, mediaDelay].compactMap { $0 }.min()
     }
 
     private func retryDelay(forRetryCount retryCount: Int) -> TimeInterval {
@@ -1207,6 +1575,7 @@ final class CloudAppModel {
             lines[index].editVersion = message.editVersion
             lines[index].isEdited = message.editVersion > 0 && message.state == "visible"
             lines[index].isDeleted = message.state == "deleted_for_all"
+            lines[index].media = message.media
             lines[index].mine = mine
             lines[index].delivery = .sent
             lines[index].timestamp = message.serverTs
@@ -1231,7 +1600,8 @@ final class CloudAppModel {
             isForwarded: message.isForwarded,
             editVersion: message.editVersion,
             isEdited: message.editVersion > 0 && message.state == "visible",
-            isDeleted: message.state == "deleted_for_all"
+            isDeleted: message.state == "deleted_for_all",
+            media: message.media
         ))
         lines.sort {
             switch ($0.msgId, $1.msgId) {

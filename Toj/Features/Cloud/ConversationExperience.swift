@@ -1,4 +1,8 @@
 import SwiftUI
+import AVFoundation
+import AVKit
+import PhotosUI
+import UniformTypeIdentifiers
 import UIKit
 
 struct TojConversationExperience: View {
@@ -21,6 +25,7 @@ struct TojConversationExperience: View {
 
     private var canSend: Bool {
         model.activeDialogId == dialogId
+            && !model.composerMode.isRecording
             && !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -50,9 +55,19 @@ struct TojConversationExperience: View {
             .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showingAttachments) {
-            DemoAttachmentPicker { attachment in
-                model.sendDemoAttachment(attachment)
-                showingAttachments = false
+            Group {
+            #if DEBUG
+                if model.isDemoMode {
+                    DemoAttachmentPicker { attachment in
+                        model.sendDemoAttachment(attachment)
+                        showingAttachments = false
+                    }
+                } else {
+                    ProductionAttachmentPicker(model: model) { showingAttachments = false }
+                }
+            #else
+                ProductionAttachmentPicker(model: model) { showingAttachments = false }
+            #endif
             }
             .presentationDetents([.height(390)])
             .presentationDragIndicator(.visible)
@@ -185,6 +200,7 @@ struct TojConversationExperience: View {
                                 unreadDivider
                             }
                             TojMessageBubble(
+                                model: model,
                                 line: line,
                                 actions: model.actions(for: line),
                                 onAction: { perform($0, on: line) },
@@ -274,6 +290,7 @@ struct TojConversationExperience: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(TojTheme.secondaryText)
+                    .disabled(model.composerMode.isRecording)
                     .accessibilityLabel("Add attachment")
                 }
 
@@ -287,6 +304,7 @@ struct TojConversationExperience: View {
                     .submitLabel(.send)
                     .onSubmit { if canSend { send() } }
                     .accessibilityLabel("Message")
+                    .disabled(model.composerMode.isRecording)
 
                 if canSend {
                     Button(action: send) {
@@ -301,11 +319,15 @@ struct TojConversationExperience: View {
                 } else if model.capabilities.contains(.voiceNotes) {
                     Button {
                         if model.composerMode.isRecording {
-                            model.finishDemoRecording()
-                            TojFeedback.sent()
+                            Task {
+                                await model.finishVoiceRecording()
+                                TojFeedback.sent()
+                            }
                         } else {
-                            model.beginDemoRecording()
-                            TojFeedback.selection()
+                            Task {
+                                await model.beginVoiceRecording()
+                                TojFeedback.selection()
+                            }
                         }
                     } label: {
                         Image(systemName: model.composerMode.isRecording ? "arrow.up" : "mic.fill")
@@ -408,6 +430,7 @@ struct TojConversationExperience: View {
 }
 
 private struct TojMessageBubble: View {
+    let model: CloudAppModel
     let line: CloudAppModel.Line
     let actions: [MessageAction]
     let onAction: (MessageAction) -> Void
@@ -437,7 +460,11 @@ private struct TojMessageBubble: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                if let attachment = line.attachment {
+                if let media = line.media {
+                    ProductionMediaBubble(model: model, media: media)
+                        .contentShape(Rectangle())
+                        .onTapGesture { if media.kind != "voice" { showingMedia = true } }
+                } else if let attachment = line.attachment {
                     DemoAttachmentBubble(attachment: attachment)
                         .contentShape(Rectangle())
                         .onTapGesture { showingMedia = true }
@@ -450,6 +477,13 @@ private struct TojMessageBubble: View {
                         .font(.body)
                         .foregroundStyle(TojTheme.text)
                         .textSelection(.enabled)
+                }
+
+                if let progress = line.transferProgress, progress < 1 {
+                    ProgressView(value: progress)
+                        .tint(TojTheme.secure)
+                        .accessibilityLabel("Uploading")
+                        .accessibilityValue("\(Int(progress * 100)) percent")
                 }
 
                 HStack(spacing: 4) {
@@ -519,7 +553,9 @@ private struct TojMessageBubble: View {
             }
         }
         .fullScreenCover(isPresented: $showingMedia) {
-            if let attachment = line.attachment {
+            if let media = line.media {
+                ProductionMediaViewer(model: model, media: media)
+            } else if let attachment = line.attachment {
                 DemoMediaViewer(attachment: attachment)
             }
         }
@@ -613,6 +649,270 @@ private struct DemoAttachmentBubble: View {
     }
 }
 
+private struct ProductionMediaBubble: View {
+    let model: CloudAppModel
+    let media: CloudMedia
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        Group {
+            switch media.kind {
+            case "photo", "video":
+                ZStack {
+                    if let thumbnail {
+                        Image(uiImage: thumbnail)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        LinearGradient(
+                            colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
+                            startPoint: .topLeading, endPoint: .bottomTrailing
+                        )
+                        ProgressView().tint(TojTheme.text)
+                    }
+                    if media.kind == "video" {
+                        Image(systemName: "play.fill")
+                            .font(.title2.weight(.bold))
+                            .frame(width: 52, height: 52)
+                            .background(.black.opacity(0.55), in: Circle())
+                    }
+                    VStack { Spacer(); HStack {
+                        Spacer()
+                        Text(media.formattedDuration ?? media.formattedSize)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 7).padding(.vertical, 4)
+                            .background(.black.opacity(0.62), in: Capsule())
+                    }.padding(8) }
+                }
+                .frame(width: 235, height: 155)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .task(id: media.id) {
+                    guard thumbnail == nil, let data = await model.thumbnailData(for: media) else { return }
+                    thumbnail = UIImage(data: data)
+                }
+            case "voice":
+                VoiceNotePlaybackView(model: model, media: media)
+            default:
+                HStack(spacing: 11) {
+                    Image(systemName: "doc.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 42, height: 42)
+                        .background(TojTheme.raised, in: Circle())
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(media.displayName).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Text(media.formattedSize).font(.caption).foregroundStyle(TojTheme.secondaryText)
+                    }
+                }
+                .frame(maxWidth: 235, alignment: .leading)
+            }
+        }
+        .accessibilityLabel("\(media.displayName), \(media.formattedSize)")
+    }
+}
+
+private struct VoiceNotePlaybackView: View {
+    let model: CloudAppModel
+    let media: CloudMedia
+    @State private var player: AVAudioPlayer?
+    @State private var isPlaying = false
+    @State private var isLoading = false
+    @State private var progress = 0.0
+    @State private var downloadProgress = 0.0
+    @State private var error: String?
+    @State private var loadingTask: Task<Void, Never>?
+    @State private var playbackTask: Task<Void, Never>?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: toggle) {
+                Group {
+                    if isLoading { ProgressView(value: downloadProgress).tint(TojTheme.canvas) }
+                    else if error != nil { Image(systemName: "arrow.clockwise") }
+                    else { Image(systemName: isPlaying ? "pause.fill" : "play.fill") }
+                }
+                .frame(width: 38, height: 38)
+                .background(TojTheme.text, in: Circle())
+                .foregroundStyle(TojTheme.canvas)
+            }
+            .buttonStyle(.plain)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Slider(
+                    value: Binding(
+                        get: { progress },
+                        set: { value in
+                            progress = value
+                            if let player { player.currentTime = player.duration * value }
+                        }
+                    ),
+                    in: 0...1
+                )
+                .tint(TojTheme.secure)
+                .frame(width: 135)
+                .accessibilityLabel("Voice message position")
+                HStack {
+                    Text(error ?? elapsedLabel)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(media.formattedDuration ?? "0:00")
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(TojTheme.secondaryText)
+            }
+        }
+        .onDisappear {
+            loadingTask?.cancel()
+            playbackTask?.cancel()
+            player?.stop()
+        }
+    }
+
+    private var elapsedLabel: String {
+        let elapsed = Int((player?.duration ?? 0) * progress)
+        return String(format: "%d:%02d", elapsed / 60, elapsed % 60)
+    }
+
+    private func toggle() {
+        if let player {
+            if player.isPlaying {
+                player.pause()
+                isPlaying = false
+            } else {
+                player.play()
+                isPlaying = true
+                monitorPlayback()
+            }
+            return
+        }
+        error = nil
+        isLoading = true
+        downloadProgress = 0
+        loadingTask?.cancel()
+        loadingTask = Task {
+            defer { loadingTask = nil }
+            do {
+                let data = try await model.mediaData(for: media) { value in
+                    await MainActor.run { downloadProgress = value }
+                }
+                try Task.checkCancellation()
+                let loaded = try AVAudioPlayer(data: data)
+                guard loaded.prepareToPlay() else { throw MediaPresentationError.unreadable }
+                player = loaded
+                isLoading = false
+                loaded.play()
+                isPlaying = true
+                monitorPlayback()
+            } catch is CancellationError {
+                isLoading = false
+            } catch {
+                isLoading = false
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func monitorPlayback() {
+        playbackTask?.cancel()
+        playbackTask = Task {
+            while !Task.isCancelled, let player, player.isPlaying {
+                progress = player.duration > 0 ? player.currentTime / player.duration : 0
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            if player?.isPlaying == false, progress > 0.99 { progress = 0; player?.currentTime = 0 }
+            isPlaying = false
+        }
+    }
+}
+
+private struct ProductionMediaViewer: View {
+    @Environment(\.dismiss) private var dismiss
+    let model: CloudAppModel
+    let media: CloudMedia
+    @State private var data: Data?
+    @State private var player: AVPlayer?
+    @State private var temporaryURL: URL?
+    @State private var error: String?
+    @State private var downloadProgress = 0.0
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            TojTheme.canvas.ignoresSafeArea()
+            Group {
+                if let error {
+                    VStack(spacing: 16) {
+                        ContentUnavailableView(
+                            "Could not open media", systemImage: "exclamationmark.triangle",
+                            description: Text(error)
+                        )
+                        Button("Try again") { Task { await load() } }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else if media.kind == "photo", let data, let image = UIImage(data: data) {
+                    Image(uiImage: image).resizable().scaledToFit().padding()
+                } else if media.kind == "video", let player {
+                    VideoPlayer(player: player).onAppear { player.play() }
+                } else if media.kind == "file", let temporaryURL {
+                    VStack(spacing: 20) {
+                        Image(systemName: "doc.fill").font(.system(size: 58)).foregroundStyle(TojTheme.secondaryText)
+                        Text(media.displayName).font(.headline)
+                        Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
+                        ShareLink(item: temporaryURL) { Label("Open or share", systemImage: "square.and.arrow.up") }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else {
+                    ProgressView(value: downloadProgress) {
+                        Text("Downloading…")
+                    }
+                    .tint(TojTheme.text)
+                    .frame(maxWidth: 240)
+                }
+            }
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").frame(width: 44, height: 44)
+            }
+            .buttonStyle(.glass)
+            .padding()
+        }
+        .task(id: media.id) { await load() }
+        .onDisappear {
+            player?.pause()
+            if let temporaryURL { Task { await model.removeTemporaryMediaURL(temporaryURL) } }
+        }
+    }
+
+    private func load() async {
+        error = nil
+        data = nil
+        player?.pause()
+        player = nil
+        if let temporaryURL { await model.removeTemporaryMediaURL(temporaryURL) }
+        temporaryURL = nil
+        downloadProgress = 0
+        do {
+            let downloaded = try await model.mediaData(for: media) { value in
+                await MainActor.run { downloadProgress = value }
+            }
+            if media.kind == "photo" {
+                guard UIImage(data: downloaded) != nil else { throw MediaPresentationError.unreadable }
+                data = downloaded
+                return
+            }
+            let ext = media.fileName.flatMap { URL(filePath: $0).pathExtension }.flatMap { $0.isEmpty ? nil : $0 }
+                ?? (media.kind == "video" ? "mp4" : "bin")
+            let url = try await model.temporaryMediaURL(data: downloaded, fileExtension: ext)
+            temporaryURL = url
+            if media.kind == "video" { player = AVPlayer(url: url) }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+}
+
+private enum MediaPresentationError: LocalizedError {
+    case unreadable
+    var errorDescription: String? { String(localized: "The downloaded media is damaged or unsupported") }
+}
+
 private extension ComposerMode {
     var isRecording: Bool {
         if case .recording = self { return true }
@@ -656,6 +956,183 @@ private extension ComposerMode {
         case let .uploading(attachment, progress): "\(attachment.title) · \(Int(progress * 100))%"
         case let .disabled(reason): reason
         case .text: ""
+        }
+    }
+}
+
+private struct ProductionAttachmentPicker: View {
+    let model: CloudAppModel
+    let onDone: () -> Void
+    @State private var photoItem: PhotosPickerItem?
+    @State private var videoItem: PhotosPickerItem?
+    @State private var importingFile = false
+    @State private var working = false
+    @State private var error: String?
+    @State private var selectionTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Share something")
+                .font(TojTheme.heading(.title, weight: .bold))
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    pickerLabel("Photo", icon: "photo.fill")
+                }
+                PhotosPicker(selection: $videoItem, matching: .videos) {
+                    pickerLabel("Video", icon: "video.fill")
+                }
+                Button { importingFile = true } label: { pickerLabel("File", icon: "doc.fill") }
+                    .buttonStyle(.plain)
+            }
+            .disabled(working)
+            if working {
+                HStack {
+                    ProgressView("Preparing encrypted upload…").tint(TojTheme.secure)
+                    Spacer()
+                    Button("Cancel", role: .cancel) { cancelSelection() }
+                }
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Label("Files are encrypted in Toj's local cache before upload", systemImage: "lock.fill")
+                .font(.caption)
+                .foregroundStyle(TojTheme.secondaryText)
+        }
+        .padding(22)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(TojTheme.canvas)
+        .onChange(of: photoItem) { _, item in
+            guard let item else { return }
+            selectionTask?.cancel()
+            selectionTask = Task { await loadPhoto(item) }
+        }
+        .onChange(of: videoItem) { _, item in
+            guard let item else { return }
+            selectionTask?.cancel()
+            selectionTask = Task { await loadVideo(item) }
+        }
+        .fileImporter(isPresented: $importingFile, allowedContentTypes: [.data, .item]) { result in
+            selectionTask?.cancel()
+            selectionTask = Task { await loadFile(result) }
+        }
+        .onDisappear {
+            selectionTask?.cancel()
+            if working { model.cancelComposerMode() }
+        }
+    }
+
+    nonisolated private func pickerLabel(_ title: LocalizedStringKey, icon: String) -> some View {
+        HStack(spacing: 11) {
+            Image(systemName: icon).frame(width: 36, height: 36).background(Color.white.opacity(0.08), in: Circle())
+            Text(title).font(.subheadline.weight(.semibold))
+            Spacer()
+        }
+        .padding(13)
+        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func loadPhoto(_ item: PhotosPickerItem) async {
+        working = true
+        defer { working = false }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), let image = UIImage(data: data) else {
+                throw PickerError.unreadable
+            }
+            try Task.checkCancellation()
+            let thumbnail = makeThumbnail(image)
+            let type = item.supportedContentTypes.first
+            await model.sendMedia(
+                data: data, kind: "photo", contentType: type?.preferredMIMEType ?? "image/jpeg",
+                fileName: "Photo.\(type?.preferredFilenameExtension ?? "jpg")",
+                width: Int(image.size.width), height: Int(image.size.height),
+                thumbnail: thumbnail
+            )
+            onDone()
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func loadVideo(_ item: PhotosPickerItem) async {
+        working = true
+        defer { working = false }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self) else { throw PickerError.unreadable }
+            try Task.checkCancellation()
+            let url = FileManager.default.temporaryDirectory.appending(path: "toj-picker-\(UUID().uuidString).mov")
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+            defer { try? FileManager.default.removeItem(at: url) }
+            let asset = AVURLAsset(url: url)
+            let duration = try await asset.load(.duration)
+            var dimensions: (Int, Int)?
+            if let track = try await asset.loadTracks(withMediaType: .video).first {
+                let naturalSize = try await track.load(.naturalSize)
+                let transform = try await track.load(.preferredTransform)
+                let size = naturalSize.applying(transform)
+                dimensions = (Int(abs(size.width)), Int(abs(size.height)))
+            }
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            let image = try? await generator.image(at: .zero).image
+            let thumbnail = image.map(UIImage.init(cgImage:)).flatMap(makeThumbnail)
+            let type = item.supportedContentTypes.first
+            await model.sendMedia(
+                data: data, kind: "video", contentType: type?.preferredMIMEType ?? "video/quicktime",
+                fileName: "Video.\(type?.preferredFilenameExtension ?? "mov")",
+                durationMs: Int64(max(0, duration.seconds) * 1_000),
+                width: dimensions?.0, height: dimensions?.1, thumbnail: thumbnail
+            )
+            onDone()
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func loadFile(_ result: Result<URL, Error>) async {
+        working = true
+        defer { working = false }
+        do {
+            let url = try result.get()
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            let values = try url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey])
+            if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 { throw PickerError.tooLarge }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            try Task.checkCancellation()
+            await model.sendMedia(
+                data: data, kind: "file",
+                contentType: values.contentType?.preferredMIMEType ?? "application/octet-stream",
+                fileName: url.lastPathComponent
+            )
+            onDone()
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func makeThumbnail(_ image: UIImage) -> Data? {
+        for dimension in [640.0, 480.0, 320.0] {
+            guard let resized = image.preparingThumbnail(of: CGSize(width: dimension, height: dimension)) else { continue }
+            for quality in [0.72, 0.55, 0.4] {
+                if let data = resized.jpegData(compressionQuality: quality), data.count <= 256 * 1024 {
+                    return data
+                }
+            }
+        }
+        return nil
+    }
+
+    private func cancelSelection() {
+        selectionTask?.cancel()
+        selectionTask = nil
+        model.cancelComposerMode()
+        working = false
+        onDone()
+    }
+}
+
+private enum PickerError: LocalizedError {
+    case unreadable, tooLarge
+    var errorDescription: String? {
+        switch self {
+        case .unreadable: String(localized: "That item could not be read")
+        case .tooLarge: String(localized: "That file is larger than 25 MB")
         }
     }
 }

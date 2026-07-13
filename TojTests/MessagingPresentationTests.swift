@@ -34,9 +34,9 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
-    func testDemoEnablesRichCapabilitiesAndProductionModelDoesNot() async {
+    func testDemoAndProductionExposeTheirRealCapabilities() async {
         let model = CloudAppModel(useDefaultLocalStore: false)
-        XCTAssertEqual(model.capabilities, .productionText)
+        XCTAssertEqual(model.capabilities, [.productionText, .media, .voiceNotes])
 
         model.enterDemoMode()
 
