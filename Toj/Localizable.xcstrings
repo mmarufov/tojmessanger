@@ -838,6 +838,22 @@
     "Jump to latest message" : {
 
     },
+    "last seen recently" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "был(а) недавно"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ба наздикӣ онлайн буд"
+          }
+        }
+      }
+    },
     "Link" : {
 
     },
@@ -1700,6 +1716,22 @@
         }
       }
     },
+    "Today" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сегодня"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Имрӯз"
+          }
+        }
+      }
+    },
     "Toj — M1 walking skeleton" : {
 
     },
@@ -1730,7 +1762,20 @@
 
     },
     "typing…" : {
-
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "печатает…"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "менависад…"
+          }
+        }
+      }
     },
     "Unmute" : {
 
@@ -1877,6 +1922,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Хуш омадед ба Toj"
+          }
+        }
+      }
+    },
+    "Yesterday" : {
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вчера"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дирӯз"
           }
         }
       }

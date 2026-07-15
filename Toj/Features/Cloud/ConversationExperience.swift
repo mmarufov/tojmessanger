@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import AVKit
 import Combine
+import Network
 import PhotosUI
 import Photos
 import UniformTypeIdentifiers
@@ -38,6 +39,8 @@ struct TojConversationExperience: View {
     @State private var voiceLocked = false
     @State private var voiceCancelled = false
     @State private var voiceStartTask: Task<Void, Never>?
+    @State private var autoplayCoordinator = VideoAutoplayCoordinator()
+    @State private var networkMonitor = MediaNetworkMonitor()
 
     let dialogId: String
 
@@ -48,15 +51,14 @@ struct TojConversationExperience: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-
-            messageTimeline
-        }
-        .background(TojTheme.canvas)
-        .safeAreaInset(edge: .bottom, spacing: 0) { composer }
+        messageTimeline
+            .background(TojTheme.canvas)
+            .overlay(alignment: .top) {
+                header
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .task(id: dialogId) {
@@ -167,22 +169,36 @@ struct TojConversationExperience: View {
         GlassEffectContainer(spacing: 10) {
             HStack(spacing: 10) {
                 Button { dismiss() } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 17, weight: .bold))
-                        .frame(width: 46, height: 46)
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 17, weight: .bold))
+                        if othersUnreadCount > 0 {
+                            Text(othersUnreadCount > 999 ? "999+" : "\(othersUnreadCount)")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(TojTheme.onAccent)
+                                .padding(.horizontal, 7)
+                                .frame(minWidth: 25, minHeight: 25)
+                                .background(TojTheme.accent, in: Capsule())
+                        }
+                    }
+                    .padding(.horizontal, othersUnreadCount > 0 ? 11 : 0)
+                    .frame(minWidth: 46)
+                    .frame(height: 46)
                 }
                 .buttonStyle(.glass)
                 .accessibilityLabel("Back")
+                .accessibilityValue(othersUnreadCount > 0 ? "\(othersUnreadCount) unread in other chats" : "")
 
                 Button { showingProfile = model.capabilities.contains(.profiles) } label: {
                     VStack(spacing: 1) {
                         Text(model.dialogTitle(dialogId))
-                            .font(.subheadline.weight(.semibold))
+                            .font(TojTheme.heading(.headline, weight: .semibold))
                             .foregroundStyle(TojTheme.text)
                             .lineLimit(1)
-                        Label(model.connectionViewState.title, systemImage: model.connectionViewState.systemImage)
-                            .font(.caption2)
-                            .foregroundStyle(connectionColor)
+                        Text(headerSubtitle)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(headerSubtitleColor)
+                            .lineLimit(1)
                     }
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
@@ -191,21 +207,42 @@ struct TojConversationExperience: View {
                 }
                 .buttonStyle(.plain)
                 .tojGlass(in: Capsule(), interactive: model.capabilities.contains(.profiles))
-                .accessibilityHint(model.capabilities.contains(.profiles) ? "Opens contact and privacy details" : "Connection security status")
+                .accessibilityHint(model.capabilities.contains(.profiles) ? "Opens contact and privacy details" : "Connection status")
 
                 Button { showingProfile = model.capabilities.contains(.profiles) } label: {
-                    TojAvatar(title: model.dialogTitle(dialogId), size: 44)
+                    TojAvatar(title: model.dialogTitle(dialogId), size: 46)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.tojPressable)
                 .disabled(!model.capabilities.contains(.profiles))
                 .accessibilityLabel("Open \(model.dialogTitle(dialogId)) profile")
             }
         }
     }
 
-    private var connectionColor: Color {
+    /// Unread total across the *other* chats — Telegram's back-pill count.
+    private var othersUnreadCount: Int {
+        model.dialogs.reduce(0) { total, dialog in
+            dialog.id == dialogId || dialog.isArchived ? total : total + dialog.unreadCount
+        }
+    }
+
+    private var isPeerTyping: Bool {
+        model.dialogs.first(where: { $0.id == dialogId })?.isTyping ?? false
+    }
+
+    /// Telegram grammar: the subtitle is presence; connection trouble takes its place when relevant.
+    private var headerSubtitle: String {
         switch model.connectionViewState {
-        case .connected: TojTheme.secure
+        case .connected:
+            isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
+        case .connecting, .offline:
+            model.connectionViewState.title
+        }
+    }
+
+    private var headerSubtitleColor: Color {
+        switch model.connectionViewState {
+        case .connected: isPeerTyping ? TojTheme.gold : TojTheme.secondaryText
         case .connecting: TojTheme.secondaryText
         case .offline: .orange
         }
@@ -215,10 +252,8 @@ struct TojConversationExperience: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    LazyVStack(spacing: 8) {
-                        Label("Private conversation", systemImage: "lock.fill")
-                            .font(.caption2)
-                            .foregroundStyle(TojTheme.secondaryText)
+                    LazyVStack(spacing: 3) {
+                        timelinePill(Text("Private conversation"), icon: "lock.fill")
                             .padding(.vertical, 8)
 
                         if model.canLoadEarlier {
@@ -236,16 +271,22 @@ struct TojConversationExperience: View {
                         }
 
                         ForEach(Array(model.lines.enumerated()), id: \.element.id) { index, line in
+                            if let dayLabel = dayHeaderLabel(at: index) {
+                                timelinePill(Text(verbatim: dayLabel))
+                                    .padding(.vertical, 7)
+                            }
                             if shouldShowUnreadDivider(at: index) {
                                 unreadDivider
                             }
                             TojMessageBubble(
                                 model: model,
                                 line: line,
+                                isLastInGroup: isLastInGroup(at: index),
                                 actions: model.actions(for: line),
                                 onAction: { perform($0, on: line) },
                                 onSwipeReply: { model.beginReply(to: line); composerFocused = true }
                             )
+                            .padding(.top, isFirstInGroup(at: index) ? 5 : 0)
                             .id(line.id)
                             .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97, anchor: line.mine ? .bottomTrailing : .bottomLeading)))
                         }
@@ -256,11 +297,14 @@ struct TojConversationExperience: View {
                             .onAppear { isAtBottom = true }
                             .onDisappear { isAtBottom = false }
                     }
-                    .padding(.horizontal, 12)
+                    .padding(.top, 62)
+                    .padding(.horizontal, 10)
                     .padding(.bottom, 10)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .defaultScrollAnchor(.bottom)
+                .environment(autoplayCoordinator)
+                .environment(networkMonitor)
                 .onChange(of: model.lines.count) { _, _ in
                     guard isAtBottom else { return }
                     scrollToLatest(proxy)
@@ -314,82 +358,138 @@ struct TojConversationExperience: View {
         initialUnreadCount > 0 && index == max(0, model.lines.count - initialUnreadCount)
     }
 
+    /// Telegram's centered timeline capsule — date separators and system notes share it.
+    private func timelinePill(_ text: Text, icon: String? = nil) -> some View {
+        HStack(spacing: 4) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            text
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(TojTheme.text.opacity(0.72))
+        .padding(.horizontal, 11)
+        .padding(.vertical, 5)
+        .background(Color.white.opacity(0.07), in: Capsule())
+    }
+
+    /// Pending sends have no server timestamp yet — treat them as "now" for grouping.
+    private func lineDate(_ line: CloudAppModel.Line) -> Date {
+        line.timestamp.flatMap(TojDateFormatting.date) ?? .now
+    }
+
+    private func inSameGroup(_ earlier: CloudAppModel.Line, _ later: CloudAppModel.Line) -> Bool {
+        guard earlier.mine == later.mine else { return false }
+        let first = lineDate(earlier)
+        let second = lineDate(later)
+        return abs(second.timeIntervalSince(first)) < 360
+            && Calendar.current.isDate(first, inSameDayAs: second)
+    }
+
+    private func isFirstInGroup(at index: Int) -> Bool {
+        index == 0 || !inSameGroup(model.lines[index - 1], model.lines[index])
+    }
+
+    private func isLastInGroup(at index: Int) -> Bool {
+        index == model.lines.count - 1 || !inSameGroup(model.lines[index], model.lines[index + 1])
+    }
+
+    private func dayHeaderLabel(at index: Int) -> String? {
+        let day = lineDate(model.lines[index])
+        if index == 0 { return TojDateFormatting.dayHeader(day) }
+        let previous = lineDate(model.lines[index - 1])
+        return Calendar.current.isDate(day, inSameDayAs: previous) ? nil : TojDateFormatting.dayHeader(day)
+    }
+
+    /// Telegram's bottom bar grammar: three floating Liquid Glass elements — attach circle,
+    /// expanding message capsule, mic/send circle — over the timeline, no solid backdrop.
     private var composer: some View {
+        GlassEffectContainer(spacing: 8) {
+            HStack(alignment: .bottom, spacing: 8) {
+                if model.capabilities.contains(.media) {
+                    Button { showingAttachments = true } label: {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(TojTheme.text)
+                            .frame(width: 46, height: 46)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(model.composerMode.isRecording)
+                    .accessibilityLabel("Add attachment")
+                }
+
+                messageField
+
+                if canSend {
+                    Button(action: send) {
+                        Image(systemName: model.composerMode.isEditing ? "checkmark" : "paperplane.fill")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(TojTheme.onAccent)
+                            .frame(width: 46, height: 46)
+                            .background(TojTheme.accent, in: Circle())
+                    }
+                    .buttonStyle(.tojPressable)
+                    .transition(reduceMotion ? .opacity : .scale(scale: 0.6).combined(with: .opacity))
+                    .accessibilityLabel(model.composerMode.isEditing ? "Save edited message" : "Send")
+                } else if model.capabilities.contains(.voiceNotes) {
+                    voiceRecordControl
+                } else {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(TojTheme.tertiaryText)
+                        .frame(width: 46, height: 46)
+                        .tojGlass(in: Circle())
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : TojTheme.microAnimation, value: model.composerMode)
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : TojTheme.microAnimation, value: canSend)
+    }
+
+    /// The message capsule: grows with the draft (1–8 lines); the reply/edit/recording strip
+    /// docks inside the same glass, above the text.
+    private var messageField: some View {
         VStack(spacing: 0) {
             if model.composerMode != .text {
                 composerContext
                     .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
             }
 
-            HStack(alignment: .bottom, spacing: 7) {
-                if model.capabilities.contains(.media) {
-                    Button { showingAttachments = true } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 17, weight: .semibold))
-                            .frame(width: 42, height: 42)
-                    }
-                    .buttonStyle(.tojPressable)
-                    .foregroundStyle(TojTheme.secondaryText)
-                    .disabled(model.composerMode.isRecording)
-                    .accessibilityLabel("Add attachment")
-                }
-
-                TextField("Message", text: $model.draft, axis: .vertical)
-                    .focused($composerFocused)
-                    .lineLimit(1...5)
-                    .font(.body)
-                    .foregroundStyle(TojTheme.text)
-                    .padding(.leading, model.capabilities.contains(.media) ? 0 : 10)
-                    .padding(.vertical, 11)
-                    .submitLabel(.send)
-                    .onSubmit { if canSend { send() } }
-                    .accessibilityLabel("Message")
-                    .disabled(model.composerMode.isRecording)
-
-                if canSend {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundStyle(TojTheme.onAccent)
-                            .frame(width: 44, height: 44)
-                            .background(TojTheme.accent, in: Circle())
-                    }
-                    .buttonStyle(.tojPressable)
-                    .accessibilityLabel(model.composerMode.isEditing ? "Save edited message" : "Send")
-                } else if model.capabilities.contains(.voiceNotes) {
-                    voiceRecordControl
-                } else {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 17, weight: .bold))
-                        .foregroundStyle(TojTheme.secondaryText)
-                        .frame(width: 44, height: 44)
-                        .background(TojTheme.strong, in: Circle())
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(6)
-            .tojGlass(in: Capsule(), interactive: true)
+            TextField("Message", text: $model.draft, axis: .vertical)
+                .focused($composerFocused)
+                .lineLimit(1...8)
+                .font(.body)
+                .foregroundStyle(TojTheme.text)
+                .tint(TojTheme.gold)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 12)
+                .submitLabel(.send)
+                .onSubmit { if canSend { send() } }
+                .accessibilityLabel("Message")
+                .disabled(model.composerMode.isRecording)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(TojTheme.canvas.opacity(0.96))
-        .animation(reduceMotion ? .easeOut(duration: 0.12) : TojTheme.microAnimation, value: model.composerMode)
+        .tojGlass(in: RoundedRectangle(cornerRadius: 23, style: .continuous), interactive: true)
     }
 
     private var composerContext: some View {
-        HStack(spacing: 10) {
-            Rectangle()
+        HStack(spacing: 9) {
+            Capsule()
                 .fill(model.composerMode.isRecording ? TojTheme.danger : TojTheme.accent)
-                .frame(width: 3, height: 34)
-                .clipShape(Capsule())
+                .frame(width: 3, height: 30)
             Image(systemName: model.composerMode.contextIcon)
-                .foregroundStyle(TojTheme.secondaryText)
-            VStack(alignment: .leading, spacing: 2) {
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(model.composerMode.isRecording ? TojTheme.danger : TojTheme.accent)
+            VStack(alignment: .leading, spacing: 1) {
                 Text(model.composerMode.contextTitle)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(TojTheme.text)
                 Text(model.composerMode.contextPreview)
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(TojTheme.secondaryText)
                     .lineLimit(1)
             }
@@ -404,17 +504,20 @@ struct TojConversationExperience: View {
                 .frame(height: 28)
                 .accessibilityHidden(true)
             }
-            Spacer()
+            Spacer(minLength: 8)
             Button { model.cancelComposerMode() } label: {
                 Image(systemName: "xmark")
-                    .frame(width: 36, height: 36)
+                    .font(.system(size: 12, weight: .bold))
+                    .frame(width: 28, height: 28)
+                    .background(Color.white.opacity(0.08), in: Circle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(TojTheme.secondaryText)
             .accessibilityLabel("Cancel")
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
+        .padding(.leading, 13)
+        .padding(.trailing, 9)
+        .padding(.top, 9)
     }
 
     @ViewBuilder
@@ -428,39 +531,49 @@ struct TojConversationExperience: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 15, weight: .bold))
-                        .frame(width: 38, height: 38)
-                        .background(TojTheme.danger.opacity(0.18), in: Circle())
+                        .foregroundStyle(TojTheme.danger)
+                        .frame(width: 40, height: 40)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.glass)
                 .accessibilityLabel("Cancel voice message")
                 Button {
                     voiceLocked = false
                     Task { await model.finishVoiceRecording(); TojFeedback.sent() }
                 } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 17, weight: .bold))
+                    Image(systemName: "paperplane.fill")
+                        .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(TojTheme.onAccent)
-                        .frame(width: 44, height: 44)
+                        .frame(width: 46, height: 46)
                         .background(TojTheme.accent, in: Circle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.tojPressable)
                 .accessibilityLabel("Send voice message")
             }
         } else {
-            Image(systemName: model.composerMode.isRecording ? "mic.fill" : "mic.fill")
-                .font(.system(size: 17, weight: .bold))
-                .foregroundStyle(model.composerMode.isRecording ? .white : TojTheme.text)
-                .frame(width: 44, height: 44)
-                .background(model.composerMode.isRecording ? TojTheme.danger : TojTheme.strong, in: Circle())
-                .scaleEffect(voiceFingerDown ? 1.08 : 1)
-                .contentShape(Circle())
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged(handleVoiceDrag)
-                        .onEnded(handleVoiceRelease)
-                )
-                .accessibilityLabel("Hold to record voice message")
-                .accessibilityHint("Release to send, slide left to cancel, or slide up to lock")
+            Group {
+                if model.composerMode.isRecording {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(.white)
+                        .frame(width: 46, height: 46)
+                        .background(TojTheme.danger, in: Circle())
+                } else {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(TojTheme.text)
+                        .frame(width: 46, height: 46)
+                        .tojGlass(in: Circle(), interactive: true)
+                }
+            }
+            .scaleEffect(voiceFingerDown ? 1.08 : 1)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged(handleVoiceDrag)
+                    .onEnded(handleVoiceRelease)
+            )
+            .accessibilityLabel("Hold to record voice message")
+            .accessibilityHint("Release to send, slide left to cancel, or slide up to lock")
         }
     }
 
@@ -549,6 +662,7 @@ struct TojConversationExperience: View {
 private struct TojMessageBubble: View {
     let model: CloudAppModel
     let line: CloudAppModel.Line
+    let isLastInGroup: Bool
     let actions: [MessageAction]
     let onAction: (MessageAction) -> Void
     let onSwipeReply: () -> Void
@@ -557,24 +671,18 @@ private struct TojMessageBubble: View {
 
     var body: some View {
         HStack {
-            if line.mine { Spacer(minLength: 54) }
+            if line.mine { Spacer(minLength: 76) }
 
-            VStack(alignment: line.mine ? .trailing : .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 4) {
                 if line.isForwarded {
                     Label("Forwarded message", systemImage: "arrowshape.turn.up.right.fill")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(TojTheme.secondaryText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(line.mine ? TojTheme.gold : TojTheme.secondaryText)
+                        .padding(.horizontal, isVisualMedia ? 6 : 0)
+                        .padding(.top, isVisualMedia ? 4 : 0)
                 }
-                if let replyPreview = line.replyPreview {
-                    HStack(spacing: 7) {
-                        Rectangle().fill(TojTheme.accent).frame(width: 2, height: 28)
-                        Text(replyPreview)
-                            .font(.caption)
-                            .foregroundStyle(TojTheme.secondaryText)
-                            .lineLimit(2)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if line.replyPreview != nil {
+                    replyQuote
                 }
 
                 if let media = line.media {
@@ -593,11 +701,8 @@ private struct TojMessageBubble: View {
                         .accessibilityHint("Opens media viewer")
                 }
 
-                if !line.text.isEmpty, line.attachment == nil || line.text != line.attachment?.title {
-                    Text(line.text)
-                        .font(.body)
-                        .foregroundStyle(TojTheme.text)
-                        .textSelection(.enabled)
+                if hasCaptionText {
+                    captionText
                         .padding(.horizontal, isVisualMedia ? 8 : 0)
                 }
 
@@ -608,29 +713,17 @@ private struct TojMessageBubble: View {
                         .accessibilityValue("\(Int(progress * 100)) percent")
                 }
 
-                if line.media == nil || !["photo", "video"].contains(line.media?.kind ?? "") || !line.text.isEmpty {
-                    HStack(spacing: 4) {
-                        if line.isEdited { Text("edited") }
-                        if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
-                        if line.mine { Image(systemName: deliverySymbol) }
-                    }
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(deliveryColor)
-                }
-
                 if !line.reactions.isEmpty {
-                    HStack(spacing: 4) {
-                        ForEach(line.reactions, id: \.self) { reaction in
-                            Text(reaction)
-                                .font(.caption)
-                                .frame(minWidth: 28, minHeight: 24)
-                                .background(TojTheme.raised, in: Capsule())
-                        }
+                    reactionsRow
+                } else if needsStandaloneMeta {
+                    HStack {
+                        Spacer(minLength: 0)
+                        metaRow
                     }
                 }
             }
             .padding(.horizontal, isVisualMedia ? 4 : 12)
-            .padding(.vertical, isVisualMedia ? 4 : 9)
+            .padding(.vertical, isVisualMedia ? 4 : 7)
             .background(line.mine ? TojTheme.bubbleMine : TojTheme.strong)
             .clipShape(bubbleShape)
             .overlay(bubbleShape.stroke(line.mine ? TojTheme.gold.opacity(0.16) : TojTheme.hairline, lineWidth: 0.5))
@@ -642,7 +735,7 @@ private struct TojMessageBubble: View {
                     .offset(x: line.mine ? 28 : -28)
             }
 
-            if !line.mine { Spacer(minLength: 54) }
+            if !line.mine { Spacer(minLength: 76) }
         }
         .contentShape(Rectangle())
         .simultaneousGesture(
@@ -678,18 +771,26 @@ private struct TojMessageBubble: View {
         }
         .fullScreenCover(isPresented: $showingMedia) {
             if let media = line.media {
-                ProductionMediaViewer(model: model, media: media)
+                ProductionMediaViewer(
+                    model: model, media: media, line: line,
+                    title: model.dialogTitle(line.dialogId ?? ""),
+                    subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
+                    onReply: { onAction(.reply) }
+                )
             } else if let attachment = line.attachment {
                 DemoMediaViewer(attachment: attachment)
             }
         }
     }
 
+    /// Telegram tail grammar: bubbles stay fully rounded; only the last message of a sender's
+    /// run pulls its bottom corner in toward the edge.
     private var bubbleShape: UnevenRoundedRectangle {
-        UnevenRoundedRectangle(
+        let tail = isLastInGroup ? TojRadius.bubbleTail : TojRadius.bubble
+        return UnevenRoundedRectangle(
             topLeadingRadius: TojRadius.bubble,
-            bottomLeadingRadius: line.mine ? TojRadius.bubble : TojRadius.bubbleTail,
-            bottomTrailingRadius: line.mine ? TojRadius.bubbleTail : TojRadius.bubble,
+            bottomLeadingRadius: line.mine ? TojRadius.bubble : tail,
+            bottomTrailingRadius: line.mine ? tail : TojRadius.bubble,
             topTrailingRadius: TojRadius.bubble,
             style: .continuous
         )
@@ -697,6 +798,141 @@ private struct TojMessageBubble: View {
 
     private var isVisualMedia: Bool {
         line.media.map { $0.kind == "photo" || $0.kind == "video" } ?? false
+    }
+
+    private var hasCaptionText: Bool {
+        !line.text.isEmpty && (line.attachment == nil || line.text != line.attachment?.title)
+    }
+
+    /// Photo/video bubbles without a caption already carry time + ticks on the image overlay.
+    private var showsMediaOverlayMeta: Bool {
+        isVisualMedia && line.text.isEmpty
+    }
+
+    private var needsStandaloneMeta: Bool {
+        !hasCaptionText && !showsMediaOverlayMeta
+    }
+
+    /// Telegram's signature layout: the timestamp flows with the last line of text. Invisible
+    /// meta-sized text reserves the corner, and the real meta row is drawn over it — so a short
+    /// last line shares the line with the time, and a full one wraps around it.
+    private var captionText: some View {
+        Group {
+            if line.reactions.isEmpty {
+                messageText
+                    + Text(verbatim: "\u{2004}\u{2004}" + metaReservation)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.clear)
+            } else {
+                messageText
+            }
+        }
+        .textSelection(.enabled)
+        .overlay(alignment: .bottomTrailing) {
+            if line.reactions.isEmpty {
+                metaRow
+            }
+        }
+    }
+
+    private var messageText: Text {
+        Text(line.text)
+            .font(.body)
+            .foregroundStyle(TojTheme.text)
+    }
+
+    private var metaReservation: String {
+        var parts: [String] = []
+        if line.isEdited { parts.append(String(localized: "edited")) }
+        if let timestamp = line.timestamp { parts.append(TojDateFormatting.message(timestamp)) }
+        if line.mine { parts.append(line.delivery == .seen ? "✓✓" : "✓") }
+        return parts.joined(separator: " ")
+    }
+
+    private var metaRow: some View {
+        HStack(spacing: 3) {
+            if line.isEdited { Text("edited") }
+            if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+            if line.mine { DeliveryTicks(delivery: line.delivery) }
+        }
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(metaColor)
+    }
+
+    private var metaColor: Color {
+        if case .failed = line.delivery { return TojTheme.danger }
+        return line.mine ? TojTheme.gold.opacity(0.8) : TojTheme.secondaryText
+    }
+
+    private var replyQuote: some View {
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(TojTheme.gold)
+                .frame(width: 3)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(replyAuthor)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(TojTheme.gold)
+                Text(line.replyPreview ?? "")
+                    .font(.caption)
+                    .foregroundStyle(TojTheme.text.opacity(0.78))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .background(TojTheme.gold.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, isVisualMedia ? 6 : 0)
+        .padding(.top, isVisualMedia ? 4 : 0)
+    }
+
+    private var replyAuthor: String {
+        if let replyId = line.replyToMsgId,
+           let original = model.lines.first(where: { $0.msgId == replyId }) {
+            return original.mine ? String(localized: "You") : model.dialogTitle(line.dialogId ?? "")
+        }
+        return model.dialogTitle(line.dialogId ?? "")
+    }
+
+    /// Reactions live inside the bubble, Telegram-style: emoji pills (gold when it's my
+    /// reaction, tap toggles) with the time + ticks finishing the row.
+    private var reactionsRow: some View {
+        HStack(alignment: .bottom, spacing: 4) {
+            ForEach(line.reactions, id: \.self) { badge in
+                reactionPill(badge)
+            }
+            if !showsMediaOverlayMeta {
+                metaRow
+                    .padding(.leading, 5)
+                    .padding(.bottom, 1)
+            }
+        }
+        .padding(.horizontal, isVisualMedia ? 6 : 0)
+        .padding(.bottom, isVisualMedia ? 4 : 0)
+    }
+
+    private func reactionPill(_ badge: String) -> some View {
+        let emoji = badge.split(separator: " ").first.map(String.init) ?? badge
+        let isMine = line.myReaction == emoji
+        return Button {
+            guard actions.contains(.react) else { return }
+            TojFeedback.selection()
+            Task { await model.reactToMessage(line, reaction: emoji) }
+        } label: {
+            Text(badge)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(isMine ? TojTheme.onAccent : TojTheme.text)
+                .padding(.horizontal, 8)
+                .frame(height: 25)
+                .background(
+                    isMine ? AnyShapeStyle(TojTheme.accent) : AnyShapeStyle(Color.white.opacity(0.10)),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(.tojPressable)
+        .accessibilityLabel("Reaction \(badge)")
+        .accessibilityAddTraits(isMine ? .isSelected : [])
     }
 
     private var accessibilityDescription: String {
@@ -710,21 +946,31 @@ private struct TojMessageBubble: View {
         }
         return "\(sender): \(line.text), \(state)"
     }
+}
 
-    private var deliverySymbol: String {
-        switch line.delivery {
-        case .sending: "clock"
-        case .sent: "checkmark"
-        case .seen: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
-        }
-    }
+/// Telegram's delivery language: clock while sending, one check when the server has it,
+/// a double check once seen. SF has no double-check glyph, so it's two overlapped checkmarks.
+private struct DeliveryTicks: View {
+    let delivery: CloudAppModel.Line.Delivery
 
-    private var deliveryColor: Color {
-        switch line.delivery {
-        case .seen: TojTheme.secure
-        case .failed: .red
-        default: TojTheme.secondaryText
+    var body: some View {
+        switch delivery {
+        case .sending:
+            Image(systemName: "clock")
+                .font(.system(size: 9.5, weight: .semibold))
+        case .sent:
+            Image(systemName: "checkmark")
+                .font(.system(size: 9.5, weight: .bold))
+        case .seen:
+            ZStack(alignment: .leading) {
+                Image(systemName: "checkmark")
+                Image(systemName: "checkmark")
+                    .padding(.leading, 4)
+            }
+            .font(.system(size: 9.5, weight: .bold))
+        case .failed:
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 10, weight: .bold))
         }
     }
 }
@@ -791,97 +1037,125 @@ nonisolated enum MediaBubbleLayout {
     }
 }
 
+/// Reports whether inline videos may autoplay. Like Telegram's "Autoplay on Wi-Fi" default, this is
+/// on for un-metered, unconstrained links and off on cellular so autoplay never fights the throttled
+/// gateway. One instance is shared through the environment.
+@MainActor @Observable
+final class MediaNetworkMonitor {
+    private(set) var allowsAutoplay = false
+    private let monitor = NWPathMonitor()
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let allowed = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            Task { @MainActor in self?.allowsAutoplay = allowed }
+        }
+        monitor.start(queue: DispatchQueue(label: "com.toj.media.network-monitor"))
+    }
+
+    deinit { monitor.cancel() }
+}
+
+/// Ensures only one inline video autoplays at a time (Telegram plays the most-visible clip). Bubbles
+/// report their on-screen state; the most recently revealed one wins.
+@MainActor @Observable
+final class VideoAutoplayCoordinator {
+    private(set) var activeID: String?
+    private var visible: [String] = []
+
+    func setVisible(_ id: String, _ isVisible: Bool) {
+        visible.removeAll { $0 == id }
+        if isVisible { visible.append(id) }
+        let next = visible.last
+        if next != activeID { activeID = next }
+    }
+}
+
+/// A muted, seamlessly-looping inline preview that streams through the resource loader — the same
+/// autoplay Telegram shows in the timeline. Builds a player only while `isActive`, tears it down
+/// otherwise, so at most one clip streams at once.
+private struct InlineVideoPlayerView: View {
+    let model: CloudAppModel
+    let media: CloudMedia
+    let isActive: Bool
+    @State private var player: AVQueuePlayer?
+    @State private var looper: AVPlayerLooper?
+    @State private var owner: StreamingMediaAsset?
+
+    var body: some View {
+        ZStack {
+            if let player {
+                VideoLayerView(player: player).transition(.opacity)
+            }
+        }
+        .onChange(of: isActive, initial: true) { _, active in
+            if active { start() } else { stop() }
+        }
+        .onDisappear(perform: stop)
+    }
+
+    private func start() {
+        guard player == nil, let owner = model.streamingVideoAsset(for: media) else { return }
+        self.owner = owner
+        let queue = AVQueuePlayer()
+        queue.isMuted = true
+        queue.actionAtItemEnd = .none
+        looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: owner.asset))
+        player = queue
+        queue.play()
+    }
+
+    private func stop() {
+        player?.pause()
+        looper = nil
+        player = nil
+        owner = nil
+    }
+}
+
 private struct ProductionMediaBubble: View {
     let model: CloudAppModel
     let line: CloudAppModel.Line
     let media: CloudMedia
     let onRetry: () -> Void
     let onRemove: () -> Void
+    @Environment(VideoAutoplayCoordinator.self) private var coordinator: VideoAutoplayCoordinator?
+    @Environment(MediaNetworkMonitor.self) private var network: MediaNetworkMonitor?
     @State private var thumbnail: UIImage?
 
-    private var mediaSize: CGSize {
-        MediaBubbleLayout.size(width: media.width, height: media.height)
+    /// A sent (not uploading, not failed) video is the only thing that can autoplay.
+    private var isFinishedVideo: Bool {
+        guard media.kind == "video", line.transferProgress == nil else { return false }
+        if case .failed = line.delivery { return false }
+        return true
+    }
+
+    /// Autoplay only on an un-metered link (network policy); playback of the active clip is muted.
+    private var autoplayEligible: Bool {
+        isFinishedVideo && (network?.allowsAutoplay ?? false)
+    }
+
+    private var isAutoplaying: Bool {
+        autoplayEligible && coordinator?.activeID == media.id
     }
 
     var body: some View {
         Group {
             switch media.kind {
             case "photo", "video":
-                ZStack {
-                    if let thumbnail {
-                        Image(uiImage: thumbnail)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: mediaSize.width, height: mediaSize.height)
-                            .background(.black.opacity(0.18))
-                    } else {
-                        LinearGradient(
-                            colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
-                            startPoint: .topLeading, endPoint: .bottomTrailing
-                        )
-                        ProgressView().tint(TojTheme.text)
-                    }
-                    if media.kind == "video" {
-                        Image(systemName: "play.fill")
-                            .font(.title2.weight(.bold))
-                            .frame(width: 52, height: 52)
-                            .background(.black.opacity(0.55), in: Circle())
-                    }
-                    if case let .failed(message) = line.delivery {
-                        VStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.circle.fill").font(.title2)
-                            Text(message).font(.caption).lineLimit(2).multilineTextAlignment(.center)
-                            HStack(spacing: 8) {
-                                Button("Retry", action: onRetry).buttonStyle(.borderedProminent)
-                                Button("Remove", role: .destructive, action: onRemove).buttonStyle(.bordered)
-                            }
-                        }
-                        .padding(12)
-                        .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 14))
-                        .padding(14)
-                    } else if let progress = line.transferProgress, progress < 1 {
-                        VStack(spacing: 7) {
-                            Button(action: onRemove) {
-                                ZStack {
-                                    Circle().fill(.black.opacity(0.62)).frame(width: 54, height: 54)
-                                    ProgressView(value: progress).tint(.white).frame(width: 42, height: 42)
-                                    Image(systemName: "xmark").font(.caption.bold()).foregroundStyle(.white)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            Text(transferStatus(progress: progress))
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 5)
-                                .background(.black.opacity(0.66), in: Capsule())
-                        }
-                        .accessibilityLabel("Cancel upload")
-                        .accessibilityValue(transferStatus(progress: progress))
-                    }
-                    VStack {
-                        Spacer()
-                        HStack(alignment: .bottom) {
-                            Text(media.formattedDuration ?? media.formattedSize)
-                            Spacer()
-                            HStack(spacing: 3) {
-                                if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
-                                if line.mine { Image(systemName: deliverySymbol) }
-                            }
-                        }
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7).padding(.vertical, 5)
-                        .background(.black.opacity(0.58), in: Capsule())
-                        .padding(8)
-                    }
-                }
-                .frame(width: mediaSize.width, height: mediaSize.height)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                MediaBubbleContent(
+                    media: media, line: line, thumbnail: thumbnail,
+                    onRetry: onRetry, onRemove: onRemove,
+                    videoOverlay: videoOverlay, isAutoplaying: isAutoplaying
+                )
                 .task(id: media.id) {
                     guard thumbnail == nil, let data = await model.thumbnailData(for: media) else { return }
                     thumbnail = SafeMediaImageDecoder.decode(data, maxPixelSize: 720)?.image
                 }
+                .onScrollVisibilityChange(threshold: 0.6) { visible in
+                    coordinator?.setVisible(media.id, visible && autoplayEligible)
+                }
+                .onDisappear { coordinator?.setVisible(media.id, false) }
             case "voice":
                 VoiceNotePlaybackView(model: model, media: media)
             default:
@@ -896,27 +1170,210 @@ private struct ProductionMediaBubble: View {
                     }
                 }
                 .frame(maxWidth: 235, alignment: .leading)
+                .accessibilityLabel("\(media.displayName), \(media.formattedSize)")
             }
         }
-        .accessibilityLabel("\(media.displayName), \(media.formattedSize)")
     }
 
-    private func transferStatus(progress: Double) -> String {
-        switch line.transferStage {
-        case .preparing: String(localized: "Preparing")
-        case .finalizing: String(localized: "Finalizing")
-        case .retrying: String(localized: "Retrying") + " · \(Int(progress * 100))%"
-        case .uploading, .none: "\(Int(progress * 100))%"
+    /// The muted looping preview, layered over the thumbnail while a sent video is on screen. Kept
+    /// mounted (idle until active) so its player state survives becoming the active clip.
+    private var videoOverlay: AnyView {
+        guard isFinishedVideo else { return AnyView(EmptyView()) }
+        // Pin identity so wrapping in AnyView can't reset the player's state across re-renders.
+        return AnyView(InlineVideoPlayerView(model: model, media: media, isActive: isAutoplaying).id(media.id))
+    }
+}
+
+/// Pure photo/video bubble composition — the Telegram-style thumbnail with its overlays.
+/// Kept free of the model (network/store) so it renders from plain state and is previewable.
+private struct MediaBubbleContent: View {
+    let media: CloudMedia
+    let line: CloudAppModel.Line
+    let thumbnail: UIImage?
+    let onRetry: () -> Void
+    let onRemove: () -> Void
+    var videoOverlay: AnyView = AnyView(EmptyView())
+    var isAutoplaying: Bool = false
+
+    private var mediaSize: CGSize {
+        MediaBubbleLayout.size(width: media.width, height: media.height)
+    }
+
+    var body: some View {
+        mediaThumbnail
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                // The muted looping preview sits above the still thumbnail, below the badges.
+                videoOverlay.clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .overlay {
+                if isTransferring {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(.black.opacity(0.22))
+                }
+            }
+            .overlay(alignment: .topLeading) { topLeadingBadge }
+            .overlay { centerControl }
+            .overlay(alignment: .bottomTrailing) {
+                if line.text.isEmpty, !isFailed { metaBadge }
+            }
+            .accessibilityLabel("\(media.displayName), \(media.formattedSize)")
+    }
+
+    @ViewBuilder private var mediaThumbnail: some View {
+        if let thumbnail {
+            Image(uiImage: thumbnail)
+                .resizable()
+                .scaledToFill()
+                .frame(width: mediaSize.width, height: mediaSize.height)
+                .clipped()
+        } else {
+            ZStack {
+                LinearGradient(
+                    colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing
+                )
+                // While uploading, the center ring already communicates activity — no extra spinner.
+                if !isTransferring { ProgressView().tint(TojTheme.text) }
+            }
+            .frame(width: mediaSize.width, height: mediaSize.height)
         }
     }
 
-    private var deliverySymbol: String {
-        switch line.delivery {
-        case .sending: "clock"
-        case .sent: "checkmark"
-        case .seen: "checkmark.circle.fill"
-        case .failed: "exclamationmark.circle.fill"
+    /// Center overlay: cancellable progress ring while uploading, retry card on failure,
+    /// a play affordance on a finished video, and nothing on a finished photo.
+    @ViewBuilder private var centerControl: some View {
+        if isFailed {
+            failedOverlay
+        } else if isTransferring {
+            Button(action: onRemove) {
+                UploadProgressRing(progress: line.transferProgress ?? 0, indeterminate: isIndeterminate)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cancel upload")
+        } else if media.kind == "video", !isAutoplaying {
+            // A sent video shows a play affordance until it begins autoplaying muted inline.
+            Image(systemName: "play.fill")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 52, height: 52)
+                .background(.black.opacity(0.4), in: Circle())
+                .overlay(Circle().stroke(.white.opacity(0.2), lineWidth: 0.5))
+                .accessibilityHidden(true)
         }
+    }
+
+    /// Top-left pill: live "uploaded / total" bytes while a video uploads, or its duration once sent.
+    @ViewBuilder private var topLeadingBadge: some View {
+        if isTransferring, media.kind == "video", let text = uploadByteText {
+            metaPill { Text(text) }.padding(8)
+        } else if !isTransferring, !isFailed, media.kind == "video", let duration = media.formattedDuration {
+            metaPill {
+                HStack(spacing: 3) {
+                    // The mute glyph appears only while the clip is genuinely autoplaying muted.
+                    if isAutoplaying { Image(systemName: "speaker.slash.fill").font(.system(size: 9, weight: .bold)) }
+                    Text(duration)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    /// Bottom-right pill: timestamp + delivery marker (clock while sending, checks once sent).
+    private var metaBadge: some View {
+        metaPill {
+            HStack(spacing: 3) {
+                if line.isEdited { Text("edited") }
+                if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+                if line.mine { DeliveryTicks(delivery: line.delivery) }
+            }
+        }
+        .padding(8)
+    }
+
+    private func metaPill<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        content()
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.5), in: Capsule())
+    }
+
+    private var failedOverlay: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill").font(.title2)
+            if case let .failed(message) = line.delivery {
+                Text(message).font(.caption).lineLimit(2).multilineTextAlignment(.center)
+            }
+            HStack(spacing: 8) {
+                Button("Retry", action: onRetry).buttonStyle(.borderedProminent)
+                Button("Remove", role: .destructive, action: onRemove).buttonStyle(.bordered)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(12)
+        .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 14))
+        .padding(14)
+    }
+
+    private var isFailed: Bool {
+        if case .failed = line.delivery { return true }
+        return false
+    }
+
+    private var isTransferring: Bool {
+        line.transferProgress != nil && !isFailed
+    }
+
+    private var isIndeterminate: Bool {
+        line.transferStage == .preparing || line.transferStage == .finalizing
+    }
+
+    private var uploadByteText: String? {
+        guard media.byteSize > 0, let progress = line.transferProgress, progress > 0 else { return nil }
+        let total = media.byteSize
+        let uploaded = min(total, Int64((Double(total) * progress).rounded()))
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return "\(formatter.string(fromByteCount: uploaded)) / \(formatter.string(fromByteCount: total))"
+    }
+}
+
+/// Telegram-style upload indicator: a thin white ring that fills clockwise with progress (or
+/// spins while preparing/finalizing), wrapping a white ✕ so a tap cancels the transfer.
+private struct UploadProgressRing: View {
+    let progress: Double
+    let indeterminate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var rotating = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(.black.opacity(0.55)).frame(width: 54, height: 54)
+            Circle().stroke(.white.opacity(0.25), lineWidth: 2.5).frame(width: 42, height: 42)
+            if indeterminate, !reduceMotion {
+                Circle()
+                    .trim(from: 0, to: 0.28)
+                    .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .frame(width: 42, height: 42)
+                    .rotationEffect(.degrees(rotating ? 360 : 0))
+                    .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: rotating)
+                    .onAppear { rotating = true }
+            } else {
+                Circle()
+                    .trim(from: 0, to: max(0.03, min(1, progress)))
+                    .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .frame(width: 42, height: 42)
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut(duration: 0.2), value: progress)
+            }
+            Image(systemName: "xmark")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: 54, height: 54)
+        .accessibilityValue("\(Int((progress * 100).rounded())) percent")
     }
 }
 
@@ -1062,6 +1519,7 @@ private struct VoiceNotePlaybackView: View {
 
 private struct ZoomablePhotoView: View {
     let image: UIImage
+    var onSingleTap: () -> Void = {}
     @State private var scale: CGFloat = 1
     @State private var baseScale: CGFloat = 1
     @State private var offset: CGSize = .zero
@@ -1100,86 +1558,94 @@ private struct ZoomablePhotoView: View {
                     if scale == 1 { offset = .zero; baseOffset = .zero }
                 }
             }
+            .onTapGesture(count: 1) { onSingleTap() }
             .accessibilityLabel("Photo")
             .accessibilityHint("Pinch or double tap to zoom")
     }
 }
 
+/// Renders an `AVPlayer` through a bare `AVPlayerLayer` so the fullscreen viewer can lay its own
+/// Liquid Glass controls over the video instead of the default `VideoPlayer` chrome.
+private struct VideoLayerView: UIViewRepresentable {
+    let player: AVPlayer
+
+    func makeUIView(context: Context) -> PlayerLayerUIView {
+        let view = PlayerLayerUIView()
+        view.playerLayer.player = player
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerLayerUIView, context: Context) {
+        if uiView.playerLayer.player !== player { uiView.playerLayer.player = player }
+    }
+}
+
+private final class PlayerLayerUIView: UIView {
+    override static var layerClass: AnyClass { AVPlayerLayer.self }
+    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        playerLayer.videoGravity = .resizeAspect
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 private struct ProductionMediaViewer: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let model: CloudAppModel
     let media: CloudMedia
+    let line: CloudAppModel.Line
+    let title: String
+    let subtitle: String
+    let onReply: () -> Void
+
     @State private var photoImage: UIImage?
     @State private var player: AVPlayer?
     @State private var temporaryURL: URL?
     @State private var error: String?
     @State private var downloadProgress = 0.0
     @State private var saveMessage: String?
+    @State private var chromeVisible = true
+    @State private var confirmingDelete = false
+    // Video playback (custom controls — no native chrome so we can overlay Liquid Glass).
+    @State private var currentTime = 0.0
+    @State private var duration = 0.0
+    @State private var isPlaying = false
+    @State private var isScrubbing = false
+    @State private var streamingOwner: StreamingMediaAsset?  // retains the resource-loader delegate
+    @State private var shareFetchTask: Task<Void, Never>?
+    private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
+
+    private var isVideoReady: Bool { media.kind == "video" && player != nil && error == nil }
+    private var canReply: Bool { model.actions(for: line).contains(.reply) }
+    private var canDelete: Bool { model.actions(for: line).contains(.delete) }
+    private var isSaveable: Bool { (media.kind == "photo" || media.kind == "video") && temporaryURL != nil }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            TojTheme.canvas.ignoresSafeArea()
-            Group {
-                if let error {
-                    VStack(spacing: 16) {
-                        ContentUnavailableView(
-                            "Could not open media", systemImage: "exclamationmark.triangle",
-                            description: Text(error)
-                        )
-                        Button("Try again") { Task { await load() } }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else if media.kind == "photo", let photoImage {
-                    ZoomablePhotoView(image: photoImage).padding(.vertical, 60)
-                } else if media.kind == "video", let player {
-                    VideoPlayer(player: player).onAppear { player.play() }
-                } else if media.kind == "file", temporaryURL != nil {
-                    VStack(spacing: 20) {
-                        Image(systemName: "doc.fill").font(.system(size: 58)).foregroundStyle(TojTheme.secondaryText)
-                        Text(media.displayName).font(.headline)
-                        Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
-                    }
-                } else {
-                    ProgressView(value: downloadProgress) {
-                        Text("Downloading…")
-                    }
-                    .tint(TojTheme.text)
-                    .frame(maxWidth: 240)
-                }
-            }
-            Button { dismiss() } label: {
-                Image(systemName: "xmark").frame(width: 44, height: 44)
-            }
-            .buttonStyle(.glass)
-            .padding()
-
-            if let temporaryURL, error == nil {
-                VStack {
-                    Spacer()
-                    HStack(spacing: 12) {
-                        ShareLink(item: temporaryURL) {
-                            Label("Share", systemImage: "square.and.arrow.up")
-                                .frame(minWidth: 90)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        if media.kind == "photo" || media.kind == "video" {
-                            Button {
-                                Task { await saveToPhotos(temporaryURL) }
-                            } label: {
-                                Label("Save", systemImage: "square.and.arrow.down")
-                                    .frame(minWidth: 90)
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-                    .padding(.bottom, 24)
-                }
-            }
+        ZStack {
+            Color.black.ignoresSafeArea()
+            contentLayer
+            if chromeVisible { chromeLayer.transition(.opacity) }
         }
+        .preferredColorScheme(.dark)
         .task(id: media.id) { await load() }
-        .onDisappear {
-            player?.pause()
-            if let temporaryURL { Task { await model.removeTemporaryMediaURL(temporaryURL) } }
+        .onReceive(ticker) { _ in
+            guard let player, isVideoReady, !isScrubbing else { return }
+            currentTime = min(duration, max(0, player.currentTime().seconds))
+            isPlaying = player.timeControlStatus == .playing
+        }
+        .onDisappear { teardown() }
+        .confirmationDialog(
+            "Delete this message?", isPresented: $confirmingDelete, titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                Task { await model.deleteMessage(line); dismiss() }
+            }
+            Button("Cancel", role: .cancel) {}
         }
         .alert("Media", isPresented: Binding(
             get: { saveMessage != nil }, set: { if !$0 { saveMessage = nil } }
@@ -1188,15 +1654,246 @@ private struct ProductionMediaViewer: View {
         } message: { Text(saveMessage ?? "") }
     }
 
+    // MARK: Content
+
+    @ViewBuilder private var contentLayer: some View {
+        if let error {
+            VStack(spacing: 16) {
+                ContentUnavailableView(
+                    "Could not open media", systemImage: "exclamationmark.triangle",
+                    description: Text(error)
+                )
+                Button("Try again") { Task { await load() } }
+                    .buttonStyle(.borderedProminent)
+            }
+        } else if media.kind == "photo", let photoImage {
+            ZoomablePhotoView(image: photoImage, onSingleTap: toggleChrome)
+                .padding(.vertical, 40)
+        } else if media.kind == "video", let player {
+            VideoLayerView(player: player)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { toggleChrome() }
+        } else if media.kind == "file", temporaryURL != nil {
+            VStack(spacing: 20) {
+                Image(systemName: "doc.fill").font(.system(size: 58)).foregroundStyle(TojTheme.secondaryText)
+                Text(media.displayName).font(.headline)
+                Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
+            }
+        } else {
+            ProgressView(value: downloadProgress) { Text("Downloading…") }
+                .tint(TojTheme.text)
+                .frame(maxWidth: 240)
+        }
+    }
+
+    // MARK: Liquid Glass chrome
+
+    private var chromeLayer: some View {
+        VStack(spacing: 0) {
+            topBar
+            Spacer(minLength: 0)
+            if isVideoReady {
+                videoScrubber
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
+            }
+            bottomBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 14)
+        .overlay { if isVideoReady { centerPlayPause } }
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            glassCircleButton(system: "chevron.left", label: "Back") { dismiss() }
+            Spacer(minLength: 8)
+            moreMenu
+        }
+        .overlay {
+            VStack(spacing: 1) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(TojTheme.text)
+                    .lineLimit(1)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 230)
+            .tojGlass(in: Capsule())
+        }
+    }
+
+    private var moreMenu: some View {
+        Menu {
+            Button { dismiss() } label: { Label("Show in Chat", systemImage: "bubble.left.and.text.bubble.right") }
+            if media.kind == "photo" || media.kind == "video" {
+                Button { Task { await saveCurrentToPhotos() } } label: {
+                    Label(media.kind == "video" ? "Save Video" : "Save Image", systemImage: "square.and.arrow.down")
+                }
+            }
+            if canReply {
+                Button { dismiss(); onReply() } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
+            }
+            if canDelete {
+                Button(role: .destructive) { confirmingDelete = true } label: { Label("Delete", systemImage: "trash") }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(TojTheme.text)
+                .frame(width: 46, height: 46)
+                .tojGlass(in: Circle())
+        }
+        .accessibilityLabel("More")
+    }
+
+    private var bottomBar: some View {
+        HStack {
+            if let temporaryURL, error == nil {
+                ShareLink(item: temporaryURL) {
+                    Image(systemName: "arrowshape.turn.up.right")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(TojTheme.text)
+                        .frame(width: 46, height: 46)
+                        .tojGlass(in: Circle())
+                }
+                .accessibilityLabel("Share")
+            } else {
+                Color.clear.frame(width: 46, height: 46)
+            }
+            Spacer()
+            if canDelete {
+                glassCircleButton(system: "trash", label: "Delete") { confirmingDelete = true }
+            } else {
+                Color.clear.frame(width: 46, height: 46)
+            }
+        }
+    }
+
+    private var centerPlayPause: some View {
+        Button(action: togglePlayback) {
+            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: 30, weight: .bold))
+                .foregroundStyle(TojTheme.text)
+                .frame(width: 76, height: 76)
+                .tojGlass(in: Circle())
+                .overlay(Circle().stroke(TojTheme.gold.opacity(0.55), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(isPlaying ? "Pause" : "Play")
+    }
+
+    private var videoScrubber: some View {
+        HStack(spacing: 12) {
+            Text(timeLabel(currentTime))
+                .font(.caption2.weight(.semibold)).monospacedDigit()
+                .foregroundStyle(TojTheme.text)
+            Slider(value: $currentTime, in: 0...max(0.1, duration)) { editing in
+                isScrubbing = editing
+                if !editing { seek(to: currentTime) }
+            }
+            .tint(.white)
+            Text(timeLabel(duration))
+                .font(.caption2.weight(.semibold)).monospacedDigit()
+                .foregroundStyle(TojTheme.text)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .tojGlass(in: Capsule())
+    }
+
+    private func glassCircleButton(
+        system: String, label: LocalizedStringKey, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: system)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(TojTheme.text)
+                .frame(width: 46, height: 46)
+        }
+        .buttonStyle(.glass)
+        .accessibilityLabel(Text(label))
+    }
+
+    // MARK: Behavior
+
+    private func toggleChrome() {
+        withAnimation(reduceMotion ? .easeInOut(duration: 0.12) : .easeInOut(duration: 0.22)) {
+            chromeVisible.toggle()
+        }
+    }
+
+    private func togglePlayback() {
+        guard let player else { return }
+        if player.timeControlStatus == .playing {
+            player.pause()
+            isPlaying = false
+        } else {
+            if currentTime >= duration - 0.1 { seek(to: 0) }
+            player.play()
+            isPlaying = true
+        }
+    }
+
+    private func seek(to seconds: Double) {
+        currentTime = seconds
+        player?.seek(
+            to: CMTime(seconds: seconds, preferredTimescale: 600),
+            toleranceBefore: .zero, toleranceAfter: .zero
+        )
+    }
+
+    private func timeLabel(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    private func saveCurrentToPhotos() async {
+        guard let temporaryURL else {
+            saveMessage = String(localized: "Still preparing this media…")
+            return
+        }
+        await saveToPhotos(temporaryURL)
+    }
+
+    private func teardown() {
+        player?.pause()
+        player = nil
+        streamingOwner = nil
+        shareFetchTask?.cancel()
+        if let temporaryURL { Task { await model.removeTemporaryMediaURL(temporaryURL) } }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
     private func load() async {
         error = nil
         photoImage = nil
         player?.pause()
         player = nil
+        streamingOwner = nil
+        shareFetchTask?.cancel()
         if let temporaryURL { await model.removeTemporaryMediaURL(temporaryURL) }
         temporaryURL = nil
         downloadProgress = 0
+        currentTime = 0
+        duration = 0
+        isPlaying = false
         do {
+            if media.kind == "video" {
+                try await loadStreamingVideo()
+                return
+            }
+            // Photos need full pixels; files need a local URL to preview and share.
             let downloaded = try await model.mediaData(for: media) { value in
                 await MainActor.run { downloadProgress = value }
             }
@@ -1205,34 +1902,51 @@ private struct ProductionMediaViewer: View {
                     throw MediaPresentationError.unreadable
                 }
                 photoImage = decoded.image
-                temporaryURL = try await model.temporaryMediaURL(
-                    data: downloaded, fileExtension: preferredFileExtension
-                )
-                return
             }
-            let url = try await model.temporaryMediaURL(
+            temporaryURL = try await model.temporaryMediaURL(
                 data: downloaded, fileExtension: preferredFileExtension
             )
-            temporaryURL = url
-            if media.kind == "video" {
-                let asset = AVURLAsset(url: url)
-                let playable = try await asset.load(.isPlayable)
-                let duration = try await asset.load(.duration).seconds
-                guard playable, duration.isFinite, duration > 0, duration <= 3_600,
-                      let track = try await asset.loadTracks(withMediaType: .video).first
-                else { throw MediaPresentationError.unreadable }
-                let naturalSize = try await track.load(.naturalSize)
-                let transform = try await track.load(.preferredTransform)
-                let transformed = naturalSize.applying(transform)
-                let width = Int64(abs(transformed.width).rounded(.up))
-                let height = Int64(abs(transformed.height).rounded(.up))
-                guard width > 0, height > 0, width <= 8_192, height <= 8_192,
-                      width * height <= 40_000_000
-                else { throw MediaPresentationError.unreadable }
-                player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
-            }
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Plays the video by streaming it through the resource loader — the first frame appears after the
+    /// header + first chunk arrive instead of after a full download. Share/Save get the whole file in
+    /// the background (reusing the streaming chunk cache).
+    private func loadStreamingVideo() async throws {
+        guard let owner = model.streamingVideoAsset(for: media) else {
+            throw MediaPresentationError.unreadable
+        }
+        let asset = owner.asset
+        let playable = try await asset.load(.isPlayable)
+        let assetDuration = try await asset.load(.duration).seconds
+        guard playable, assetDuration.isFinite, assetDuration > 0, assetDuration <= 3_600,
+              let track = try await asset.loadTracks(withMediaType: .video).first
+        else { throw MediaPresentationError.unreadable }
+        let naturalSize = try await track.load(.naturalSize)
+        let transform = try await track.load(.preferredTransform)
+        let transformed = naturalSize.applying(transform)
+        let width = Int64(abs(transformed.width).rounded(.up))
+        let height = Int64(abs(transformed.height).rounded(.up))
+        guard width > 0, height > 0, width <= 8_192, height <= 8_192,
+              width * height <= 40_000_000
+        else { throw MediaPresentationError.unreadable }
+        try? AVAudioSession.sharedInstance().setCategory(.playback)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        streamingOwner = owner
+        let newPlayer = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        duration = assetDuration
+        player = newPlayer
+        newPlayer.play()
+        isPlaying = true
+        shareFetchTask = Task { @MainActor in
+            guard
+                let data = try? await model.mediaData(for: media),
+                let url = try? await model.temporaryMediaURL(data: data, fileExtension: preferredFileExtension),
+                !Task.isCancelled
+            else { return }
+            temporaryURL = url
         }
     }
 
@@ -2118,10 +2832,35 @@ private enum MediaAssetDataLoader {
         if let sourceURL = (source as? AVURLAsset)?.url,
            let size = try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
            size <= maxBytes {
+            // Remux to faststart (moov atom at the front) so the video streams from the first chunk
+            // instead of forcing a full download to locate the header. Lossless passthrough — no
+            // re-encode. Fall back to the original bytes if passthrough isn't supported.
+            if let faststart = try? await remuxFaststart(source), faststart.count <= maxBytes {
+                return faststart
+            }
             return try Data(contentsOf: sourceURL)
         }
 
         return try await exportForUpload(source)
+    }
+
+    private static func remuxFaststart(_ source: AVAsset) async throws -> Data {
+        guard await AVAssetExportSession.compatibility(
+            ofExportPreset: AVAssetExportPresetPassthrough, with: source, outputFileType: .mp4
+        ) else { throw PickerError.unsupportedVideo }
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "toj-video-faststart-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let outputURL = directory.appending(path: "faststart.mp4")
+        guard let exporter = AVAssetExportSession(asset: source, presetName: AVAssetExportPresetPassthrough) else {
+            throw PickerError.unsupportedVideo
+        }
+        exporter.shouldOptimizeForNetworkUse = true
+        try await exporter.export(to: outputURL, as: .mp4)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: outputURL.path)
+        return try Data(contentsOf: outputURL)
     }
 
     static func fittedVideoData(_ data: Data) async throws -> Data {

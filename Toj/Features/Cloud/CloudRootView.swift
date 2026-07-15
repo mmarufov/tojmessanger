@@ -1019,9 +1019,35 @@ enum TojDateFormatting {
         date(raw)?.formatted(date: .omitted, time: .shortened) ?? ""
     }
 
+    /// Media-viewer subtitle, e.g. "today at 02:49" / "yesterday at 14:11" / "14 Jul at 09:03".
+    static func mediaTimestamp(_ raw: String) -> String {
+        guard let date = date(raw) else { return "" }
+        let time = date.formatted(date: .omitted, time: .shortened)
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return String(localized: "today at \(time)")
+        }
+        if calendar.isDateInYesterday(date) {
+            return String(localized: "yesterday at \(time)")
+        }
+        let day = date.formatted(.dateTime.day().month(.abbreviated))
+        return String(localized: "\(day) at \(time)")
+    }
+
     static func lastSeen(_ raw: String) -> String {
         guard let date = date(raw) else { return String(localized: "Activity time unavailable") }
         return date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
+    }
+
+    /// In-chat date separator: "Today", "Yesterday", "July 14", or "August 11, 2025".
+    static func dayHeader(_ date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) { return String(localized: "Today") }
+        if calendar.isDateInYesterday(date) { return String(localized: "Yesterday") }
+        if calendar.isDate(date, equalTo: .now, toGranularity: .year) {
+            return date.formatted(.dateTime.month(.wide).day())
+        }
+        return date.formatted(.dateTime.month(.wide).day().year())
     }
 }
 
