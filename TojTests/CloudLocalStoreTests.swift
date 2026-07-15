@@ -862,6 +862,46 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(decryptedAfterReset, plaintext)
     }
 
+    func testCachedByteRangeAssemblesChunksAndDetectsGaps() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x2a, count: 32), limitBytes: 4 * 1024 * 1024
+        )
+
+        // 15 distinct bytes stored as three 5-byte chunks, written out of order.
+        let mediaId = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(Data("ABCDE".utf8), mediaId: mediaId, offset: 10)
+        try await cache.storeDownloadChunk(Data("01234".utf8), mediaId: mediaId, offset: 0)
+        try await cache.storeDownloadChunk(Data("56789".utf8), mediaId: mediaId, offset: 5)
+
+        let wholeData = try await cache.cachedByteRange(mediaId: mediaId, offset: 0, length: 15)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(wholeData), as: UTF8.self), "0123456789ABCDE")
+        let straddleData = try await cache.cachedByteRange(mediaId: mediaId, offset: 3, length: 5)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(straddleData), as: UTF8.self), "34567")
+        let tailData = try await cache.cachedByteRange(mediaId: mediaId, offset: 12, length: 3)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(tailData), as: UTF8.self), "CDE")
+        let coverageEnd = try await cache.coverageEnd(mediaId: mediaId, from: 0)
+        XCTAssertEqual(coverageEnd, 15)
+
+        // A missing middle chunk breaks coverage across the gap but not ranges that avoid it.
+        let gapMedia = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(Data("01234".utf8), mediaId: gapMedia, offset: 0)
+        try await cache.storeDownloadChunk(Data("ABCDE".utf8), mediaId: gapMedia, offset: 10)
+        let coveredData = try await cache.cachedByteRange(mediaId: gapMedia, offset: 0, length: 5)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(coveredData), as: UTF8.self), "01234")
+        let acrossGap = try await cache.cachedByteRange(mediaId: gapMedia, offset: 0, length: 8)
+        XCTAssertNil(acrossGap)
+        let afterGapData = try await cache.cachedByteRange(mediaId: gapMedia, offset: 10, length: 5)
+        XCTAssertEqual(String(decoding: try XCTUnwrap(afterGapData), as: UTF8.self), "ABCDE")
+        let gapCoverageFromStart = try await cache.coverageEnd(mediaId: gapMedia, from: 0)
+        let gapCoverageAfter = try await cache.coverageEnd(mediaId: gapMedia, from: 10)
+        XCTAssertEqual(gapCoverageFromStart, 5)
+        XCTAssertEqual(gapCoverageAfter, 15)
+    }
+
     func testMediaCacheRefusesToEvictPendingUploadsForNewSelections() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)

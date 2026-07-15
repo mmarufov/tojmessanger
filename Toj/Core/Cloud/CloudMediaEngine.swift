@@ -578,6 +578,69 @@ actor EncryptedMediaCache {
         }
     }
 
+    /// Returns decrypted bytes for `[offset, offset+length)` iff every byte in that range is already
+    /// cached (chunks are contiguous across it); otherwise `nil`. Chunk plaintext sizes are derived
+    /// from the sealed file size (AES-GCM `.combined` adds a fixed 28-byte nonce+tag) so coverage can
+    /// be computed without decrypting chunks outside the requested window. Enables streaming playback.
+    func cachedByteRange(mediaId: String, offset start: Int64, length: Int64) throws -> Data? {
+        guard length > 0 else { return Data() }
+        let end = start + length
+        let entries = try sortedChunkExtents(mediaId: mediaId)
+        guard !entries.isEmpty else { return nil }
+        var result = Data(capacity: Int(length))
+        var pos = start
+        for entry in entries {
+            let chunkEnd = entry.offset + entry.size
+            if chunkEnd <= pos { continue }        // fully before the cursor
+            if entry.offset > pos { break }        // gap: `pos` is not covered
+            let plaintext = try readEncrypted(
+                from: chunkURL(mediaId: mediaId, offset: entry.offset),
+                aad: "download|\(mediaId)|\(entry.offset)"
+            )
+            let localStart = Int(pos - entry.offset)
+            let localEnd = Int(min(chunkEnd, end) - entry.offset)
+            guard localStart >= 0, localEnd <= plaintext.count, localStart <= localEnd else { return nil }
+            result.append(plaintext.subdata(in: localStart..<localEnd))
+            pos = chunkEnd
+            if pos >= end { break }
+        }
+        guard pos >= end else { return nil }
+        try? touch(downloadDirectory(mediaId))
+        return result
+    }
+
+    /// How far contiguous cached coverage extends from `start` (returns `start` when nothing is
+    /// cached there). The engine downloads the next chunk at this offset to grow the covered range.
+    func coverageEnd(mediaId: String, from start: Int64) throws -> Int64 {
+        let entries = try sortedChunkExtents(mediaId: mediaId)
+        var pos = start
+        for entry in entries {
+            let chunkEnd = entry.offset + entry.size
+            if chunkEnd <= pos { continue }
+            if entry.offset > pos { break }
+            pos = chunkEnd
+        }
+        return pos
+    }
+
+    private func sortedChunkExtents(mediaId: String) throws -> [(offset: Int64, size: Int64)] {
+        let dir = downloadDirectory(mediaId)
+        guard fileManager.fileExists(atPath: dir.path) else { return [] }
+        return try fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey])
+            .compactMap { url -> (offset: Int64, size: Int64)? in
+                guard
+                    let offset = Int64(url.deletingPathExtension().lastPathComponent),
+                    let cipherSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                    cipherSize > Self.sealOverhead
+                else { return nil }
+                return (offset, Int64(cipherSize - Self.sealOverhead))
+            }
+            .sorted { $0.offset < $1.offset }
+    }
+
+    /// AES-GCM `.combined` layout overhead = 12-byte nonce + 16-byte tag.
+    private static let sealOverhead = 28
+
     func clearAll() throws {
         if fileManager.fileExists(atPath: root.path) { try fileManager.removeItem(at: root) }
         if fileManager.fileExists(atPath: previewRoot.path) { try fileManager.removeItem(at: previewRoot) }
@@ -1070,6 +1133,48 @@ actor CloudMediaTransferEngine {
         return result
     }
 
+    /// Serves `[offset, offset+length)` decrypted, downloading (and caching) only the chunks that
+    /// range needs — the streaming primitive behind `AVAssetResourceLoader`. Unlike `data`, it never
+    /// requires the whole file, so playback starts after the first covering chunk and seeks fetch
+    /// only their target region. Requests are clamped to the media's real byte size.
+    func byteRange(media: CloudMedia, token: String, offset: Int64, length: Int64) async throws -> Data {
+        guard let cache else { throw MediaCacheError.encryptionFailed }
+        if let transferId = Self.pendingTransferId(media.id) {
+            // Just-sent media is already fully local — slice it in memory.
+            let full = try await cache.preparedData(transferId: transferId)
+            return Self.slice(full, offset: offset, length: length)
+        }
+        let total = media.byteSize
+        guard total > 0, total <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
+        let start = max(0, offset)
+        let end = min(total, start + max(0, length))
+        guard end > start else { return Data() }
+        let wanted = end - start
+        while true {
+            if let data = try await cache.cachedByteRange(mediaId: media.id, offset: start, length: wanted) {
+                return data
+            }
+            try Task.checkCancellation()
+            let downloadAt = try await cache.coverageEnd(mediaId: media.id, from: start)
+            guard downloadAt < end, downloadAt < total else { throw MediaCacheError.invalidState }
+            let chunk = try await api.downloadChunk(mediaId: media.id, offset: downloadAt, token: token)
+            guard chunk.nextOffset > downloadAt, chunk.totalSize == total else { throw MediaCacheError.invalidState }
+            try await cache.storeDownloadChunk(chunk.data, mediaId: media.id, offset: downloadAt)
+        }
+    }
+
+    /// Builds an `AVURLAsset` that streams this media through `EncryptedMediaResourceLoader`. The
+    /// returned owner must be retained for the lifetime of playback (the asset holds the delegate weakly).
+    nonisolated func makeStreamingAsset(media: CloudMedia, token: String) -> StreamingMediaAsset {
+        StreamingMediaAsset(media: media, token: token, engine: self)
+    }
+
+    nonisolated private static func slice(_ data: Data, offset: Int64, length: Int64) -> Data {
+        let start = Int(max(0, min(Int64(data.count), offset)))
+        let end = Int(max(Int64(start), min(Int64(data.count), offset + max(0, length))))
+        return data.subdata(in: start..<end)
+    }
+
     func clearCache() async { try? await cache?.clearAll() }
 
     func clearDownloadedCache() async { try? await cache?.clearDownloaded() }
@@ -1088,6 +1193,85 @@ actor CloudMediaTransferEngine {
         guard mediaId.hasPrefix(prefix) else { return nil }
         let value = String(mediaId.dropFirst(prefix.count))
         return value.isEmpty ? nil : value
+    }
+}
+
+/// Owns a streaming `AVURLAsset` and the resource-loader delegate that feeds it (the asset retains
+/// the delegate only weakly, so this owner must outlive playback). Hand `asset` to an `AVPlayerItem`.
+nonisolated final class StreamingMediaAsset {
+    let asset: AVURLAsset
+    private let delegate: EncryptedMediaResourceLoader
+    private let queue = DispatchQueue(label: "com.toj.media.resource-loader")
+
+    init(media: CloudMedia, token: String, engine: CloudMediaTransferEngine) {
+        let ext = UTType(mimeType: media.contentType)?.preferredFilenameExtension ?? "mp4"
+        let url = URL(string: "\(EncryptedMediaResourceLoader.scheme)://stream/\(UUID().uuidString).\(ext)")!
+        asset = AVURLAsset(url: url)
+        delegate = EncryptedMediaResourceLoader(media: media, token: token, engine: engine)
+        asset.resourceLoader.setDelegate(delegate, queue: queue)
+    }
+}
+
+/// Bridges `AVPlayer`'s byte-range requests to the encrypted chunk store via `engine.byteRange`,
+/// so video streams (plays before it is fully downloaded) straight from Toj's own chunk API.
+/// Delegate callbacks are serialized on the loader queue supplied to `setDelegate(_:queue:)`.
+nonisolated final class EncryptedMediaResourceLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    static let scheme = "toj-media"
+    private let media: CloudMedia
+    private let token: String
+    private let engine: CloudMediaTransferEngine
+    private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+
+    init(media: CloudMedia, token: String, engine: CloudMediaTransferEngine) {
+        self.media = media
+        self.token = token
+        self.engine = engine
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        let key = ObjectIdentifier(loadingRequest)
+        let media = media, token = token, engine = engine
+        tasks[key] = Task {
+            do {
+                if let info = loadingRequest.contentInformationRequest {
+                    info.contentType = UTType(mimeType: media.contentType)?.identifier ?? UTType.mpeg4Movie.identifier
+                    info.isByteRangeAccessSupported = true
+                    info.contentLength = media.byteSize
+                }
+                if let dataRequest = loadingRequest.dataRequest {
+                    var pos = dataRequest.currentOffset
+                    let end = dataRequest.requestsAllDataToEndOfResource
+                        ? media.byteSize
+                        : dataRequest.requestedOffset + Int64(dataRequest.requestedLength)
+                    while pos < end {
+                        try Task.checkCancellation()
+                        let sliceLength = min(Int64(512 * 1024), end - pos)
+                        let data = try await engine.byteRange(media: media, token: token, offset: pos, length: sliceLength)
+                        if data.isEmpty { break }
+                        dataRequest.respond(with: data)
+                        pos += Int64(data.count)
+                    }
+                }
+                loadingRequest.finishLoading()
+            } catch is CancellationError {
+                // The player abandoned this request (seek/teardown); nothing to report.
+            } catch {
+                loadingRequest.finishLoading(with: error)
+            }
+        }
+        return true
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        let key = ObjectIdentifier(loadingRequest)
+        tasks[key]?.cancel()
+        tasks[key] = nil
     }
 }
 

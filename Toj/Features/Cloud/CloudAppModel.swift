@@ -1096,6 +1096,13 @@ final class CloudAppModel {
         return try await mediaEngine.data(media: media, token: token, progress: progress)
     }
 
+    /// A streaming asset that plays this media progressively (chunk-by-chunk) instead of requiring a
+    /// full download first. Returns `nil` until there is a session token. Retain the owner while playing.
+    func streamingVideoAsset(for media: CloudMedia) -> StreamingMediaAsset? {
+        guard let token = storedSession?.session.token else { return nil }
+        return mediaEngine.makeStreamingAsset(media: media, token: token)
+    }
+
     func temporaryMediaURL(data: Data, fileExtension: String?) async throws -> URL {
         try await mediaEngine.temporaryPreview(data: data, fileExtension: fileExtension)
     }
@@ -2132,6 +2139,7 @@ final class CloudAppModel {
             displayName: "Меҳмон"
         )
         status = "Demo mode"
+        connectionViewState = .connected
         activeDialogId = nil
         draft = ""
         peerPhone = ""
@@ -2148,11 +2156,14 @@ final class CloudAppModel {
 
         demoLinesByDialog = [
             "demo-mehrona": [
-                demoLine(dialogId: "demo-mehrona", messageId: 1, text: "Салом! Имрӯз вақт дорӣ?", mine: false, minutesAgo: 9),
-                demoLine(dialogId: "demo-mehrona", messageId: 2, text: "Салом 👋 Бале, баъди соати ҳафт.", mine: true, minutesAgo: 7, delivery: .seen),
-                demoLine(dialogId: "demo-mehrona", messageId: 3, text: "Олично. Тогда напишу ближе к вечеру.", mine: false, minutesAgo: 4),
-                demoLine(dialogId: "demo-mehrona", messageId: 4, text: "Хуб, мунтазир мешавам.", mine: true, minutesAgo: 2, delivery: .seen),
-                Line(id: "demo-mehrona-5", dialogId: "demo-mehrona", msgId: 5, clientMsgId: "demo-mehrona-5", text: "Шоми Душанбе", mine: false, delivery: .sent, timestamp: Self.demoTimestamp(minutesAgo: 1), attachment: .photo(name: "Шоми Душанбе")),
+                demoLine(dialogId: "demo-mehrona", messageId: 1, text: "Салом! Пагоҳ вақт дорӣ?", mine: false, minutesAgo: 1_565),
+                demoLine(dialogId: "demo-mehrona", messageId: 2, text: "Салом 👋 Бале, баъди соати ҳафт.", mine: true, minutesAgo: 1_562, delivery: .seen),
+                demoLine(dialogId: "demo-mehrona", messageId: 3, text: "Агар хоҳӣ, дар маркази шаҳр вомехӯрем.", mine: true, minutesAgo: 1_561, delivery: .seen),
+                Line(id: "demo-mehrona-4", dialogId: "demo-mehrona", msgId: 4, clientMsgId: "demo-mehrona-4", text: "Зӯр! То пагоҳ 🎉", mine: false, delivery: .sent, timestamp: Self.demoTimestamp(minutesAgo: 1_558), reactions: ["🔥"], myReaction: "🔥"),
+                demoLine(dialogId: "demo-mehrona", messageId: 5, text: "Имрӯз соати чанд вомехӯрем?", mine: false, minutesAgo: 9),
+                Line(id: "demo-mehrona-6", dialogId: "demo-mehrona", msgId: 6, clientMsgId: "demo-mehrona-6", text: "Соати ҳафт мешавад?", mine: true, delivery: .seen, timestamp: Self.demoTimestamp(minutesAgo: 7), replyToMsgId: 5, replyPreview: "Имрӯз соати чанд вомехӯрем?", reactions: ["❤️"]),
+                demoLine(dialogId: "demo-mehrona", messageId: 7, text: "Олично. Тогда до вечера.", mine: false, minutesAgo: 4),
+                Line(id: "demo-mehrona-8", dialogId: "demo-mehrona", msgId: 8, clientMsgId: "demo-mehrona-8", text: "Шоми Душанбе", mine: false, delivery: .sent, timestamp: Self.demoTimestamp(minutesAgo: 1), attachment: .photo(name: "Шоми Душанбе")),
             ],
             "demo-firooz": [
                 demoLine(dialogId: "demo-firooz", messageId: 1, text: "Салом, файлҳоро фиристодам.", mine: true, minutesAgo: 31, delivery: .seen),
