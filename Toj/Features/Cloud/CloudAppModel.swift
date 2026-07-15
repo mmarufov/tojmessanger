@@ -2312,6 +2312,30 @@ final class CloudAppModel {
     private static func demoTimestamp(minutesAgo: Int) -> String {
         ISO8601DateFormatter().string(from: Date().addingTimeInterval(TimeInterval(-minutesAgo * 60)))
     }
+
+    private func demoMediaBytes(for media: CloudMedia, thumbnail: Bool) -> Data? {
+        guard media.kind == "photo" || thumbnail else { return nil }
+
+        let side: CGFloat = thumbnail ? 320 : 1_200
+        let size = CGSize(width: side, height: side * 0.72)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { context in
+            let bounds = CGRect(origin: .zero, size: size)
+            UIColor(red: 0.05, green: 0.06, blue: 0.08, alpha: 1).setFill()
+            context.fill(bounds)
+
+            let accent = UIColor(red: 0.84, green: 0.66, blue: 0.21, alpha: 1)
+            accent.withAlphaComponent(0.18).setFill()
+            context.cgContext.fillEllipse(in: bounds.insetBy(dx: side * 0.16, dy: side * 0.05))
+
+            let symbolName = media.kind == "video" ? "play.fill" : "photo.fill"
+            let configuration = UIImage.SymbolConfiguration(pointSize: side * 0.14, weight: .medium)
+            let symbol = UIImage(systemName: symbolName, withConfiguration: configuration)?
+                .withTintColor(accent, renderingMode: .alwaysOriginal)
+            symbol?.draw(at: CGPoint(x: bounds.midX - side * 0.07, y: bounds.midY - side * 0.07))
+        }
+        return image.jpegData(compressionQuality: thumbnail ? 0.72 : 0.88)
+    }
     #endif
 
     #if !DEBUG
