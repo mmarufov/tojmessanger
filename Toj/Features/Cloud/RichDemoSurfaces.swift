@@ -282,34 +282,121 @@ struct DemoGroupCreationView: View {
     }
 }
 
+/// Demo twin of the production media viewer — same Telegram-style chrome grammar (uniform 46 pt
+/// glass circles, tappable title capsule, fading chrome) over placeholder content.
 struct DemoMediaViewer: View {
     @Environment(\.dismiss) private var dismiss
     let attachment: DemoAttachment
+    var title = ""
+    var subtitle = ""
+    var onDelete: (() -> Void)? = nil
+    @State private var chromeVisible = true
+    @State private var confirmingDelete = false
 
     var body: some View {
         ZStack {
-            TojTheme.canvas.ignoresSafeArea()
-            VStack {
-                HStack {
-                    Button { dismiss() } label: { Image(systemName: "xmark").frame(width: 46, height: 46) }
-                        .buttonStyle(.glass)
-                        .accessibilityLabel("Close media")
-                    Spacer()
-                    Button {} label: { Image(systemName: "square.and.arrow.up").frame(width: 46, height: 46) }
-                        .buttonStyle(.glass)
-                        .accessibilityLabel("Share")
+            Color.black.ignoresSafeArea()
+
+            LinearGradient(
+                colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
+                startPoint: .topLeading, endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+            .overlay {
+                VStack(spacing: 18) {
+                    Image(systemName: mediaIcon)
+                        .font(.system(size: 84, weight: .ultraLight))
+                        .foregroundStyle(.white.opacity(0.85))
+                    Text(attachment.title)
+                        .font(TojTheme.heading(.title3))
+                        .foregroundStyle(.white)
                 }
-                .padding()
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { chromeVisible.toggle() }
+
+            chrome
+                .opacity(chromeVisible ? 1 : 0)
+                .allowsHitTesting(chromeVisible)
+                .animation(.easeInOut(duration: 0.22), value: chromeVisible)
+        }
+        .preferredColorScheme(.dark)
+        .confirmationDialog(
+            "Delete this message?", isPresented: $confirmingDelete, titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                onDelete?()
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+
+    private var chrome: some View {
+        VStack {
+            HStack(spacing: 8) {
+                Button { dismiss() } label: { TojGlassIconLabel(systemImage: "chevron.left") }
+                    .buttonStyle(.tojPressable)
+                    .accessibilityLabel("Back")
+                Spacer(minLength: 8)
+                Menu {
+                    Button { dismiss() } label: {
+                        Label("Show in Chat", systemImage: "bubble.left.and.text.bubble.right")
+                    }
+                    if onDelete != nil {
+                        Button(role: .destructive) { confirmingDelete = true } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    TojGlassIconLabel(systemImage: "ellipsis")
+                }
+                .buttonStyle(.tojPressable)
+                .accessibilityLabel("More")
+            }
+            .overlay {
+                Button { dismiss() } label: {
+                    VStack(spacing: 1) {
+                        Text(title.isEmpty ? attachment.title : title)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(TojTheme.text)
+                            .lineLimit(1)
+                        if !subtitle.isEmpty {
+                            Text(subtitle)
+                                .font(.system(size: 12))
+                                .foregroundStyle(TojTheme.secondaryText)
+                                .lineLimit(1)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .frame(height: 46)
+                    .frame(maxWidth: 240)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.tojPressable)
+                .tojGlass(in: Capsule(), interactive: true)
+                .accessibilityLabel("Back to chat")
+            }
+
+            Spacer()
+
+            HStack {
+                TojGlassIconLabel(systemImage: "arrowshape.turn.up.right")
+                    .opacity(0.45)
+                    .accessibilityHidden(true)
                 Spacer()
-                Image(systemName: mediaIcon)
-                    .font(.system(size: 96, weight: .ultraLight))
-                    .foregroundStyle(TojTheme.text)
-                Text(attachment.title)
-                    .font(TojTheme.heading(.title3))
-                    .padding(.top, 20)
-                Spacer()
+                if onDelete != nil {
+                    Button { confirmingDelete = true } label: { TojGlassIconLabel(systemImage: "trash") }
+                        .buttonStyle(.tojPressable)
+                        .accessibilityLabel("Delete")
+                } else {
+                    Color.clear.frame(width: 46, height: 46)
+                }
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 14)
     }
 
     private var mediaIcon: String {

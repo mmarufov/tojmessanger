@@ -192,6 +192,23 @@ extension ButtonStyle where Self == TojPressableStyle {
 
 // MARK: - Shared components
 
+/// A bare circular Liquid Glass icon label — put it inside Button/Menu/ShareLink so every
+/// floating control renders pixel-identically (46 pt circle, 17 pt semibold glyph).
+struct TojGlassIconLabel: View {
+    let systemImage: String
+    var size: CGFloat = 46
+    var iconSize: CGFloat = 17
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: iconSize, weight: .semibold))
+            .foregroundStyle(TojTheme.text)
+            .frame(width: size, height: size)
+            .contentShape(Circle())
+            .tojGlass(in: Circle(), interactive: true)
+    }
+}
+
 /// A circular Liquid Glass icon button — the floating control used across headers and toolbars.
 struct TojGlassIconButton: View {
     let systemImage: String

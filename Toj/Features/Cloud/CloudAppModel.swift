@@ -1082,6 +1082,9 @@ final class CloudAppModel {
     }
 
     func thumbnailData(for media: CloudMedia) async -> Data? {
+        #if DEBUG
+        if isDemoMode { return demoMediaBytes(for: media, thumbnail: true) }
+        #endif
         guard let token = storedSession?.session.token else { return nil }
         return try? await mediaEngine.thumbnail(media: media, token: token)
     }
@@ -1090,6 +1093,17 @@ final class CloudAppModel {
         for media: CloudMedia,
         progress: @Sendable (Double) async -> Void = { _ in }
     ) async throws -> Data {
+        #if DEBUG
+        if isDemoMode {
+            // Staged progress so the viewer's download ring is demonstrable.
+            await progress(0.4)
+            try? await Task.sleep(for: .milliseconds(220))
+            await progress(0.85)
+            try? await Task.sleep(for: .milliseconds(180))
+            await progress(1)
+            return demoMediaBytes(for: media, thumbnail: false) ?? Data()
+        }
+        #endif
         guard let token = storedSession?.session.token else {
             throw CloudAPIError(status: 401, message: "Sign in required", retryAfter: nil)
         }

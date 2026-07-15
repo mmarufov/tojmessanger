@@ -668,6 +668,7 @@ private struct TojMessageBubble: View {
     let onSwipeReply: () -> Void
     @State private var replyOffset: CGFloat = 0
     @State private var showingMedia = false
+    @Namespace private var mediaZoom
 
     var body: some View {
         HStack {
@@ -692,10 +693,12 @@ private struct TojMessageBubble: View {
                         onRemove: { model.removeFailedMedia(line) }
                     )
                         .contentShape(Rectangle())
+                        .matchedTransitionSource(id: line.id, in: mediaZoom)
                         .onTapGesture { if media.kind != "voice" { showingMedia = true } }
                 } else if let attachment = line.attachment {
                     DemoAttachmentBubble(attachment: attachment)
                         .contentShape(Rectangle())
+                        .matchedTransitionSource(id: line.id, in: mediaZoom)
                         .onTapGesture { showingMedia = true }
                         .accessibilityAddTraits(.isButton)
                         .accessibilityHint("Opens media viewer")
@@ -770,17 +773,36 @@ private struct TojMessageBubble: View {
             }
         }
         .fullScreenCover(isPresented: $showingMedia) {
-            if let media = line.media {
-                ProductionMediaViewer(
-                    model: model, media: media, line: line,
-                    title: model.dialogTitle(line.dialogId ?? ""),
-                    subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
-                    onReply: { onAction(.reply) }
-                )
-            } else if let attachment = line.attachment {
-                DemoMediaViewer(attachment: attachment)
+            Group {
+                if let media = line.media {
+                    ProductionMediaViewer(
+                        model: model, media: media, line: line,
+                        title: model.dialogTitle(line.dialogId ?? ""),
+                        subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
+                        onReply: { onAction(.reply) }
+                    )
+                } else if let attachment = line.attachment {
+                    DemoMediaViewer(
+                        attachment: attachment,
+                        title: model.dialogTitle(line.dialogId ?? ""),
+                        subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
+                        onDelete: actions.contains(.delete)
+                            ? { Task { await model.deleteMessage(line) } }
+                            : nil
+                    )
+                }
             }
+            .navigationTransition(.zoom(sourceID: line.id, in: mediaZoom))
         }
+        #if DEBUG
+        // Demo/dev hook (same family as TOJ_DEMO_DIALOG): auto-present this line's media viewer.
+        .task(id: line.id) {
+            guard ProcessInfo.processInfo.environment["TOJ_DEMO_MEDIA"] == line.id,
+                  line.media != nil || line.attachment != nil else { return }
+            try? await Task.sleep(for: .milliseconds(450))
+            showingMedia = true
+        }
+        #endif
     }
 
     /// Telegram tail grammar: bubbles stay fully rounded; only the last message of a sender's
@@ -1604,6 +1626,7 @@ private struct ProductionMediaViewer: View {
     let onReply: () -> Void
 
     @State private var photoImage: UIImage?
+    @State private var thumbnailImage: UIImage?
     @State private var player: AVPlayer?
     @State private var temporaryURL: URL?
     @State private var error: String?
@@ -1612,13 +1635,14 @@ private struct ProductionMediaViewer: View {
     @State private var chromeVisible = true
     @State private var confirmingDelete = false
     // Video playback (custom controls — no native chrome so we can overlay Liquid Glass).
-    @State private var currentTime = 0.0
     @State private var duration = 0.0
     @State private var isPlaying = false
     @State private var isScrubbing = false
+    @State private var scrubTime = 0.0
+    // Bumped when an async seek lands so a paused scrubber re-reads the playhead.
+    @State private var seekGeneration = 0
     @State private var streamingOwner: StreamingMediaAsset?  // retains the resource-loader delegate
     @State private var shareFetchTask: Task<Void, Never>?
-    private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
     private var isVideoReady: Bool { media.kind == "video" && player != nil && error == nil }
     private var canReply: Bool { model.actions(for: line).contains(.reply) }
@@ -1629,14 +1653,23 @@ private struct ProductionMediaViewer: View {
         ZStack {
             Color.black.ignoresSafeArea()
             contentLayer
-            if chromeVisible { chromeLayer.transition(.opacity) }
+            chromeLayer
+                .opacity(chromeVisible ? 1 : 0)
+                .allowsHitTesting(chromeVisible)
+                .animation(
+                    reduceMotion ? .easeOut(duration: 0.1) : .easeInOut(duration: 0.22),
+                    value: chromeVisible
+                )
         }
         .preferredColorScheme(.dark)
         .task(id: media.id) { await load() }
-        .onReceive(ticker) { _ in
-            guard let player, isVideoReady, !isScrubbing else { return }
-            currentTime = min(duration, max(0, player.currentTime().seconds))
-            isPlaying = player.timeControlStatus == .playing
+        .onReceive(playStatePublisher) { status in
+            isPlaying = status == .playing
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification)) { note in
+            guard let item = note.object as? AVPlayerItem, item === player?.currentItem else { return }
+            isPlaying = false
+            chromeVisible = true
         }
         .onDisappear { teardown() }
         .confirmationDialog(
@@ -1654,6 +1687,19 @@ private struct ProductionMediaViewer: View {
         } message: { Text(saveMessage ?? "") }
     }
 
+    /// Live playhead straight from the player — read per frame by the scrubber, never polled into state.
+    private var liveTime: Double {
+        guard let player else { return 0 }
+        let seconds = player.currentTime().seconds
+        guard seconds.isFinite else { return 0 }
+        return min(duration, max(0, seconds))
+    }
+
+    private var playStatePublisher: AnyPublisher<AVPlayer.TimeControlStatus, Never> {
+        player?.publisher(for: \.timeControlStatus).receive(on: DispatchQueue.main).eraseToAnyPublisher()
+            ?? Empty().eraseToAnyPublisher()
+    }
+
     // MARK: Content
 
     @ViewBuilder private var contentLayer: some View {
@@ -1666,9 +1712,29 @@ private struct ProductionMediaViewer: View {
                 Button("Try again") { Task { await load() } }
                     .buttonStyle(.borderedProminent)
             }
-        } else if media.kind == "photo", let photoImage {
-            ZoomablePhotoView(image: photoImage, onSingleTap: toggleChrome)
-                .padding(.vertical, 40)
+        } else if media.kind == "photo", photoImage != nil || thumbnailImage != nil {
+            // Telegram order: the cached thumbnail fills the screen instantly; the full-resolution
+            // image cross-fades over it when ready; a ring shows only while pixels are in flight.
+            ZStack {
+                if let photoImage {
+                    ZoomablePhotoView(image: photoImage, onSingleTap: toggleChrome)
+                        .transition(.opacity)
+                } else if let thumbnailImage {
+                    Image(uiImage: thumbnailImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
+                        .onTapGesture { toggleChrome() }
+                        .transition(.opacity)
+                }
+            }
+            .ignoresSafeArea()
+            .overlay {
+                if photoImage == nil {
+                    MediaDownloadRing(progress: downloadProgress)
+                }
+            }
         } else if media.kind == "video", let player {
             VideoLayerView(player: player)
                 .ignoresSafeArea()
@@ -1681,9 +1747,7 @@ private struct ProductionMediaViewer: View {
                 Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
             }
         } else {
-            ProgressView(value: downloadProgress) { Text("Downloading…") }
-                .tint(TojTheme.text)
-                .frame(maxWidth: 240)
+            MediaDownloadRing(progress: downloadProgress)
         }
     }
 
@@ -1709,27 +1773,35 @@ private struct ProductionMediaViewer: View {
 
     private var topBar: some View {
         HStack(spacing: 8) {
-            glassCircleButton(system: "chevron.left", label: "Back") { dismiss() }
+            Button { dismiss() } label: { viewerGlassIcon("chevron.left") }
+                .buttonStyle(.tojPressable)
+                .accessibilityLabel("Back")
             Spacer(minLength: 8)
             moreMenu
         }
         .overlay {
-            VStack(spacing: 1) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(TojTheme.text)
-                    .lineLimit(1)
-                if !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.caption2)
-                        .foregroundStyle(TojTheme.secondaryText)
+            // Telegram: the title capsule is a button — tapping it returns to the chat.
+            Button { dismiss() } label: {
+                VStack(spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(TojTheme.text)
                         .lineLimit(1)
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .lineLimit(1)
+                    }
                 }
+                .padding(.horizontal, 18)
+                .frame(height: 46)
+                .frame(maxWidth: 240)
+                .contentShape(Capsule())
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 8)
-            .frame(maxWidth: 230)
-            .tojGlass(in: Capsule())
+            .buttonStyle(.tojPressable)
+            .tojGlass(in: Capsule(), interactive: true)
+            .accessibilityLabel("\(title). Back to chat")
         }
     }
 
@@ -1748,89 +1820,93 @@ private struct ProductionMediaViewer: View {
                 Button(role: .destructive) { confirmingDelete = true } label: { Label("Delete", systemImage: "trash") }
             }
         } label: {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(TojTheme.text)
-                .frame(width: 46, height: 46)
-                .tojGlass(in: Circle())
+            viewerGlassIcon("ellipsis")
         }
+        .buttonStyle(.tojPressable)
         .accessibilityLabel("More")
     }
 
     private var bottomBar: some View {
         HStack {
             if let temporaryURL, error == nil {
-                ShareLink(item: temporaryURL) {
-                    Image(systemName: "arrowshape.turn.up.right")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(TojTheme.text)
-                        .frame(width: 46, height: 46)
-                        .tojGlass(in: Circle())
-                }
-                .accessibilityLabel("Share")
+                ShareLink(item: temporaryURL) { viewerGlassIcon("arrowshape.turn.up.right") }
+                    .buttonStyle(.tojPressable)
+                    .accessibilityLabel("Share")
             } else {
-                Color.clear.frame(width: 46, height: 46)
+                // Keep the slot so the bar stays symmetric while the shareable file is prepared.
+                viewerGlassIcon("arrowshape.turn.up.right")
+                    .opacity(0.45)
+                    .accessibilityHidden(true)
             }
             Spacer()
             if canDelete {
-                glassCircleButton(system: "trash", label: "Delete") { confirmingDelete = true }
+                Button { confirmingDelete = true } label: { viewerGlassIcon("trash") }
+                    .buttonStyle(.tojPressable)
+                    .accessibilityLabel("Delete")
             } else {
                 Color.clear.frame(width: 46, height: 46)
             }
         }
+    }
+
+    /// The one true viewer control: every top/bottom button renders through this so they are
+    /// pixel-identical — 46 pt circle, 17 pt semibold glyph, interactive Liquid Glass.
+    private func viewerGlassIcon(_ system: String) -> some View {
+        TojGlassIconLabel(systemImage: system)
     }
 
     private var centerPlayPause: some View {
         Button(action: togglePlayback) {
             Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                 .font(.system(size: 30, weight: .bold))
-                .foregroundStyle(TojTheme.text)
-                .frame(width: 76, height: 76)
-                .tojGlass(in: Circle())
-                .overlay(Circle().stroke(TojTheme.gold.opacity(0.55), lineWidth: 1))
+                .foregroundStyle(.white)
+                .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
+                .frame(width: 78, height: 78)
+                .contentShape(Circle())
+                .tojGlass(in: Circle(), interactive: true)
+                .overlay(Circle().stroke(TojTheme.gold.opacity(0.45), lineWidth: 0.8))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tojPressable)
+        .animation(.easeInOut(duration: 0.2), value: isPlaying)
         .accessibilityLabel(isPlaying ? "Pause" : "Play")
     }
 
+    /// Telegram's scrubber strip: elapsed / bar / duration in one glass capsule. TimelineView
+    /// re-reads the playhead every display frame, so the fill glides instead of stepping.
     private var videoScrubber: some View {
-        HStack(spacing: 12) {
-            Text(timeLabel(currentTime))
-                .font(.caption2.weight(.semibold)).monospacedDigit()
-                .foregroundStyle(TojTheme.text)
-            Slider(value: $currentTime, in: 0...max(0.1, duration)) { editing in
-                isScrubbing = editing
-                if !editing { seek(to: currentTime) }
+        TimelineView(.animation(minimumInterval: nil, paused: !isPlaying && !isScrubbing)) { _ in
+            HStack(spacing: 12) {
+                Text(timeLabel(isScrubbing ? scrubTime : liveTime))
+                    .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                    .foregroundStyle(.white)
+                MediaScrubberBar(
+                    fraction: duration > 0 ? (isScrubbing ? scrubTime : liveTime) / duration : 0,
+                    isScrubbing: isScrubbing,
+                    onScrub: { fraction in
+                        isScrubbing = true
+                        scrubTime = fraction * max(0.1, duration)
+                    },
+                    onCommit: {
+                        seek(to: scrubTime)
+                        isScrubbing = false
+                    }
+                )
+                Text(timeLabel(duration))
+                    .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                    .foregroundStyle(.white)
             }
-            .tint(.white)
-            Text(timeLabel(duration))
-                .font(.caption2.weight(.semibold)).monospacedDigit()
-                .foregroundStyle(TojTheme.text)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .tojGlass(in: Capsule())
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 9)
-        .tojGlass(in: Capsule())
-    }
-
-    private func glassCircleButton(
-        system: String, label: LocalizedStringKey, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: system)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(TojTheme.text)
-                .frame(width: 46, height: 46)
-        }
-        .buttonStyle(.glass)
-        .accessibilityLabel(Text(label))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Video position")
     }
 
     // MARK: Behavior
 
     private func toggleChrome() {
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.12) : .easeInOut(duration: 0.22)) {
-            chromeVisible.toggle()
-        }
+        chromeVisible.toggle()
     }
 
     private func togglePlayback() {
@@ -1839,18 +1915,19 @@ private struct ProductionMediaViewer: View {
             player.pause()
             isPlaying = false
         } else {
-            if currentTime >= duration - 0.1 { seek(to: 0) }
+            if liveTime >= duration - 0.1 { seek(to: 0) }
             player.play()
             isPlaying = true
         }
     }
 
     private func seek(to seconds: Double) {
-        currentTime = seconds
         player?.seek(
             to: CMTime(seconds: seconds, preferredTimescale: 600),
             toleranceBefore: .zero, toleranceAfter: .zero
-        )
+        ) { _ in
+            Task { @MainActor in seekGeneration += 1 }
+        }
     }
 
     private func timeLabel(_ seconds: Double) -> String {
@@ -1878,6 +1955,7 @@ private struct ProductionMediaViewer: View {
     private func load() async {
         error = nil
         photoImage = nil
+        thumbnailImage = nil
         player?.pause()
         player = nil
         streamingOwner = nil
@@ -1885,13 +1963,19 @@ private struct ProductionMediaViewer: View {
         if let temporaryURL { await model.removeTemporaryMediaURL(temporaryURL) }
         temporaryURL = nil
         downloadProgress = 0
-        currentTime = 0
         duration = 0
         isPlaying = false
         do {
             if media.kind == "video" {
                 try await loadStreamingVideo()
                 return
+            }
+            // The bubble's thumbnail is already cached — put it on screen immediately so the
+            // viewer never opens onto a spinner, then fetch the full pixels behind it.
+            if media.kind == "photo",
+               let thumbnailData = await model.thumbnailData(for: media),
+               let decodedThumbnail = SafeMediaImageDecoder.decode(thumbnailData, maxPixelSize: 720) {
+                thumbnailImage = decodedThumbnail.image
             }
             // Photos need full pixels; files need a local URL to preview and share.
             let downloaded = try await model.mediaData(for: media) { value in
@@ -1901,7 +1985,9 @@ private struct ProductionMediaViewer: View {
                 guard let decoded = SafeMediaImageDecoder.decode(downloaded, maxPixelSize: 4_096) else {
                     throw MediaPresentationError.unreadable
                 }
-                photoImage = decoded.image
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
+                    photoImage = decoded.image
+                }
             }
             temporaryURL = try await model.temporaryMediaURL(
                 data: downloaded, fileExtension: preferredFileExtension
@@ -1976,6 +2062,72 @@ private struct ProductionMediaViewer: View {
         } catch {
             saveMessage = error.localizedDescription
         }
+    }
+}
+
+/// Telegram's scrubber line: a thin white capsule that fills continuously, no knob; it thickens
+/// slightly under the finger and the whole track is draggable to seek.
+private struct MediaScrubberBar: View {
+    let fraction: Double
+    let isScrubbing: Bool
+    let onScrub: (Double) -> Void
+    let onCommit: () -> Void
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.3))
+                Capsule().fill(.white)
+                    .frame(width: max(0, min(1, fraction)) * width)
+            }
+            .frame(height: isScrubbing ? 7 : 4)
+            .frame(maxHeight: .infinity, alignment: .center)
+            .animation(.easeInOut(duration: 0.15), value: isScrubbing)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard width > 0 else { return }
+                        onScrub(min(1, max(0, value.location.x / width)))
+                    }
+                    .onEnded { _ in onCommit() }
+            )
+        }
+        .frame(height: 30)
+    }
+}
+
+/// Telegram's download indicator: a thin white ring over the media that fills with progress,
+/// spinning while the transfer has not reported bytes yet.
+private struct MediaDownloadRing: View {
+    let progress: Double
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var rotating = false
+
+    var body: some View {
+        ZStack {
+            Circle().fill(.black.opacity(0.45)).frame(width: 54, height: 54)
+            Circle().stroke(.white.opacity(0.25), lineWidth: 2.5).frame(width: 42, height: 42)
+            if progress <= 0.01, !reduceMotion {
+                Circle()
+                    .trim(from: 0, to: 0.28)
+                    .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .frame(width: 42, height: 42)
+                    .rotationEffect(.degrees(rotating ? 360 : 0))
+                    .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: rotating)
+                    .onAppear { rotating = true }
+            } else {
+                Circle()
+                    .trim(from: 0, to: max(0.03, min(1, progress)))
+                    .stroke(.white, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .frame(width: 42, height: 42)
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeInOut(duration: 0.2), value: progress)
+            }
+        }
+        .accessibilityLabel("Downloading")
+        .accessibilityValue("\(Int((progress * 100).rounded())) percent")
     }
 }
 
