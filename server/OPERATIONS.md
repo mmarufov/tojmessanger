@@ -35,8 +35,11 @@ clients that send media. These optional server settings are byte counts and are 
 - `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
 - `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
 
-The iOS client additionally keeps an encrypted, automatically evicted 200 MB download cache. Pending
-uploads are never evicted; new selections fail cleanly when the local quota cannot accommodate them.
+The iOS client keeps downloaded media encrypted on disk and, by default, retains it until the user
+clears it. Existing user-selected limits remain authoritative. The low-disk reserve is the only
+automatic deletion path: it preserves 5% free space, clamped to 1–5 GB, and surfaces a storage notice
+when reclamation occurs. Pending uploads are never evicted; new selections fail cleanly when the local
+quota cannot accommodate them.
 
 API version 3 adds `media_multipart_v2`. Clients using it upload numbered, idempotent parts out of
 order with up to three concurrent requests: 256 KiB parts through 10 MiB and 512 KiB parts above
