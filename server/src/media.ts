@@ -94,7 +94,7 @@ function optionalPositiveInt(value: unknown, name: string): number | null {
   return parsed;
 }
 
-function toDTO(row: any): MediaDTO {
+export function mediaDTOFromRow(row: any): MediaDTO {
   const encryptedFileName = row.file_name_ciphertext == null ? null : open(
     {
       keyId: row.file_name_key_id,
@@ -122,7 +122,7 @@ export async function loadMediaDTO(sql: SQL, mediaId: string | null): Promise<Me
     SELECT id, kind, content_type, file_name, file_name_key_id, file_name_nonce,
            file_name_ciphertext, byte_size, duration_ms, width, height, thumbnail_ciphertext
     FROM media_objects WHERE id = ${mediaId} AND status = 'ready'`)[0];
-  return row ? toDTO(row) : null;
+  return row ? mediaDTOFromRow(row) : null;
 }
 
 export async function createMediaUpload(sql: SQL, accountId: string, deviceId: string, input: {

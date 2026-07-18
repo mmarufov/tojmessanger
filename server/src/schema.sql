@@ -11,12 +11,30 @@ CREATE TABLE IF NOT EXISTS accounts (
   phone_e164_ciphertext BYTEA NOT NULL,              -- AEAD-encrypted phone (server can decrypt; never plaintext at rest)
   phone_nonce           BYTEA NOT NULL,
   phone_key_id          TEXT  NOT NULL,
+  first_name            TEXT  NOT NULL DEFAULT '',
+  last_name             TEXT  NOT NULL DEFAULT '',
   display_name          TEXT  NOT NULL DEFAULT '',
+  bio                   TEXT  NOT NULL DEFAULT '',
+  birthday              DATE,
+  profile_color         INT   NOT NULL DEFAULT 0 CHECK (profile_color BETWEEN 0 AND 7),
   status                TEXT  NOT NULL DEFAULT 'active'
                           CHECK (status IN ('active','limited','banned','deleted')),
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS first_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS birthday DATE;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_color INT NOT NULL DEFAULT 0;
+DO $$ BEGIN
+  ALTER TABLE accounts ADD CONSTRAINT accounts_profile_color_check
+    CHECK (profile_color BETWEEN 0 AND 7);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+UPDATE accounts
+SET first_name = display_name
+WHERE first_name = '' AND last_name = '' AND display_name <> '';
 
 -- The sync cursor per account. NO `seq` (I1: redundant with pts). pruned_through_pts (B3) is the
 -- floor below which events are gone -> get_difference must answer difference_too_long.
@@ -266,7 +284,7 @@ CREATE TABLE IF NOT EXISTS account_events (
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
                        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-                        'dialog.created','member.added','member.removed')),
+                        'dialog.created','member.added','member.removed','profile.updated')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -277,7 +295,7 @@ CREATE TABLE IF NOT EXISTS account_events (
 ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
 ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
   ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-   'dialog.created','member.added','member.removed'));
+   'dialog.created','member.added','member.removed','profile.updated'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
