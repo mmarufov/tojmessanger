@@ -1,5 +1,12 @@
 import Foundation
 
+nonisolated enum LaunchPhase: Equatable, Sendable {
+    case restoringLocal
+    case signedOut
+    case localReady
+    case recoveringStore
+}
+
 nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     let rawValue: UInt16
 
@@ -73,14 +80,14 @@ nonisolated enum ComposerMode: Equatable, Sendable {
     case disabled(reason: String)
 }
 
-nonisolated enum ConnectionViewState: Equatable, Sendable {
-    case connected
+nonisolated enum ReplicaConnectionState: Equatable, Sendable {
+    case live
     case connecting
     case offline
 
     var title: String {
         switch self {
-        case .connected: String(localized: "Protected")
+        case .live: String(localized: "Protected")
         case .connecting: String(localized: "Connecting…")
         case .offline: String(localized: "Waiting for network")
         }
@@ -88,7 +95,7 @@ nonisolated enum ConnectionViewState: Equatable, Sendable {
 
     var systemImage: String {
         switch self {
-        case .connected: "lock.fill"
+        case .live: "lock.fill"
         case .connecting: "arrow.triangle.2.circlepath"
         case .offline: "wifi.slash"
         }
@@ -117,6 +124,52 @@ nonisolated enum SearchScope: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+nonisolated enum ChatListPreviewKind: String, Equatable, Sendable {
+    case text
+    case photo
+    case video
+    case voice
+    case file
+    case link
+    case attachment
+
+    init(messageKind: String?) {
+        switch messageKind?.lowercased() {
+        case nil, "", "text": self = .text
+        case "photo", "image": self = .photo
+        case "video": self = .video
+        case "voice", "audio": self = .voice
+        case "file", "document": self = .file
+        case "link": self = .link
+        default: self = .attachment
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .text: ""
+        case .photo: String(localized: "Photo")
+        case .video: String(localized: "Video")
+        case .voice: String(localized: "Voice message")
+        case .file: String(localized: "File")
+        case .link: String(localized: "Link")
+        case .attachment: String(localized: "Attachment")
+        }
+    }
+
+    var systemImage: String? {
+        switch self {
+        case .text: nil
+        case .photo: "photo.fill"
+        case .video: "video.fill"
+        case .voice: "mic.fill"
+        case .file: "doc.fill"
+        case .link: "link"
+        case .attachment: "paperclip"
+        }
+    }
+}
+
 nonisolated enum DemoAttachment: Equatable, Sendable {
     case photo(name: String)
     case video(name: String, duration: String)
@@ -129,6 +182,16 @@ nonisolated enum DemoAttachment: Equatable, Sendable {
         case let .photo(name), let .video(name, _), let .file(name, _): name
         case let .voice(duration): String(localized: "Voice message \(duration)")
         case let .link(title, _): title
+        }
+    }
+
+    var chatListPreviewKind: ChatListPreviewKind {
+        switch self {
+        case .photo: .photo
+        case .video: .video
+        case .file: .file
+        case .voice: .voice
+        case .link: .link
         }
     }
 }
@@ -157,7 +220,7 @@ nonisolated struct ConversationViewState: Equatable, Sendable {
     }
 
     let phase: Phase
-    let connection: ConnectionViewState
+    let connection: ReplicaConnectionState
     let unreadBelow: Int
 }
 

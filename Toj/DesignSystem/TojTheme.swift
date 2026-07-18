@@ -137,10 +137,26 @@ struct TojAvatar: View {
     let title: String
     var size: CGFloat = 52
     var highlighted = false
+    var colorIndex: Int? = nil
+
+    private static let palettes: [(UInt32, UInt32)] = [
+        (0x365C78, 0x172B3A),
+        (0x67503A, 0x2D2118),
+        (0x4D596F, 0x222733),
+        (0x3F665E, 0x1C302C),
+        (0x654B63, 0x2D202C),
+        (0x596342, 0x282E1D),
+    ]
 
     private var initial: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.first.map { String($0).uppercased() } ?? "T"
+    }
+
+    private var palette: (UInt32, UInt32) {
+        let seed = title.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+        let index = Int(UInt(bitPattern: seed) % UInt(Self.palettes.count))
+        return Self.palettes[index]
     }
 
     var body: some View {
@@ -149,14 +165,46 @@ struct TojAvatar: View {
                 .fill(
                     highlighted
                         ? AnyShapeStyle(LinearGradient(colors: [Color(hex: 0x4B401F), Color(hex: 0x211D13)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        : AnyShapeStyle(LinearGradient(colors: [Color(hex: 0x292D34), TojTheme.raised], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        : colorIndex.map { AnyShapeStyle(TojProfilePalette.gradient($0)) }
+                            ?? AnyShapeStyle(LinearGradient(colors: [Color(hex: palette.0), Color(hex: palette.1)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 )
             Text(initial)
                 .font(TojTheme.heading(.headline, weight: .semibold))
                 .foregroundStyle(highlighted ? TojTheme.gold : TojTheme.text)
         }
         .frame(width: size, height: size)
+        .overlay(Circle().stroke(Color.white.opacity(0.08), lineWidth: 0.5))
         .accessibilityLabel(title)
+    }
+}
+
+enum TojProfilePalette {
+    private static let values: [(UInt32, UInt32)] = [
+        (0x76A8FF, 0x6254F4),
+        (0x5DDC8A, 0x24A967),
+        (0xFFB45C, 0xE86C49),
+        (0xED77D4, 0xA64DE0),
+        (0x52D5E8, 0x2589CF),
+        (0xFFE16A, 0xD89C2A),
+        (0xFF7D7D, 0xCE3D68),
+        (0xB7C2D8, 0x5A6988),
+    ]
+
+    static var count: Int { values.count }
+
+    static func gradient(_ index: Int) -> LinearGradient {
+        let safeIndex = values.indices.contains(index) ? index : 0
+        let pair = values[safeIndex]
+        return LinearGradient(
+            colors: [Color(hex: pair.0), Color(hex: pair.1)],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    static func primary(_ index: Int) -> Color {
+        let safeIndex = values.indices.contains(index) ? index : 0
+        return Color(hex: values[safeIndex].1)
     }
 }
 
@@ -220,6 +268,7 @@ struct TojGlassIconButton: View {
         Button(action: action) {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(TojTheme.text)
                 .frame(width: size, height: size)
         }
         .buttonStyle(.glass)

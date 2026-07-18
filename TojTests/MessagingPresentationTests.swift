@@ -54,6 +54,330 @@ final class MessagingPresentationTests: XCTestCase {
         ))
     }
 
+    func testFirstCachedTimelinePopulationIsTreatedAsAnAppend() {
+        XCTAssertFalse(TimelineScrollBehavior.addedMessagesWereAppended(oldIDs: [], newIDs: []))
+        XCTAssertTrue(TimelineScrollBehavior.addedMessagesWereAppended(
+            oldIDs: [],
+            newIDs: ["message-1", "message-2"]
+        ))
+        XCTAssertTrue(TimelineScrollBehavior.addedMessagesWereAppended(
+            oldIDs: ["message-1"],
+            newIDs: ["message-1", "message-2"]
+        ))
+        XCTAssertFalse(TimelineScrollBehavior.addedMessagesWereAppended(
+            oldIDs: ["message-2"],
+            newIDs: ["message-1", "message-2"]
+        ))
+    }
+
+    func testReplicaSyncStatesExposeBoundedRetryablePresentation() {
+        XCTAssertEqual(CloudAppModel.foregroundSyncTimeoutSeconds, 15)
+        XCTAssertEqual(ReplicaSyncState.checking.title, "Checking connection…")
+        XCTAssertEqual(ReplicaSyncState.updating.title, "Updating chats…")
+        XCTAssertTrue(ReplicaSyncState.checking.showsProgress)
+        XCTAssertTrue(ReplicaSyncState.updating.showsProgress)
+        XCTAssertFalse(ReplicaSyncState.ready.showsRetry)
+        XCTAssertTrue(ReplicaSyncState.offline.showsRetry)
+    }
+
+    func testReplicaFailuresKeepConnectivitySeparateFromProtocolAndStorageFailures() {
+        let reachable = ReplicaNetworkSnapshot(
+            networkClass: .wifi,
+            isExpensive: false,
+            isConstrained: false,
+            isRoaming: false
+        )
+        let offline = ReplicaNetworkSnapshot(
+            networkClass: .offline,
+            isExpensive: false,
+            isConstrained: false,
+            isRoaming: false
+        )
+
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(for: URLError(.notConnectedToInternet), network: reachable),
+            .offline
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(for: URLError(.timedOut), network: reachable),
+            .connectionSlow
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(
+                for: CloudAPIError(status: 503, message: "unavailable", retryAfter: nil),
+                network: reachable
+            ),
+            .serverUnavailable
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(
+                for: CloudAPIError(status: 401, message: "expired", retryAfter: nil),
+                network: reachable
+            ),
+            .sessionExpired
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(
+                for: DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "bad")),
+                network: reachable
+            ),
+            .protocolFailure
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(for: CocoaError(.fileReadCorruptFile), network: reachable),
+            .localFailure
+        )
+        XCTAssertEqual(
+            CloudAppModel.replicaFailureState(
+                for: CloudAPIError(status: 503, message: "unavailable", retryAfter: nil),
+                network: offline
+            ),
+            .offline
+        )
+    }
+
+    func testDifferencePageBudgetsFollowTheCurrentNetworkClass() {
+        func snapshot(_ networkClass: ReplicaNetworkClass) -> ReplicaNetworkSnapshot {
+            ReplicaNetworkSnapshot(
+                networkClass: networkClass,
+                isExpensive: networkClass != .wifi,
+                isConstrained: networkClass == .constrained,
+                isRoaming: networkClass == .roaming
+            )
+        }
+
+        let wifi = CloudAppModel.differenceRequestLimits(for: snapshot(.wifi))
+        XCTAssertEqual(wifi.maxEvents, 200)
+        XCTAssertEqual(wifi.maxBytes, 256 * 1_024)
+        let cellular = CloudAppModel.differenceRequestLimits(for: snapshot(.cellular))
+        XCTAssertEqual(cellular.maxEvents, 100)
+        XCTAssertEqual(cellular.maxBytes, 128 * 1_024)
+        for networkClass in [
+            ReplicaNetworkClass.unknown, .offline, .constrained, .roaming,
+        ] {
+            let bounded = CloudAppModel.differenceRequestLimits(for: snapshot(networkClass))
+            XCTAssertEqual(bounded.maxEvents, 50)
+            XCTAssertEqual(bounded.maxBytes, 64 * 1_024)
+        }
+    }
+
+    func testPhysicalDeviceLoopbackRequiresAnExplicitDebugOverride() throws {
+        let config = CloudConfig(baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:8788")))
+        XCTAssertEqual(config.validationIssue(environment: [:]), .loopbackOnPhysicalDevice)
+        XCTAssertNil(config.validationIssue(environment: ["SIMULATOR_UDID": "simulator"]))
+        XCTAssertNil(config.validationIssue(environment: ["TOJ_ALLOW_LOOPBACK": "1"]))
+        let productionLike = CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://cloud.toj.example"))
+        )
+        XCTAssertNil(productionLike.validationIssue(environment: [:]))
+    }
+
+    func testReplicaSyncCoordinatorReplacesStaleWorkAndCoalescesRetryTaps() async throws {
+        let probe = ReplicaCoordinatorProbe()
+        let holder = ReplicaCoordinatorHolder()
+        let coordinator = ReplicaSyncCoordinator { generation in
+            await probe.start(generation)
+            try? await Task.sleep(for: .milliseconds(30))
+            if await holder.isCurrent(generation) {
+                await probe.publish(generation)
+            }
+        }
+        await holder.install(coordinator)
+
+        await coordinator.trigger(.foreground)
+        try await Task.sleep(for: .milliseconds(5))
+        await coordinator.trigger(.manualRetry)
+        await coordinator.trigger(.manualRetry)
+        await coordinator.waitUntilIdle()
+
+        let started = await probe.started
+        let published = await probe.published
+        XCTAssertEqual(started, [1, 2])
+        XCTAssertEqual(published, [2])
+    }
+
+    func testReplicaSyncCoordinatorCoalescesHintsIntoOneFollowUpPass() async throws {
+        let probe = ReplicaCoordinatorProbe()
+        let coordinator = ReplicaSyncCoordinator { generation in
+            await probe.start(generation)
+            try? await Task.sleep(for: .milliseconds(20))
+            await probe.publish(generation)
+        }
+
+        await coordinator.trigger(.foreground)
+        try await Task.sleep(for: .milliseconds(2))
+        await coordinator.trigger(.hint)
+        await coordinator.trigger(.socketReconnect)
+        await coordinator.trigger(.push)
+        await coordinator.waitUntilIdle()
+
+        let started = await probe.started
+        XCTAssertEqual(started, [1, 2])
+    }
+
+    func testReplicaProbeDeadlineDoesNotWaitForCancellationInsensitiveWork() async {
+        let startedAt = Date()
+        let result = await ReplicaDeadline.run(for: .milliseconds(10)) {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
+                    continuation.resume(returning: 7)
+                }
+            }
+        }
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        if case .timedOut = result {
+            // Expected.
+        } else {
+            XCTFail("The initial probe should time out independently of the old operation")
+        }
+        XCTAssertLessThan(elapsed, 0.1)
+    }
+
+    func testMediaPrefetchSchedulerDrainsMoreThanSixJobsAndUsesWifiConcurrency() async {
+        let probe = MediaPrefetchProbe(remaining: 17)
+        let scheduler = MediaPrefetchScheduler { lane in await probe.perform(lane) }
+
+        await scheduler.update(networkClass: .wifi, foregrounded: true)
+        await scheduler.waitUntilIdle()
+
+        let processed = await probe.processed
+        let maximumConcurrent = await probe.maximumConcurrent
+        let lanes = await probe.laneCounts
+        XCTAssertEqual(processed, 17)
+        XCTAssertEqual(maximumConcurrent, 3)
+        XCTAssertGreaterThan(lanes[.fullMedia, default: 0], 0)
+        XCTAssertGreaterThan(lanes[.thumbnail, default: 0], 0)
+    }
+
+    func testMediaPrefetchSchedulerWaitsOfflineAndResumesOnRecovery() async throws {
+        let probe = MediaPrefetchProbe(remaining: 4)
+        let scheduler = MediaPrefetchScheduler { lane in await probe.perform(lane) }
+
+        await scheduler.update(networkClass: .offline, foregrounded: true)
+        await scheduler.wake()
+        try await Task.sleep(for: .milliseconds(20))
+        let offlineProcessed = await probe.processed
+        XCTAssertEqual(offlineProcessed, 0)
+
+        await scheduler.update(networkClass: .cellular, foregrounded: true)
+        await scheduler.waitUntilIdle()
+        let recoveredProcessed = await probe.processed
+        let maximumConcurrent = await probe.maximumConcurrent
+        XCTAssertEqual(recoveredProcessed, 4)
+        XCTAssertLessThanOrEqual(maximumConcurrent, 2)
+    }
+
+    @MainActor
+    func testDecodedMediaRequestsCoalesceAndRemainMemoryCached() async throws {
+        let cache = MediaPresentationCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(
+            size: CGSize(width: 24, height: 16), format: format
+        ).image { context in
+            UIColor.systemIndigo.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 24, height: 16))
+        }
+        let decoded = SafeDecodedImage(image: image, pixelWidth: 24, pixelHeight: 16)
+        let producer = DecodedMediaProducer(decoded: decoded)
+        let key = MediaPresentationKey(mediaId: UUID().uuidString, variant: .bubble720)
+
+        async let first = cache.image(for: key) { await producer.produce() }
+        async let second = cache.image(for: key) { await producer.produce() }
+        let images = await (first, second)
+
+        XCTAssertNotNil(images.0)
+        XCTAssertNotNil(images.1)
+        let coalescedCount = await producer.count
+        XCTAssertEqual(coalescedCount, 1)
+        let cachedImage = await cache.image(for: key) { await producer.produce() }
+        let cachedCount = await producer.count
+        XCTAssertNotNil(cachedImage)
+        XCTAssertEqual(cachedCount, 1)
+    }
+
+    @MainActor
+    func testPreparedVideoDescriptorIsReusedOnceAndClearedWithItsMedia() {
+        let cache = MediaPresentationCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: URL(string: "https://media.invalid")!)
+        )
+        let media = CloudMedia(
+            id: UUID().uuidString,
+            kind: "video",
+            contentType: "video/mp4",
+            fileName: "cached.mp4",
+            byteSize: 1_024,
+            durationMs: 1_000,
+            width: 320,
+            height: 180,
+            hasThumbnail: true
+        )
+        let prepared = engine.makeStreamingAsset(
+            media: media,
+            token: "test-token",
+            startsAccessImmediately: false
+        )
+
+        cache.storePreparedVideoAsset(prepared, mediaId: media.id)
+        XCTAssertTrue(cache.hasPreparedVideoAsset(mediaId: media.id))
+        XCTAssertTrue(cache.takePreparedVideoAsset(mediaId: media.id) === prepared)
+        XCTAssertFalse(cache.hasPreparedVideoAsset(mediaId: media.id))
+
+        cache.storePreparedVideoAsset(prepared, mediaId: media.id)
+        cache.invalidate(mediaIds: [media.id])
+        XCTAssertFalse(cache.hasPreparedVideoAsset(mediaId: media.id))
+    }
+
+    @MainActor
+    func testProductionChatOpensNewestEncryptedWindowAtBottom() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("latest-window-test-key".utf8)
+        )
+        let dialogId = "dialog-latest-window"
+        let messages = (1...130).map { msgId in
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: Int64(msgId),
+                senderAccountId: "peer-account",
+                clientMsgId: "client-\(msgId)",
+                kind: "text",
+                text: "message \(msgId)",
+                editVersion: 0,
+                state: "visible",
+                serverTs: String(format: "2026-07-18T00:%02d:%02dZ", (msgId / 60) % 60, msgId % 60)
+            )
+        }
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: messages,
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        let model = CloudAppModel(
+            localStore: store,
+            useDefaultLocalStore: false
+        )
+
+        await model.selectDialog(dialogId)
+
+        XCTAssertEqual(model.openingTimelineAnchor, .bottom)
+        XCTAssertEqual(model.lines.count, TimelineWindow.initialLimit)
+        XCTAssertEqual(model.lines.first?.msgId, 11)
+        XCTAssertEqual(model.lines.last?.msgId, 130)
+        model.deselectDialog(dialogId)
+    }
+
     func testVoiceRecorderCreatesProtectedDestinationBeforeAudioRecorderStarts() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "toj-voice-recorder-test-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -73,6 +397,18 @@ final class MessagingPresentationTests: XCTestCase {
             XCTAssertFalse(action.title.isEmpty)
             XCTAssertFalse(action.systemImage.isEmpty)
         }
+    }
+
+    func testChatListPreviewKindMapsMessageMediaPrecisely() {
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "text"), .text)
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "photo"), .photo)
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "video"), .video)
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "voice"), .voice)
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "document"), .file)
+        XCTAssertEqual(ChatListPreviewKind(messageKind: "unexpected"), .attachment)
+        XCTAssertEqual(DemoAttachment.video(name: "Clip", duration: "0:08").chatListPreviewKind, .video)
+        XCTAssertNil(ChatListPreviewKind.text.systemImage)
+        XCTAssertFalse(ChatListPreviewKind.photo.title.isEmpty)
     }
 
     @MainActor
@@ -230,7 +566,7 @@ final class MessagingPresentationTests: XCTestCase {
             ComposerViewState(mode: .text, text: "Hello", canSend: true)
         )
         XCTAssertNotEqual(
-            ConversationViewState(phase: .content, connection: .connected, unreadBelow: 0),
+            ConversationViewState(phase: .content, connection: .live, unreadBelow: 0),
             ConversationViewState(phase: .partial(message: "Offline"), connection: .offline, unreadBelow: 2)
         )
     }
@@ -377,6 +713,32 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(model.lines.first(where: { $0.id == outgoing.id })?.isEdited, true)
         XCTAssertEqual(model.composerMode, .text)
     }
+
+    func testTimelinePresentationIsPrecomputedWithStableGrouping() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-16T12:00:00Z"))
+        let result = TimelinePresentationBuilder.build(
+            [
+                TimelinePresentationInput(id: "1", mine: true, timestamp: "2026-07-15T20:00:00Z"),
+                TimelinePresentationInput(id: "2", mine: true, timestamp: "2026-07-16T10:00:00Z"),
+                TimelinePresentationInput(id: "3", mine: true, timestamp: "2026-07-16T10:03:00Z"),
+                TimelinePresentationInput(id: "4", mine: false, timestamp: "2026-07-16T10:04:00Z"),
+            ],
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(result.map(\.id), ["1", "2", "3", "4"])
+        XCTAssertEqual(result[0].dayLabel, "Yesterday")
+        XCTAssertEqual(result[1].dayLabel, "Today")
+        XCTAssertTrue(result[1].isFirstInGroup)
+        XCTAssertFalse(result[1].isLastInGroup)
+        XCTAssertFalse(result[2].isFirstInGroup)
+        XCTAssertTrue(result[2].isLastInGroup)
+        XCTAssertTrue(result[3].isFirstInGroup)
+        XCTAssertNotNil(result[3].timestampLabel)
+    }
 }
 
 private actor MediaSchedulerProbe {
@@ -398,5 +760,70 @@ private actor MediaSchedulerProbe {
     func acknowledge(_ partIndex: Int, bytes: Int64) {
         guard bytes == Int64(partIndex + 1) else { return }
         acknowledged.append(partIndex)
+    }
+}
+
+private actor MediaPrefetchProbe {
+    private var remaining: Int
+    private var active = 0
+    private(set) var processed = 0
+    private(set) var maximumConcurrent = 0
+    private(set) var laneCounts: [MediaPrefetchLane: Int] = [:]
+
+    init(remaining: Int) {
+        self.remaining = remaining
+    }
+
+    func perform(_ lane: MediaPrefetchLane) async -> Bool {
+        guard remaining > 0 else { return false }
+        remaining -= 1
+        processed += 1
+        laneCounts[lane, default: 0] += 1
+        active += 1
+        maximumConcurrent = max(maximumConcurrent, active)
+        try? await Task.sleep(for: .milliseconds(5))
+        active -= 1
+        return true
+    }
+}
+
+private actor DecodedMediaProducer {
+    private let decoded: SafeDecodedImage
+    private(set) var count = 0
+
+    init(decoded: SafeDecodedImage) {
+        self.decoded = decoded
+    }
+
+    func produce() async -> SafeDecodedImage? {
+        count += 1
+        try? await Task.sleep(for: .milliseconds(20))
+        return decoded
+    }
+}
+
+private actor ReplicaCoordinatorProbe {
+    private(set) var started: [UInt64] = []
+    private(set) var published: [UInt64] = []
+
+    func start(_ generation: UInt64) {
+        started.append(generation)
+    }
+
+    func publish(_ generation: UInt64) {
+        published.append(generation)
+    }
+}
+
+private actor ReplicaCoordinatorHolder {
+    private var coordinator: ReplicaSyncCoordinator?
+
+    func install(_ coordinator: ReplicaSyncCoordinator) {
+        self.coordinator = coordinator
+    }
+
+    func isCurrent(_ generation: UInt64) async -> Bool {
+        guard let coordinator else { return false }
+        return await coordinator.isCurrent(generation)
     }
 }

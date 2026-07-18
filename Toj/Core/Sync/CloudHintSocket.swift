@@ -23,12 +23,16 @@ actor CloudHintSocket {
 
     private let hintsContinuation: AsyncStream<SyncHint>.Continuation
     nonisolated let hints: AsyncStream<SyncHint>
+    private let statesContinuation: AsyncStream<State>.Continuation
+    nonisolated let states: AsyncStream<State>
 
     init(url: URL, token: String, session: URLSession = URLSession(configuration: .ephemeral)) {
         self.url = url
         self.token = token
         self.session = session
         (hints, hintsContinuation) = AsyncStream.makeStream(of: SyncHint.self)
+        (states, statesContinuation) = AsyncStream.makeStream(of: State.self)
+        statesContinuation.yield(.disconnected)
     }
 
     func start() {
@@ -41,7 +45,7 @@ actor CloudHintSocket {
         runLoop = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
-        state = .disconnected
+        setState(.disconnected)
     }
 
     private func run() async {
@@ -50,15 +54,26 @@ actor CloudHintSocket {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             let task = session.webSocketTask(with: request)
             self.task = task
-            state = .connecting
+            setState(.connecting)
             task.resume()
             do {
-                try await receiveLoop(on: task)
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { [weak self, task] in
+                        guard let self else { return }
+                        try await self.receiveLoop(on: task)
+                    }
+                    group.addTask { [weak self, task] in
+                        guard let self else { return }
+                        try await self.heartbeatLoop(on: task)
+                    }
+                    _ = try await group.next()
+                    group.cancelAll()
+                }
             } catch {
                 // Reconnect below.
             }
             task.cancel(with: .abnormalClosure, reason: nil)
-            state = .disconnected
+            setState(.disconnected)
             guard !Task.isCancelled else { return }
             let delay = backoff.nextDelay()
             try? await Task.sleep(for: .seconds(delay))
@@ -66,13 +81,45 @@ actor CloudHintSocket {
     }
 
     private func receiveLoop(on task: URLSessionWebSocketTask) async throws {
-        state = .connected
+        setState(.connected)
         while !Task.isCancelled {
             let message = try await task.receive()
             backoff.reset()
             guard let hint = Self.hint(from: message), hint.type == "sync_hint" else { continue }
             hintsContinuation.yield(hint)
         }
+    }
+
+    private func heartbeatLoop(on task: URLSessionWebSocketTask) async throws {
+        while !Task.isCancelled {
+            try await Task.sleep(for: .seconds(25))
+            try Task.checkCancellation()
+            try await Self.awaitPong(on: task)
+        }
+    }
+
+    private nonisolated static func awaitPong(on task: URLSessionWebSocketTask) async throws {
+        let stream = AsyncThrowingStream<Void, Error> { continuation in
+            task.sendPing { error in
+                if let error { continuation.finish(throwing: error) }
+                else { continuation.finish() }
+            }
+            Task {
+                do {
+                    try await Task.sleep(for: .seconds(10))
+                    continuation.finish(throwing: URLError(.timedOut))
+                } catch {
+                    // The stream already completed or its parent was cancelled.
+                }
+            }
+        }
+        for try await _ in stream {}
+    }
+
+    private func setState(_ next: State) {
+        guard state != next else { return }
+        state = next
+        statesContinuation.yield(next)
     }
 
     private nonisolated static func hint(from message: URLSessionWebSocketTask.Message) -> SyncHint? {

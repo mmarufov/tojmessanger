@@ -33,8 +33,13 @@ struct TojConversationExperience: View {
     @State private var detailsLine: CloudAppModel.Line?
     @State private var deleteLine: CloudAppModel.Line?
     @State private var reactionLine: CloudAppModel.Line?
-    @State private var initialUnreadCount = 0
     @State private var isAtBottom = true
+    @State private var shouldFollowLatest = true
+    @State private var didApplyOpeningAnchor = false
+    @State private var openingUnreadMsgId: Int64?
+    @State private var visibleTimelineTargets: [TimelineTargetID] = []
+    @State private var timelinePosition = ScrollPosition(idType: TimelineTargetID.self)
+    @State private var timelineScrollPhase: ScrollPhase = .idle
     @State private var voiceFingerDown = false
     @State private var voiceLocked = false
     @State private var voiceCancelled = false
@@ -61,11 +66,23 @@ struct TojConversationExperience: View {
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
+        .accessibilityIdentifier("conversation-\(dialogId)")
         .task(id: dialogId) {
-            initialUnreadCount = model.dialogs.first(where: { $0.id == dialogId })?.unreadCount ?? 0
+            didApplyOpeningAnchor = false
+            isAtBottom = true
+            shouldFollowLatest = true
+            openingUnreadMsgId = nil
+            visibleTimelineTargets = []
+            timelinePosition = ScrollPosition(idType: TimelineTargetID.self)
             await model.selectDialog(dialogId)
+            guard !Task.isCancelled, model.activeDialogId == dialogId else { return }
+            refreshOpeningUnreadDivider(for: model.openingTimelineAnchor)
+            applyOpeningTimelineAnchor()
         }
-        .onDisappear { model.deselectDialog(dialogId) }
+        .onDisappear {
+            publishTimelineViewport()
+            Task { await model.flushAndDeselectDialog(dialogId) }
+        }
         .sheet(isPresented: $showingProfile) {
             TojPeerProfileView(model: model, dialogId: dialogId) {
                 showingProfile = false
@@ -79,14 +96,24 @@ struct TojConversationExperience: View {
             #if DEBUG
                 if model.isDemoMode {
                     DemoAttachmentPicker { attachment in
+                        shouldFollowLatest = true
                         model.sendDemoAttachment(attachment)
                         showingAttachments = false
+                        scrollToLatest()
                     }
                 } else {
-                    ProductionAttachmentPicker(model: model) { showingAttachments = false }
+                    ProductionAttachmentPicker(
+                        model: model,
+                        onDone: { showingAttachments = false },
+                        onSent: { followUserSendToLatest() }
+                    )
                 }
             #else
-                ProductionAttachmentPicker(model: model) { showingAttachments = false }
+                ProductionAttachmentPicker(
+                    model: model,
+                    onDone: { showingAttachments = false },
+                    onSent: { followUserSendToLatest() }
+                )
             #endif
             }
             .presentationDetents([.fraction(0.72), .large])
@@ -106,7 +133,10 @@ struct TojConversationExperience: View {
             .presentationDragIndicator(.visible)
         }
         .fullScreenCover(isPresented: $showingCall) {
-            TojDemoCallView(peerName: model.dialogTitle(dialogId))
+            TojDemoCallView(
+                peerName: model.dialogTitle(dialogId),
+                colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex
+            )
         }
         .alert("Delete message?", isPresented: Binding(
             get: { deleteLine != nil },
@@ -189,16 +219,29 @@ struct TojConversationExperience: View {
                 .accessibilityLabel("Back")
                 .accessibilityValue(othersUnreadCount > 0 ? "\(othersUnreadCount) unread in other chats" : "")
 
-                Button { showingProfile = model.capabilities.contains(.profiles) } label: {
-                    VStack(spacing: 1) {
-                        Text(model.dialogTitle(dialogId))
-                            .font(TojTheme.heading(.headline, weight: .semibold))
-                            .foregroundStyle(TojTheme.text)
-                            .lineLimit(1)
-                        Text(headerSubtitle)
-                            .font(.system(size: 12.5))
-                            .foregroundStyle(headerSubtitleColor)
-                            .lineLimit(1)
+                Button {
+                    if model.replicaSyncState.showsRetry {
+                        model.retryReplicaSync()
+                    } else {
+                        showingProfile = model.capabilities.contains(.profiles)
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        VStack(spacing: 1) {
+                            Text(model.dialogTitle(dialogId))
+                                .font(TojTheme.heading(.headline, weight: .semibold))
+                                .foregroundStyle(TojTheme.text)
+                                .lineLimit(1)
+                            Text(headerSubtitle)
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(headerSubtitleColor)
+                                .lineLimit(1)
+                        }
+                        if model.replicaSyncState.showsRetry {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(TojTheme.gold)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .frame(height: 46)
@@ -206,11 +249,22 @@ struct TojConversationExperience: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .tojGlass(in: Capsule(), interactive: model.capabilities.contains(.profiles))
-                .accessibilityHint(model.capabilities.contains(.profiles) ? "Opens contact and privacy details" : "Connection status")
+                .tojGlass(
+                    in: Capsule(),
+                    interactive: model.capabilities.contains(.profiles) || model.replicaSyncState.showsRetry
+                )
+                .accessibilityHint(
+                    model.replicaSyncState.showsRetry
+                        ? "Checks for new messages again"
+                        : (model.capabilities.contains(.profiles) ? "Opens contact and privacy details" : "Connection status")
+                )
 
                 Button { showingProfile = model.capabilities.contains(.profiles) } label: {
-                    TojAvatar(title: model.dialogTitle(dialogId), size: 46)
+                    TojAvatar(
+                        title: model.dialogTitle(dialogId),
+                        size: 46,
+                        colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex
+                    )
                 }
                 .buttonStyle(.tojPressable)
                 .disabled(!model.capabilities.contains(.profiles))
@@ -226,120 +280,212 @@ struct TojConversationExperience: View {
         }
     }
 
+    /// This count comes from the durable dialog summary, so messages beyond the rendered window
+    /// still appear in the jump-to-latest badge.
+    private var durableUnreadCount: Int {
+        model.dialogs.first(where: { $0.id == dialogId })?.unreadCount ?? 0
+    }
+
     private var isPeerTyping: Bool {
         model.dialogs.first(where: { $0.id == dialogId })?.isTyping ?? false
     }
 
     /// Telegram grammar: the subtitle is presence; connection trouble takes its place when relevant.
     private var headerSubtitle: String {
-        switch model.connectionViewState {
-        case .connected:
+        switch model.replicaSyncState {
+        case .ready:
             isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
-        case .connecting, .offline:
-            model.connectionViewState.title
+        case .checking, .updating, .offline, .connectionSlow, .serverUnavailable,
+             .sessionExpired, .protocolFailure, .localFailure, .configurationError:
+            model.replicaSyncState.title
         }
     }
 
     private var headerSubtitleColor: Color {
-        switch model.connectionViewState {
-        case .connected: isPeerTyping ? TojTheme.gold : TojTheme.secondaryText
-        case .connecting: TojTheme.secondaryText
-        case .offline: .orange
+        switch model.replicaSyncState {
+        case .ready: isPeerTyping ? TojTheme.gold : TojTheme.secondaryText
+        case .checking, .updating, .connectionSlow: TojTheme.secondaryText
+        case .offline, .serverUnavailable, .sessionExpired, .protocolFailure,
+             .localFailure, .configurationError: .orange
         }
     }
 
     private var messageTimeline: some View {
-        ScrollViewReader { proxy in
-            ZStack(alignment: .bottomTrailing) {
-                ScrollView {
-                    LazyVStack(spacing: 3) {
-                        timelinePill(Text("Private conversation"), icon: "lock.fill")
-                            .padding(.vertical, 8)
+        ZStack(alignment: .bottomTrailing) {
+            ScrollView {
+                LazyVStack(spacing: 3) {
+                    timelinePill(Text("Private conversation"), icon: "lock.fill")
+                        .padding(.vertical, 8)
 
-                        if model.canLoadEarlier {
-                            Button {
-                                Task { await model.loadEarlier() }
-                            } label: {
-                                Label(model.loadingEarlier ? "Loading" : "Earlier messages", systemImage: "arrow.up")
-                                    .font(.caption.weight(.medium))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 8)
-                            }
-                            .buttonStyle(.glass)
-                            .disabled(model.loadingEarlier)
-                            .padding(.bottom, 6)
+                    if model.lines.isEmpty {
+                        conversationLocalPlaceholder
+                    }
+
+                    if model.canLoadEarlier {
+                        Button {
+                            loadEarlierPreservingPosition()
+                        } label: {
+                            Label(model.loadingEarlier ? "Loading" : "Earlier messages", systemImage: "arrow.up")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
                         }
+                        .buttonStyle(.glass)
+                        .disabled(model.loadingEarlier)
+                        .padding(.bottom, 6)
+                    }
 
-                        ForEach(Array(model.lines.enumerated()), id: \.element.id) { index, line in
-                            if let dayLabel = dayHeaderLabel(at: index) {
+                    ForEach(timelineItems) { item in
+                        VStack(spacing: 3) {
+                            if let dayLabel = item.dayLabel {
                                 timelinePill(Text(verbatim: dayLabel))
                                     .padding(.vertical, 7)
                             }
-                            if shouldShowUnreadDivider(at: index) {
+                            if item.showsUnreadDivider {
                                 unreadDivider
                             }
                             TojMessageBubble(
                                 model: model,
-                                line: line,
-                                isLastInGroup: isLastInGroup(at: index),
-                                actions: model.actions(for: line),
-                                onAction: { perform($0, on: line) },
-                                onSwipeReply: { model.beginReply(to: line); composerFocused = true }
+                                line: item.line,
+                                isLastInGroup: item.isLastInGroup,
+                                actions: model.actions(for: item.line),
+                                onAction: { perform($0, on: item.line) },
+                                onSwipeReply: { model.beginReply(to: item.line); composerFocused = true }
                             )
-                            .padding(.top, isFirstInGroup(at: index) ? 5 : 0)
-                            .id(line.id)
-                            .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97, anchor: line.mine ? .bottomTrailing : .bottomLeading)))
+                            .padding(.top, item.isFirstInGroup ? 5 : 0)
                         }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id("timeline-bottom")
-                            .onAppear { isAtBottom = true }
-                            .onDisappear { isAtBottom = false }
+                        .id(item.id)
+                        .transition(
+                            reduceMotion
+                                ? .opacity
+                                : .opacity.combined(with: .scale(
+                                    scale: 0.97,
+                                    anchor: item.line.mine ? .bottomTrailing : .bottomLeading
+                                ))
+                        )
                     }
-                    .padding(.top, 62)
-                    .padding(.horizontal, 10)
-                    .padding(.bottom, 10)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .defaultScrollAnchor(.bottom)
-                .environment(autoplayCoordinator)
-                .environment(networkMonitor)
-                .onChange(of: model.lines.count) { _, _ in
-                    guard isAtBottom else { return }
-                    scrollToLatest(proxy)
-                }
-                .task {
-                    try? await Task.sleep(for: .milliseconds(80))
-                    scrollToLatest(proxy, animated: false, clearUnread: false)
-                }
 
-                if !isAtBottom {
-                    Button {
-                        scrollToLatest(proxy)
-                    } label: {
-                        ZStack(alignment: .topTrailing) {
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 16, weight: .bold))
-                                .frame(width: 46, height: 46)
-                            if initialUnreadCount > 0 {
-                                Text(initialUnreadCount > 99 ? "99+" : "\(initialUnreadCount)")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .foregroundStyle(TojTheme.onAccent)
-                                    .padding(.horizontal, 5)
-                                    .frame(minWidth: 18, minHeight: 18)
-                                    .background(TojTheme.accent, in: Capsule())
-                                    .offset(x: 5, y: -4)
-                            }
-                        }
+                    if model.loadingLater {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.vertical, 8)
                     }
-                    .buttonStyle(.glass)
-                    .padding(14)
-                    .transition(.opacity)
-                    .accessibilityLabel("Jump to latest message")
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id(TimelineTargetID.bottom)
+                }
+                .scrollTargetLayout()
+                .padding(.top, 62)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 10)
+            }
+            .scrollPosition($timelinePosition, anchor: .top)
+            .scrollDismissesKeyboard(.interactively)
+            .defaultScrollAnchor(.bottom)
+            .environment(autoplayCoordinator)
+            .environment(networkMonitor)
+            .onScrollTargetVisibilityChange(idType: TimelineTargetID.self, threshold: 0.1) {
+                updateTimelineVisibility($0)
+            }
+            .onScrollPhaseChange { oldPhase, newPhase in
+                updateTimelineScrollPhase(from: oldPhase, to: newPhase)
+            }
+            .onChange(of: timelineLineIDs) { oldIDs, newIDs in
+                if didApplyOpeningAnchor {
+                    handleTimelineLineIDsChange(from: oldIDs, to: newIDs)
+                } else {
+                    applyOpeningTimelineAnchor()
                 }
             }
+            .onChange(of: model.openingTimelineAnchor) { _, anchor in
+                refreshOpeningUnreadDivider(for: anchor)
+                didApplyOpeningAnchor = false
+                applyOpeningTimelineAnchor()
+            }
+
+            if !isAtBottom {
+                Button {
+                    didApplyOpeningAnchor = true
+                    shouldFollowLatest = true
+                    Task {
+                        await model.jumpToLatest(dialogId)
+                        guard model.activeDialogId == dialogId else { return }
+                        scrollToLatest()
+                    }
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 16, weight: .bold))
+                            .frame(width: 46, height: 46)
+                        if durableUnreadCount > 0 {
+                            Text(durableUnreadCount > 99 ? "99+" : "\(durableUnreadCount)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundStyle(TojTheme.onAccent)
+                                .padding(.horizontal, 5)
+                                .frame(minWidth: 18, minHeight: 18)
+                                .background(TojTheme.accent, in: Capsule())
+                                .offset(x: 5, y: -4)
+                        }
+                    }
+                }
+                .buttonStyle(.glass)
+                .padding(14)
+                .transition(.opacity)
+                .accessibilityLabel("Jump to latest message")
+            }
         }
+    }
+
+    @ViewBuilder
+    private var conversationLocalPlaceholder: some View {
+        switch model.conversationOpenState {
+        case .loadingLocal, .cached:
+            savedMessageSkeleton
+                .accessibilityLabel("Loading saved messages")
+        case .empty, .ready:
+            VStack(spacing: 7) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 22, weight: .medium))
+                Text("No messages yet")
+                    .font(.subheadline.weight(.semibold))
+                Text("Messages you send will appear here and stay available offline.")
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+            }
+            .foregroundStyle(TojTheme.secondaryText)
+            .padding(.top, 36)
+            .padding(.horizontal, 32)
+        case .failedLocal:
+            VStack(spacing: 10) {
+                Label("Saved messages could not be opened", systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.subheadline.weight(.semibold))
+                Button("Try saved copy again") { model.retryConversationLocalLoad() }
+                    .buttonStyle(.glass)
+            }
+            .foregroundStyle(TojTheme.secondaryText)
+            .padding(.top, 32)
+        }
+    }
+
+    private var savedMessageSkeleton: some View {
+        VStack(spacing: 9) {
+            skeletonBubble(width: 0.62, alignment: .leading)
+            skeletonBubble(width: 0.48, alignment: .trailing)
+            skeletonBubble(width: 0.74, alignment: .leading)
+        }
+        .padding(.top, 14)
+        .redacted(reason: .placeholder)
+    }
+
+    private func skeletonBubble(width: CGFloat, alignment: Alignment) -> some View {
+        GeometryReader { proxy in
+            RoundedRectangle(cornerRadius: 17, style: .continuous)
+                .fill(TojTheme.raised.opacity(0.72))
+                .frame(width: proxy.size.width * width, height: 50)
+                .frame(maxWidth: .infinity, alignment: alignment)
+        }
+        .frame(height: 50)
     }
 
     private var unreadDivider: some View {
@@ -352,10 +498,6 @@ struct TojConversationExperience: View {
         }
         .accessibilityLabel("Start of unread messages")
         .padding(.vertical, 7)
-    }
-
-    private func shouldShowUnreadDivider(at index: Int) -> Bool {
-        initialUnreadCount > 0 && index == max(0, model.lines.count - initialUnreadCount)
     }
 
     /// Telegram's centered timeline capsule — date separators and system notes share it.
@@ -374,32 +516,16 @@ struct TojConversationExperience: View {
         .background(Color.white.opacity(0.07), in: Capsule())
     }
 
-    /// Pending sends have no server timestamp yet — treat them as "now" for grouping.
-    private func lineDate(_ line: CloudAppModel.Line) -> Date {
-        line.timestamp.flatMap(TojDateFormatting.date) ?? .now
-    }
-
-    private func inSameGroup(_ earlier: CloudAppModel.Line, _ later: CloudAppModel.Line) -> Bool {
-        guard earlier.mine == later.mine else { return false }
-        let first = lineDate(earlier)
-        let second = lineDate(later)
-        return abs(second.timeIntervalSince(first)) < 360
-            && Calendar.current.isDate(first, inSameDayAs: second)
-    }
-
-    private func isFirstInGroup(at index: Int) -> Bool {
-        index == 0 || !inSameGroup(model.lines[index - 1], model.lines[index])
-    }
-
-    private func isLastInGroup(at index: Int) -> Bool {
-        index == model.lines.count - 1 || !inSameGroup(model.lines[index], model.lines[index + 1])
-    }
-
-    private func dayHeaderLabel(at index: Int) -> String? {
-        let day = lineDate(model.lines[index])
-        if index == 0 { return TojDateFormatting.dayHeader(day) }
-        let previous = lineDate(model.lines[index - 1])
-        return Calendar.current.isDate(day, inSameDayAs: previous) ? nil : TojDateFormatting.dayHeader(day)
+    private var timelineItems: [TimelinePresentationItem] {
+        model.lines.map { line in
+            return TimelinePresentationItem(
+                line: line,
+                dayLabel: line.presentationDayLabel,
+                showsUnreadDivider: line.msgId == openingUnreadMsgId,
+                isFirstInGroup: line.presentationIsFirstInGroup,
+                isLastInGroup: line.presentationIsLastInGroup
+            )
+        }
     }
 
     /// Telegram's bottom bar grammar: three floating Liquid Glass elements — attach circle,
@@ -538,7 +664,7 @@ struct TojConversationExperience: View {
                 .accessibilityLabel("Cancel voice message")
                 Button {
                     voiceLocked = false
-                    Task { await model.finishVoiceRecording(); TojFeedback.sent() }
+                    Task { await finishVoiceRecordingAndFollowLatest() }
                 } label: {
                     Image(systemName: "paperplane.fill")
                         .font(.system(size: 17, weight: .semibold))
@@ -587,7 +713,7 @@ struct TojConversationExperience: View {
                 await model.beginVoiceRecording()
                 guard !Task.isCancelled else { return }
                 if !voiceFingerDown, !voiceLocked, !voiceCancelled, model.composerMode.isRecording {
-                    await model.finishVoiceRecording()
+                    await finishVoiceRecordingAndFollowLatest()
                 }
             }
         }
@@ -612,14 +738,31 @@ struct TojConversationExperience: View {
         guard !voiceCancelled else { voiceCancelled = false; return }
         guard !voiceLocked else { return }
         if model.composerMode.isRecording {
-            Task { await model.finishVoiceRecording(); TojFeedback.sent() }
+            Task { await finishVoiceRecordingAndFollowLatest() }
         }
     }
 
     private func send() {
         guard canSend else { return }
         TojFeedback.sent()
-        Task { await model.sendDraft() }
+        let shouldFollowSend = !model.composerMode.isEditing
+        if shouldFollowSend { shouldFollowLatest = true }
+        Task {
+            await model.sendDraft()
+            if shouldFollowSend { scrollToLatest() }
+        }
+    }
+
+    private func finishVoiceRecordingAndFollowLatest() async {
+        shouldFollowLatest = true
+        await model.finishVoiceRecording()
+        TojFeedback.sent()
+        scrollToLatest()
+    }
+
+    private func followUserSendToLatest() {
+        shouldFollowLatest = true
+        scrollToLatest()
     }
 
     private func perform(_ action: MessageAction, on line: CloudAppModel.Line) {
@@ -647,16 +790,173 @@ struct TojConversationExperience: View {
         }
     }
 
-    private func scrollToLatest(_ proxy: ScrollViewProxy, animated: Bool = true, clearUnread: Bool = true) {
-        let action = { proxy.scrollTo("timeline-bottom", anchor: .bottom) }
+    private var timelineLineIDs: [String] {
+        model.lines.map(\.id)
+    }
+
+    private var visibleTimelineLineIDs: [String] {
+        let currentLineIDs = Set(timelineLineIDs)
+        return visibleTimelineTargets.compactMap { target in
+            guard case let .message(lineID) = target, currentLineIDs.contains(lineID) else {
+                return nil
+            }
+            return lineID
+        }
+    }
+
+    private func applyOpeningTimelineAnchor() {
+        guard model.activeDialogId == dialogId else { return }
+        switch model.openingTimelineAnchor {
+        case let .provisionalFirstUnread(msgId), let .firstUnread(msgId), let .saved(msgId):
+            guard let line = model.lines.first(where: { $0.msgId == msgId }) else {
+                // A sparse first bootstrap page may not contain this semantic target yet. Keep
+                // rendering the cached recent page while the model hydrates around the anchor.
+                shouldFollowLatest = false
+                isAtBottom = false
+                return
+            }
+            didApplyOpeningAnchor = true
+            shouldFollowLatest = false
+            isAtBottom = false
+            timelinePosition.scrollTo(id: TimelineTargetID.message(line.id), anchor: .top)
+        case .bottom:
+            guard !model.lines.isEmpty else {
+                // SwiftUI cannot resolve the bottom sentinel before the first local rows exist.
+                // Keep the command pending; the line-ID change will apply it after layout targets
+                // are present instead of marking an empty scroll as complete.
+                didApplyOpeningAnchor = false
+                shouldFollowLatest = true
+                isAtBottom = true
+                return
+            }
+            didApplyOpeningAnchor = true
+            scrollToLatest(animated: false, clearUnread: false)
+        }
+    }
+
+    private func refreshOpeningUnreadDivider(for anchor: TimelineAnchor) {
+        if case let .firstUnread(msgId) = anchor {
+            openingUnreadMsgId = msgId
+        } else {
+            openingUnreadMsgId = nil
+        }
+    }
+
+    private func loadEarlierPreservingPosition() {
+        let existingLineIDs = timelineLineIDs
+        let visibleAnchor = visibleTimelineTargets.first { target in
+            if case .message = target { return true }
+            return false
+        }
+        let positionAnchor = timelinePosition.viewID(type: TimelineTargetID.self).flatMap { target in
+            if case .message = target { return target }
+            return nil
+        }
+        let preservedAnchor = positionAnchor ?? visibleAnchor
+        shouldFollowLatest = false
+        Task {
+            await model.loadEarlier()
+            guard existingLineIDs != timelineLineIDs,
+                  let preservedAnchor,
+                  timelinePosition.viewID(type: TimelineTargetID.self) != preservedAnchor else {
+                return
+            }
+            timelinePosition.scrollTo(id: preservedAnchor, anchor: .top)
+        }
+    }
+
+    private func handleTimelineLineIDsChange(from oldIDs: [String], to newIDs: [String]) {
+        guard didApplyOpeningAnchor else { return }
+        if !shouldFollowLatest {
+            return
+        }
+        guard TimelineScrollBehavior.addedMessagesWereAppended(
+            oldIDs: oldIDs,
+            newIDs: newIDs
+        ) else { return }
+        scrollToLatest()
+    }
+
+    private func updateTimelineVisibility(_ targets: [TimelineTargetID]) {
+        visibleTimelineTargets = targets
+        guard didApplyOpeningAnchor else { return }
+        let renderedBottomIsVisible = targets.contains(.bottom)
+        if renderedBottomIsVisible, model.canLoadLater, !model.loadingLater {
+            shouldFollowLatest = false
+            isAtBottom = false
+            Task { await model.loadLater() }
+        }
+        let bottomIsVisible = renderedBottomIsVisible && !model.canLoadLater
+        isAtBottom = bottomIsVisible
+        if bottomIsVisible {
+            shouldFollowLatest = true
+        } else if timelineScrollPhase == .tracking
+                    || timelineScrollPhase == .interacting
+                    || timelineScrollPhase == .decelerating {
+            shouldFollowLatest = false
+        }
+        publishTimelineViewport()
+    }
+
+    private func updateTimelineScrollPhase(from oldPhase: ScrollPhase, to newPhase: ScrollPhase) {
+        timelineScrollPhase = newPhase
+        guard didApplyOpeningAnchor, newPhase == .idle else { return }
+        if !isAtBottom, oldPhase != .idle, oldPhase != .animating {
+            shouldFollowLatest = false
+        }
+        publishTimelineViewport()
+    }
+
+    private func publishTimelineViewport() {
+        guard didApplyOpeningAnchor, model.activeDialogId == dialogId else { return }
+        model.updateTimelineViewport(
+            dialogId: dialogId,
+            visibleLineIds: visibleTimelineLineIDs,
+            isAtBottom: isAtBottom
+        )
+    }
+
+    private func scrollToLatest(animated: Bool = true, clearUnread _: Bool = true) {
+        let action = { timelinePosition.scrollTo(edge: .bottom) }
         if animated {
             withAnimation(reduceMotion ? .easeOut(duration: 0.12) : TojTheme.microAnimation, action)
         } else {
             action()
         }
+        shouldFollowLatest = true
         isAtBottom = true
-        if clearUnread { initialUnreadCount = 0 }
     }
+}
+
+nonisolated enum TimelineScrollBehavior {
+    static func addedMessagesWereAppended(oldIDs: [String], newIDs: [String]) -> Bool {
+        guard !newIDs.isEmpty else { return false }
+        // The first encrypted SQLite snapshot is an append from the view's perspective. Treating
+        // [] -> messages as false was the exact blank-until-touch opening race.
+        if oldIDs.isEmpty { return true }
+        guard let previousLastID = oldIDs.last,
+              let previousLastIndex = newIDs.firstIndex(of: previousLastID) else {
+            return false
+        }
+        let previousIDs = Set(oldIDs)
+        let indexAfterPreviousLast = newIDs.index(after: previousLastIndex)
+        return newIDs[indexAfterPreviousLast...].contains { !previousIDs.contains($0) }
+    }
+}
+
+nonisolated private enum TimelineTargetID: Hashable, Sendable {
+    case message(String)
+    case bottom
+}
+
+private struct TimelinePresentationItem: Identifiable {
+    let line: CloudAppModel.Line
+    let dayLabel: String?
+    let showsUnreadDivider: Bool
+    let isFirstInGroup: Bool
+    let isLastInGroup: Bool
+
+    var id: TimelineTargetID { .message(line.id) }
 }
 
 private struct TojMessageBubble: View {
@@ -765,6 +1065,9 @@ private struct TojMessageBubble: View {
             }
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(
+            line.media.map { "media-bubble-\($0.id)" } ?? "message-\(line.clientMsgId)"
+        )
         .accessibilityLabel(accessibilityDescription)
         .accessibilityHint("Swipe to reply or use message actions")
         .accessibilityActions {
@@ -778,14 +1081,14 @@ private struct TojMessageBubble: View {
                     ProductionMediaViewer(
                         model: model, media: media, line: line,
                         title: model.dialogTitle(line.dialogId ?? ""),
-                        subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
+                        subtitle: line.presentationMediaTimestampLabel ?? "",
                         onReply: { onAction(.reply) }
                     )
                 } else if let attachment = line.attachment {
                     DemoMediaViewer(
                         attachment: attachment,
                         title: model.dialogTitle(line.dialogId ?? ""),
-                        subtitle: line.timestamp.map(TojDateFormatting.mediaTimestamp) ?? "",
+                        subtitle: line.presentationMediaTimestampLabel ?? "",
                         onDelete: actions.contains(.delete)
                             ? { Task { await model.deleteMessage(line) } }
                             : nil
@@ -841,10 +1144,7 @@ private struct TojMessageBubble: View {
     private var captionText: some View {
         Group {
             if line.reactions.isEmpty {
-                messageText
-                    + Text(verbatim: "\u{2004}\u{2004}" + metaReservation)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.clear)
+                messageTextWithMetaReservation
             } else {
                 messageText
             }
@@ -863,10 +1163,17 @@ private struct TojMessageBubble: View {
             .foregroundStyle(TojTheme.text)
     }
 
+    private var messageTextWithMetaReservation: Text {
+        let reservation = Text(verbatim: "\u{2004}\u{2004}" + metaReservation)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(.clear)
+        return Text("\(messageText)\(reservation)")
+    }
+
     private var metaReservation: String {
         var parts: [String] = []
         if line.isEdited { parts.append(String(localized: "edited")) }
-        if let timestamp = line.timestamp { parts.append(TojDateFormatting.message(timestamp)) }
+        if let timestamp = line.presentationTimestampLabel { parts.append(timestamp) }
         if line.mine { parts.append(line.delivery == .seen ? "✓✓" : "✓") }
         return parts.joined(separator: " ")
     }
@@ -874,7 +1181,7 @@ private struct TojMessageBubble: View {
     private var metaRow: some View {
         HStack(spacing: 3) {
             if line.isEdited { Text("edited") }
-            if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+            if let timestamp = line.presentationTimestampLabel { Text(timestamp) }
             if line.mine { DeliveryTicks(delivery: line.delivery) }
         }
         .font(.system(size: 11, weight: .medium))
@@ -1171,8 +1478,8 @@ private struct ProductionMediaBubble: View {
                     videoOverlay: videoOverlay, isAutoplaying: isAutoplaying
                 )
                 .task(id: media.id) {
-                    guard thumbnail == nil, let data = await model.thumbnailData(for: media) else { return }
-                    thumbnail = SafeMediaImageDecoder.decode(data, maxPixelSize: 720)?.image
+                    guard thumbnail == nil else { return }
+                    thumbnail = await model.presentationImage(for: media, variant: .bubble720)
                 }
                 .onScrollVisibilityChange(threshold: 0.6) { visible in
                     coordinator?.setVisible(media.id, visible && autoplayEligible)
@@ -1306,7 +1613,7 @@ private struct MediaBubbleContent: View {
         metaPill {
             HStack(spacing: 3) {
                 if line.isEdited { Text("edited") }
-                if let timestamp = line.timestamp { Text(TojDateFormatting.message(timestamp)) }
+                if let timestamp = line.presentationTimestampLabel { Text(timestamp) }
                 if line.mine { DeliveryTicks(delivery: line.delivery) }
             }
         }
@@ -1662,6 +1969,7 @@ private struct ProductionMediaViewer: View {
                 )
         }
         .preferredColorScheme(.dark)
+        .accessibilityIdentifier("media-viewer-\(media.id)")
         .task(id: media.id) { await load() }
         .onReceive(playStatePublisher) { status in
             isPlaying = status == .playing
@@ -1972,22 +2280,33 @@ private struct ProductionMediaViewer: View {
             }
             // The bubble's thumbnail is already cached — put it on screen immediately so the
             // viewer never opens onto a spinner, then fetch the full pixels behind it.
-            if media.kind == "photo",
-               let thumbnailData = await model.thumbnailData(for: media),
-               let decodedThumbnail = SafeMediaImageDecoder.decode(thumbnailData, maxPixelSize: 720) {
-                thumbnailImage = decodedThumbnail.image
-            }
-            // Photos need full pixels; files need a local URL to preview and share.
-            let downloaded = try await model.mediaData(for: media) { value in
-                await MainActor.run { downloadProgress = value }
+            if media.kind == "photo" {
+                thumbnailImage = await model.presentationImage(for: media, variant: .bubble720)
+                try Task.checkCancellation()
             }
             if media.kind == "photo" {
-                guard let decoded = SafeMediaImageDecoder.decode(downloaded, maxPixelSize: 4_096) else {
+                let image = await model.presentationImage(for: media, variant: .screen2048)
+                try Task.checkCancellation()
+                guard let image else {
                     throw MediaPresentationError.unreadable
                 }
                 withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
-                    photoImage = decoded.image
+                    photoImage = image
                 }
+                downloadProgress = 1
+                shareFetchTask = Task { @MainActor in
+                    guard let downloaded = try? await model.mediaData(for: media),
+                          let url = try? await model.temporaryMediaURL(
+                            data: downloaded,
+                            fileExtension: preferredFileExtension
+                          ), !Task.isCancelled else { return }
+                    temporaryURL = url
+                }
+                return
+            }
+            // Files need a local URL to preview and share.
+            let downloaded = try await model.mediaData(for: media) { value in
+                await MainActor.run { downloadProgress = value }
             }
             temporaryURL = try await model.temporaryMediaURL(
                 data: downloaded, fileExtension: preferredFileExtension
@@ -2186,6 +2505,7 @@ private extension ComposerMode {
 private struct ProductionAttachmentPicker: View {
     let model: CloudAppModel
     let onDone: () -> Void
+    let onSent: () -> Void
     @StateObject private var library = RecentMediaLibrary()
     @State private var mediaItem: PhotosPickerItem?
     @State private var photoItem: PhotosPickerItem?
@@ -2536,6 +2856,7 @@ private struct ProductionAttachmentPicker: View {
                 thumbnail: prepared.thumbnail
             )
         }
+        onSent()
         onDone()
     }
 
@@ -2576,11 +2897,20 @@ private struct ProductionAttachmentPicker: View {
         }
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "toj-video-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appending(path: "source.\(container.filenameExtension)")
-        try data.write(to: url, options: [.atomic, .completeFileProtection])
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: directory.path
+            )
+            try data.write(to: url, options: [.atomic, .completeFileProtection])
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
 
         let videoAsset = AVURLAsset(url: url)
         let duration = try await videoAsset.load(.duration)
@@ -2598,7 +2928,9 @@ private struct ProductionAttachmentPicker: View {
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 640, height: 640)
         let image = try await generator.image(at: .zero).image
-        let thumbnail = SafeMediaImageDecoder.thumbnailData(UIImage(cgImage: image))
+        let thumbnail = await Task.detached(priority: .userInitiated) {
+            SafeMediaImageDecoder.thumbnailData(UIImage(cgImage: image))
+        }.value
         try Task.checkCancellation()
         working = false
         selectionTask = nil
@@ -2610,6 +2942,7 @@ private struct ProductionAttachmentPicker: View {
                 width: dimensions.0, height: dimensions.1, thumbnail: thumbnail
             )
         }
+        onSent()
         onDone()
     }
 
@@ -2618,28 +2951,31 @@ private struct ProductionAttachmentPicker: View {
         defer { working = false }
         do {
             let url = try result.get()
-            let accessed = url.startAccessingSecurityScopedResource()
-            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-            let values = try url.resourceValues(forKeys: [
-                .contentTypeKey, .fileSizeKey, .isDirectoryKey, .isRegularFileKey,
-            ])
-            guard values.isDirectory != true else { throw PickerError.unreadable }
-            if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 {
-                throw PickerError.tooLarge
-            }
-            let data = try Data(contentsOf: url)
-            guard !data.isEmpty else { throw PickerError.emptyFile }
-            guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
-            guard let fileName = SafeMediaFileMetadata.sanitizedFileName(url.lastPathComponent) else {
-                throw PickerError.invalidFileName
-            }
+            let selection = try await Task.detached(priority: .userInitiated) {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                let values = try url.resourceValues(forKeys: [
+                    .contentTypeKey, .fileSizeKey, .isDirectoryKey, .isRegularFileKey,
+                ])
+                guard values.isDirectory != true else { throw PickerError.unreadable }
+                if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 {
+                    throw PickerError.tooLarge
+                }
+                let data = try Data(contentsOf: url, options: .mappedIfSafe)
+                guard !data.isEmpty else { throw PickerError.emptyFile }
+                guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
+                guard let fileName = SafeMediaFileMetadata.sanitizedFileName(url.lastPathComponent) else {
+                    throw PickerError.invalidFileName
+                }
+                return PreparedFileSelection(
+                    data: data,
+                    fileName: fileName,
+                    contentType: values.contentType?.preferredMIMEType ?? "application/octet-stream"
+                )
+            }.value
             try Task.checkCancellation()
             selectedAsset = nil
-            selectedFile = PreparedFileSelection(
-                data: data,
-                fileName: fileName,
-                contentType: values.contentType?.preferredMIMEType ?? "application/octet-stream"
-            )
+            selectedFile = selection
             working = false
             selectionTask = nil
             error = nil
@@ -2661,6 +2997,7 @@ private struct ProductionAttachmentPicker: View {
                 fileName: file.fileName
             )
         }
+        onSent()
         onDone()
     }
 
@@ -2955,7 +3292,7 @@ private struct RecentMediaTile: View {
     }
 }
 
-private enum MediaAssetDataLoader {
+nonisolated private enum MediaAssetDataLoader {
     private static let maxBytes = 25 * 1024 * 1024
 
     static func imageData(for asset: PHAsset) async throws -> Data {
@@ -2982,7 +3319,9 @@ private enum MediaAssetDataLoader {
     static func videoData(for asset: PHAsset) async throws -> Data {
         let source = try await videoAsset(for: asset).asset
         if let sourceURL = (source as? AVURLAsset)?.url,
-           let size = try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           let size = await Task.detached(priority: .utility, operation: {
+               try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+           }).value,
            size <= maxBytes {
             // Remux to faststart (moov atom at the front) so the video streams from the first chunk
             // instead of forcing a full download to locate the header. Lossless passthrough — no
@@ -2990,7 +3329,9 @@ private enum MediaAssetDataLoader {
             if let faststart = try? await remuxFaststart(source), faststart.count <= maxBytes {
                 return faststart
             }
-            return try Data(contentsOf: sourceURL)
+            return try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: sourceURL, options: .mappedIfSafe)
+            }.value
         }
 
         return try await exportForUpload(source)
@@ -3002,17 +3343,31 @@ private enum MediaAssetDataLoader {
         ) else { throw PickerError.unsupportedVideo }
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "toj-video-faststart-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: directory.path
+            )
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
         let outputURL = directory.appending(path: "faststart.mp4")
         guard let exporter = AVAssetExportSession(asset: source, presetName: AVAssetExportPresetPassthrough) else {
             throw PickerError.unsupportedVideo
         }
         exporter.shouldOptimizeForNetworkUse = true
         try await exporter.export(to: outputURL, as: .mp4)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: outputURL.path)
-        return try Data(contentsOf: outputURL)
+        return try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: outputURL.path
+            )
+            return try Data(contentsOf: outputURL, options: .mappedIfSafe)
+        }.value
     }
 
     static func fittedVideoData(_ data: Data) async throws -> Data {
@@ -3022,20 +3377,38 @@ private enum MediaAssetDataLoader {
         }
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "toj-video-source-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.removeItem(at: directory) }
         let sourceURL = directory.appending(path: "source.\(container.filenameExtension)")
-        try data.write(to: sourceURL, options: [.atomic, .completeFileProtection])
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: directory.path
+            )
+            try data.write(to: sourceURL, options: [.atomic, .completeFileProtection])
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
         return try await exportForUpload(AVURLAsset(url: sourceURL))
     }
 
     private static func exportForUpload(_ source: AVAsset) async throws -> Data {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "toj-video-export-\(UUID().uuidString)", directoryHint: .isDirectory)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: directory.path)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        try await Task.detached(priority: .utility) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: directory.path
+            )
+        }.value
+        defer {
+            Task.detached(priority: .utility) {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
         let outputURL = directory.appending(path: "video.mp4")
 
         let duration = try await source.load(.duration)
@@ -3060,8 +3433,13 @@ private enum MediaAssetDataLoader {
         }
         exporter.shouldOptimizeForNetworkUse = true
         try await exporter.export(to: outputURL, as: .mp4)
-        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: outputURL.path)
-        let data = try Data(contentsOf: outputURL)
+        let data = try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.complete],
+                ofItemAtPath: outputURL.path
+            )
+            return try Data(contentsOf: outputURL, options: .mappedIfSafe)
+        }.value
         guard data.count <= maxBytes else { throw PickerError.tooLarge }
         return data
     }
@@ -3088,7 +3466,7 @@ private enum MediaAssetDataLoader {
     }
 }
 
-private final class VideoAssetReference: @unchecked Sendable {
+nonisolated private final class VideoAssetReference: @unchecked Sendable {
     let asset: AVAsset
 
     init(asset: AVAsset) {
@@ -3096,7 +3474,7 @@ private final class VideoAssetReference: @unchecked Sendable {
     }
 }
 
-private enum PickerError: LocalizedError {
+nonisolated private enum PickerError: LocalizedError, Sendable {
     case unreadable, emptyFile, tooLarge, unsupportedVideo, invalidFileName
     var errorDescription: String? {
         switch self {
@@ -3157,7 +3535,7 @@ private struct DemoForwardingView: View {
                     onDone(dialog.id)
                 } label: {
                     HStack(spacing: 12) {
-                        TojAvatar(title: dialog.title, size: 42)
+                        TojAvatar(title: dialog.title, size: 42, colorIndex: dialog.profileColorIndex)
                         Text(dialog.title).foregroundStyle(TojTheme.text)
                         Spacer()
                     }

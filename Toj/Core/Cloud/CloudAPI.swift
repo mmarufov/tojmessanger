@@ -114,6 +114,59 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let message: CloudMessage?
     let readerAccountId: String?
     let maxReadMsgId: Int64?
+    let unreadCount: Int?
+    let subjectAccountId: String?
+    let firstName: String?
+    let lastName: String?
+    let displayName: String?
+    let bio: String?
+    let birthday: String?
+    let colorIndex: Int?
+    let profileUpdatedAt: String?
+    let peerAccountId: String?
+    let sharedDialogIds: [String]?
+
+    init(
+        pts: Int64,
+        ptsCount: Int64,
+        type: String,
+        dialogId: String?,
+        dialogTitle: String?,
+        message: CloudMessage?,
+        readerAccountId: String?,
+        maxReadMsgId: Int64?,
+        unreadCount: Int? = nil,
+        subjectAccountId: String? = nil,
+        firstName: String? = nil,
+        lastName: String? = nil,
+        displayName: String? = nil,
+        bio: String? = nil,
+        birthday: String? = nil,
+        colorIndex: Int? = nil,
+        profileUpdatedAt: String? = nil,
+        peerAccountId: String? = nil,
+        sharedDialogIds: [String]? = nil
+    ) {
+        self.pts = pts
+        self.ptsCount = ptsCount
+        self.type = type
+        self.dialogId = dialogId
+        self.dialogTitle = dialogTitle
+        self.message = message
+        self.readerAccountId = readerAccountId
+        self.maxReadMsgId = maxReadMsgId
+        self.unreadCount = unreadCount
+        self.subjectAccountId = subjectAccountId
+        self.firstName = firstName
+        self.lastName = lastName
+        self.displayName = displayName
+        self.bio = bio
+        self.birthday = birthday
+        self.colorIndex = colorIndex
+        self.profileUpdatedAt = profileUpdatedAt
+        self.peerAccountId = peerAccountId
+        self.sharedDialogIds = sharedDialogIds
+    }
 
     enum CodingKeys: String, CodingKey {
         case pts
@@ -124,6 +177,17 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case message
         case readerAccountId = "reader_account_id"
         case maxReadMsgId = "max_read_msg_id"
+        case unreadCount = "unread_count"
+        case subjectAccountId = "subject_account_id"
+        case firstName = "first_name"
+        case lastName = "last_name"
+        case displayName = "display_name"
+        case bio
+        case birthday
+        case colorIndex = "color_index"
+        case profileUpdatedAt = "updated_at"
+        case peerAccountId = "peer_account_id"
+        case sharedDialogIds = "shared_dialog_ids"
     }
 }
 
@@ -154,6 +218,31 @@ nonisolated struct ContactLookupResponse: Codable, Sendable {
     let accountId: String?
     let displayName: String?
     let found: Bool?
+    let firstName: String?
+    let lastName: String?
+    let bio: String?
+    let birthday: String?
+    let colorIndex: Int?
+    let updatedAt: String?
+}
+
+nonisolated struct CloudProfile: Codable, Equatable, Sendable {
+    let accountId: String
+    let firstName: String
+    let lastName: String
+    let displayName: String
+    let bio: String
+    let birthday: String?
+    let colorIndex: Int
+    let updatedAt: String
+}
+
+private struct ProfileUpdateRequest: Codable, Sendable {
+    let firstName: String
+    let lastName: String
+    let bio: String
+    let birthday: String?
+    let colorIndex: Int
 }
 
 nonisolated struct DirectDialogResponse: Codable, Sendable {
@@ -230,8 +319,32 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
     let title: String?
     let lastMsgId: Int64
     let updatedAt: String
+    let unreadCount: Int?
     let members: [BootstrapDialogMember]
+    let profiles: [CloudProfile]?
     let messages: [CloudMessage]
+
+    init(
+        dialogId: String,
+        type: String,
+        title: String?,
+        lastMsgId: Int64,
+        updatedAt: String,
+        unreadCount: Int? = nil,
+        members: [BootstrapDialogMember],
+        profiles: [CloudProfile]? = nil,
+        messages: [CloudMessage]
+    ) {
+        self.dialogId = dialogId
+        self.type = type
+        self.title = title
+        self.lastMsgId = lastMsgId
+        self.updatedAt = updatedAt
+        self.unreadCount = unreadCount
+        self.members = members
+        self.profiles = profiles
+        self.messages = messages
+    }
 
     enum CodingKeys: String, CodingKey {
         case dialogId = "dialog_id"
@@ -239,7 +352,9 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         case title
         case lastMsgId = "last_msg_id"
         case updatedAt = "updated_at"
+        case unreadCount = "unread_count"
         case members
+        case profiles
         case messages
     }
 }
@@ -260,12 +375,28 @@ nonisolated struct HistoryPageResponse: Codable, Sendable {
     let dialogId: String
     let messages: [CloudMessage]
     let nextBeforeMsgId: Int64?
+    let nextAfterMsgId: Int64?
     let hasMore: Bool
+
+    init(
+        dialogId: String,
+        messages: [CloudMessage],
+        nextBeforeMsgId: Int64?,
+        nextAfterMsgId: Int64? = nil,
+        hasMore: Bool
+    ) {
+        self.dialogId = dialogId
+        self.messages = messages
+        self.nextBeforeMsgId = nextBeforeMsgId
+        self.nextAfterMsgId = nextAfterMsgId
+        self.hasMore = hasMore
+    }
 
     enum CodingKeys: String, CodingKey {
         case dialogId
         case messages
         case nextBeforeMsgId
+        case nextAfterMsgId
         case hasMore
     }
 }
@@ -273,6 +404,7 @@ nonisolated struct HistoryPageResponse: Codable, Sendable {
 nonisolated struct ReadResponse: Codable, Sendable {
     let dialogId: String
     let maxReadMsgId: Int64
+    let unreadCount: Int?
 }
 
 nonisolated struct PushRegistrationResponse: Codable, Sendable {
@@ -377,6 +509,15 @@ struct CloudAPI: Sendable {
         return decoder
     }()
 
+    private static let profileDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
     func startAuth(phone: String) async throws -> AuthStartResponse {
         try await post("v1/auth/start", body: ["phone": phone], token: nil)
     }
@@ -403,6 +544,24 @@ struct CloudAPI: Sendable {
         try await post("v1/contacts/lookup", body: ["phone": phone], token: token)
     }
 
+    func getProfile(token: String) async throws -> CloudProfile {
+        try await get("v1/profile", token: token)
+    }
+
+    func updateProfile(_ profile: StoredProfileDetails, token: String) async throws -> CloudProfile {
+        try await put(
+            "v1/profile",
+            body: ProfileUpdateRequest(
+                firstName: profile.firstName,
+                lastName: profile.lastName,
+                bio: profile.bio,
+                birthday: profile.birthday.map(Self.profileDateFormatter.string(from:)),
+                colorIndex: profile.colorIndex
+            ),
+            token: token
+        )
+    }
+
     func createDirectDialog(peerAccountId: String, token: String) async throws -> DirectDialogResponse {
         try await post("v1/dialogs/direct", body: ["peerAccountId": peerAccountId], token: token)
     }
@@ -411,8 +570,22 @@ struct CloudAPI: Sendable {
         try await get("v1/sync/state", token: token)
     }
 
-    func getDifference(sincePts: Int64, token: String) async throws -> DifferenceResponse {
-        try await post("v1/sync/difference", body: ["sincePts": sincePts], token: token)
+    func getDifference(
+        sincePts: Int64,
+        maxEvents: Int = 200,
+        maxBytes: Int = 256 * 1_024,
+        token: String
+    ) async throws -> DifferenceResponse {
+        try await post(
+            "v1/sync/difference",
+            body: DifferenceRequest(
+                sincePts: sincePts,
+                maxEvents: maxEvents,
+                maxBytes: maxBytes
+            ),
+            token: token,
+            timeout: 20
+        )
     }
 
     func startBootstrap(token: String) async throws -> BootstrapStartResponse {
@@ -558,10 +731,22 @@ struct CloudAPI: Sendable {
         )
     }
 
-    func getHistory(dialogId: String, beforeMsgId: Int64?, limit: Int = 50, token: String) async throws -> HistoryPageResponse {
+    func getHistory(
+        dialogId: String,
+        beforeMsgId: Int64?,
+        afterMsgId: Int64? = nil,
+        limit: Int = 50,
+        token: String
+    ) async throws -> HistoryPageResponse {
         try await post(
             "v1/history",
-            body: HistoryRequest(dialogId: dialogId, beforeMsgId: beforeMsgId, limit: limit),
+            body: HistoryRequest(
+                dialogId: dialogId,
+                beforeMsgId: beforeMsgId,
+                afterMsgId: afterMsgId,
+                limit: limit,
+                maxBytes: 512 * 1_024
+            ),
             token: token
         )
     }
@@ -616,9 +801,26 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
-    private func post<Body: Encodable, Response: Decodable>(_ path: String, body: Body, token: String?) async throws -> Response {
+    private func post<Body: Encodable, Response: Decodable>(
+        _ path: String,
+        body: Body,
+        token: String?,
+        timeout: TimeInterval? = nil
+    ) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "POST"
+        if let timeout { request.timeoutInterval = timeout }
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(body)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return try await run(request)
+    }
+
+    private func put<Body: Encodable, Response: Decodable>(_ path: String, body: Body, token: String?) async throws -> Response {
+        var request = URLRequest(url: config.httpURL(path: path))
+        request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try encoder.encode(body)
         if let token {
@@ -667,6 +869,12 @@ struct CloudAPI: Sendable {
     }
 }
 
+private struct DifferenceRequest: Codable, Sendable {
+    let sincePts: Int64
+    let maxEvents: Int
+    let maxBytes: Int
+}
+
 private struct ServerError: Codable {
     let error: String
 }
@@ -683,7 +891,9 @@ private struct BootstrapDialogsRequest: Encodable {
 private struct HistoryRequest: Encodable {
     let dialogId: String
     let beforeMsgId: Int64?
+    let afterMsgId: Int64?
     let limit: Int
+    let maxBytes: Int
 }
 
 private struct SendMessageRequest: Encodable {

@@ -4,21 +4,39 @@ struct TojPeerProfileView: View {
     @Bindable var model: CloudAppModel
     @Environment(\.dismiss) private var dismiss
     @State private var notificationsEnabled = true
-    @State private var showingBlockConfirmation = false
+    @State private var showingClearMedia = false
 
     let dialogId: String
     let onCall: () -> Void
 
     private var title: String { model.dialogTitle(dialogId) }
+    private var dialog: CloudAppModel.Dialog? { model.dialogs.first(where: { $0.id == dialogId }) }
+
+    private var birthdayText: LocalizedStringKey? {
+        guard let value = dialog?.peerBirthday else { return nil }
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = .current
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let date = formatter.date(from: value) else { return LocalizedStringKey(value) }
+        return LocalizedStringKey(date.formatted(date: .long, time: .omitted))
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 22) {
                     VStack(spacing: 10) {
-                        TojAvatar(title: title, size: 82)
+                        TojAvatar(title: title, size: 82, colorIndex: dialog?.profileColorIndex)
                         Text(title)
                             .font(TojTheme.heading(.title, weight: .bold))
+                        if let bio = dialog?.peerBio, !bio.isEmpty {
+                            Text(bio)
+                                .font(.subheadline)
+                                .foregroundStyle(TojTheme.secondaryText)
+                                .multilineTextAlignment(.center)
+                        }
                         Label("Private conversation", systemImage: "lock.fill")
                             .font(.caption)
                             .foregroundStyle(TojTheme.secure)
@@ -26,21 +44,18 @@ struct TojPeerProfileView: View {
                     .padding(.top, 12)
 
                     HStack(spacing: 12) {
-                        profileAction("Audio", icon: "phone.fill") { onCall() }
-                        profileAction("Video", icon: "video.fill") { onCall() }
+                        if model.capabilities.contains(.calls) {
+                            profileAction("Audio", icon: "phone.fill") { onCall() }
+                            profileAction("Video", icon: "video.fill") { onCall() }
+                        }
                         profileAction("Search", icon: "magnifyingglass") { dismiss() }
                     }
 
                     profileSection("Privacy") {
+                        if let birthdayText {
+                            profileRow("Birthday", detail: birthdayText, icon: "birthday.cake.fill")
+                        }
                         profileRow("Connection", detail: "Protected", icon: "lock.fill", iconTint: TojTheme.secure, detailColor: TojTheme.secure)
-                        profileRow("Devices", detail: "Tap to inspect", icon: "checkmark.shield.fill")
-                        profileRow("Verification", detail: "Available when connected", icon: "person.badge.shield.checkmark")
-                    }
-
-                    profileSection("Shared content") {
-                        profileRow("Media", detail: "12", icon: "photo.on.rectangle")
-                        profileRow("Files", detail: "4", icon: "doc.fill")
-                        profileRow("Links", detail: "7", icon: "link")
                     }
 
                     profileSection("Conversation") {
@@ -51,13 +66,24 @@ struct TojPeerProfileView: View {
                         .padding(.horizontal, 15)
                         .frame(minHeight: 54)
 
-                        Button(role: .destructive) { showingBlockConfirmation = true } label: {
-                            Label("Block or report", systemImage: "hand.raised.fill")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .frame(minHeight: 54)
+                        Divider().overlay(TojTheme.hairline).padding(.leading, 58)
+
+                        Button(role: .destructive) {
+                            showingClearMedia = true
+                        } label: {
+                            HStack(spacing: 12) {
+                                TojIconTile(systemImage: "trash.fill", tint: TojTheme.danger)
+                                Text(model.clearingMediaCache ? "Clearing downloaded media…" : "Clear downloaded media")
+                                    .font(.subheadline.weight(.medium))
+                                Spacer()
+                            }
+                            .foregroundStyle(TojTheme.danger)
+                            .padding(.horizontal, 15)
+                            .frame(minHeight: 56)
+                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 15)
+                        .buttonStyle(.tojPressable(scale: 0.985))
+                        .disabled(model.clearingMediaCache)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -69,12 +95,17 @@ struct TojPeerProfileView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .confirmationDialog("Block or report this contact?", isPresented: $showingBlockConfirmation, titleVisibility: .visible) {
-                Button("Block", role: .destructive) {}
-                Button("Report", role: .destructive) {}
+            .confirmationDialog(
+                "Clear this chat’s downloaded media?",
+                isPresented: $showingClearMedia,
+                titleVisibility: .visible
+            ) {
+                Button("Clear downloaded media", role: .destructive) {
+                    Task { await model.clearMediaCache(dialogId: dialogId) }
+                }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Demo only. No account action will be sent.")
+                Text("Messages stay in the chat. Cloud media downloads again when you open it.")
             }
         }
     }
@@ -122,6 +153,7 @@ struct TojDemoCallView: View {
     @State private var isSpeakerEnabled = false
 
     let peerName: String
+    var colorIndex: Int? = nil
 
     var body: some View {
         ZStack {
@@ -147,7 +179,7 @@ struct TojDemoCallView: View {
                             .frame(width: 154, height: 154)
                             .scaleEffect(1.15)
                     }
-                    TojAvatar(title: peerName, size: 122)
+                    TojAvatar(title: peerName, size: 122, colorIndex: colorIndex)
                 }
 
                 Text(peerName)

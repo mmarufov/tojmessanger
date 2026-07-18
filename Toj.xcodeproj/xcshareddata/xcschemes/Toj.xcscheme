@@ -47,6 +47,16 @@
                ReferencedContainer = "container:Toj.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "04CF34BEB867389D5ACDDD1F"
+               BuildableName = "TojUITests.xctest"
+               BlueprintName = "TojUITests"
+               ReferencedContainer = "container:Toj.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

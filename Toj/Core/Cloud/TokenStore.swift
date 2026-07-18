@@ -2,11 +2,24 @@ import Foundation
 import Security
 
 actor TokenStore {
-    private let service = "com.toj.cloud"
+    private let service: String
     private let sessionAccount = "device-session"
     private let pendingRevocationAccount = "pending-session-revocation"
+    private let pendingLocalErasureAccount = "pending-local-erasure"
+    private let profileAccountPrefix = "profile-"
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+
+    init(service: String? = nil) {
+        #if DEBUG
+        let fixtureService = ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE"] == "telegram-fast"
+            ? "com.toj.cloud.ui-fixture"
+            : nil
+        #else
+        let fixtureService: String? = nil
+        #endif
+        self.service = service ?? fixtureService ?? "com.toj.cloud"
+    }
 
     func load() throws -> StoredCloudSession? {
         guard let data = try loadData(account: sessionAccount) else { return nil }
@@ -21,6 +34,19 @@ actor TokenStore {
         try clearData(account: sessionAccount)
     }
 
+    func loadProfile(accountId: String) throws -> StoredProfileDetails? {
+        guard let data = try loadData(account: profileAccountPrefix + accountId) else { return nil }
+        return try decoder.decode(StoredProfileDetails.self, from: data)
+    }
+
+    func saveProfile(_ profile: StoredProfileDetails, accountId: String) throws {
+        try saveData(encoder.encode(profile), account: profileAccountPrefix + accountId)
+    }
+
+    func clearProfile(accountId: String) throws {
+        try clearData(account: profileAccountPrefix + accountId)
+    }
+
     func loadPendingRevocationToken() throws -> String? {
         guard let data = try loadData(account: pendingRevocationAccount) else { return nil }
         return String(data: data, encoding: .utf8)
@@ -32,6 +58,51 @@ actor TokenStore {
 
     func clearPendingRevocationToken() throws {
         try clearData(account: pendingRevocationAccount)
+    }
+
+    /// Crash-safe marker written before explicit logout starts deleting local state. Its payload
+    /// keeps the account id available even if the active session item was already removed.
+    func savePendingLocalErasure(accountId: String?) throws {
+        try saveData(Data((accountId ?? "").utf8), account: pendingLocalErasureAccount)
+    }
+
+    func hasPendingLocalErasure() throws -> Bool {
+        try loadData(account: pendingLocalErasureAccount) != nil
+    }
+
+    func clearPendingLocalErasure() throws {
+        try clearData(account: pendingLocalErasureAccount)
+    }
+
+    /// Explicit logout removes every locally cached profile. Enumerating this app's Keychain
+    /// service also covers an interrupted logout whose active session item is already gone.
+    func clearAllProfiles() throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var items: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &items)
+        if status == errSecItemNotFound { return }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+
+        let attributes: [[String: Any]]
+        if let many = items as? [[String: Any]] {
+            attributes = many
+        } else if let one = items as? [String: Any] {
+            attributes = [one]
+        } else {
+            throw KeychainError(status: errSecDecode)
+        }
+        for item in attributes {
+            guard
+                let account = item[kSecAttrAccount as String] as? String,
+                account.hasPrefix(profileAccountPrefix)
+            else { continue }
+            try clearData(account: account)
+        }
     }
 
     private func loadData(account: String) throws -> Data? {
@@ -75,6 +146,33 @@ actor TokenStore {
             kSecAttrAccount as String: account
         ]
     }
+}
+
+nonisolated struct StoredProfileDetails: Codable, Equatable, Sendable {
+    var firstName: String
+    var lastName: String
+    var bio: String
+    var birthday: Date?
+    var colorIndex: Int
+    var serverUpdatedAt: String? = nil
+    var pendingSync: Bool? = nil
+
+    static let empty = StoredProfileDetails(
+        firstName: "",
+        lastName: "",
+        bio: "",
+        birthday: nil,
+        colorIndex: 0
+    )
+
+    var displayName: String {
+        [firstName, lastName]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    var needsServerSync: Bool { pendingSync ?? false }
 }
 
 struct KeychainError: Error, LocalizedError {

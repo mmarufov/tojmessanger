@@ -4,20 +4,31 @@ struct CloudRootView: View {
     private static let isRunningUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var model = CloudAppModel()
+    @State private var model = CloudAppModel.shared
 
     var body: some View {
         Group {
-            if model.storedSession == nil {
+            switch model.launchPhase {
+            case .restoringLocal:
+                CloudLocalLaunchView()
+            case .recoveringStore:
+                CloudLocalRecoveryView(status: model.status) {
+                    Task { await model.retryLocalRecovery() }
+                }
+            case .signedOut:
                 CloudAuthView(model: model)
                     .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.985)))
-            } else {
-                CloudMainView(model: model)
-                    .transition(.opacity)
+            case .localReady:
+                if model.storedSession == nil {
+                    CloudAuthView(model: model)
+                } else {
+                    CloudMainView(model: model)
+                        .transition(.opacity)
+                }
             }
         }
         .background(TojTheme.canvas.ignoresSafeArea())
-        .animation(reduceMotion ? .easeOut(duration: 0.15) : TojTheme.stateAnimation, value: model.storedSession == nil)
+        .animation(reduceMotion ? .easeOut(duration: 0.15) : TojTheme.stateAnimation, value: model.launchPhase)
         .task {
             guard !Self.isRunningUnitTests else { return }
             #if DEBUG
@@ -29,9 +40,52 @@ struct CloudRootView: View {
             await model.start()
         }
         .onChange(of: scenePhase) { _, phase in
-            guard phase == .active, !Self.isRunningUnitTests else { return }
-            Task { await model.resume() }
+            guard !Self.isRunningUnitTests else { return }
+            Task {
+                let isActive = phase == .active
+                await model.setForegroundActive(isActive)
+                if isActive { await model.activateForegroundServices() }
+            }
         }
+    }
+}
+
+private struct CloudLocalLaunchView: View {
+    var body: some View {
+        VStack(spacing: 18) {
+            TojMark(size: 76)
+            ProgressView()
+                .tint(TojTheme.gold)
+                .accessibilityLabel("Opening encrypted messages")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TojTheme.canvas)
+    }
+}
+
+private struct CloudLocalRecoveryView: View {
+    let status: String
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "lock.trianglebadge.exclamationmark")
+                .font(.system(size: 42, weight: .semibold))
+                .foregroundStyle(TojTheme.gold)
+            Text("Encrypted messages are unavailable")
+                .font(TojTheme.heading(.title2, weight: .bold))
+                .foregroundStyle(TojTheme.text)
+            Text(status)
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            Button("Try Again", action: retry)
+                .buttonStyle(.borderedProminent)
+                .tint(TojTheme.gold)
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TojTheme.canvas)
     }
 }
 
@@ -253,8 +307,9 @@ private struct TojInputField: View {
 // MARK: - Main navigation
 
 private enum MainTab: Hashable {
-    case chats
     case contacts
+    case calls
+    case chats
     case settings
     case search
 }
@@ -269,17 +324,28 @@ private struct CloudMainView: View {
     @State private var searchScope: SearchScope = .chats
     @State private var showingCompose = false
     @State private var splitDialogId: String?
-    @FocusState private var searchFocused: Bool
+
+    private var unreadCount: Int {
+        model.dialogs.reduce(0) { $0 + ($1.isArchived ? 0 : $1.unreadCount) }
+    }
 
     var body: some View {
         TabView(selection: $selection) {
+            Tab("Contacts", systemImage: "person.crop.circle.fill", value: .contacts) {
+                CloudContactsView(model: model)
+            }
+
+            Tab("Calls", systemImage: "phone.fill", value: .calls) {
+                ComingSoonView(
+                    title: "Calls", systemImage: "phone.fill",
+                    detail: "Recent voice and video calls will appear here."
+                )
+            }
+
             Tab("Chats", systemImage: "bubble.left.and.bubble.right.fill", value: .chats) {
                 chatNavigation(path: $chatPath, focusSearchOnAppear: false)
             }
-
-            Tab("Contacts", systemImage: "person.2.fill", value: .contacts) {
-                ComingSoonView()
-            }
+            .badge(unreadCount)
 
             Tab("Settings", systemImage: "gearshape.fill", value: .settings) {
                 CloudSettingsView(model: model)
@@ -294,19 +360,26 @@ private struct CloudMainView: View {
         .tabBarMinimizeBehavior(.onScrollDown)
         .tint(TojTheme.text)
         .background(TojTheme.canvas)
-        .onChange(of: selection) { _, newValue in
+        .onChange(of: selection) { _, _ in
             TojFeedback.selection()
-            if newValue == .search {
-                Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(180))
-                    searchFocused = true
-                }
-            }
         }
         #if DEBUG
         .task {
+            if ProcessInfo.processInfo.environment["TOJ_DEMO_SEARCH"] == "1" {
+                selection = .search
+                return
+            }
+            if ProcessInfo.processInfo.environment["TOJ_DEMO_CONTACTS"] == "1" {
+                selection = .contacts
+                return
+            }
+            if ProcessInfo.processInfo.environment["TOJ_DEMO_SETTINGS"] == "1" {
+                selection = .settings
+                return
+            }
             if let dialogId = ProcessInfo.processInfo.environment["TOJ_DEMO_DIALOG"], chatPath.isEmpty {
                 selection = .chats
+                model.prepareConversationOpen(dialogId: dialogId)
                 chatPath = [dialogId]
             }
         }
@@ -315,6 +388,7 @@ private struct CloudMainView: View {
             NewChatSheet(model: model) { dialogId in
                 showingCompose = false
                 selection = .chats
+                model.prepareConversationOpen(dialogId: dialogId)
                 chatPath = [dialogId]
             }
             .presentationDetents([.height(330)])
@@ -330,10 +404,12 @@ private struct CloudMainView: View {
                     model: model,
                     query: $query,
                     searchScope: $searchScope,
-                    searchFocused: $searchFocused,
                     focusSearchOnAppear: focusSearchOnAppear,
                     onCompose: { showingCompose = true },
-                    onOpen: { splitDialogId = $0 }
+                    onOpen: {
+                        model.prepareConversationOpen(dialogId: $0)
+                        splitDialogId = $0
+                    }
                 )
                 .navigationSplitViewColumnWidth(min: 330, ideal: 390, max: 440)
             } detail: {
@@ -359,9 +435,12 @@ private struct CloudMainView: View {
                     model: model,
                     query: $query,
                     searchScope: $searchScope,
-                    searchFocused: $searchFocused,
                     focusSearchOnAppear: focusSearchOnAppear,
-                    onCompose: { showingCompose = true }
+                    onCompose: { showingCompose = true },
+                    onOpen: {
+                        model.prepareConversationOpen(dialogId: $0)
+                        path.wrappedValue.append($0)
+                    }
                 )
                 .navigationDestination(for: String.self) { dialogId in
                     TojConversationExperience(model: model, dialogId: dialogId)
@@ -373,27 +452,30 @@ private struct CloudMainView: View {
 
 // MARK: - Chats
 
-private enum ChatFolder: String, CaseIterable, Identifiable, Hashable {
-    case all
-    case unread
-    case pinned
+nonisolated enum ChatSearchDrawerBehavior {
+    static let height: CGFloat = 52
+    static let revealDeadZone: CGFloat = 14
+    static let openThreshold: CGFloat = 22
+    static let closeThreshold: CGFloat = 14
 
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .all: String(localized: "All")
-        case .unread: String(localized: "Unread")
-        case .pinned: String(localized: "Pinned")
-        }
+    static func revealIsArmed(startingAt offset: CGFloat) -> Bool {
+        offset <= height + 0.5
     }
 
-    func matches(_ dialog: CloudAppModel.Dialog) -> Bool {
-        switch self {
-        case .all: true
-        case .unread: dialog.unreadCount > 0
-        case .pinned: dialog.isPinned
-        }
+    static func revealProgress(at offset: CGFloat, revealWasArmed: Bool) -> CGFloat {
+        guard revealWasArmed else { return 0 }
+        let visibleHeight = height - min(max(offset, 0), height)
+        let revealRange = height - revealDeadZone
+        return min(max((visibleHeight - revealDeadZone) / revealRange, 0), 1)
+    }
+
+    static func shouldOpen(wasOpen: Bool, revealWasArmed: Bool, offset: CGFloat) -> Bool {
+        guard revealWasArmed else { return false }
+        let clampedOffset = max(offset, 0)
+        guard clampedOffset < height else { return false }
+        return wasOpen
+            ? clampedOffset < closeThreshold
+            : height - clampedOffset >= openThreshold
     }
 }
 
@@ -401,106 +483,175 @@ private struct CloudChatsView: View {
     @Bindable var model: CloudAppModel
     @Binding var query: String
     @Binding var searchScope: SearchScope
-    let searchFocused: FocusState<Bool>.Binding
     let focusSearchOnAppear: Bool
     let onCompose: () -> Void
     var onOpen: ((String) -> Void)? = nil
-    @State private var folder: ChatFolder = .all
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isEditing = false
+    @State private var isSearchDrawerOpen = false
+    @State private var searchScrollOffset = ChatSearchDrawerBehavior.height
+    @State private var searchRevealWasArmed = true
+    @FocusState private var searchFocused: Bool
 
     private var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    private var hasActiveDialogs: Bool { model.dialogs.contains { !$0.isArchived } }
-
     private var filteredDialogs: [CloudAppModel.Dialog] {
-        let base = model.dialogs(matching: query, scope: searchScope)
-        guard !isSearching, folder != .all else { return base }
-        return base.filter { folder.matches($0) }
+        model.dialogs(matching: query, scope: searchScope)
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                header
-                searchField
-                if isSearching {
-                    if model.capabilities.contains(.richSearch) { searchScopes }
-                } else if hasActiveDialogs {
-                    folderFilter
-                }
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        searchDrawer
+                            .id("chat-search")
+                        Color.clear
+                            .frame(height: 0)
+                            .id("chat-list-top")
 
-                if filteredDialogs.isEmpty {
-                    emptyState
-                        .padding(.top, 92)
-                } else {
-                    ForEach(filteredDialogs) { dialog in
-                        dialogLink(dialog)
-                        .contextMenu {
-                            if model.capabilities.contains(.chatOrganization) {
-                                Button(dialog.isPinned ? "Unpin" : "Pin", systemImage: dialog.isPinned ? "pin.slash" : "pin") {
-                                    model.togglePinned(dialog.id)
+                        if isSearching, model.capabilities.contains(.richSearch) {
+                            TojPillFilter(items: SearchScope.allCases, selection: $searchScope) { $0.title }
+                                .padding(.bottom, 6)
+                                .accessibilityLabel("Search filters")
+                        }
+
+                        if filteredDialogs.isEmpty {
+                            emptyState
+                                .padding(.top, 92)
+                        } else {
+                            ForEach(filteredDialogs) { dialog in
+                                dialogLink(dialog)
+                                .contextMenu {
+                                    if model.capabilities.contains(.chatOrganization) {
+                                        Button(dialog.isPinned ? "Unpin" : "Pin", systemImage: dialog.isPinned ? "pin.slash" : "pin") {
+                                            model.togglePinned(dialog.id)
+                                        }
+                                        Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
+                                            model.toggleMuted(dialog.id)
+                                        }
+                                        Button("Archive", systemImage: "archivebox") { model.archive(dialog.id) }
+                                    }
                                 }
-                                Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
-                                    model.toggleMuted(dialog.id)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                    if model.capabilities.contains(.chatOrganization) {
+                                        Button { model.archive(dialog.id) } label: {
+                                            Label("Archive", systemImage: "archivebox")
+                                        }
+                                        .tint(TojTheme.strong)
+                                        Button { model.toggleMuted(dialog.id) } label: {
+                                            Label(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash")
+                                        }
+                                        .tint(.gray)
+                                    }
                                 }
-                                Button("Archive", systemImage: "archivebox") { model.archive(dialog.id) }
                             }
                         }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            if model.capabilities.contains(.chatOrganization) {
-                                Button { model.archive(dialog.id) } label: {
-                                    Label("Archive", systemImage: "archivebox")
-                                }
-                                .tint(TojTheme.strong)
-                                Button { model.toggleMuted(dialog.id) } label: {
-                                    Label(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash")
-                                }
-                                .tint(.gray)
+                    }
+                    .frame(minHeight: geometry.size.height + 54, alignment: .top)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 26)
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onScrollGeometryChange(for: CGFloat.self) { scrollGeometry in
+                    normalizedScrollOffset(scrollGeometry)
+                } action: { _, newOffset in
+                    if !searchRevealWasArmed, newOffset < ChatSearchDrawerBehavior.height {
+                        searchScrollOffset = ChatSearchDrawerBehavior.height
+                        proxy.scrollTo("chat-list-top", anchor: .top)
+                    } else {
+                        searchScrollOffset = newOffset
+                    }
+                }
+                .onScrollPhaseChange { oldPhase, newPhase, context in
+                    let offset = normalizedScrollOffset(context.geometry)
+                    if newPhase == .tracking {
+                        searchRevealWasArmed = ChatSearchDrawerBehavior.revealIsArmed(startingAt: offset)
+                        return
+                    }
+                    guard oldPhase == .interacting,
+                          newPhase == .decelerating || newPhase == .idle else { return }
+                    settleSearchDrawer(
+                        at: offset,
+                        using: proxy
+                    )
+                }
+                .onAppear {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(80))
+                        #if DEBUG
+                        if ProcessInfo.processInfo.environment["TOJ_DEMO_EDIT"] == "1" {
+                            isEditing = true
+                        }
+                        #endif
+                        if focusSearchOnAppear {
+                            isSearchDrawerOpen = true
+                            searchRevealWasArmed = true
+                            withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
+                                proxy.scrollTo("chat-search", anchor: .top)
                             }
+                            searchFocused = true
+                        } else {
+                            isSearchDrawerOpen = false
+                            searchRevealWasArmed = true
+                            proxy.scrollTo("chat-list-top", anchor: .top)
                         }
                     }
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 26)
         }
-        .scrollDismissesKeyboard(.interactively)
         .background(TojTheme.canvas)
-        .toolbar(.hidden, for: .navigationBar)
-        .onAppear {
-            if focusSearchOnAppear { searchFocused.wrappedValue = true }
-        }
-    }
-
-    @ViewBuilder
-    private func dialogLink(_ dialog: CloudAppModel.Dialog) -> some View {
-        Group {
-            if let onOpen {
-                Button { onOpen(dialog.id) } label: { CloudDialogRow(dialog: dialog) }
-            } else {
-                NavigationLink(value: dialog.id) { CloudDialogRow(dialog: dialog) }
+        .navigationTitle("Chats")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(isEditing ? "Done" : "Edit") {
+                    withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
+                        isEditing.toggle()
+                    }
+                    TojFeedback.selection()
+                }
+                .font(.body.weight(.medium))
+                .foregroundStyle(TojTheme.text)
+            }
+            ToolbarItem(placement: .principal) {
+                Text("Chats")
+                    .font(TojTheme.heading(.headline, weight: .semibold))
+                    .foregroundStyle(TojTheme.text)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: onCompose) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+                .buttonStyle(.glass)
+                .accessibilityLabel("New chat")
             }
         }
-        .buttonStyle(.tojPressable)
-    }
-
-    private var header: some View {
-        TojNavHeader("Chats", subtitle: "Protected", subtitleIcon: "lock.fill") {
-            TojGlassIconButton(systemImage: "square.and.pencil", accessibilityLabel: "New chat", action: onCompose)
+        .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if model.replicaSyncState != .ready {
+                ReplicaSyncBanner(state: model.replicaSyncState) {
+                    model.retryReplicaSync()
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 4)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
+        .animation(
+            reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation,
+            value: model.replicaSyncState
+        )
     }
 
-    private var folderFilter: some View {
-        TojPillFilter(items: ChatFolder.allCases, selection: $folder) { $0.title }
-            .padding(.bottom, 7)
-            .accessibilityLabel("Chat folders")
-    }
-
-    private var searchField: some View {
+    private var searchDrawer: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(TojTheme.secondaryText)
             TextField("Search chats", text: $query)
-                .focused(searchFocused)
+                .focused($searchFocused)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
@@ -511,25 +662,93 @@ private struct CloudChatsView: View {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(TojTheme.secondaryText)
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Clear search")
             }
         }
         .font(.subheadline)
         .foregroundStyle(TojTheme.text)
-        .padding(.horizontal, 16)
-        .frame(height: 46)
+        .padding(.horizontal, 14)
+        .frame(height: 44)
         .tojGlass(in: Capsule(), interactive: true)
-        .padding(.bottom, 7)
+        .padding(.bottom, 8)
+        .opacity(Double(searchDrawerRevealProgress))
+        .scaleEffect(
+            x: 1,
+            y: 0.92 + (0.08 * searchDrawerRevealProgress),
+            anchor: .top
+        )
+        .offset(y: -8 * (1 - searchDrawerRevealProgress))
+        .allowsHitTesting(searchDrawerRevealProgress > 0.95)
     }
 
-    private var searchScopes: some View {
-        TojPillFilter(items: SearchScope.allCases, selection: $searchScope) { $0.title }
-            .padding(.vertical, 5)
-            .accessibilityLabel("Search filters")
+    private var searchDrawerRevealProgress: CGFloat {
+        ChatSearchDrawerBehavior.revealProgress(
+            at: searchScrollOffset,
+            revealWasArmed: searchRevealWasArmed
+        )
+    }
+
+    private func normalizedScrollOffset(_ geometry: ScrollGeometry) -> CGFloat {
+        geometry.contentOffset.y + geometry.contentInsets.top
+    }
+
+    private func settleSearchDrawer(at offset: CGFloat, using proxy: ScrollViewProxy) {
+        let clampedOffset = max(offset, 0)
+        guard clampedOffset < ChatSearchDrawerBehavior.height else {
+            isSearchDrawerOpen = false
+            return
+        }
+
+        let shouldOpen = ChatSearchDrawerBehavior.shouldOpen(
+            wasOpen: isSearchDrawerOpen,
+            revealWasArmed: searchRevealWasArmed,
+            offset: clampedOffset
+        )
+
+        isSearchDrawerOpen = shouldOpen
+        if !shouldOpen {
+            searchFocused = false
+        }
+
+        withAnimation(reduceMotion ? .easeOut(duration: 0.14) : .snappy(duration: 0.28, extraBounce: 0.08)) {
+            proxy.scrollTo(shouldOpen ? "chat-search" : "chat-list-top", anchor: .top)
+        }
+    }
+
+    @ViewBuilder
+    private func dialogLink(_ dialog: CloudAppModel.Dialog) -> some View {
+        Group {
+            if isEditing, model.capabilities.contains(.chatOrganization) {
+                HStack(spacing: 0) {
+                    CloudDialogRow(dialog: dialog)
+                    Button {
+                        withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
+                            model.archive(dialog.id)
+                        }
+                    } label: {
+                        Image(systemName: "archivebox.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(TojTheme.gold)
+                            .frame(width: 44, height: 44)
+                            .background(TojTheme.raised, in: Circle())
+                    }
+                    .buttonStyle(.tojPressable)
+                    .accessibilityLabel("Archive")
+                }
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            } else if let onOpen {
+                Button { onOpen(dialog.id) } label: { CloudDialogRow(dialog: dialog) }
+            } else {
+                NavigationLink(value: dialog.id) { CloudDialogRow(dialog: dialog) }
+            }
+        }
+        .buttonStyle(.tojPressable)
+        .accessibilityIdentifier("chat-row-\(dialog.id)")
     }
 
     private var emptyState: some View {
-        let filtered = isSearching || folder != .all
+        let filtered = isSearching
         return VStack(spacing: 14) {
             TojMark(size: 66)
             Text(filtered ? "No results" : "No chats yet")
@@ -544,17 +763,57 @@ private struct CloudChatsView: View {
     }
 }
 
+private struct ReplicaSyncBanner: View {
+    let state: ReplicaSyncState
+    let retry: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if state.showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(TojTheme.gold)
+            } else {
+                Image(systemName: state.systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.orange)
+            }
+            Text(state.title)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(TojTheme.text)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if state.showsRetry {
+                Button(action: retry) {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                        .font(.footnote.weight(.semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(TojTheme.gold)
+            }
+        }
+        .padding(.horizontal, 13)
+        .frame(minHeight: 40)
+        .tojGlass(in: Capsule(), interactive: state.showsRetry)
+    }
+}
+
 private struct CloudDialogRow: View {
     let dialog: CloudAppModel.Dialog
 
     var body: some View {
-        HStack(spacing: 13) {
-            TojAvatar(title: dialog.title, size: 52, highlighted: false)
+        HStack(spacing: 12) {
+            TojAvatar(
+                title: dialog.title,
+                size: 56,
+                highlighted: false,
+                colorIndex: dialog.profileColorIndex
+            )
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(dialog.title)
-                        .font(.body.weight(.semibold))
+                        .font(TojTheme.heading(.headline, weight: .semibold))
                         .foregroundStyle(TojTheme.text)
                         .lineLimit(1)
                     if dialog.isPinned {
@@ -579,23 +838,39 @@ private struct CloudDialogRow: View {
                             .foregroundStyle(TojTheme.secure)
                             .lineLimit(1)
                     } else if let draft = dialog.draftPreview {
-                        (Text("Draft: ").foregroundStyle(Color.red) + Text(draft).foregroundStyle(TojTheme.secondaryText))
-                            .font(.subheadline)
+                        HStack(spacing: 3) {
+                            Text("Draft:")
+                                .foregroundStyle(Color.red)
+                            Text(draft)
+                                .foregroundStyle(TojTheme.secondaryText)
+                        }
                             .lineLimit(1)
                     } else {
+                        if dialog.lastMessageMine, !dialog.isPending {
+                            Image(systemName: "checkmark")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(TojTheme.secure)
+                        }
+                        if let systemImage = dialog.previewKind.systemImage {
+                            Image(systemName: systemImage)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(TojTheme.secondaryText)
+                        }
                         Text(dialog.subtitle)
-                            .font(.subheadline)
                             .foregroundStyle(TojTheme.secondaryText)
                             .lineLimit(1)
                     }
                 }
+                .font(.subheadline)
+                .lineLimit(1)
             }
 
             Spacer(minLength: 8)
 
-            VStack(alignment: .trailing, spacing: 7) {
+            VStack(alignment: .trailing, spacing: 5) {
                 Text(TojDateFormatting.chatList(dialog.updatedAt))
-                    .font(.caption2)
+                    .font(.caption)
+                    .monospacedDigit()
                     .foregroundStyle(dialog.unreadCount > 0 ? TojTheme.text : TojTheme.secondaryText)
                 if dialog.unreadCount > 0 {
                     HStack(spacing: 4) {
@@ -619,7 +894,7 @@ private struct CloudDialogRow: View {
                 }
             }
         }
-        .padding(.vertical, 12)
+        .padding(.vertical, 8)
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityHint("Opens conversation. Long press for chat actions.")
@@ -627,7 +902,7 @@ private struct CloudDialogRow: View {
             Rectangle()
                 .fill(TojTheme.hairline)
                 .frame(height: 0.5)
-                .padding(.leading, 65)
+                .padding(.leading, 68)
         }
     }
 }
@@ -712,15 +987,24 @@ private struct NewChatSheet: View {
 // MARK: - Contacts and settings
 
 private struct ComingSoonView: View {
+    let title: LocalizedStringKey
+    let systemImage: String
+    let detail: LocalizedStringKey
+
     var body: some View {
         VStack(spacing: 16) {
-            TojMark(size: 78)
-            Text("Contacts")
+            Image(systemName: systemImage)
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(TojTheme.gold)
+                .frame(width: 78, height: 78)
+                .background(TojTheme.raised, in: Circle())
+                .overlay(Circle().stroke(TojTheme.hairlineStrong, lineWidth: 0.5))
+            Text(title)
                 .font(TojTheme.heading(.title, weight: .bold))
             Text("Coming soon")
                 .font(.headline)
                 .foregroundStyle(TojTheme.secondaryText)
-            Text("Your contacts will appear here in a future update.")
+            Text(detail)
                 .font(.subheadline)
                 .foregroundStyle(TojTheme.secondaryText)
                 .multilineTextAlignment(.center)
@@ -734,67 +1018,189 @@ private struct ComingSoonView: View {
 private struct CloudSettingsView: View {
     @Bindable var model: CloudAppModel
     @State private var showingSignOut = false
+    @State private var pendingLogoutItemCount = 0
     @State private var showingDeletionWarning = false
     @State private var showingDeletionCode = false
     @State private var showingClearMedia = false
+    @State private var showingProfileEditor = false
+    @State private var profilePhotoData: Data?
+
+    private var displayName: String {
+        let candidate = model.storedSession?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return candidate.isEmpty ? String(localized: "Toj") : candidate
+    }
+
+    private var phone: String {
+        model.storedSession?.phone ?? ""
+    }
+
+    private var profilePhotoAccountId: String? {
+        model.storedSession?.session.accountId
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 18) {
-                    TojNavHeader("Settings")
+                LazyVStack(spacing: 20) {
+                    ZStack(alignment: .topTrailing) {
+                        SettingsProfileCard(
+                            displayName: displayName,
+                            phone: phone,
+                            photoData: profilePhotoData,
+                            colorIndex: model.profileDetails.colorIndex
+                        )
 
-                    HStack(spacing: 14) {
-                        TojAvatar(title: model.storedSession?.displayName ?? "Toj", size: 62)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(model.storedSession?.displayName ?? "Toj")
-                                .font(TojTheme.heading(.title3, weight: .semibold))
-                            Text(model.storedSession?.phone ?? "")
-                                .font(.subheadline)
-                                .foregroundStyle(TojTheme.secondaryText)
+                        Button {
+                            showingProfileEditor = true
+                            TojFeedback.selection()
+                        } label: {
+                            Text("Edit")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(TojTheme.text)
+                                .padding(.horizontal, 17)
+                                .frame(height: 44)
+                                .contentShape(Capsule())
+                                .tojGlass(in: Capsule(), interactive: true)
                         }
-                        Spacer()
+                        .buttonStyle(.tojPressable)
+                        .accessibilityHint("Opens your profile details")
+                        .padding(.top, 4)
                     }
-                    .padding(17)
-                    .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: TojRadius.cardLarge, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: TojRadius.cardLarge, style: .continuous).stroke(TojTheme.hairline, lineWidth: 0.5))
+                    .padding(.top, 16)
 
-                    TojSectionCard("Devices") {
-                        if model.loadingDevices && model.devices.isEmpty {
-                            ProgressView("Loading devices")
-                                .frame(maxWidth: .infinity)
-                                .padding(20)
-                        } else if model.devices.isEmpty {
-                            Label("No active devices", systemImage: "iphone.slash")
-                                .foregroundStyle(TojTheme.secondaryText)
-                                .frame(maxWidth: .infinity)
-                                .padding(20)
-                        } else {
-                            ForEach(model.devices) { device in
-                                DeviceRow(device: device) {
-                                    Task { await model.revokeDevice(device) }
-                                }
-                            }
+                    TojSectionCard {
+                        settingsLink(
+                            title: "Saved Messages",
+                            icon: "bookmark.fill",
+                            colors: [Color(hex: 0x4EA5FF), Color(hex: 0x2474ED)],
+                            divider: true,
+                            detail: "Keep notes, links and files close at hand."
+                        )
+                        settingsLink(
+                            title: "Recent Calls",
+                            icon: "phone.fill",
+                            colors: [Color(hex: 0x57DC7C), Color(hex: 0x27B85A)],
+                            divider: true,
+                            detail: "Your voice and video call history will live here."
+                        )
+                        NavigationLink {
+                            SettingsDevicesView(model: model)
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Devices",
+                                icon: "iphone.gen3",
+                                colors: [Color(hex: 0xFFC85A), Color(hex: 0xF59B22)],
+                                value: model.devices.isEmpty ? nil : "\(model.devices.count)",
+                                showsDivider: false
+                            )
                         }
+                        .buttonStyle(.tojPressable(scale: 0.985))
                     }
 
-                    TojSectionCard("Account") {
-                        SettingsAction(title: "Sign out", systemImage: "rectangle.portrait.and.arrow.right") {
-                            showingSignOut = true
+                    TojSectionCard {
+                        settingsLink(
+                            title: "Notifications and Sounds",
+                            icon: "bell.badge.fill",
+                            colors: [Color(hex: 0xFF746D), Color(hex: 0xF04444)],
+                            divider: true,
+                            detail: "Fine-tuned alerts, tones and notification controls are on the way."
+                        )
+                        settingsLink(
+                            title: "Privacy and Security",
+                            icon: "lock.fill",
+                            colors: [Color(hex: 0xC4C7CE), Color(hex: 0x858B96)],
+                            divider: true,
+                            detail: "Advanced privacy controls and security options are coming soon."
+                        )
+                        NavigationLink {
+                            DataStorageSettingsView(model: model)
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Data and Storage",
+                                icon: "externaldrive.fill",
+                                colors: [Color(hex: 0x55DE81), Color(hex: 0x22B95A)],
+                                value: nil,
+                                showsDivider: true
+                            )
                         }
-                        SettingsAction(title: "Delete account", systemImage: "trash.fill", destructive: true) {
-                            showingDeletionWarning = true
-                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
+                        settingsLink(
+                            title: "Appearance",
+                            icon: "circle.lefthalf.filled",
+                            colors: [Color(hex: 0x61CCFF), Color(hex: 0x299DDA)],
+                            divider: true,
+                            detail: "Themes, chat backgrounds and text sizing are coming soon."
+                        )
+                        settingsLink(
+                            title: "Power Saving",
+                            icon: "battery.25percent",
+                            colors: [Color(hex: 0xFFC85C), Color(hex: 0xF49A22)],
+                            value: "Off",
+                            divider: true,
+                            detail: "Power-saving controls will help Toj use less energy."
+                        )
+                        settingsLink(
+                            title: "Language",
+                            icon: "globe",
+                            colors: [Color(hex: 0xCE70F4), Color(hex: 0x9D43D7)],
+                            value: "English",
+                            divider: false,
+                            detail: "More interface languages are being prepared."
+                        )
                     }
 
-                    TojSectionCard("Storage") {
+                    TojSectionCard("Info") {
+                        settingsLink(
+                            title: "Ask a Question",
+                            icon: "questionmark.bubble.fill",
+                            colors: [Color(hex: 0xFFC254), Color(hex: 0xF39A1E)],
+                            divider: true,
+                            detail: "A direct line to Toj support is coming soon."
+                        )
+                        settingsLink(
+                            title: "Toj FAQ",
+                            icon: "questionmark.circle.fill",
+                            colors: [Color(hex: 0x63CFFF), Color(hex: 0x2D9FDC)],
+                            divider: true,
+                            detail: "Helpful answers and guides are being written now."
+                        )
+                        settingsLink(
+                            title: "Toj Features",
+                            icon: "lightbulb.fill",
+                            colors: [Color(hex: 0xFFE95B), Color(hex: 0xF1BC19)],
+                            divider: false,
+                            detail: "Discover everything Toj can do as new features arrive."
+                        )
+                    }
+
+                    TojSectionCard("Storage and account") {
                         SettingsAction(
                             title: model.clearingMediaCache
                                 ? "Clearing downloaded media…"
-                                : "Clear downloaded media (\(ByteCountFormatter.string(fromByteCount: model.mediaCacheBytes, countStyle: .file)))",
-                            systemImage: "externaldrive.badge.xmark"
+                                : "Clear downloaded media",
+                            systemImage: "externaldrive.badge.xmark",
+                            value: ByteCountFormatter.string(fromByteCount: model.mediaCacheBytes, countStyle: .file),
+                            showsDivider: true
                         ) {
                             showingClearMedia = true
+                        }
+                        SettingsAction(
+                            title: "Sign out",
+                            systemImage: "rectangle.portrait.and.arrow.right",
+                            showsDivider: true
+                        ) {
+                            Task {
+                                pendingLogoutItemCount = await model.pendingDestructiveLogoutItemCount()
+                                showingSignOut = true
+                            }
+                        }
+                        SettingsAction(
+                            title: "Delete account",
+                            systemImage: "trash.fill",
+                            destructive: true,
+                            showsDivider: false
+                        ) {
+                            showingDeletionWarning = true
                         }
                     }
 
@@ -830,16 +1236,43 @@ private struct CloudSettingsView: View {
                 .padding(.horizontal, 16)
                 .padding(.bottom, 28)
             }
-            .refreshable { await model.loadDevices() }
             .background(TojTheme.canvas)
             .toolbar(.hidden, for: .navigationBar)
-            .task {
+            .task(id: profilePhotoAccountId) {
                 await model.loadDevices()
+                await model.loadProfileDetails()
                 await model.refreshMediaCacheUsage()
+                if let accountId = profilePhotoAccountId {
+                    profilePhotoData = await EncryptedProfilePhotoStore.load(accountId: accountId)
+                } else {
+                    profilePhotoData = nil
+                }
+                #if DEBUG
+                if ProcessInfo.processInfo.environment["TOJ_DEMO_PROFILE_EDIT"] == "1" {
+                    showingProfileEditor = true
+                }
+                #endif
             }
-            .confirmationDialog("Sign out of Toj?", isPresented: $showingSignOut, titleVisibility: .visible) {
-                Button("Sign out", role: .destructive) { Task { await model.signOut() } }
+            .confirmationDialog(
+                pendingLogoutItemCount > 0
+                    ? "Discard pending work and sign out?"
+                    : "Sign out of Toj?",
+                isPresented: $showingSignOut,
+                titleVisibility: .visible
+            ) {
+                Button(
+                    pendingLogoutItemCount > 0
+                        ? "Discard \(pendingLogoutItemCount) pending item\(pendingLogoutItemCount == 1 ? "" : "s")"
+                        : "Sign out",
+                    role: .destructive
+                ) { Task { await model.signOut() } }
                 Button("Cancel", role: .cancel) {}
+            } message: {
+                if pendingLogoutItemCount > 0 {
+                    Text("Pending messages, edits, or uploads have not reached the cloud and will be permanently removed from this device.")
+                } else {
+                    Text("Your encrypted local replica and downloaded media will be removed from this device.")
+                }
             }
             .confirmationDialog("Delete your Toj account?", isPresented: $showingDeletionWarning, titleVisibility: .visible) {
                 Button("Request deletion code", role: .destructive) {
@@ -860,13 +1293,281 @@ private struct CloudSettingsView: View {
             .sheet(isPresented: $showingDeletionCode) {
                 AccountDeletionView(model: model)
             }
+            .fullScreenCover(isPresented: $showingProfileEditor) {
+                ProfileEditView(
+                    model: model,
+                    persistedPhotoData: $profilePhotoData,
+                    photoAccountId: profilePhotoAccountId
+                )
+                .presentationBackground(TojTheme.canvas)
+            }
         }
+    }
+
+    @ViewBuilder
+    private func settingsLink(
+        title: LocalizedStringKey,
+        icon: String,
+        colors: [Color],
+        value: LocalizedStringKey? = nil,
+        divider: Bool,
+        detail: LocalizedStringKey
+    ) -> some View {
+        NavigationLink {
+            SettingsComingSoonView(title: title, systemImage: icon, colors: colors, detail: detail)
+        } label: {
+            SettingsRowLabel(
+                title: title,
+                icon: icon,
+                colors: colors,
+                value: value,
+                showsDivider: divider
+            )
+        }
+        .buttonStyle(.tojPressable(scale: 0.985))
     }
 
 }
 
+private struct SettingsProfileCard: View {
+    let displayName: String
+    let phone: String
+    let photoData: Data?
+    let colorIndex: Int
+
+    var body: some View {
+        VStack(spacing: 14) {
+            SettingsProfileAvatar(
+                displayName: displayName,
+                photoData: photoData,
+                size: 94,
+                colorIndex: colorIndex
+            )
+                .shadow(color: TojProfilePalette.primary(colorIndex).opacity(0.18), radius: 26, y: 12)
+
+            VStack(spacing: 4) {
+                Text(displayName)
+                    .font(TojTheme.heading(.title2, weight: .bold))
+                    .foregroundStyle(TojTheme.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+                Text(phone)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(TojTheme.secondaryText)
+                    .contentTransition(.numericText())
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
+        .padding(.bottom, 10)
+        .padding(.horizontal, 18)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct SettingsProfileAvatar: View {
+    let displayName: String
+    let photoData: Data?
+    let size: CGFloat
+    let colorIndex: Int
+
+    var body: some View {
+        Group {
+            if let photoData, let image = UIImage(data: photoData) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+            } else {
+                ZStack {
+                    Circle()
+                        .fill(
+                            TojProfilePalette.gradient(colorIndex)
+                        )
+                    Text(displayName.trimmingCharacters(in: .whitespacesAndNewlines).first.map { String($0).uppercased() } ?? "T")
+                        .font(TojTheme.heading(.largeTitle, weight: .medium))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: size, height: size)
+            }
+        }
+        .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 1))
+        .accessibilityHidden(true)
+    }
+}
+
+struct SettingsIconTile: View {
+    let systemImage: String
+    let colors: [Color]
+    var size: CGFloat = 34
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: size * 0.48, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(
+                LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: size * 0.29, style: .continuous)
+            )
+            .overlay(RoundedRectangle(cornerRadius: size * 0.29, style: .continuous).stroke(Color.white.opacity(0.16), lineWidth: 0.5))
+            .shadow(color: (colors.last ?? .clear).opacity(0.16), radius: 7, y: 3)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct SettingsRowLabel: View {
+    let title: LocalizedStringKey
+    let icon: String
+    let colors: [Color]
+    var value: LocalizedStringKey? = nil
+    let showsDivider: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            SettingsIconTile(systemImage: icon, colors: colors)
+            Text(title)
+                .font(.body.weight(.medium))
+                .foregroundStyle(TojTheme.text)
+                .lineLimit(1)
+            Spacer(minLength: 10)
+            if let value {
+                Text(value)
+                    .font(.body)
+                    .foregroundStyle(TojTheme.secondaryText)
+                    .lineLimit(1)
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption.bold())
+                .foregroundStyle(TojTheme.tertiaryText)
+        }
+        .padding(.horizontal, 15)
+        .frame(minHeight: 58)
+        .contentShape(Rectangle())
+        .overlay(alignment: .bottom) {
+            if showsDivider {
+                Rectangle()
+                    .fill(TojTheme.hairlineStrong)
+                    .frame(height: 0.5)
+                    .padding(.leading, 63)
+            }
+        }
+    }
+}
+
+private struct SettingsComingSoonView: View {
+    let title: LocalizedStringKey
+    let systemImage: String
+    let colors: [Color]
+    let detail: LocalizedStringKey
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var animated = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            ZStack {
+                Circle()
+                    .fill((colors.last ?? TojTheme.accent).opacity(0.14))
+                    .frame(width: 156, height: 156)
+                    .blur(radius: animated ? 18 : 8)
+                    .scaleEffect(animated ? 1.08 : 0.9)
+                SettingsIconTile(systemImage: systemImage, colors: colors, size: 82)
+                    .shadow(color: (colors.last ?? .clear).opacity(0.28), radius: 28, y: 14)
+            }
+            .padding(.bottom, 30)
+
+            Text(title)
+                .font(TojTheme.heading(.title, weight: .bold))
+                .foregroundStyle(TojTheme.text)
+                .multilineTextAlignment(.center)
+            Text("Coming soon")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(colors.first ?? TojTheme.accent)
+                .padding(.top, 8)
+            Text(detail)
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 300)
+                .padding(.top, 10)
+            Spacer()
+            Text("We’re making it worth the wait.")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(TojTheme.tertiaryText)
+                .padding(.bottom, 28)
+        }
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TojTheme.canvas)
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                animated = true
+            }
+        }
+    }
+}
+
+private struct SettingsDevicesView: View {
+    @Bindable var model: CloudAppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 10) {
+                    SettingsIconTile(
+                        systemImage: "iphone.gen3",
+                        colors: [Color(hex: 0xFFC85A), Color(hex: 0xF59B22)],
+                        size: 72
+                    )
+                    Text("Active sessions")
+                        .font(TojTheme.heading(.title2, weight: .bold))
+                    Text("Review the devices signed in to your Toj account. You can end any session you don’t recognize.")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 320)
+                }
+                .padding(.vertical, 18)
+
+                TojSectionCard("Devices") {
+                    if model.loadingDevices && model.devices.isEmpty {
+                        ProgressView("Loading devices")
+                            .frame(maxWidth: .infinity)
+                            .padding(24)
+                    } else if model.devices.isEmpty {
+                        Label("No active devices", systemImage: "iphone.slash")
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .frame(maxWidth: .infinity)
+                            .padding(24)
+                    } else {
+                        ForEach(Array(model.devices.enumerated()), id: \.element.id) { index, device in
+                            DeviceRow(device: device, showsDivider: index < model.devices.count - 1) {
+                                Task { await model.revokeDevice(device) }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(TojTheme.canvas)
+        .navigationTitle("Devices")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await model.loadDevices() }
+        .task { await model.loadDevices() }
+    }
+}
+
 private struct DeviceRow: View {
     let device: CloudDevice
+    var showsDivider = true
     let revoke: () -> Void
 
     var body: some View {
@@ -888,7 +1589,9 @@ private struct DeviceRow: View {
         }
         .padding(13)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(TojTheme.hairline).frame(height: 0.5).padding(.leading, 62)
+            if showsDivider {
+                Rectangle().fill(TojTheme.hairline).frame(height: 0.5).padding(.leading, 62)
+            }
         }
     }
 }
@@ -896,26 +1599,43 @@ private struct DeviceRow: View {
 private struct SettingsAction: View {
     let title: String
     let systemImage: String
+    var value: String? = nil
     var destructive = false
+    var showsDivider = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 13) {
-                TojIconTile(systemImage: systemImage, tint: destructive ? TojTheme.danger : nil)
+            HStack(spacing: 14) {
+                SettingsIconTile(
+                    systemImage: systemImage,
+                    colors: destructive
+                        ? [Color(hex: 0xFF746D), Color(hex: 0xE33E3E)]
+                        : [Color(hex: 0x727986), Color(hex: 0x414752)]
+                )
                 Text(title)
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption.bold())
-                    .foregroundStyle(TojTheme.secondaryText)
+                Spacer(minLength: 10)
+                if let value {
+                    Text(value)
+                        .font(.body)
+                        .foregroundStyle(TojTheme.secondaryText)
+                }
             }
             .font(.body.weight(.medium))
             .foregroundStyle(destructive ? TojTheme.danger : TojTheme.text)
             .padding(.horizontal, 15)
-            .frame(minHeight: 54)
+            .frame(minHeight: 58)
             .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                if showsDivider {
+                    Rectangle()
+                        .fill(TojTheme.hairlineStrong)
+                        .frame(height: 0.5)
+                        .padding(.leading, 63)
+                }
+            }
         }
-        .buttonStyle(.tojPressable)
+        .buttonStyle(.tojPressable(scale: 0.985))
     }
 }
 

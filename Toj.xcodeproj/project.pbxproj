@@ -12,13 +12,25 @@
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
 		3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */; };
 		3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */; };
+		4C19CECBBB68FA38A643EACD /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
 		5FBC1A8DF7D90DF358C187F1 /* MessagingPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */; };
+		7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
+		DAE6D5DFCCA9A3125DC90412 /* TelegramFastLocalFirstUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */; };
+		DAF0BE9F58109F5B51592FC6 /* BackgroundMediaTransferSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */; };
 		E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */; };
+		E4A8C89C215B4C37BF5246E1 /* EncryptedProfilePhotoStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		5A640D4C3E46E62876E5C66E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 65F7816C2FF68D07000D35EE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 65F781732FF68D07000D35EE;
+			remoteInfo = Toj;
+		};
 		DA20B4300784965FDDE35BB9 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 65F7816C2FF68D07000D35EE /* Project object */;
@@ -32,8 +44,10 @@
 		13415778815A010ACF1EC8F6 /* Pods-TojTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TojTests.debug.xcconfig"; path = "Target Support Files/Pods-TojTests/Pods-TojTests.debug.xcconfig"; sourceTree = "<group>"; };
 		3DD0437071A3938BAE23617C /* Pods_TojTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_TojTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		4F8DF8F3E80AB4C80C4C67B0 /* Pods-Toj.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.debug.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.debug.xcconfig"; sourceTree = "<group>"; };
+		5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TelegramFastLocalFirstUITests.swift; sourceTree = "<group>"; };
 		51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EnvelopeTests.swift; sourceTree = "<group>"; };
 		65F781742FF68D07000D35EE /* Toj.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Toj.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackgroundMediaTransferSessionTests.swift; sourceTree = "<group>"; };
 		8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CryptoSpikeTests.swift; sourceTree = "<group>"; };
 		9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessagingPresentationTests.swift; sourceTree = "<group>"; };
 		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
@@ -41,7 +55,10 @@
 		C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudLocalStoreTests.swift; sourceTree = "<group>"; };
 		C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Toj.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		C675B0B03C30BD47406B7692 /* TojTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TojTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		C893B353B16FBFCFC5980844 /* TojUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TojUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C8A0117AB39498F640BAC25A /* Pods-TojTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TojTests.release.xcconfig"; path = "Target Support Files/Pods-TojTests/Pods-TojTests.release.xcconfig"; sourceTree = "<group>"; };
+		E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalFirstPerformanceTests.swift; sourceTree = "<group>"; };
+		E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EncryptedProfilePhotoStoreTests.swift; sourceTree = "<group>"; };
 		F0C03914F0029DBF5289BE42 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackoffPolicyTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -49,12 +66,22 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		65F781762FF68D07000D35EE /* Toj */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = Toj;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		53F2964D1CC3A5072DA18514 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4C19CECBBB68FA38A643EACD /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		65F781712FF68D07000D35EE /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -84,6 +111,9 @@
 				8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */,
 				C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */,
 				9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */,
+				7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */,
+				E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */,
+				E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */,
 			);
 			path = TojTests;
 			sourceTree = "<group>";
@@ -117,6 +147,7 @@
 				23069261A8C1657CB5CB4AD3 /* Frameworks */,
 				227E262CA0870AFCBC751B27 /* TojTests */,
 				568303A52439F1F4CEE6D1B4 /* Pods */,
+				7CCA63084692DA7D54E881EA /* TojUITests */,
 			);
 			sourceTree = "<group>";
 		};
@@ -125,8 +156,18 @@
 			children = (
 				65F781742FF68D07000D35EE /* Toj.app */,
 				C675B0B03C30BD47406B7692 /* TojTests.xctest */,
+				C893B353B16FBFCFC5980844 /* TojUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		7CCA63084692DA7D54E881EA /* TojUITests */ = {
+			isa = PBXGroup;
+			children = (
+				5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */,
+			);
+			name = TojUITests;
+			path = TojUITests;
 			sourceTree = "<group>";
 		};
 		85E79E9C0A40DFE9F527E2D0 /* iOS */ = {
@@ -140,6 +181,24 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		04CF34BEB867389D5ACDDD1F /* TojUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FD6CC5A0383D1F99372A0DC6 /* Build configuration list for PBXNativeTarget "TojUITests" */;
+			buildPhases = (
+				1E11EB0B80D61A0BA9EDB902 /* Sources */,
+				53F2964D1CC3A5072DA18514 /* Frameworks */,
+				46156E1708F0D0C7644B5AA9 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				394ECF160D38283B82C578CE /* PBXTargetDependency */,
+			);
+			name = TojUITests;
+			productName = TojUITests;
+			productReference = C893B353B16FBFCFC5980844 /* TojUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		3AF456BBB488BAA1093F650B /* TojTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 6D0CB8F875CD7010D1047A6C /* Build configuration list for PBXNativeTarget "TojTests" */;
@@ -214,11 +273,19 @@
 			targets = (
 				65F781732FF68D07000D35EE /* Toj */,
 				3AF456BBB488BAA1093F650B /* TojTests */,
+				04CF34BEB867389D5ACDDD1F /* TojUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		46156E1708F0D0C7644B5AA9 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		4BFB64BAF912FB67976FE149 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -304,6 +371,14 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		1E11EB0B80D61A0BA9EDB902 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DAE6D5DFCCA9A3125DC90412 /* TelegramFastLocalFirstUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		28BAEDA83108696F47564874 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -314,6 +389,9 @@
 				CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */,
 				3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */,
 				5FBC1A8DF7D90DF358C187F1 /* MessagingPresentationTests.swift in Sources */,
+				DAF0BE9F58109F5B51592FC6 /* BackgroundMediaTransferSessionTests.swift in Sources */,
+				E4A8C89C215B4C37BF5246E1 /* EncryptedProfilePhotoStoreTests.swift in Sources */,
+				7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -332,6 +410,12 @@
 			name = Toj;
 			target = 65F781732FF68D07000D35EE /* Toj */;
 			targetProxy = DA20B4300784965FDDE35BB9 /* PBXContainerItemProxy */;
+		};
+		394ECF160D38283B82C578CE /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = Toj;
+			target = 65F781732FF68D07000D35EE /* Toj */;
+			targetProxy = 5A640D4C3E46E62876E5C66E /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -591,6 +675,43 @@
 			};
 			name = Release;
 		};
+		DB1140DBF0E114BEA636788A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojUITests;
+				PRODUCT_NAME = TojUITests;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Toj;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F7AE2E3CDB28B665F311F502 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.toj.TojUITests;
+				PRODUCT_NAME = TojUITests;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Toj;
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -617,6 +738,15 @@
 			buildConfigurations = (
 				510EAE3CDD3D351F9BD1527A /* Release */,
 				244C12B54990E01FDEF0EA41 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FD6CC5A0383D1F99372A0DC6 /* Build configuration list for PBXNativeTarget "TojUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DB1140DBF0E114BEA636788A /* Release */,
+				F7AE2E3CDB28B665F311F502 /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

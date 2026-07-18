@@ -1,5 +1,19 @@
 import Foundation
 
+nonisolated enum CloudConfigValidationIssue: Equatable, Sendable {
+    case insecureReleaseEndpoint
+    case loopbackOnPhysicalDevice
+
+    var message: String {
+        switch self {
+        case .insecureReleaseEndpoint:
+            "The cloud endpoint must use HTTPS in release builds."
+        case .loopbackOnPhysicalDevice:
+            "This iPhone is configured to connect to itself instead of the Toj server."
+        }
+    }
+}
+
 nonisolated struct CloudConfig: Sendable {
     var baseURL: URL
 
@@ -26,5 +40,21 @@ nonisolated struct CloudConfig: Sendable {
         var components = URLComponents(url: httpURL(path: "v1/ws"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"
         return components.url!
+    }
+
+    func validationIssue(environment: [String: String] = ProcessInfo.processInfo.environment) -> CloudConfigValidationIssue? {
+        #if !DEBUG
+        guard baseURL.scheme?.lowercased() == "https" else {
+            return .insecureReleaseEndpoint
+        }
+        #endif
+
+        let host = baseURL.host?.lowercased() ?? ""
+        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard isLoopback else { return nil }
+        let isSimulator = environment["SIMULATOR_UDID"] != nil
+            || environment["SIMULATOR_DEVICE_NAME"] != nil
+        let explicitlyAllowed = environment["TOJ_ALLOW_LOOPBACK"] == "1"
+        return isSimulator || explicitlyAllowed ? nil : .loopbackOnPhysicalDevice
     }
 }
