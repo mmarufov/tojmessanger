@@ -33,7 +33,7 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Toj uses the microphone only when you record a voice message.</string>
+	<string>Toj uses the microphone when you record a voice message or join an encrypted voice call.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Toj uses your contacts to help you find people you know and invite friends who are not on Toj yet.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
@@ -42,9 +42,11 @@
 	<string>Toj shows your recent photos only while you choose something to send.</string>
 	<key>UIBackgroundModes</key>
 	<array>
+		<string>audio</string>
 		<string>fetch</string>
 		<string>processing</string>
 		<string>remote-notification</string>
+		<string>voip</string>
 	</array>
 	<key>TOJPushEnabled</key>
 	<string>$(TOJ_PUSH_ENABLED)</string>

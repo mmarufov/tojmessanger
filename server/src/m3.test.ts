@@ -531,14 +531,21 @@ describe("M3 cloud sync", () => {
 
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
+    const originalConsoleError = console.error;
+    const logged: string[] = [];
+    console.error = (...parts: unknown[]) => logged.push(parts.map(String).join(" "));
     try {
       await startVerification(db, testPhone(123), { delivery: new FailingOTPDelivery() });
     } catch (value) {
       error = value;
+    } finally {
+      console.error = originalConsoleError;
     }
     expect(error).toBeInstanceOf(AuthError);
     expect((error as AuthError).status).toBe(503);
     expect((await db`SELECT consumed_at FROM otp_challenges`)[0].consumed_at).not.toBeNull();
+    expect(logged.join(" ")).not.toContain("provider unavailable");
+    expect(logged.join(" ")).toContain("Error");
   });
 
   test("APNs token registration encrypts at rest and transfers a reused token", async () => {

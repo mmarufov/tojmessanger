@@ -437,6 +437,7 @@ nonisolated struct CloudAPIError: Error, LocalizedError {
     let message: String
     let retryAfter: Int?
     var code: String? = nil
+    var existingCallId: String? = nil
 
     var errorDescription: String? {
         message
@@ -584,7 +585,7 @@ struct CloudAPI: Sendable {
                 maxBytes: maxBytes
             ),
             token: token,
-            timeout: 20
+            timeoutInterval: 20
         )
     }
 
@@ -771,6 +772,115 @@ struct CloudAPI: Sendable {
         try await delete("v1/devices/push", token: token)
     }
 
+    func registerVoIPPushToken(
+        _ deviceToken: String,
+        environment: String,
+        token: String
+    ) async throws -> PushRegistrationResponse {
+        try await put(
+            "v1/devices/voip-push",
+            body: PushRegistrationRequest(token: deviceToken, environment: environment),
+            token: token
+        )
+    }
+
+    func unregisterVoIPPushToken(token: String) async throws -> PushRegistrationResponse {
+        try await delete("v1/devices/voip-push", token: token)
+    }
+
+    func createCall(_ body: CreateCloudCallRequest, token: String) async throws -> CloudCallCreateResponse {
+        try await post("v1/calls", body: body, token: token, timeoutInterval: 8)
+    }
+
+    func activeCalls(token: String) async throws -> CloudActiveCallsResponse {
+        try await get("v1/calls/active", token: token, timeoutInterval: 8)
+    }
+
+    func call(id: String, token: String) async throws -> CloudCallResponse {
+        try await get("v1/calls/\(id)", token: token, timeoutInterval: 8)
+    }
+
+    func acceptCall(
+        id: String,
+        body: AcceptCloudCallRequest,
+        token: String
+    ) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/accept", body: body, token: token, timeoutInterval: 8)
+    }
+
+    func revealCall(
+        id: String,
+        body: RevealCloudCallRequest,
+        token: String
+    ) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/reveal", body: body, token: token, timeoutInterval: 8)
+    }
+
+    func confirmCall(
+        id: String,
+        body: ConfirmCloudCallRequest,
+        token: String
+    ) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/confirm", body: body, token: token, timeoutInterval: 8)
+    }
+
+    func declineCall(id: String, reason: String? = nil, token: String) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/decline", body: EndCloudCallRequest(reason: reason), token: token, timeoutInterval: 8)
+    }
+
+    func cancelCall(id: String, reason: String? = nil, token: String) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/cancel", body: EndCloudCallRequest(reason: reason), token: token, timeoutInterval: 8)
+    }
+
+    func endCall(id: String, reason: String? = nil, token: String) async throws -> CloudCallResponse {
+        try await post("v1/calls/\(id)/end", body: EndCloudCallRequest(reason: reason), token: token, timeoutInterval: 8)
+    }
+
+    func sendCallEvent(
+        callId: String,
+        body: SendCloudCallEventRequest,
+        token: String
+    ) async throws -> CloudCallEventResponse {
+        try await post("v1/calls/\(callId)/events", body: body, token: token, timeoutInterval: 8)
+    }
+
+    func callEvents(
+        callId: String,
+        after eventSequence: Int64,
+        limit: Int = 100,
+        token: String
+    ) async throws -> CloudCallEventsResponse {
+        try await get(
+            "v1/calls/\(callId)/events",
+            queryItems: [
+                URLQueryItem(name: "after", value: String(max(0, eventSequence))),
+                URLQueryItem(name: "limit", value: String(max(1, min(100, limit)))),
+            ],
+            token: token,
+            timeoutInterval: 8
+        )
+    }
+
+    func sendCallTelemetry(
+        callId: String,
+        body: CallTelemetryRequest,
+        token: String
+    ) async throws -> CloudCallTelemetryResponse {
+        try await post("v1/calls/\(callId)/telemetry", body: body, token: token)
+    }
+
+    func callIceConfiguration(callId: String, token: String) async throws -> CloudCallIceConfiguration {
+        try await get("v1/calls/\(callId)/ice-config", token: token, timeoutInterval: 8)
+    }
+
+    func blockAccount(id: String, token: String) async throws -> CloudBlockResponse {
+        try await put("v1/blocks/\(id)", body: EmptyBody(), token: token)
+    }
+
+    func unblockAccount(id: String, token: String) async throws -> CloudBlockResponse {
+        try await delete("v1/blocks/\(id)", token: token)
+    }
+
     func revokeSession(token: String) async throws -> SessionRevocationResponse {
         try await delete("v1/session", token: token)
     }
@@ -792,9 +902,25 @@ struct CloudAPI: Sendable {
         try await delete("v1/account", body: ["code": code], token: token)
     }
 
-    private func get<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
-        var request = URLRequest(url: config.httpURL(path: path))
+    private func get<Response: Decodable>(
+        _ path: String,
+        token: String?,
+        timeoutInterval: TimeInterval? = nil
+    ) async throws -> Response {
+        try await get(path, queryItems: [], token: token, timeoutInterval: timeoutInterval)
+    }
+
+    private func get<Response: Decodable>(
+        _ path: String,
+        queryItems: [URLQueryItem],
+        token: String?,
+        timeoutInterval: TimeInterval? = nil
+    ) async throws -> Response {
+        var components = URLComponents(url: config.httpURL(path: path), resolvingAgainstBaseURL: false)!
+        if !queryItems.isEmpty { components.queryItems = queryItems }
+        var request = URLRequest(url: components.url!)
         request.httpMethod = "GET"
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
@@ -805,11 +931,11 @@ struct CloudAPI: Sendable {
         _ path: String,
         body: Body,
         token: String?,
-        timeout: TimeInterval? = nil
+        timeoutInterval: TimeInterval? = nil
     ) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "POST"
-        if let timeout { request.timeoutInterval = timeout }
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try encoder.encode(body)
         if let token {
@@ -818,7 +944,11 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
-    private func put<Body: Encodable, Response: Decodable>(_ path: String, body: Body, token: String?) async throws -> Response {
+    private func put<Body: Encodable, Response: Decodable>(
+        _ path: String,
+        body: Body,
+        token: String?
+    ) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -859,11 +989,18 @@ struct CloudAPI: Sendable {
             throw CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil)
         }
         guard (200..<300).contains(http.statusCode) else {
-            let message = (try? decoder.decode(ServerError.self, from: data).error)
+            let serverError = try? decoder.decode(ServerError.self, from: data)
+            let message = serverError?.error
                 ?? String(data: data, encoding: .utf8)
                 ?? "HTTP \(http.statusCode)"
             let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
-            throw CloudAPIError(status: http.statusCode, message: message, retryAfter: retryAfter)
+            throw CloudAPIError(
+                status: http.statusCode,
+                message: message,
+                retryAfter: retryAfter,
+                code: serverError?.code,
+                existingCallId: serverError?.existingCallId
+            )
         }
         return try decoder.decode(Response.self, from: data)
     }
@@ -877,6 +1014,8 @@ private struct DifferenceRequest: Codable, Sendable {
 
 private struct ServerError: Codable {
     let error: String
+    let code: String?
+    let existingCallId: String?
 }
 
 private struct EmptyBody: Encodable {}

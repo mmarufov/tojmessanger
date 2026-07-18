@@ -1,0 +1,24 @@
+services:
+  coturn:
+    image: coturn/coturn:4.14.0-r0@sha256:0c0e8fc0c263b85a134e9e4242b5e46e1f4c077c5029633511191c05b5c2c814
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: '3'
+    tmpfs:
+      - /var/lib/coturn:size=32m,uid=65534,gid=65534,mode=0700
+      - /tmp:size=32m,uid=65534,gid=65534,mode=0700
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./certs:/etc/coturn/certs:ro
+    command: ['-c', '/etc/coturn/turnserver.conf']
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE

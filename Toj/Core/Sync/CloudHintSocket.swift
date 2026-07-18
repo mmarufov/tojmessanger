@@ -6,6 +6,24 @@ nonisolated struct SyncHint: Codable, Equatable, Sendable {
     let ptsCount: Int64
 }
 
+nonisolated struct CallHint: Codable, Equatable, Sendable {
+    let type: String
+    let callId: String
+    let latestEventSeq: Int64
+}
+
+nonisolated struct SessionRevokedHint: Codable, Equatable, Sendable {
+    let type: String
+    let deviceId: String?
+    let reason: String?
+}
+
+nonisolated enum CloudSocketEvent: Equatable, Sendable {
+    case sync(SyncHint)
+    case call(CallHint)
+    case sessionRevoked(SessionRevokedHint)
+}
+
 actor CloudHintSocket {
     enum State: Equatable, Sendable {
         case disconnected
@@ -21,18 +39,18 @@ actor CloudHintSocket {
     private var backoff = BackoffPolicy()
     private(set) var state: State = .disconnected
 
-    private let hintsContinuation: AsyncStream<SyncHint>.Continuation
-    nonisolated let hints: AsyncStream<SyncHint>
     private let statesContinuation: AsyncStream<State>.Continuation
     nonisolated let states: AsyncStream<State>
+    private let eventsContinuation: AsyncStream<CloudSocketEvent>.Continuation
+    nonisolated let events: AsyncStream<CloudSocketEvent>
 
     init(url: URL, token: String, session: URLSession = URLSession(configuration: .ephemeral)) {
         self.url = url
         self.token = token
         self.session = session
-        (hints, hintsContinuation) = AsyncStream.makeStream(of: SyncHint.self)
         (states, statesContinuation) = AsyncStream.makeStream(of: State.self)
         statesContinuation.yield(.disconnected)
+        (events, eventsContinuation) = AsyncStream.makeStream(of: CloudSocketEvent.self)
     }
 
     func start() {
@@ -85,8 +103,8 @@ actor CloudHintSocket {
         while !Task.isCancelled {
             let message = try await task.receive()
             backoff.reset()
-            guard let hint = Self.hint(from: message), hint.type == "sync_hint" else { continue }
-            hintsContinuation.yield(hint)
+            guard let event = Self.event(from: message) else { continue }
+            eventsContinuation.yield(event)
         }
     }
 
@@ -122,13 +140,30 @@ actor CloudHintSocket {
         statesContinuation.yield(next)
     }
 
-    private nonisolated static func hint(from message: URLSessionWebSocketTask.Message) -> SyncHint? {
+    private nonisolated static func event(from message: URLSessionWebSocketTask.Message) -> CloudSocketEvent? {
         let data: Data
         switch message {
         case .string(let text): data = Data(text.utf8)
         case .data(let raw): data = raw
         @unknown default: return nil
         }
-        return try? JSONDecoder().decode(SyncHint.self, from: data)
+        guard let discriminator = try? JSONDecoder().decode(SocketDiscriminator.self, from: data) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        switch discriminator.type {
+        case "sync_hint":
+            return (try? decoder.decode(SyncHint.self, from: data)).map(CloudSocketEvent.sync)
+        case "call_hint":
+            return (try? decoder.decode(CallHint.self, from: data)).map(CloudSocketEvent.call)
+        case "session_revoked":
+            return (try? decoder.decode(SessionRevokedHint.self, from: data)).map(CloudSocketEvent.sessionRevoked)
+        default:
+            return nil
+        }
     }
+}
+
+private nonisolated struct SocketDiscriminator: Codable, Sendable {
+    let type: String
 }

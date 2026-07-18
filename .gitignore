@@ -15,6 +15,7 @@ Pods/
 
 # Local agent context; keep public repos free of private project/security notes.
 CLAUDE.md
+.gstack/
 
 # Server
 node_modules/
@@ -25,3 +26,13 @@ node_modules/
 *.local.xcconfig
 Local.xcconfig
 secrets.xcconfig
+
+# Reproducible WebRTC build output (published as a release artifact, never committed)
+.webrtc-build/
+Dependencies/TojWebRTC/WebRTC.xcframework/
+Dependencies/TojWebRTC/WebRTC.xcframework.zip
+Dependencies/TojWebRTC/WebRTC.xcframework.zip.sha256
+
+# Coturn deployment secrets and certificates
+infra/coturn/turnserver.conf
+infra/coturn/certs/

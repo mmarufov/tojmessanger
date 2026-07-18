@@ -183,6 +183,7 @@ final class CloudAppModel {
         var clientMsgId: String
         var senderAccountId: String? = nil
         var text: String
+        var kind: String = "text"
         var mine: Bool
         var delivery: Delivery
         var timestamp: String?
@@ -269,6 +270,7 @@ final class CloudAppModel {
     private let localStoreBootstrapper = CloudLocalStoreBootstrapper()
     private let opensDefaultLocalStore: Bool
     private let pushCenter: PushRegistrationCenter
+    private let voipPushCenter: VoIPPushRegistrationCenter
     private let mediaEngine: CloudMediaTransferEngine
     private let capabilityDefaults: UserDefaults
     private let capabilityCacheKey: String
@@ -317,6 +319,7 @@ final class CloudAppModel {
     private var messageMutationsInFlight: Set<String> = []
     private var mutationTargetsBeingQueued: Set<String> = []
     private var uploadedPushRegistration: String?
+    private var uploadedVoIPPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftsByDialog: [String: String] = [:]
     private var cachedLinesByDialog: [String: [Line]] = [:]
@@ -343,11 +346,16 @@ final class CloudAppModel {
     private var demoLinesByDialog: [String: [Line]] = [:]
     #endif
 
+    let callCoordinator: CallCoordinator
+    let callPreferences: CallPrivacyPreferences
+
     var capabilities: MessagingCapabilities {
         #if DEBUG
         if isDemoMode { return .demo }
         #endif
-        return negotiatedCapabilities
+        return WebRTCEngineFactory.isAvailable
+            ? negotiatedCapabilities
+            : negotiatedCapabilities.subtracting(.calls)
     }
 
     var replicaSyncSnapshot: ReplicaSyncSnapshot {
@@ -378,6 +386,9 @@ final class CloudAppModel {
         config: CloudConfig = .current,
         tokenStore: TokenStore = TokenStore(),
         pushCenter: PushRegistrationCenter = .shared,
+        voipPushCenter: VoIPPushRegistrationCenter = .shared,
+        callCoordinator: CallCoordinator = .shared,
+        callPreferences: CallPrivacyPreferences = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
         useDefaultLocalStore: Bool = true,
         capabilityDefaults: UserDefaults = .standard
@@ -385,6 +396,9 @@ final class CloudAppModel {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
+        self.voipPushCenter = voipPushCenter
+        self.callCoordinator = callCoordinator
+        self.callPreferences = callPreferences
         self.mediaEngine = CloudMediaTransferEngine(config: config)
         self.opensDefaultLocalStore = useDefaultLocalStore && injectedLocalStore == nil
         self.capabilityDefaults = capabilityDefaults
@@ -414,6 +428,9 @@ final class CloudAppModel {
                 await self?.syncFromPush() ?? false
             }
         )
+        voipPushCenter.bind { [weak self] token, environment in
+            await self?.uploadVoIPPushToken(token, environment: environment)
+        }
     }
 
     func start() async {
@@ -990,6 +1007,8 @@ final class CloudAppModel {
         devices = []
         loadingDevices = false
         uploadedPushRegistration = nil
+        uploadedVoIPPushRegistration = nil
+        callCoordinator.unbind()
         pts = 0
         phone = "+992 "
         displayName = ""
@@ -1788,6 +1807,48 @@ final class CloudAppModel {
         dialogs.first(where: { $0.id == dialogId })?.title ?? shortDialogId(dialogId)
     }
 
+    func startVoiceCall(dialogId: String) async {
+        #if DEBUG
+        if isDemoMode {
+            presentNotice("Voice calls", message: "Sign in to place a secure voice call.")
+            return
+        }
+        #endif
+        guard capabilities.contains(.calls) else {
+            presentNotice("Voice calls unavailable", message: "This server has not enabled encrypted calling yet.")
+            return
+        }
+        guard
+            let accountId = storedSession?.session.accountId,
+            let peerAccountId = try? await localStore?.peerAccountId(dialogId: dialogId, excluding: accountId)
+        else {
+            presentNotice("Call unavailable", message: "The other participant could not be verified.")
+            return
+        }
+        await callCoordinator.startOutgoing(
+            dialogId: dialogId,
+            peerAccountId: peerAccountId,
+            displayName: dialogTitle(dialogId)
+        )
+    }
+
+    func blockPeer(dialogId: String) async -> Bool {
+        #if DEBUG
+        if isDemoMode { return false }
+        #endif
+        guard
+            let session = storedSession?.session,
+            let peer = try? await localStore?.peerAccountId(dialogId: dialogId, excluding: session.accountId)
+        else { return false }
+        do {
+            _ = try await api.blockAccount(id: peer, token: session.token)
+            return true
+        } catch {
+            presentNotice("Could not block account", message: error.localizedDescription)
+            return false
+        }
+    }
+
     func sendDraft() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -2385,6 +2446,12 @@ final class CloudAppModel {
             launchPhase = .recoveringStore
             return
         }
+        if let session = storedSession?.session {
+            callCoordinator.configure(api: api, session: session) { [weak self] dialogId, _ in
+                self?.dialogTitle(dialogId) ?? String(localized: "Toj caller")
+            }
+        }
+        await refreshMediaCacheUsage()
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
@@ -2818,6 +2885,9 @@ final class CloudAppModel {
                 resolved.insert(.voiceNotes)
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
+            if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
+                resolved.insert(.calls)
+            }
             negotiatedCapabilities = resolved
             capabilityDefaults.set(Int(resolved.rawValue), forKey: capabilityCacheKey)
         } catch let error as CloudAPIError where error.status == 404 {
@@ -2969,6 +3039,32 @@ final class CloudAppModel {
         }
     }
 
+    private func uploadVoIPPushToken(_ deviceToken: String?, environment: String) async {
+        guard let token = storedSession?.session.token else { return }
+        guard let deviceToken, callCoordinator.canRegisterForIncomingCalls else {
+            // Token rotation and permission changes can race the normal resume path. Always clear
+            // the server registration when this installation cannot answer; otherwise a later
+            // PushKit callback could silently make a microphone-denied device callable again.
+            _ = try? await api.unregisterVoIPPushToken(token: token)
+            uploadedVoIPPushRegistration = nil
+            return
+        }
+        let registration = "\(environment):\(deviceToken)"
+        guard uploadedVoIPPushRegistration != registration else { return }
+        do {
+            _ = try await api.registerVoIPPushToken(deviceToken, environment: environment, token: token)
+            guard storedSession?.session.token == token,
+                  callCoordinator.canRegisterForIncomingCalls else {
+                _ = try? await api.unregisterVoIPPushToken(token: token)
+                uploadedVoIPPushRegistration = nil
+                return
+            }
+            uploadedVoIPPushRegistration = registration
+        } catch {
+            status = "Call push registration failed: \(error.localizedDescription)"
+        }
+    }
+
     private func syncFromPush() async -> Bool {
         let previousPts = pts
         _ = await syncNow()
@@ -2979,11 +3075,16 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return }
         #endif
-        guard storedSession?.session.token != nil else { return }
+        guard let token = storedSession?.session.token else { return }
         setReplicaSyncState(.checking)
         status = "Checking connection"
         pushCenter.refreshRegistration()
+        if capabilities.contains(.calls) {
+            await syncVoIPCallingAvailability()
+        }
+        await startHints(token: token)
         scheduleSync(trigger: .foreground)
+        scheduleOutboxRetry()
     }
 
     func retryReplicaSync() {
@@ -2996,6 +3097,16 @@ final class CloudAppModel {
         scheduleSync(trigger: .manualRetry)
     }
 
+    private func syncVoIPCallingAvailability() async {
+        guard let token = storedSession?.session.token else { return }
+        if callCoordinator.canRegisterForIncomingCalls {
+            voipPushCenter.refreshRegistration()
+        } else {
+            _ = try? await api.unregisterVoIPPushToken(token: token)
+            uploadedVoIPPushRegistration = nil
+        }
+    }
+
     private func startHints(token: String) async {
         hintTask?.cancel()
         await hintSocket?.stop()
@@ -3006,9 +3117,20 @@ final class CloudAppModel {
             await socket.start()
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { [weak self, socket] in
-                    for await _ in socket.hints {
+                    for await event in socket.events {
                         guard let self, !Task.isCancelled else { return }
-                        await self.replicaSyncCoordinator.trigger(.hint)
+                        switch event {
+                        case .sync:
+                            await self.replicaSyncCoordinator.trigger(.hint)
+                        case .call(let hint):
+                            await self.callCoordinator.handle(hint)
+                        case .sessionRevoked(let hint):
+                            if let revokedDeviceId = hint.deviceId {
+                                let currentDeviceId = await self.storedSession?.session.deviceId
+                                guard revokedDeviceId == currentDeviceId else { continue }
+                            }
+                            await self.clearLocalSession(finalStatus: "Session ended")
+                        }
                     }
                 }
                 group.addTask { [weak self, socket] in
@@ -3146,6 +3268,9 @@ final class CloudAppModel {
             }
             guard let self, self.storedSession?.session.token == token else { return }
             await self.refreshServerCapabilities()
+            if self.capabilities.contains(.calls) {
+                await self.syncVoIPCallingAvailability()
+            }
             self.reconcileProfileWithServer()
             await self.refreshMediaCacheUsage()
             await self.loadMediaPolicies()
@@ -3618,7 +3743,13 @@ final class CloudAppModel {
         mutation: PendingMessageMutation? = nil,
         mediaTransfer: MediaTransferRecord? = nil
     ) -> Line {
-        let mine = message.senderAccountId == storedSession?.session.accountId
+        let senderIsCurrentAccount = message.senderAccountId == storedSession?.session.accountId
+        let mine = message.kind == "service"
+            ? VoiceCallServicePresentation.callerIsCurrentAccount(
+                body: message.text,
+                currentAccountId: storedSession?.session.accountId
+            ) ?? senderIsCurrentAccount
+            : senderIsCurrentAccount
         let deliveryState: Line.Delivery
         if let mediaTransfer, mediaTransfer.terminal {
             deliveryState = .failed(mediaTransfer.lastError ?? String(localized: "Attachment failed"))
@@ -3649,6 +3780,7 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
             text: presentedText,
+            kind: message.kind,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
@@ -3683,7 +3815,13 @@ final class CloudAppModel {
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let previewKind = ChatListPreviewKind(messageKind: local.lastKind)
         let subtitle: String
-        if let lastText, !lastText.isEmpty {
+        if local.lastKind == "service", let lastText, !lastText.isEmpty {
+            subtitle = VoiceCallServicePresentation.parse(
+                body: lastText,
+                callerIsCurrentAccount: local.lastSenderAccountId == storedSession?.session.accountId,
+                currentAccountId: storedSession?.session.accountId
+            ).title
+        } else if let lastText, !lastText.isEmpty {
             subtitle = lastText
         } else if local.lastState == "visible" {
             subtitle = previewKind.title.isEmpty ? String(localized: "Attachment") : previewKind.title
@@ -4194,6 +4332,7 @@ final class CloudAppModel {
             lines[index].dialogId = message.dialogId
             lines[index].msgId = message.msgId
             lines[index].senderAccountId = message.senderAccountId
+            lines[index].kind = message.kind
             lines[index].text = message.text
             lines[index].replyToMsgId = message.replyToMsgId
             lines[index].reactions = Self.reactionBadges(message.reactions)
@@ -4218,6 +4357,7 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
             text: message.text,
+            kind: message.kind,
             mine: mine,
             delivery: .sent,
             timestamp: message.serverTs,

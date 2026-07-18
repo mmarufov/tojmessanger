@@ -1,0 +1,59 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "TojWebRTC-e3512de97abf",
+  "documentNamespace": "https://github.com/mmarufov/tojmessanger/sbom/webrtc/e3512de97abf8631e98785300ccd5502cb1edd36",
+  "creationInfo": {
+    "created": "2026-07-16T00:00:00Z",
+    "creators": [
+      "Tool: Toj pinned WebRTC build workflow"
+    ]
+  },
+  "packages": [
+    {
+      "name": "WebRTC",
+      "SPDXID": "SPDXRef-Package-WebRTC",
+      "versionInfo": "e3512de97abf8631e98785300ccd5502cb1edd36",
+      "downloadLocation": "git+https://webrtc.googlesource.com/src@e3512de97abf8631e98785300ccd5502cb1edd36",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:generic/webrtc@e3512de97abf8631e98785300ccd5502cb1edd36?vcs_url=https%3A%2F%2Fwebrtc.googlesource.com%2Fsrc"
+        }
+      ]
+    },
+    {
+      "name": "depot_tools",
+      "SPDXID": "SPDXRef-Package-depot-tools",
+      "versionInfo": "99d255e39ab1d5a6a56fa19605bef619b3c0e31b",
+      "downloadLocation": "git+https://chromium.googlesource.com/chromium/tools/depot_tools.git@99d255e39ab1d5a6a56fa19605bef619b3c0e31b",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-WebRTC"
+    },
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-depot-tools"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-depot-tools",
+      "relationshipType": "BUILD_DEPENDENCY_OF",
+      "relatedSpdxElement": "SPDXRef-Package-WebRTC"
+    }
+  ]
+}

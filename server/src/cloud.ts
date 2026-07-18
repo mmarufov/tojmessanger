@@ -8,10 +8,8 @@ import {
   getProfile,
   updateProfile,
   otpDeliveryFromEnvironment,
-  revokeDevice,
   listDevices,
   startAccountDeletion,
-  deleteAccount,
   privateBetaOTPConfigured,
   AuthError,
   type OTPDelivery,
@@ -20,8 +18,10 @@ import {
   APNsClient,
   PushError,
   registerPushToken,
+  registerVoIPPushToken,
   startPushWorker,
   unregisterPushToken,
+  unregisterVoIPPushToken,
   type PushSender,
 } from "./push";
 import {
@@ -61,6 +61,30 @@ import {
   uploadMediaPart,
   uploadMediaThumbnail,
 } from "./media";
+import {
+  acceptCall,
+  blockAccount,
+  CallError,
+  cancelCall,
+  confirmCallKey,
+  createCall,
+  declineCall,
+  deleteAccountAndTerminateCalls,
+  endCall,
+  getActiveCalls,
+  getCall,
+  getCallEvents,
+  getIceConfig,
+  recordCallTelemetry,
+  revealCallKey,
+  revokeDeviceAndTerminateCalls,
+  sendEncryptedCallEvent,
+  startCallCleanupWorker,
+  startCallNotificationListener,
+  unblockAccount,
+  voiceCallsConfigured,
+  type CallHint,
+} from "./calls";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -83,6 +107,12 @@ export const CLOUD_CAPABILITIES = {
   ],
 } as const;
 
+function cloudCapabilities(voiceCalls: boolean) {
+  return voiceCalls
+    ? { ...CLOUD_CAPABILITIES, capabilities: [...CLOUD_CAPABILITIES.capabilities, "voice_calls_v1"] }
+    : CLOUD_CAPABILITIES;
+}
+
 function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -90,13 +120,13 @@ function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Res
   });
 }
 
-async function readJson(req: Request): Promise<any> {
+async function readJson(req: Request, maxBytes = MAX_JSON_BYTES): Promise<any> {
   if (req.method === "GET" || req.method === "HEAD") return {};
   const contentLength = Number(req.headers.get("content-length") ?? 0);
-  if (contentLength > MAX_JSON_BYTES) throw new SyncError("request body too large");
+  if (contentLength > maxBytes) throw new SyncError("request body too large");
   const text = await req.text();
   if (!text) return {};
-  if (Buffer.byteLength(text) > MAX_JSON_BYTES) throw new SyncError("request body too large");
+  if (Buffer.byteLength(text) > maxBytes) throw new SyncError("request body too large");
   try {
     return JSON.parse(text);
   } catch {
@@ -155,6 +185,17 @@ function pushHints(sockets: Map<string, Set<ServerWebSocket<SocketData>>>, pushe
   }
 }
 
+function pushCallHints(sockets: Map<string, Set<ServerWebSocket<SocketData>>>, hints: CallHint[]) {
+  for (const hint of hints) {
+    const payload = JSON.stringify({
+      type: "call_hint", callId: hint.callId, latestEventSeq: hint.latestEventSeq,
+    });
+    for (const ws of sockets.get(hint.accountId) ?? []) {
+      if (ws.readyState === 1) ws.send(payload);
+    }
+  }
+}
+
 function disconnectDevice(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
@@ -188,8 +229,14 @@ export function startCloudServer(
 ) {
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const metrics = new OperationalMetrics();
+  const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
+  const stopCallCleanupWorker = startCallCleanupWorker(db);
+  const stopCallNotifications = startCallNotificationListener(
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
+    (hint) => pushCallHints(sockets, [hint]),
+  );
 
   const server = Bun.serve<SocketData>({
     port,
@@ -210,7 +257,7 @@ export function startCloudServer(
         }
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
-          response = json(CLOUD_CAPABILITIES);
+          response = json(cloudCapabilities(callsAvailable));
         }
 
         else if (url.pathname === "/metrics") {
@@ -297,7 +344,15 @@ export function startCloudServer(
               headers: { "content-type": result.contentType, "cache-control": "private, no-store" },
             });
           } else {
-          const body = await readJson(req);
+          const body = await readJson(
+            req,
+            /^\/v1\/calls\/[0-9a-f-]+\/events$/i.test(url.pathname) ? 96 * 1024 : MAX_JSON_BYTES,
+          );
+          const callActionMatch = url.pathname.match(
+            /^\/v1\/calls\/([0-9a-f-]+)\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i,
+          );
+          const callMatch = url.pathname.match(/^\/v1\/calls\/([0-9a-f-]+)$/i);
+          const blockMatch = url.pathname.match(/^\/v1\/blocks\/([0-9a-f-]+)$/i);
 
         if (url.pathname === "/v1/devices/push" && req.method === "POST") {
           if (!body.token || !body.environment) throw new PushError("token and environment required");
@@ -308,10 +363,145 @@ export function startCloudServer(
           response = json(await unregisterPushToken(db, session.deviceId));
         }
 
+        if (url.pathname === "/v1/devices/voip-push" && req.method === "PUT") {
+          if (!body.token || !body.environment) throw new PushError("token and environment required");
+          response = json(await registerVoIPPushToken(db, session.deviceId, body.token, body.environment));
+        }
+
+        if (url.pathname === "/v1/devices/voip-push" && req.method === "DELETE") {
+          response = json(await unregisterVoIPPushToken(db, session.deviceId));
+        }
+
+        if (blockMatch && req.method === "PUT") {
+          const result = await blockAccount(db, session.accountId, blockMatch[1]);
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes);
+          response = json({ blocked: result.blocked });
+        }
+
+        if (blockMatch && req.method === "DELETE") {
+          response = json(await unblockAccount(db, session.accountId, blockMatch[1]));
+        }
+
+        if (url.pathname === "/v1/calls" && req.method === "POST") {
+          if (!callsAvailable) throw new CallError("voice calls are disabled", "calls_disabled", 503);
+          const result = await createCall(db, {
+            callerAccountId: session.accountId,
+            callerDeviceId: session.deviceId,
+            callId: body.callId,
+            dialogId: body.dialogId,
+            callerCommitment: body.callerCommitment,
+            supportedProtocolVersions: body.supportedProtocolVersions,
+            offeredMediaProfileVersions: body.offeredMediaProfileVersions,
+            networkKey: networkKey(req, server),
+          });
+          pushCallHints(sockets, result.hints);
+          response = json({ call: result.call, ringTargetCount: result.ringTargetCount }, 201);
+        }
+
+        if (url.pathname === "/v1/calls/active" && req.method === "GET") {
+          response = json(await getActiveCalls(db, session.accountId));
+        }
+
+        if (callMatch && req.method === "GET") {
+          response = json(await getCall(db, session.accountId, callMatch[1]));
+        }
+
+        if (callActionMatch?.[2] === "accept" && req.method === "POST") {
+          const result = await acceptCall(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1],
+            calleeCommitment: body.calleeCommitment, protocolVersion: body.protocolVersion,
+            selectedMediaProfileVersion: body.selectedMediaProfileVersion,
+          });
+          pushCallHints(sockets, result.hints);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "reveal" && req.method === "POST") {
+          const result = await revealCallKey(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1],
+            publicKey: body.publicKey, nonce: body.nonce, fingerprint: body.fingerprint,
+            confirmation: body.confirmation,
+          });
+          pushCallHints(sockets, result.hints);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "confirm" && req.method === "POST") {
+          const result = await confirmCallKey(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1],
+            confirmation: body.confirmation,
+          });
+          pushCallHints(sockets, result.hints);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "decline" && req.method === "POST") {
+          const result = await declineCall(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1], reason: body.reason,
+          });
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes ?? []);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "cancel" && req.method === "POST") {
+          const result = await cancelCall(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1], reason: body.reason,
+          });
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes ?? []);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "end" && req.method === "POST") {
+          const result = await endCall(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1], reason: body.reason,
+          });
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes ?? []);
+          response = json({ call: result.call });
+        }
+
+        if (callActionMatch?.[2] === "events" && req.method === "POST") {
+          const result = await sendEncryptedCallEvent(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1],
+            senderSequence: body.senderSequence, ciphertext: body.ciphertext,
+            version: body.version, kind: body.kind, expiresAtMilliseconds: body.expiresAtMilliseconds,
+          });
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes ?? []);
+          response = json({ event: result.event }, 201);
+        }
+
+        if (callActionMatch?.[2] === "events" && req.method === "GET") {
+          response = json(await getCallEvents(
+            db, session.accountId, callActionMatch[1],
+            url.searchParams.get("after") ?? 0, url.searchParams.get("limit") ?? 100,
+          ));
+        }
+
+        if (callActionMatch?.[2] === "ice-config" && req.method === "GET") {
+          response = json(await getIceConfig(db, session.accountId, session.deviceId, callActionMatch[1]));
+        }
+
+        if (callActionMatch?.[2] === "telemetry" && req.method === "POST") {
+          response = json(await recordCallTelemetry(db, {
+            accountId: session.accountId, deviceId: session.deviceId, callId: callActionMatch[1],
+            outcome: body.outcome, role: body.role, routeClass: body.routeClass,
+            privacyMode: body.privacyMode, setupBucket: body.setupBucket, recoveryBucket: body.recoveryBucket,
+            rttBucket: body.rttBucket, lossBucket: body.lossBucket, jitterBucket: body.jitterBucket,
+            bitrateBucket: body.bitrateBucket, recoveryCount: body.recoveryCount,
+            appVersion: body.appVersion, region: body.region,
+          }), 202);
+        }
+
         if (url.pathname === "/v1/session" && req.method === "DELETE") {
-          const result = await revokeDevice(db, session.accountId, session.deviceId);
+          const result = await revokeDeviceAndTerminateCalls(db, session.accountId, session.deviceId);
           disconnectDevice(sockets, session.accountId, session.deviceId);
-          response = json(result);
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes);
+          response = json({ revoked: result.revoked });
         }
 
         if (url.pathname === "/v1/account/deletion/start" && req.method === "POST") {
@@ -322,9 +512,11 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/account" && req.method === "DELETE") {
           if (!body.code) throw new AuthError("code required", 400);
-          const result = await deleteAccount(db, session.accountId, String(body.code));
+          const result = await deleteAccountAndTerminateCalls(db, session.accountId, String(body.code));
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes);
           disconnectAccount(sockets, session.accountId);
-          response = json(result);
+          response = json({ deleted: result.deleted });
         }
 
         if (url.pathname === "/v1/devices" && req.method === "GET") {
@@ -337,9 +529,11 @@ export function startCloudServer(
           if (targetDeviceId === session.deviceId) {
             throw new AuthError("use sign out for the current device", 400);
           }
-          const result = await revokeDevice(db, session.accountId, targetDeviceId);
+          const result = await revokeDeviceAndTerminateCalls(db, session.accountId, targetDeviceId);
           disconnectDevice(sockets, session.accountId, targetDeviceId);
-          response = json(result);
+          pushCallHints(sockets, result.hints);
+          pushHints(sockets, result.syncPushes);
+          response = json({ revoked: result.revoked });
         }
 
         if (url.pathname === "/v1/sync/state" && req.method === "GET") {
@@ -490,6 +684,7 @@ export function startCloudServer(
         const status = err instanceof AuthError
           ? err.status
           : err instanceof MediaError ? err.status
+          : err instanceof CallError ? err.status
           : err instanceof SyncError || err instanceof PushError ? 400 : 500;
         if (status === 500) {
           console.error(JSON.stringify({
@@ -503,10 +698,12 @@ export function startCloudServer(
         const headers: Record<string, string> = {};
         if (err instanceof AuthError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
           ...(err instanceof MediaError ? { code: err.code } : {}),
+          ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
         }, status, headers);
       }
       const status = response?.status ?? 101;
@@ -541,6 +738,8 @@ export function startCloudServer(
   server.stop = ((closeActiveConnections?: boolean) => {
     stopPushWorker();
     stopMaintenanceWorker();
+    stopCallCleanupWorker();
+    stopCallNotifications();
     return originalStop(closeActiveConnections);
   }) as typeof server.stop;
 

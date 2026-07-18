@@ -5,6 +5,7 @@ struct TojPeerProfileView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var notificationsEnabled = true
     @State private var showingClearMedia = false
+    @State private var showingBlockConfirmation = false
 
     let dialogId: String
     let onCall: () -> Void
@@ -44,10 +45,12 @@ struct TojPeerProfileView: View {
                     .padding(.top, 12)
 
                     HStack(spacing: 12) {
-                        if model.capabilities.contains(.calls) {
-                            profileAction("Audio", icon: "phone.fill") { onCall() }
-                            profileAction("Video", icon: "video.fill") { onCall() }
-                        }
+                        profileAction("Audio", icon: "phone.fill") { onCall() }
+                            .disabled(!model.capabilities.contains(.calls))
+                            .opacity(model.capabilities.contains(.calls) ? 1 : 0.42)
+                        profileAction("Video", icon: "video.slash.fill") {}
+                            .disabled(true)
+                            .opacity(0.42)
                         profileAction("Search", icon: "magnifyingglass") { dismiss() }
                     }
 
@@ -84,6 +87,16 @@ struct TojPeerProfileView: View {
                         }
                         .buttonStyle(.tojPressable(scale: 0.985))
                         .disabled(model.clearingMediaCache)
+
+                        Divider().overlay(TojTheme.hairline).padding(.leading, 58)
+
+                        Button(role: .destructive) { showingBlockConfirmation = true } label: {
+                            Label("Block or report", systemImage: "hand.raised.fill")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(minHeight: 54)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 15)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -106,6 +119,21 @@ struct TojPeerProfileView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Messages stay in the chat. Cloud media downloads again when you open it.")
+            }
+            .confirmationDialog(
+                "Block or report this contact?",
+                isPresented: $showingBlockConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Block", role: .destructive) {
+                    Task {
+                        if await model.blockPeer(dialogId: dialogId) { dismiss() }
+                    }
+                }
+                Button("Report", role: .destructive) {}
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Blocking prevents new messages and voice calls in both directions.")
             }
         }
     }

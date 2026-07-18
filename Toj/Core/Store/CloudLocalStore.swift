@@ -1620,6 +1620,22 @@ actor CloudLocalStore {
         }
     }
 
+    func peerAccountId(dialogId: String, excluding accountId: String) throws -> String? {
+        try dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                SELECT account_id
+                FROM dialog_members
+                WHERE dialog_id = ? AND account_id != ?
+                ORDER BY account_id
+                LIMIT 1
+                """,
+                arguments: [dialogId, accountId]
+            )
+        }
+    }
+
     func messages(dialogId: String) throws -> [LocalMessage] {
         try dbQueue.read { db in
             let rows = try Row.fetchAll(

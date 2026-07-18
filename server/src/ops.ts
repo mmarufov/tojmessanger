@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import { cleanupCallData } from "./calls";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const CLEANUP_BATCH_SIZE = 1_000;
@@ -19,14 +20,19 @@ export function safeRoute(pathname: string): string {
   if (/^\/v1\/media\/uploads\/[0-9a-f-]+$/i.test(pathname)) return "/v1/media/uploads/:id";
   if (/^\/v1\/media\/[0-9a-f-]+\/chunks$/i.test(pathname)) return "/v1/media/:id/chunks";
   if (/^\/v1\/media\/[0-9a-f-]+\/thumbnail$/i.test(pathname)) return "/v1/media/:id/thumbnail";
+  if (/^\/v1\/blocks\/[0-9a-f-]+$/i.test(pathname)) return "/v1/blocks/:id";
+  if (/^\/v1\/calls\/[0-9a-f-]+\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i.test(pathname)) {
+    return pathname.replace(/[0-9a-f-]{36}/i, ":id");
+  }
+  if (/^\/v1\/calls\/[0-9a-f-]+$/i.test(pathname)) return "/v1/calls/:id";
   const known = new Set([
     "/health", "/ready", "/metrics", "/v1/capabilities", "/v1/ws", "/v1/auth/start", "/v1/auth/check",
-    "/v1/devices", "/v1/devices/push", "/v1/session", "/v1/account/deletion/start",
+    "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
     "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/messages/react",
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
-    "/v1/media/uploads",
+    "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -98,6 +104,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
 }
 
 export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZE) {
+  const callData = await cleanupCallData(sql, batchSize);
   const otp = await sql`
     WITH doomed AS (
       SELECT id FROM otp_challenges
@@ -163,6 +170,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     mediaUploads: media.length,
     mediaAttempts: mediaAttempts.length,
     mediaOrphans: mediaOrphans.length,
+    callData,
   };
 }
 
@@ -178,7 +186,8 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
     try {
       const deleted = await cleanupExpiredData(sql);
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
-          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans) {
+          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans
+          || Object.values(deleted.callData).some((value) => value > 0)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }
     } catch (error) {
