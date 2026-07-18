@@ -1,0 +1,74 @@
+# Render this file from the deployment secret store as turnserver.conf.
+# Never commit the rendered file, secret, private key, public IP, or hostname.
+listening-port=3478
+tls-listening-port=443
+min-port=49152
+max-port=65535
+fingerprint
+# REST authentication enables coturn's long-term credential mechanism internally.
+use-auth-secret
+static-auth-secret=REPLACE_FROM_SECRET_STORE
+realm=turn.example.invalid
+server-name=turn.example.invalid
+external-ip=REPLACE_PUBLIC_IP
+relay-ip=REPLACE_PRIVATE_OR_PUBLIC_RELAY_IP
+cert=/etc/coturn/certs/fullchain.pem
+pkey=/etc/coturn/certs/privkey.pem
+# Coturn 4.14 defaults to TLS 1.2 or newer. Do not add the `tlsv1` or
+# `tlsv1_1` compatibility switches; those opt back into obsolete protocols.
+stale-nonce=600
+user-quota=4
+total-quota=REPLACE_PROVISIONED_ALLOCATION_CAPACITY
+max-bps=128000
+bps-capacity=REPLACE_PROVISIONED_BYTES_PER_SECOND
+# Keep TURN-over-TCP and TURN-over-TLS client listeners enabled, but never
+# provide RFC 6062 TCP relay endpoints that can act as a generic TCP proxy.
+no-tcp-relay
+no-multicast-peers
+
+# Peer permissions explicitly deny these special-use ranges; public peer IPs
+# remain available for peer-to-peer media.
+# Never add allowed-peer-ip exceptions for deployment/VPC networks. The
+# provider firewall must mirror these denies so a coturn regression cannot
+# expose metadata, control-plane, or private services.
+
+# IPv4: this network, RFC1918, CGNAT, loopback, link-local/metadata,
+# protocol assignments, documentation, benchmarking, multicast, and reserved.
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.0.2.0-192.0.2.255
+denied-peer-ip=192.88.99.0-192.88.99.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=198.51.100.0-198.51.100.255
+denied-peer-ip=203.0.113.0-203.0.113.255
+denied-peer-ip=224.0.0.0-239.255.255.255
+denied-peer-ip=240.0.0.0-255.255.255.255
+
+# Azure's platform virtual IP is outside the ranges above. Other major cloud
+# metadata endpoints are covered by link-local, CGNAT, or RFC1918 denies.
+denied-peer-ip=168.63.129.16
+
+# IPv6: unspecified/loopback/IPv4-mapped, discard-only, benchmarking,
+# documentation, ULA, link/deprecated-site-local, and multicast.
+denied-peer-ip=::-::ffff:ffff:ffff:ffff
+denied-peer-ip=100::-100::ffff:ffff:ffff:ffff
+denied-peer-ip=2001:2::-2001:2:0:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=2001:db8::-2001:db8:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=3fff::-3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+no-cli
+pidfile=/tmp/turnserver.pid
+prometheus
+prometheus-port=9641
+prometheus-address=REPLACE_PRIVATE_METRICS_IP
+simple-log
+log-file=stdout

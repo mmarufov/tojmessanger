@@ -5,6 +5,35 @@ All notable changes to Toj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to a `MAJOR.MINOR.PATCH.BUILD` version scheme.
 
+## [0.2.0.0] — 2026-07-18
+
+Prepares encrypted one-to-one iOS voice calls for an Apple Developer and
+infrastructure-gated rollout. Calling remains unavailable until APNs, TURN, the
+pinned WebRTC artifact, and the explicit production readiness flags are present.
+
+### Added
+
+- CallKit and PushKit lifecycle integration, encrypted signaling, X25519 call-key
+  agreement, DTLS fingerprint commitments, multi-device first-answer-wins, call
+  history, and privacy-preserving quality buckets.
+- PostgreSQL call control, durable call/history/push outboxes, abuse limits,
+  block enforcement, atomic session revocation, and bounded cleanup.
+- A pinned WebRTC XCFramework build and immutable-release workflow with checksum,
+  SBOM, slice, symbol, and provenance verification.
+- Hardened coturn deployment templates, relay peer-policy validation, operational
+  gates, and explicit Apple/APNs/TURN follow-up checklists.
+- Required backend, signed iOS simulator, and repository-policy CI checks.
+
+### Security
+
+- Serialized blocking, message, call, and invite-budget mutations to close
+  cross-request races.
+- Restricted telemetry to call-owning devices and made reports idempotent.
+- Protected generated call-history identifiers from client-controlled UUIDs and
+  retained terminal calls until history delivery succeeds.
+- Added safe concurrent production indexes and retry repair for interrupted index
+  builds.
+
 ## [0.1.1.0] — 2026-07-13
 
 Premium-black design pass. Keeps Toj's black identity (X/Grok-grade minimalism)
@@ -59,4 +88,6 @@ messaging presentation layer on top of the milestone M1–M4 cloud skeleton.
 - Updated project configuration, Info.plist, and prep tooling to bundle fonts,
   icons, and localized resources.
 
+[0.2.0.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.2.0.0
+[0.1.1.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.1.1.0
 [0.1.0.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.1.0.0
