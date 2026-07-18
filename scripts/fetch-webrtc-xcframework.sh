@@ -19,10 +19,22 @@ gh release download "$TAG" \
   --pattern 'WebRTC.xcframework.zip' \
   --pattern 'WebRTC.xcframework.zip.sha256' \
   --pattern 'REVISION' \
+  --pattern 'BUILD_SOURCE_REF' \
   --dir "$TMP"
 
 if ! cmp -s "$DEST/REVISION" "$TMP/REVISION"; then
   echo "Release revision does not match the repository pin" >&2
+  exit 3
+fi
+
+if [[ "$(wc -l < "$TMP/BUILD_SOURCE_REF" | tr -d ' ')" != "1" ]]; then
+  echo "Release build source reference has an invalid format" >&2
+  exit 3
+fi
+BUILD_SOURCE_REF="$(tr -d '\n' < "$TMP/BUILD_SOURCE_REF")"
+if [[ "$BUILD_SOURCE_REF" != "refs/tags/$TAG" && \
+      ! "$BUILD_SOURCE_REF" =~ ^refs/tags/${TAG}-build\.[1-9][0-9]*$ ]]; then
+  echo "Release build source is not an approved immutable tag" >&2
   exit 3
 fi
 
@@ -41,7 +53,7 @@ else
   gh attestation verify "$TMP/WebRTC.xcframework.zip" \
     --repo "$REPOSITORY" \
     --signer-workflow "$REPOSITORY/.github/workflows/webrtc-xcframework.yml" \
-    --source-ref "refs/tags/$TAG" \
+    --source-ref "$BUILD_SOURCE_REF" \
     --deny-self-hosted-runners
 fi
 
