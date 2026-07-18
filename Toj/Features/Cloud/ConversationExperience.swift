@@ -29,7 +29,6 @@ struct TojConversationExperience: View {
     @State private var showingAttachments = false
     @State private var showingForwarding = false
     @State private var forwardLine: CloudAppModel.Line?
-    @State private var showingCall = false
     @State private var detailsLine: CloudAppModel.Line?
     @State private var deleteLine: CloudAppModel.Line?
     @State private var reactionLine: CloudAppModel.Line?
@@ -69,7 +68,7 @@ struct TojConversationExperience: View {
         .sheet(isPresented: $showingProfile) {
             TojPeerProfileView(model: model, dialogId: dialogId) {
                 showingProfile = false
-                showingCall = true
+                Task { await model.startVoiceCall(dialogId: dialogId) }
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
@@ -104,9 +103,6 @@ struct TojConversationExperience: View {
             }
             .presentationDetents([.medium])
             .presentationDragIndicator(.visible)
-        }
-        .fullScreenCover(isPresented: $showingCall) {
-            TojDemoCallView(peerName: model.dialogTitle(dialogId))
         }
         .alert("Delete message?", isPresented: Binding(
             get: { deleteLine != nil },
@@ -189,7 +185,7 @@ struct TojConversationExperience: View {
                 .accessibilityLabel("Back")
                 .accessibilityValue(othersUnreadCount > 0 ? "\(othersUnreadCount) unread in other chats" : "")
 
-                Button { showingProfile = model.capabilities.contains(.profiles) } label: {
+                Button { showingProfile = model.capabilities.contains(.profiles) || model.capabilities.contains(.calls) } label: {
                     VStack(spacing: 1) {
                         Text(model.dialogTitle(dialogId))
                             .font(TojTheme.heading(.headline, weight: .semibold))
@@ -206,14 +202,26 @@ struct TojConversationExperience: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .tojGlass(in: Capsule(), interactive: model.capabilities.contains(.profiles))
-                .accessibilityHint(model.capabilities.contains(.profiles) ? "Opens contact and privacy details" : "Connection status")
+                .tojGlass(in: Capsule(), interactive: model.capabilities.contains(.profiles) || model.capabilities.contains(.calls))
+                .accessibilityHint(model.capabilities.contains(.profiles) || model.capabilities.contains(.calls) ? "Opens contact and privacy details" : "Connection status")
 
-                Button { showingProfile = model.capabilities.contains(.profiles) } label: {
+                if model.capabilities.contains(.calls) {
+                    Button {
+                        Task { await model.startVoiceCall(dialogId: dialogId) }
+                    } label: {
+                        Image(systemName: "phone.fill")
+                            .frame(width: 46, height: 46)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(model.callCoordinator.state.isInProgress)
+                    .accessibilityLabel("Call \(model.dialogTitle(dialogId))")
+                }
+
+                Button { showingProfile = model.capabilities.contains(.profiles) || model.capabilities.contains(.calls) } label: {
                     TojAvatar(title: model.dialogTitle(dialogId), size: 46)
                 }
                 .buttonStyle(.tojPressable)
-                .disabled(!model.capabilities.contains(.profiles))
+                .disabled(!model.capabilities.contains(.profiles) && !model.capabilities.contains(.calls))
                 .accessibilityLabel("Open \(model.dialogTitle(dialogId)) profile")
             }
         }
@@ -278,17 +286,23 @@ struct TojConversationExperience: View {
                             if shouldShowUnreadDivider(at: index) {
                                 unreadDivider
                             }
-                            TojMessageBubble(
-                                model: model,
-                                line: line,
-                                isLastInGroup: isLastInGroup(at: index),
-                                actions: model.actions(for: line),
-                                onAction: { perform($0, on: line) },
-                                onSwipeReply: { model.beginReply(to: line); composerFocused = true }
-                            )
-                            .padding(.top, isFirstInGroup(at: index) ? 5 : 0)
-                            .id(line.id)
-                            .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97, anchor: line.mine ? .bottomTrailing : .bottomLeading)))
+                            if line.kind == "service" {
+                                VoiceCallServiceRow(line: line)
+                                    .padding(.vertical, 5)
+                                    .id(line.id)
+                            } else {
+                                TojMessageBubble(
+                                    model: model,
+                                    line: line,
+                                    isLastInGroup: isLastInGroup(at: index),
+                                    actions: model.actions(for: line),
+                                    onAction: { perform($0, on: line) },
+                                    onSwipeReply: { model.beginReply(to: line); composerFocused = true }
+                                )
+                                .padding(.top, isFirstInGroup(at: index) ? 5 : 0)
+                                .id(line.id)
+                                .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97, anchor: line.mine ? .bottomTrailing : .bottomLeading)))
+                            }
                         }
 
                         Color.clear
@@ -656,6 +670,33 @@ struct TojConversationExperience: View {
         }
         isAtBottom = true
         if clearUnread { initialUnreadCount = 0 }
+    }
+}
+
+private struct VoiceCallServiceRow: View {
+    let line: CloudAppModel.Line
+
+    private var presentation: VoiceCallServicePresentation {
+        .parse(body: line.text, callerIsCurrentAccount: line.mine)
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: presentation.systemImage)
+                .foregroundStyle(TojTheme.secure)
+            Text(presentation.title)
+            if let duration = presentation.duration {
+                Text(duration)
+                    .foregroundStyle(TojTheme.secondaryText)
+            }
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(TojTheme.text)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 8)
+        .background(TojTheme.strong.opacity(0.88), in: Capsule())
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 

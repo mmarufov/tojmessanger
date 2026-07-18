@@ -52,6 +52,7 @@ final class CloudAppModel {
         var clientMsgId: String
         var senderAccountId: String? = nil
         var text: String
+        var kind: String = "text"
         var mine: Bool
         var delivery: Delivery
         var timestamp: String?
@@ -118,6 +119,7 @@ final class CloudAppModel {
     private let tokenStore: TokenStore
     private let localStore: CloudLocalStore?
     private let pushCenter: PushRegistrationCenter
+    private let voipPushCenter: VoIPPushRegistrationCenter
     private let mediaEngine: CloudMediaTransferEngine
     private let capabilityDefaults: UserDefaults
     private let capabilityCacheKey: String
@@ -141,17 +143,23 @@ final class CloudAppModel {
     private var messageMutationsInFlight: Set<String> = []
     private var mutationTargetsBeingQueued: Set<String> = []
     private var uploadedPushRegistration: String?
+    private var uploadedVoIPPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftsByDialog: [String: String] = [:]
     #if DEBUG
     private var demoLinesByDialog: [String: [Line]] = [:]
     #endif
 
+    let callCoordinator: CallCoordinator
+    let callPreferences: CallPrivacyPreferences
+
     var capabilities: MessagingCapabilities {
         #if DEBUG
         if isDemoMode { return .demo }
         #endif
-        return negotiatedCapabilities
+        return WebRTCEngineFactory.isAvailable
+            ? negotiatedCapabilities
+            : negotiatedCapabilities.subtracting(.calls)
     }
 
     var voiceRecordingLevel: Float { voiceRecorder.level }
@@ -174,6 +182,9 @@ final class CloudAppModel {
         config: CloudConfig = .current,
         tokenStore: TokenStore = TokenStore(),
         pushCenter: PushRegistrationCenter = .shared,
+        voipPushCenter: VoIPPushRegistrationCenter = .shared,
+        callCoordinator: CallCoordinator = .shared,
+        callPreferences: CallPrivacyPreferences = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
         useDefaultLocalStore: Bool = true,
         capabilityDefaults: UserDefaults = .standard
@@ -181,6 +192,9 @@ final class CloudAppModel {
         self.api = CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
+        self.voipPushCenter = voipPushCenter
+        self.callCoordinator = callCoordinator
+        self.callPreferences = callPreferences
         self.mediaEngine = CloudMediaTransferEngine(config: config)
         self.capabilityDefaults = capabilityDefaults
         self.capabilityCacheKey = "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
@@ -209,6 +223,9 @@ final class CloudAppModel {
                 await self?.syncFromPush() ?? false
             }
         )
+        voipPushCenter.bind { [weak self] token, environment in
+            await self?.uploadVoIPPushToken(token, environment: environment)
+        }
     }
 
     func start() async {
@@ -491,6 +508,8 @@ final class CloudAppModel {
         devices = []
         loadingDevices = false
         uploadedPushRegistration = nil
+        uploadedVoIPPushRegistration = nil
+        callCoordinator.unbind()
         pts = 0
         requestedCode = false
         authRequestInFlight = false
@@ -711,6 +730,48 @@ final class CloudAppModel {
 
     func dialogTitle(_ dialogId: String) -> String {
         dialogs.first(where: { $0.id == dialogId })?.title ?? shortDialogId(dialogId)
+    }
+
+    func startVoiceCall(dialogId: String) async {
+        #if DEBUG
+        if isDemoMode {
+            presentNotice("Voice calls", message: "Sign in to place a secure voice call.")
+            return
+        }
+        #endif
+        guard capabilities.contains(.calls) else {
+            presentNotice("Voice calls unavailable", message: "This server has not enabled encrypted calling yet.")
+            return
+        }
+        guard
+            let accountId = storedSession?.session.accountId,
+            let peerAccountId = try? await localStore?.peerAccountId(dialogId: dialogId, excluding: accountId)
+        else {
+            presentNotice("Call unavailable", message: "The other participant could not be verified.")
+            return
+        }
+        await callCoordinator.startOutgoing(
+            dialogId: dialogId,
+            peerAccountId: peerAccountId,
+            displayName: dialogTitle(dialogId)
+        )
+    }
+
+    func blockPeer(dialogId: String) async -> Bool {
+        #if DEBUG
+        if isDemoMode { return false }
+        #endif
+        guard
+            let session = storedSession?.session,
+            let peer = try? await localStore?.peerAccountId(dialogId: dialogId, excluding: session.accountId)
+        else { return false }
+        do {
+            _ = try await api.blockAccount(id: peer, token: session.token)
+            return true
+        } catch {
+            presentNotice("Could not block account", message: error.localizedDescription)
+            return false
+        }
     }
 
     func sendDraft() async {
@@ -1114,6 +1175,14 @@ final class CloudAppModel {
     private func afterSignIn() async {
         guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
         await refreshServerCapabilities()
+        if let session = storedSession?.session {
+            callCoordinator.configure(api: api, session: session) { [weak self] dialogId, _ in
+                self?.dialogTitle(dialogId) ?? String(localized: "Toj caller")
+            }
+            if capabilities.contains(.calls) {
+                await syncVoIPCallingAvailability()
+            }
+        }
         await refreshMediaCacheUsage()
         do {
             pts = try await localStore?.loadPts(accountId: accountId) ?? 0
@@ -1150,6 +1219,9 @@ final class CloudAppModel {
             if advertised.contains("voice_notes"), resolved.contains(.media) {
                 resolved.insert(.voiceNotes)
             }
+            if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
+                resolved.insert(.calls)
+            }
             negotiatedCapabilities = resolved
             capabilityDefaults.set(Int(resolved.rawValue), forKey: capabilityCacheKey)
         } catch let error as CloudAPIError where error.status == 404 {
@@ -1183,6 +1255,32 @@ final class CloudAppModel {
         }
     }
 
+    private func uploadVoIPPushToken(_ deviceToken: String?, environment: String) async {
+        guard let token = storedSession?.session.token else { return }
+        guard let deviceToken, callCoordinator.canRegisterForIncomingCalls else {
+            // Token rotation and permission changes can race the normal resume path. Always clear
+            // the server registration when this installation cannot answer; otherwise a later
+            // PushKit callback could silently make a microphone-denied device callable again.
+            _ = try? await api.unregisterVoIPPushToken(token: token)
+            uploadedVoIPPushRegistration = nil
+            return
+        }
+        let registration = "\(environment):\(deviceToken)"
+        guard uploadedVoIPPushRegistration != registration else { return }
+        do {
+            _ = try await api.registerVoIPPushToken(deviceToken, environment: environment, token: token)
+            guard storedSession?.session.token == token,
+                  callCoordinator.canRegisterForIncomingCalls else {
+                _ = try? await api.unregisterVoIPPushToken(token: token)
+                uploadedVoIPPushRegistration = nil
+                return
+            }
+            uploadedVoIPPushRegistration = registration
+        } catch {
+            status = "Call push registration failed: \(error.localizedDescription)"
+        }
+    }
+
     private func syncFromPush() async -> Bool {
         let previousPts = pts
         await syncNow()
@@ -1196,9 +1294,22 @@ final class CloudAppModel {
         guard let token = storedSession?.session.token else { return }
         connectionViewState = .connecting
         pushCenter.refreshRegistration()
+        if capabilities.contains(.calls) {
+            await syncVoIPCallingAvailability()
+        }
         await startHints(token: token)
         scheduleSync()
         scheduleOutboxRetry()
+    }
+
+    private func syncVoIPCallingAvailability() async {
+        guard let token = storedSession?.session.token else { return }
+        if callCoordinator.canRegisterForIncomingCalls {
+            voipPushCenter.refreshRegistration()
+        } else {
+            _ = try? await api.unregisterVoIPPushToken(token: token)
+            uploadedVoIPPushRegistration = nil
+        }
     }
 
     private func startHints(token: String) async {
@@ -1209,8 +1320,16 @@ final class CloudAppModel {
         hintSocket = socket
         hintTask = Task { [weak self, socket] in
             await socket.start()
-            for await _ in socket.hints {
-                await self?.syncNow()
+            for await event in socket.events {
+                switch event {
+                case .sync:
+                    await self?.syncNow()
+                case .call(let hint):
+                    await self?.callCoordinator.handle(hint)
+                case .sessionRevoked(let hint):
+                    guard hint.deviceId == nil || hint.deviceId == self?.storedSession?.session.deviceId else { continue }
+                    await self?.clearLocalSession(finalStatus: "Session ended")
+                }
             }
         }
     }
@@ -1412,7 +1531,13 @@ final class CloudAppModel {
         mutation: PendingMessageMutation? = nil,
         mediaTransfer: MediaTransferRecord? = nil
     ) -> Line {
-        let mine = message.senderAccountId == storedSession?.session.accountId
+        let senderIsCurrentAccount = message.senderAccountId == storedSession?.session.accountId
+        let mine = message.kind == "service"
+            ? VoiceCallServicePresentation.callerIsCurrentAccount(
+                body: message.text,
+                currentAccountId: storedSession?.session.accountId
+            ) ?? senderIsCurrentAccount
+            : senderIsCurrentAccount
         let deliveryState: Line.Delivery
         if let mediaTransfer, mediaTransfer.terminal {
             deliveryState = .failed(mediaTransfer.lastError ?? String(localized: "Attachment failed"))
@@ -1443,6 +1568,7 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
             text: presentedText,
+            kind: message.kind,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
@@ -1476,7 +1602,13 @@ final class CloudAppModel {
         let title = displayTitle(local.title, fallback: shortDialogId(local.dialogId))
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let subtitle: String
-        if let lastText, !lastText.isEmpty {
+        if local.lastKind == "service", let lastText, !lastText.isEmpty {
+            subtitle = VoiceCallServicePresentation.parse(
+                body: lastText,
+                callerIsCurrentAccount: local.lastSenderAccountId == storedSession?.session.accountId,
+                currentAccountId: storedSession?.session.accountId
+            ).title
+        } else if let lastText, !lastText.isEmpty {
             subtitle = lastText
         } else if local.lastState == "visible" {
             subtitle = String(localized: "Attachment")
@@ -1803,6 +1935,7 @@ final class CloudAppModel {
             lines[index].dialogId = message.dialogId
             lines[index].msgId = message.msgId
             lines[index].senderAccountId = message.senderAccountId
+            lines[index].kind = message.kind
             lines[index].text = message.text
             lines[index].replyToMsgId = message.replyToMsgId
             lines[index].reactions = Self.reactionBadges(message.reactions)
@@ -1827,6 +1960,7 @@ final class CloudAppModel {
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
             text: message.text,
+            kind: message.kind,
             mine: mine,
             delivery: .sent,
             timestamp: message.serverTs,

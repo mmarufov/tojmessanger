@@ -6,6 +6,12 @@ final class TojAppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        _ = CallKitAdapter.shared
+        // PushKit may launch the process in the background without constructing a SwiftUI scene.
+        // Restore the call-control session at process scope so a lock-screen answer never depends
+        // on CloudRootView's task having run first.
+        CallProcessBootstrap.shared.start()
+        VoIPPushRegistrationCenter.shared.install()
         PushRegistrationCenter.shared.install()
         return true
     }

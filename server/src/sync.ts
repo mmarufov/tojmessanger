@@ -3,6 +3,7 @@ import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
 import { loadMediaDTO, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
+import { lockAccountMutations } from "./locks";
 
 export class SyncError extends Error {}
 
@@ -157,6 +158,8 @@ export async function sendMessage(sql: SQL, p: {
   clientMsgId: string; kind?: string; body?: string; replyToMsgId?: number | null;
   mediaId?: string | null;
   forwardedFrom?: { dialogId: string; msgId: number } | null;
+  /** Server-only escape hatch for generated lifecycle rows such as call history. */
+  internalService?: boolean;
 }): Promise<SendResult> {
   return await sql.begin(async (tx) => {
     let body = p.forwardedFrom || p.mediaId ? String(p.body ?? "") : requireTextBody(p.body);
@@ -178,6 +181,14 @@ export async function sendMessage(sql: SQL, p: {
         FOR UPDATE`)[0];
       if (row.status !== "completed") throw new SyncError("send already in progress");
       const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id));
+      if (p.internalService === true && (
+        row.dialog_id !== p.dialogId
+        || msg?.sender_account_id !== p.senderAccountId
+        || msg?.kind !== "service"
+        || msg?.text !== body
+      )) {
+        throw new SyncError("internal send idempotency conflict");
+      }
       return {
         dialogId: row.dialog_id, clientMsgId: p.clientMsgId, msgId: n(row.msg_id),
         senderPts: n(row.sender_pts), duplicate: true, pushes: [],
@@ -185,7 +196,9 @@ export async function sendMessage(sql: SQL, p: {
       };
     }
 
-    await requireActiveAccount(tx, p.senderAccountId);
+    // Lifecycle service rows are authored by the original actor even if account deletion and call
+    // termination commit together. `internalService` is never accepted from an HTTP request.
+    if (p.internalService !== true) await requireActiveAccount(tx, p.senderAccountId);
     if (p.senderDeviceId) {
       const device = await tx`
         SELECT id FROM devices
@@ -193,7 +206,22 @@ export async function sendMessage(sql: SQL, p: {
         FOR SHARE`;
       if (!device.length) throw new SyncError("sending device is no longer active");
     }
+    const directPair = (await tx`
+      SELECT account_low, account_high
+      FROM direct_dialog_pairs WHERE dialog_id = ${p.dialogId}`)[0];
+    if (directPair) {
+      await lockAccountMutations(tx, [directPair.account_low, directPair.account_high]);
+    }
     await requireActiveMember(tx, p.senderAccountId, p.dialogId);
+    const blocked = await tx`
+      SELECT 1
+      FROM direct_dialog_pairs pair
+      JOIN account_blocks b ON
+        (b.blocker_account_id = pair.account_low AND b.blocked_account_id = pair.account_high)
+        OR (b.blocker_account_id = pair.account_high AND b.blocked_account_id = pair.account_low)
+      WHERE pair.dialog_id = ${p.dialogId}
+      LIMIT 1`;
+    if (blocked.length && p.internalService !== true) throw new SyncError("conversation is blocked");
 
     if (p.forwardedFrom) {
       const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
@@ -219,7 +247,8 @@ export async function sendMessage(sql: SQL, p: {
       if (!media || media.owner_account_id !== p.senderAccountId) throw new SyncError("media upload not found");
       if (media.status !== "ready") throw new SyncError("media upload is incomplete");
       kind = media.kind;
-    } else if (!mediaId && !p.forwardedFrom && kind !== "text") {
+    } else if (!mediaId && !p.forwardedFrom && kind !== "text"
+      && !(kind === "service" && p.internalService === true)) {
       throw new SyncError("media upload required");
     }
 

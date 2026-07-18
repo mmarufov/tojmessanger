@@ -10,6 +10,12 @@ target 'Toj' do
   pod 'LibSignalClient', git: 'https://github.com/signalapp/libsignal.git', tag: 'v0.96.4'
   pod 'GRDB.swift/SQLCipher'
 
+  # The official WebRTC build is a pinned release artifact. Keep ordinary
+  # development and server-only CI usable until that artifact is fetched.
+  if File.directory?(File.join(__dir__, 'Dependencies/TojWebRTC/WebRTC.xcframework'))
+    pod 'TojWebRTC', path: 'Dependencies/TojWebRTC'
+  end
+
   target 'TojTests' do
     inherit! :search_paths
   end

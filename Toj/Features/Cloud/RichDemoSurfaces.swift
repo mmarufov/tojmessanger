@@ -27,7 +27,11 @@ struct TojPeerProfileView: View {
 
                     HStack(spacing: 12) {
                         profileAction("Audio", icon: "phone.fill") { onCall() }
-                        profileAction("Video", icon: "video.fill") { onCall() }
+                            .disabled(!model.capabilities.contains(.calls))
+                            .opacity(model.capabilities.contains(.calls) ? 1 : 0.42)
+                        profileAction("Video", icon: "video.slash.fill") {}
+                            .disabled(true)
+                            .opacity(0.42)
                         profileAction("Search", icon: "magnifyingglass") { dismiss() }
                     }
 
@@ -70,11 +74,15 @@ struct TojPeerProfileView: View {
                 }
             }
             .confirmationDialog("Block or report this contact?", isPresented: $showingBlockConfirmation, titleVisibility: .visible) {
-                Button("Block", role: .destructive) {}
+                Button("Block", role: .destructive) {
+                    Task {
+                        if await model.blockPeer(dialogId: dialogId) { dismiss() }
+                    }
+                }
                 Button("Report", role: .destructive) {}
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Demo only. No account action will be sent.")
+                Text("Blocking prevents new messages and voice calls in both directions.")
             }
         }
     }

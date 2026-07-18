@@ -6,7 +6,7 @@ import {
   type IncomingHttpHeaders,
 } from "node:http2";
 import { createPrivateKey, sign } from "node:crypto";
-import { hashToken, open, pushTokenAAD, seal } from "./crypto";
+import { hashToken, open, pushTokenAAD, seal, voipPushTokenAAD } from "./crypto";
 
 export type PushEnvironment = "sandbox" | "production";
 
@@ -56,7 +56,7 @@ export async function registerPushToken(
          OR (push_environment = ${environment} AND push_token_hash = ${tokenHash})
       ORDER BY id
       FOR UPDATE`;
-    const device = devices.find((row) => row.id === deviceId);
+    const device = devices.find((row: { id: string; platform: string; revoked_at: unknown }) => row.id === deviceId);
     if (!device || device.platform !== "ios" || device.revoked_at) {
       throw new PushError("active iOS device required");
     }
@@ -101,6 +101,57 @@ export async function unregisterPushToken(sql: SQL, deviceId: string): Promise<{
   return { registered: false };
 }
 
+export async function registerVoIPPushToken(
+  sql: SQL,
+  deviceId: string,
+  rawToken: string,
+  rawEnvironment: string,
+): Promise<{ registered: true }> {
+  const token = normalizeDeviceToken(rawToken);
+  const environment = validateEnvironment(rawEnvironment);
+  const tokenHash = hashToken(`apns-voip|${environment}|${token}`);
+  const registrationLock = tokenHash.readBigInt64BE(0);
+  const sealed = seal(token, voipPushTokenAAD(deviceId));
+
+  await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(${registrationLock})`;
+    const devices = await tx`
+      SELECT id, platform, revoked_at FROM devices
+      WHERE id = ${deviceId}
+         OR (voip_push_environment = ${environment} AND voip_push_token_hash = ${tokenHash})
+      ORDER BY id FOR UPDATE`;
+    const device = devices.find((row: { id: string; platform: string; revoked_at: unknown }) => row.id === deviceId);
+    if (!device || device.platform !== "ios" || device.revoked_at) {
+      throw new PushError("active iOS device required");
+    }
+    await tx`
+      UPDATE devices SET
+        voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+        voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
+        voip_push_environment = NULL, voip_push_updated_at = now()
+      WHERE id <> ${deviceId}
+        AND voip_push_environment = ${environment}
+        AND voip_push_token_hash = ${tokenHash}`;
+    await tx`
+      UPDATE devices SET
+        voip_push_token_hash = ${tokenHash}, voip_push_token_ciphertext = ${sealed.ciphertext},
+        voip_push_token_nonce = ${sealed.nonce}, voip_push_token_key_id = ${sealed.keyId},
+        voip_push_environment = ${environment}, voip_push_updated_at = now()
+      WHERE id = ${deviceId}`;
+  });
+  return { registered: true };
+}
+
+export async function unregisterVoIPPushToken(sql: SQL, deviceId: string): Promise<{ registered: false }> {
+  await sql`
+    UPDATE devices SET
+      voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+      voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
+      voip_push_environment = NULL, voip_push_updated_at = now()
+    WHERE id = ${deviceId}`;
+  return { registered: false };
+}
+
 /** Called inside the message transaction, after account_events is inserted. */
 export async function enqueuePushDeliveries(sql: SQL, p: {
   accountId: string;
@@ -123,12 +174,24 @@ export async function enqueuePushDeliveries(sql: SQL, p: {
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
 }
 
-export type APNsSendRequest = {
+export type APNsSyncSendRequest = {
+  kind?: "sync";
   token: string;
   environment: PushEnvironment;
   pts: number;
   alert: boolean;
 };
+
+export type APNsVoIPSendRequest = {
+  kind: "voip";
+  token: string;
+  environment: PushEnvironment;
+  callId: string;
+  callerAccountId: string;
+  expiresAt: string;
+};
+
+export type APNsSendRequest = APNsSyncSendRequest | APNsVoIPSendRequest;
 
 export type APNsSendResult = { status: number; reason?: string; apnsId?: string };
 
@@ -137,7 +200,7 @@ export interface PushSender {
   close?(): void;
 }
 
-export function buildAPNsPayload(request: Pick<APNsSendRequest, "pts" | "alert">): Record<string, unknown> {
+export function buildAPNsPayload(request: Pick<APNsSyncSendRequest, "pts" | "alert">): Record<string, unknown> {
   return request.alert
     ? {
         aps: {
@@ -150,10 +213,42 @@ export function buildAPNsPayload(request: Pick<APNsSendRequest, "pts" | "alert">
     : { aps: { "content-available": 1 }, toj: { pts: request.pts } };
 }
 
+export function buildVoIPAPNsPayload(
+  request: Pick<APNsVoIPSendRequest, "callId" | "callerAccountId" | "expiresAt">,
+): Record<string, unknown> {
+  return {
+    aps: { "content-available": 1 },
+    toj: {
+      v: 1,
+      type: "voice_call",
+      callId: request.callId,
+      callerAccountId: request.callerAccountId,
+      expiresAt: request.expiresAt,
+    },
+  };
+}
+
+export function buildAPNsHeaders(
+  request: APNsSendRequest,
+  topic: string,
+  voipTopic = `${topic}.voip`,
+  nowSeconds = Math.floor(Date.now() / 1_000),
+): Record<string, string> {
+  const voip = request.kind === "voip";
+  return {
+    "apns-topic": voip ? voipTopic : topic,
+    "apns-push-type": voip ? "voip" : request.alert ? "alert" : "background",
+    "apns-priority": voip || request.alert ? "10" : "5",
+    ...(voip ? {} : { "apns-collapse-id": "sync" }),
+    "apns-expiration": voip ? "0" : String(nowSeconds + 24 * 60 * 60),
+  };
+}
+
 type APNsConfig = {
   teamId: string;
   keyId: string;
   topic: string;
+  voipTopic: string;
   privateKey: ReturnType<typeof createPrivateKey>;
 };
 
@@ -181,24 +276,22 @@ export class APNsClient implements PushSender {
       teamId: teamId!,
       keyId: keyId!,
       topic: process.env.TOJ_APNS_TOPIC ?? "com.toj.Toj",
+      voipTopic: process.env.TOJ_APNS_VOIP_TOPIC ?? `${process.env.TOJ_APNS_TOPIC ?? "com.toj.Toj"}.voip`,
       privateKey: createPrivateKey(pem),
     });
   }
 
   async send(request: APNsSendRequest): Promise<APNsSendResult> {
     const session = this.session(request.environment);
-    const payload = buildAPNsPayload(request);
+    const voip = request.kind === "voip";
+    const payload = voip ? buildVoIPAPNsPayload(request) : buildAPNsPayload(request);
 
     const response = await new Promise<{ headers: IncomingHttpHeaders; body: string }>((resolve, reject) => {
       const stream = session.request({
         [constants.HTTP2_HEADER_METHOD]: "POST",
         [constants.HTTP2_HEADER_PATH]: `/3/device/${request.token}`,
         authorization: `bearer ${this.providerToken()}`,
-        "apns-topic": this.config.topic,
-        "apns-push-type": request.alert ? "alert" : "background",
-        "apns-priority": request.alert ? "10" : "5",
-        "apns-collapse-id": "sync",
-        "apns-expiration": String(Math.floor(Date.now() / 1000) + 24 * 60 * 60),
+        ...buildAPNsHeaders(request, this.config.topic, this.config.voipTopic),
       });
       let headers: IncomingHttpHeaders = {};
       let body = "";
@@ -401,14 +494,186 @@ export async function processPushBatch(sql: SQL, sender: PushSender, limit = 50)
   return deliveries.length;
 }
 
-export function startPushWorker(sql: SQL, sender: PushSender | null, intervalMs = 2_000): () => void {
+type ClaimedVoIPDelivery = {
+  id: string;
+  call_id: string;
+  caller_account_id: string;
+  device_id: string;
+  attempts: number;
+  expires_at: Date | string;
+  voip_push_token_ciphertext: Uint8Array | null;
+  voip_push_token_nonce: Uint8Array | null;
+  voip_push_token_key_id: string | null;
+  voip_push_environment: PushEnvironment | null;
+};
+
+async function claimVoIPDeliveries(sql: SQL, limit: number): Promise<ClaimedVoIPDelivery[]> {
+  await sql`
+    UPDATE voip_push_deliveries SET status = 'dead', last_error = 'expired', claimed_at = NULL
+    WHERE status IN ('pending','sending') AND expires_at <= now()`;
+  return await sql`
+    WITH picked AS (
+      SELECT pd.id FROM voip_push_deliveries pd
+      JOIN calls c ON c.id = pd.call_id
+      JOIN devices d ON d.id = pd.device_id
+      WHERE pd.expires_at > now() AND c.state = 'requested' AND c.expires_at > now()
+        AND d.revoked_at IS NULL
+        AND d.voip_push_token_hash IS NOT NULL
+        AND d.voip_push_token_ciphertext IS NOT NULL
+        AND d.voip_push_token_nonce IS NOT NULL
+        AND d.voip_push_token_key_id IS NOT NULL
+        AND d.voip_push_environment IS NOT NULL
+        AND ((pd.status = 'pending' AND pd.available_at <= now())
+          OR (pd.status = 'sending'
+            AND pd.claimed_at < now() - (${CLAIM_TIMEOUT_SECONDS} * interval '1 second')))
+      ORDER BY pd.available_at, pd.created_at
+      FOR UPDATE SKIP LOCKED LIMIT ${limit}
+    )
+    UPDATE voip_push_deliveries pd SET status = 'sending', claimed_at = now()
+    FROM picked, devices d
+    WHERE pd.id = picked.id AND d.id = pd.device_id
+    RETURNING pd.id, pd.call_id, pd.caller_account_id, pd.device_id, pd.attempts, pd.expires_at,
+      d.voip_push_token_ciphertext, d.voip_push_token_nonce, d.voip_push_token_key_id,
+      d.voip_push_environment` as ClaimedVoIPDelivery[];
+}
+
+async function retryOrKillVoIP(sql: SQL, delivery: ClaimedVoIPDelivery, error: string): Promise<void> {
+  const attempts = Number(delivery.attempts) + 1;
+  const expired = new Date(delivery.expires_at).getTime() <= Date.now();
+  if (attempts >= MAX_ATTEMPTS || expired) {
+    await sql`
+      UPDATE voip_push_deliveries
+      SET status = 'dead', attempts = ${attempts}, last_error = ${error}, claimed_at = NULL
+      WHERE id = ${delivery.id} AND status = 'sending'`;
+    return;
+  }
+  // Call invites expire quickly. Keep retry delays sub-second at first, then cap at five seconds.
+  const delayMilliseconds = Math.min(5_000, 250 * 2 ** Math.min(attempts, 5));
+  await sql`
+    UPDATE voip_push_deliveries
+    SET status = 'pending', attempts = ${attempts}, last_error = ${error}, claimed_at = NULL,
+        available_at = now() + (${delayMilliseconds} * interval '1 millisecond')
+    WHERE id = ${delivery.id} AND status = 'sending'`;
+}
+
+async function voipDeliveryStillCurrent(sql: SQL, delivery: ClaimedVoIPDelivery, token: string): Promise<boolean> {
+  const tokenHash = hashToken(`apns-voip|${delivery.voip_push_environment}|${token}`);
+  const current = await sql`
+    SELECT 1
+    FROM voip_push_deliveries pd
+    JOIN calls c ON c.id = pd.call_id
+    JOIN devices d ON d.id = pd.device_id
+    WHERE pd.id = ${delivery.id} AND pd.status = 'sending'
+      AND pd.expires_at > now() AND c.state = 'requested' AND c.expires_at > now()
+      AND d.revoked_at IS NULL
+      AND d.voip_push_environment = ${delivery.voip_push_environment}
+      AND d.voip_push_token_hash = ${tokenHash}`;
+  if (current.length) return true;
+  await sql`
+    UPDATE voip_push_deliveries
+    SET status = 'dead', last_error = COALESCE(last_error, 'call no longer ringing'), claimed_at = NULL
+    WHERE id = ${delivery.id} AND status = 'sending'`;
+  return false;
+}
+
+async function processVoIPDelivery(sql: SQL, sender: PushSender, delivery: ClaimedVoIPDelivery): Promise<void> {
+  if (!delivery.voip_push_token_ciphertext || !delivery.voip_push_token_nonce
+    || !delivery.voip_push_token_key_id || !delivery.voip_push_environment) {
+    await sql`
+      UPDATE voip_push_deliveries
+      SET status = 'dead', last_error = 'VoIP token unavailable', claimed_at = NULL
+      WHERE id = ${delivery.id} AND status = 'sending'`;
+    return;
+  }
+  let token: string;
+  try {
+    token = open({
+      keyId: delivery.voip_push_token_key_id,
+      nonce: Buffer.from(delivery.voip_push_token_nonce),
+      ciphertext: Buffer.from(delivery.voip_push_token_ciphertext),
+    }, voipPushTokenAAD(delivery.device_id)).toString("utf8");
+  } catch (error) {
+    await sql`
+      UPDATE voip_push_deliveries
+      SET status = 'dead', last_error = ${cleanError(error)}, claimed_at = NULL
+      WHERE id = ${delivery.id} AND status = 'sending'`;
+    return;
+  }
+
+  if (!await voipDeliveryStillCurrent(sql, delivery, token)) return;
+
+  try {
+    const result = await sender.send({
+      kind: "voip",
+      token,
+      environment: delivery.voip_push_environment,
+      callId: delivery.call_id,
+      callerAccountId: delivery.caller_account_id,
+      expiresAt: new Date(delivery.expires_at).toISOString(),
+    });
+    if (result.status === 200) {
+      await sql`
+        UPDATE voip_push_deliveries
+        SET status = 'sent', sent_at = now(), apns_id = ${result.apnsId ?? null},
+            last_error = NULL, claimed_at = NULL
+        WHERE id = ${delivery.id} AND status = 'sending'`;
+    } else if (invalidDeviceToken(result.status, result.reason)) {
+      const sentTokenHash = hashToken(`apns-voip|${delivery.voip_push_environment}|${token}`);
+      await sql.begin(async (tx) => {
+        await tx`
+          UPDATE devices SET
+            voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+            voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
+            voip_push_environment = NULL, voip_push_updated_at = now()
+          WHERE id = ${delivery.device_id} AND voip_push_token_hash = ${sentTokenHash}`;
+        await tx`
+          UPDATE voip_push_deliveries
+          SET status = 'dead', attempts = attempts + 1,
+              last_error = ${cleanError(result.reason ?? `APNs ${result.status}`)}, claimed_at = NULL
+          WHERE id = ${delivery.id} AND status = 'sending'`;
+      });
+    } else if (retryable(result.status, result.reason)) {
+      await retryOrKillVoIP(sql, delivery, cleanError(result.reason ?? `APNs ${result.status}`));
+    } else {
+      await sql`
+        UPDATE voip_push_deliveries
+        SET status = 'dead', attempts = attempts + 1,
+            last_error = ${cleanError(result.reason ?? `APNs ${result.status}`)}, claimed_at = NULL
+        WHERE id = ${delivery.id} AND status = 'sending'`;
+    }
+  } catch (error) {
+    await retryOrKillVoIP(sql, delivery, cleanError(error));
+  }
+}
+
+export async function processVoIPPushBatch(sql: SQL, sender: PushSender, limit = 50): Promise<number> {
+  const deliveries = await claimVoIPDeliveries(sql, limit);
+  let next = 0;
+  const worker = async () => {
+    while (next < deliveries.length) {
+      const delivery = deliveries[next++];
+      await processVoIPDelivery(sql, sender, delivery);
+    }
+  };
+  const concurrency = Math.min(8, deliveries.length);
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return deliveries.length;
+}
+
+export function startPushWorker(sql: SQL, sender: PushSender | null, intervalMs = 500): () => void {
   if (!sender) return () => {};
   let running = false;
   const tick = async () => {
     if (running) return;
     running = true;
     try {
-      while (await processPushBatch(sql, sender) > 0) { /* drain ready work */ }
+      while (true) {
+        const [sync, voip] = await Promise.all([
+          processPushBatch(sql, sender),
+          processVoIPPushBatch(sql, sender),
+        ]);
+        if (sync === 0 && voip === 0) break;
+      }
     } catch (error) {
       console.error(new Date().toISOString(), "push.worker.error", cleanError(error));
     } finally {

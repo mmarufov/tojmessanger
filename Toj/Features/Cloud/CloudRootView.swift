@@ -32,6 +32,27 @@ struct CloudRootView: View {
             guard phase == .active, !Self.isRunningUnitTests else { return }
             Task { await model.resume() }
         }
+        .overlay(alignment: .top) {
+            if model.callCoordinator.hasCall,
+               !model.callCoordinator.isPresented,
+               model.callCoordinator.state != .ended {
+                TojActiveCallPill(coordinator: model.callCoordinator)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { model.callCoordinator.isPresented },
+            set: { presented in
+                if !presented {
+                    if model.callCoordinator.state == .ended { model.callCoordinator.dismissEnded() }
+                    else { model.callCoordinator.minimize() }
+                }
+            }
+        )) {
+            TojCallScreen(coordinator: model.callCoordinator)
+        }
     }
 }
 
@@ -776,6 +797,25 @@ private struct CloudSettingsView: View {
                                 }
                             }
                         }
+                    }
+
+                    TojSectionCard("Privacy") {
+                        Toggle(isOn: Binding(
+                            get: { model.callPreferences.hidesIPAddress },
+                            set: { model.callPreferences.hidesIPAddress = $0 }
+                        )) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Label("Hide IP address in calls", systemImage: "network.badge.shield.half.filled")
+                                    .font(.body.weight(.medium))
+                                Text("Routes calls through Toj relays. This improves privacy but may add latency.")
+                                    .font(.caption)
+                                    .foregroundStyle(TojTheme.secondaryText)
+                            }
+                        }
+                        .tint(TojTheme.secure)
+                        .padding(.horizontal, 15)
+                        .frame(minHeight: 68)
+                        .disabled(model.callCoordinator.state.isInProgress)
                     }
 
                     TojSectionCard("Account") {

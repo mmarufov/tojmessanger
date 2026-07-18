@@ -50,15 +50,30 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_nonce BYTEA;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_key_id TEXT;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_environment TEXT;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_updated_at TIMESTAMPTZ;
+-- PushKit uses a different APNs token and topic from ordinary notifications. Keep the
+-- registrations separate so an Unregistered response for one topic cannot erase the other.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_hash BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_ciphertext BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_nonce BYTEA;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_key_id TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_environment TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_updated_at TIMESTAMPTZ;
 DO $$ BEGIN
   ALTER TABLE devices ADD CONSTRAINT devices_push_environment_check
     CHECK (push_environment IN ('sandbox','production'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE devices ADD CONSTRAINT devices_voip_push_environment_check
+    CHECK (voip_push_environment IN ('sandbox','production')) NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS devices_account_active_idx ON devices(account_id) WHERE revoked_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS devices_push_token_active_idx
   ON devices(push_environment, push_token_hash)
   WHERE push_token_hash IS NOT NULL AND revoked_at IS NULL;
+-- The VoIP token index is built concurrently by schema-concurrent.sql because devices may already
+-- be large in production.
 
 CREATE TABLE IF NOT EXISTS otp_challenges (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -238,6 +253,8 @@ ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;
 ALTER TABLE messages ADD CONSTRAINT messages_kind_check
   CHECK (kind IN ('text','photo','video','file','voice','service'));
 CREATE INDEX IF NOT EXISTS messages_media_idx ON messages(media_id) WHERE media_id IS NOT NULL;
+-- The call-eligibility index is built concurrently by schema-concurrent.sql because messages is an
+-- existing, high-write table.
 DO $$ BEGIN
   ALTER TABLE messages ADD CONSTRAINT messages_reply_target_fk
     FOREIGN KEY (dialog_id, reply_to_msg_id) REFERENCES messages(dialog_id, msg_id);
@@ -337,6 +354,204 @@ CREATE TABLE IF NOT EXISTS push_deliveries (
 CREATE INDEX IF NOT EXISTS push_deliveries_ready_idx
   ON push_deliveries(available_at, created_at)
   WHERE status IN ('pending','sending');
+
+-- ============ one-to-one E2EE voice-call control plane ============
+-- The server stores lifecycle metadata, public key-agreement material, and opaque encrypted
+-- signaling only. It never receives the derived call key, plaintext SDP/ICE, or media.
+CREATE TABLE IF NOT EXISTS account_blocks (
+  blocker_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  blocked_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (blocker_account_id, blocked_account_id),
+  CHECK (blocker_account_id <> blocked_account_id)
+);
+CREATE INDEX IF NOT EXISTS account_blocks_blocked_idx ON account_blocks(blocked_account_id, blocker_account_id);
+
+CREATE TABLE IF NOT EXISTS calls (
+  id                        UUID PRIMARY KEY,
+  dialog_id                 UUID NOT NULL REFERENCES dialogs(id),
+  caller_account_id         UUID NOT NULL REFERENCES accounts(id),
+  caller_device_id          UUID NOT NULL REFERENCES devices(id),
+  callee_account_id         UUID NOT NULL REFERENCES accounts(id),
+  state                     TEXT NOT NULL DEFAULT 'requested'
+                              CHECK (state IN ('requested','accepted','key_exchange','active','ended')),
+  supported_protocols       INT[] NOT NULL,
+  offered_media_profiles    INT[] NOT NULL,
+  protocol_version          INT,
+  media_profile_version     INT,
+  caller_commitment         BYTEA NOT NULL CHECK (octet_length(caller_commitment) = 32),
+  callee_commitment         BYTEA CHECK (callee_commitment IS NULL OR octet_length(callee_commitment) = 32),
+  caller_fingerprint        BYTEA CHECK (caller_fingerprint IS NULL OR octet_length(caller_fingerprint) = 32),
+  accepted_device_id        UUID REFERENCES devices(id),
+  callee_public_key         BYTEA CHECK (callee_public_key IS NULL OR octet_length(callee_public_key) = 32),
+  callee_nonce              BYTEA CHECK (callee_nonce IS NULL OR octet_length(callee_nonce) = 32),
+  callee_fingerprint        BYTEA CHECK (callee_fingerprint IS NULL OR octet_length(callee_fingerprint) = 32),
+  caller_public_key         BYTEA CHECK (caller_public_key IS NULL OR octet_length(caller_public_key) = 32),
+  caller_nonce              BYTEA CHECK (caller_nonce IS NULL OR octet_length(caller_nonce) = 32),
+  caller_confirmation       BYTEA CHECK (caller_confirmation IS NULL OR octet_length(caller_confirmation) = 32),
+  callee_confirmation       BYTEA CHECK (callee_confirmation IS NULL OR octet_length(callee_confirmation) = 32),
+  latest_event_seq          BIGINT NOT NULL DEFAULT 0,
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at                TIMESTAMPTZ NOT NULL DEFAULT now() + interval '30 seconds',
+  accepted_at               TIMESTAMPTZ,
+  confirmed_at              TIMESTAMPTZ,
+  ended_at                  TIMESTAMPTZ,
+  end_reason                TEXT,
+  CHECK (caller_account_id <> callee_account_id)
+);
+CREATE INDEX IF NOT EXISTS calls_caller_active_idx ON calls(caller_account_id, created_at DESC)
+  WHERE state <> 'ended';
+CREATE INDEX IF NOT EXISTS calls_callee_active_idx ON calls(callee_account_id, created_at DESC)
+  WHERE state <> 'ended';
+CREATE INDEX IF NOT EXISTS calls_expiry_idx ON calls(expires_at) WHERE state <> 'ended';
+CREATE INDEX IF NOT EXISTS calls_ended_retention_idx ON calls(ended_at) WHERE state = 'ended';
+
+-- At most one active call can hold an account lease. Acquiring both leases in account UUID order
+-- makes simultaneous cross-calls deterministic and prevents double CallKit sessions.
+CREATE TABLE IF NOT EXISTS call_participant_leases (
+  account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  call_id    UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (call_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS call_participant_leases_expiry_idx ON call_participant_leases(expires_at);
+
+CREATE TABLE IF NOT EXISTS call_ring_targets (
+  call_id     UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  device_id   UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  status      TEXT NOT NULL DEFAULT 'ringing'
+                CHECK (status IN ('ringing','accepted','declined','answered_elsewhere','expired','ended')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  responded_at TIMESTAMPTZ,
+  PRIMARY KEY (call_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS call_ring_targets_device_idx ON call_ring_targets(device_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS call_events (
+  call_id          UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  event_seq        BIGINT NOT NULL CHECK (event_seq > 0),
+  event_type       TEXT NOT NULL CHECK (event_type IN ('requested','accepted','revealed','confirmed','encrypted','ended')),
+  sender_account_id UUID REFERENCES accounts(id),
+  sender_device_id UUID REFERENCES devices(id),
+  sender_sequence  BIGINT CHECK (sender_sequence IS NULL OR sender_sequence > 0),
+  signal_version   INT,
+  signal_kind      TEXT CHECK (signal_kind IS NULL OR signal_kind IN
+                       ('offer','answer','ice_candidate','ice_restart','hangup','control')),
+  envelope_expires_at TIMESTAMPTZ,
+  ciphertext       BYTEA CHECK (ciphertext IS NULL OR octet_length(ciphertext) BETWEEN 1 AND 65564),
+  data             JSONB,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at       TIMESTAMPTZ NOT NULL DEFAULT now() + interval '24 hours',
+  PRIMARY KEY (call_id, event_seq),
+  CHECK ((event_type = 'encrypted' AND ciphertext IS NOT NULL AND data IS NULL AND sender_sequence IS NOT NULL
+          AND signal_version IS NOT NULL AND signal_kind IS NOT NULL AND envelope_expires_at IS NOT NULL)
+      OR (event_type <> 'encrypted' AND ciphertext IS NULL AND data IS NOT NULL AND sender_sequence IS NULL
+          AND signal_version IS NULL AND signal_kind IS NULL AND envelope_expires_at IS NULL))
+);
+CREATE INDEX IF NOT EXISTS call_events_expiry_idx ON call_events(expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS call_events_sender_sequence_idx
+  ON call_events(call_id, sender_device_id, sender_sequence) WHERE sender_sequence IS NOT NULL;
+
+-- One active call is allowed per account, and each owning device gets a small rolling signaling
+-- budget. This bounds database/WAL/NOTIFY amplification without inspecting encrypted SDP or ICE.
+CREATE TABLE IF NOT EXISTS call_signal_budgets (
+  call_id                 UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  sender_device_id        UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  window_started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_count             INT NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+  ciphertext_bytes        BIGINT NOT NULL DEFAULT 0 CHECK (ciphertext_bytes >= 0),
+  negotiation_event_count INT NOT NULL DEFAULT 0 CHECK (negotiation_event_count >= 0),
+  PRIMARY KEY (call_id, sender_device_id)
+);
+
+CREATE TABLE IF NOT EXISTS call_telemetry_reports (
+  call_id    UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  device_id  UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (call_id, device_id)
+);
+
+-- The call row and its user-visible history row must survive independent process/database failures.
+-- A terminal transition inserts this record in the same transaction; a retrying worker delivers the
+-- service message with the original caller identity as its stable idempotency owner.
+CREATE TABLE IF NOT EXISTS call_history_outbox (
+  call_id            UUID PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE,
+  history_client_msg_id UUID NOT NULL DEFAULT gen_random_uuid(),
+  dialog_id          UUID NOT NULL REFERENCES dialogs(id),
+  caller_account_id  UUID NOT NULL REFERENCES accounts(id),
+  outcome            TEXT NOT NULL CHECK (outcome IN ('completed','declined','missed','busy','cancelled','failed')),
+  duration_seconds   INT NOT NULL DEFAULT 0 CHECK (duration_seconds >= 0),
+  status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','sending','delivered')),
+  attempts           INT NOT NULL DEFAULT 0,
+  available_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at         TIMESTAMPTZ,
+  last_error         TEXT,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  delivered_at       TIMESTAMPTZ
+);
+ALTER TABLE call_history_outbox ADD COLUMN IF NOT EXISTS history_client_msg_id UUID DEFAULT gen_random_uuid();
+UPDATE call_history_outbox SET history_client_msg_id = gen_random_uuid()
+WHERE history_client_msg_id IS NULL;
+ALTER TABLE call_history_outbox ALTER COLUMN history_client_msg_id SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS call_history_outbox_client_msg_idx
+  ON call_history_outbox(caller_account_id, history_client_msg_id);
+CREATE INDEX IF NOT EXISTS call_history_outbox_ready_idx
+  ON call_history_outbox(available_at, created_at) WHERE status IN ('pending','sending');
+
+-- Attempts survive cancelled/expired call cleanup so repeated invite/cancel loops remain limited.
+CREATE TABLE IF NOT EXISTS call_invite_attempts (
+  id                BIGSERIAL PRIMARY KEY,
+  caller_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  callee_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  caller_device_id  UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  network_hash      BYTEA,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS call_invite_attempts_caller_idx
+  ON call_invite_attempts(caller_account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS call_invite_attempts_callee_idx
+  ON call_invite_attempts(callee_account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS call_invite_attempts_network_idx
+  ON call_invite_attempts(network_hash, created_at DESC) WHERE network_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS call_invite_attempts_retention_idx ON call_invite_attempts(created_at);
+
+CREATE TABLE IF NOT EXISTS voip_push_deliveries (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  call_id           UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  caller_account_id UUID NOT NULL REFERENCES accounts(id),
+  device_id         UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending','sending','sent','dead')),
+  attempts          INT NOT NULL DEFAULT 0,
+  available_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at        TIMESTAMPTZ,
+  expires_at        TIMESTAMPTZ NOT NULL,
+  apns_id           TEXT,
+  last_error        TEXT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at           TIMESTAMPTZ,
+  UNIQUE (call_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS voip_push_deliveries_ready_idx
+  ON voip_push_deliveries(available_at, created_at) WHERE status IN ('pending','sending');
+CREATE INDEX IF NOT EXISTS voip_push_deliveries_retention_idx
+  ON voip_push_deliveries(created_at) WHERE status IN ('sent','dead');
+
+-- Credential secrets are never stored. This table is a short-lived allocation/abuse audit only.
+CREATE TABLE IF NOT EXISTS turn_allocations (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  call_id    UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  username   TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (call_id, account_id, username)
+);
+CREATE INDEX IF NOT EXISTS turn_allocations_expiry_idx ON turn_allocations(expires_at);
+CREATE INDEX IF NOT EXISTS turn_allocations_account_expiry_idx
+  ON turn_allocations(account_id, expires_at);
 
 -- ============ resumable bootstrap (B1/I2): snapshot token + per-dialog ceilings ============
 CREATE TABLE IF NOT EXISTS bootstrap_snapshots (

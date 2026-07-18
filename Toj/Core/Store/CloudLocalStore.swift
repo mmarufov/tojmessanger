@@ -32,6 +32,7 @@ nonisolated struct LocalDialog: Identifiable, Equatable, Sendable {
     let lastMsgId: Int64
     let updatedAt: String
     let lastText: String?
+    let lastKind: String?
     let lastState: String?
     let lastSenderAccountId: String?
     let lastLocalState: String?
@@ -774,6 +775,22 @@ actor CloudLocalStore {
         }
     }
 
+    func peerAccountId(dialogId: String, excluding accountId: String) throws -> String? {
+        try dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                SELECT account_id
+                FROM dialog_members
+                WHERE dialog_id = ? AND account_id != ?
+                ORDER BY account_id
+                LIMIT 1
+                """,
+                arguments: [dialogId, accountId]
+            )
+        }
+    }
+
     func messages(dialogId: String) throws -> [LocalMessage] {
         try dbQueue.read { db in
             let reactionRows = try Row.fetchAll(
@@ -888,6 +905,7 @@ actor CloudLocalStore {
                   d.last_msg_id,
                   d.updated_at,
                   m.text AS last_text,
+                  m.kind AS last_kind,
                   m.state AS last_state,
                   m.sender_account_id AS last_sender_account_id,
                   m.local_state AS last_local_state,
@@ -1272,6 +1290,7 @@ actor CloudLocalStore {
             lastMsgId: row["last_msg_id"],
             updatedAt: row["updated_at"],
             lastText: row["last_text"],
+            lastKind: row["last_kind"],
             lastState: row["last_state"],
             lastSenderAccountId: row["last_sender_account_id"],
             lastLocalState: row["last_local_state"],
