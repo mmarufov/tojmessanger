@@ -207,16 +207,18 @@ jobs:
         run: |
           revision="$(tr -d '[:space:]' < release-assets/REVISION)"
           release_tag="webrtc-${revision:0:12}"
-          if gh release view "${release_tag}" >/dev/null 2>&1; then
-            test "$(gh release view "${release_tag}" --json isDraft --jq .isDraft)" = true
+          if gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            test "$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)" = true
           else
             gh release create "${release_tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
               --draft \
               --verify-tag \
               --title "${release_tag}" \
               --notes "Pinned upstream WebRTC XCFramework for Toj. Verify provenance with gh attestation verify before use."
           fi
           gh release upload "${release_tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --clobber \
             release-assets/WebRTC.xcframework.zip \
             release-assets/WebRTC.xcframework.zip.sha256 \
@@ -226,4 +228,7 @@ jobs:
             release-assets/LICENSE \
             release-assets/README.md \
             release-assets/SBOM.spdx.json
-          gh release edit "${release_tag}" --draft=false --verify-tag
+          gh release edit "${release_tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --verify-tag
