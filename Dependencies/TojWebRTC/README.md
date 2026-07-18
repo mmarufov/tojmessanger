@@ -17,7 +17,10 @@ pod install
 ```
 
 The fetch script verifies the repository pin, SHA-256 sidecar, archive paths, and signed provenance
-from `.github/workflows/webrtc-xcframework.yml` at the expected release tag. It rejects attestations
-from self-hosted runners. A developer testing a custom, unattested local release can explicitly set
+from `.github/workflows/webrtc-xcframework.yml` at an immutable protected tag. The normal source ref
+is the expected release tag. If a build fails after that tag is protected, a reviewed repair can use
+`webrtc-<revision>-build.<number>` without moving the original tag; the signed `BUILD_SOURCE_REF`
+release asset records that provenance. The fetcher rejects any other source-ref shape and all
+self-hosted runners. A developer testing a custom, unattested local release can explicitly set
 `TOJ_WEBRTC_ALLOW_UNATTESTED=1`; CI rejects that escape hatch, and release/deployment builds must
 never use it.

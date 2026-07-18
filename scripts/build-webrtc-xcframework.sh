@@ -46,9 +46,12 @@ fi
   git checkout --detach "$REVISION"
   test "$(git rev-parse HEAD)" = "$REVISION"
 
+  # The pinned source still uses an API deprecated as of iOS 18. Building the
+  # reusable framework at iOS 17 keeps upstream warnings-as-errors intact; Toj
+  # itself remains an iOS 26 application and links this lower-minimum slice.
   vpython3 tools_webrtc/ios/build_ios_libs.py \
     --build_config release \
-    --deployment-target 26.0 \
+    --deployment-target 17.0 \
     --arch device:arm64 simulator:arm64 simulator:x64 \
     --output-dir "$SOURCE/out/toj_ios_libs"
 )

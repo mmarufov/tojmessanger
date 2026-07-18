@@ -39,11 +39,17 @@ jobs:
             test "${bundle}/Contents/Developer" = "${DEVELOPER_DIR}" || sudo rm -rf -- "${bundle}"
           done
           df -h .
-      - name: Validate release tag
+      - name: Validate immutable build tag
         if: startsWith(github.ref, 'refs/tags/webrtc-')
         run: |
           revision="$(tr -d '[:space:]' < Dependencies/TojWebRTC/REVISION)"
-          test "${GITHUB_REF_NAME}" = "webrtc-${revision:0:12}"
+          release_tag="webrtc-${revision:0:12}"
+          if test "${GITHUB_REF_NAME}" = "${release_tag}"; then
+            exit 0
+          fi
+          recovery_number="${GITHUB_REF_NAME#"${release_tag}-build."}"
+          test "${GITHUB_REF_NAME}" = "${release_tag}-build.${recovery_number}"
+          [[ "${recovery_number}" =~ ^[1-9][0-9]*$ ]]
       - name: Build pinned upstream WebRTC
         run: scripts/build-webrtc-xcframework.sh
       - name: Verify framework slices and checksum
@@ -140,6 +146,7 @@ jobs:
       - name: Stage immutable release inputs
         run: |
           mkdir -p release-assets
+          printf 'refs/tags/%s\n' "${GITHUB_REF_NAME}" > release-assets/BUILD_SOURCE_REF
           install -m 0644 \
             Dependencies/TojWebRTC/WebRTC.xcframework.zip \
             Dependencies/TojWebRTC/WebRTC.xcframework.zip.sha256 \
@@ -176,7 +183,13 @@ jobs:
       - name: Verify handoff and release identity
         run: |
           revision="$(tr -d '[:space:]' < release-assets/REVISION)"
-          test "${GITHUB_REF_NAME}" = "webrtc-${revision:0:12}"
+          release_tag="webrtc-${revision:0:12}"
+          test "$(cat release-assets/BUILD_SOURCE_REF)" = "${GITHUB_REF}"
+          if test "${GITHUB_REF_NAME}" != "${release_tag}"; then
+            recovery_number="${GITHUB_REF_NAME#"${release_tag}-build."}"
+            test "${GITHUB_REF_NAME}" = "${release_tag}-build.${recovery_number}"
+            [[ "${recovery_number}" =~ ^[1-9][0-9]*$ ]]
+          fi
           (
             cd release-assets
             sha256sum -c WebRTC.xcframework.zip.sha256
@@ -189,22 +202,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft)" = true
+          revision="$(tr -d '[:space:]' < release-assets/REVISION)"
+          release_tag="webrtc-${revision:0:12}"
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            test "$(gh release view "${release_tag}" --json isDraft --jq .isDraft)" = true
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "${release_tag}" \
               --draft \
               --verify-tag \
-              --title "${GITHUB_REF_NAME}" \
+              --title "${release_tag}" \
               --notes "Pinned upstream WebRTC XCFramework for Toj. Verify provenance with gh attestation verify before use."
           fi
-          gh release upload "${GITHUB_REF_NAME}" \
+          gh release upload "${release_tag}" \
             --clobber \
             release-assets/WebRTC.xcframework.zip \
             release-assets/WebRTC.xcframework.zip.sha256 \
             release-assets/REVISION \
             release-assets/DEPOT_TOOLS_REVISION \
+            release-assets/BUILD_SOURCE_REF \
             release-assets/LICENSE \
             release-assets/README.md \
             release-assets/SBOM.spdx.json
-          gh release edit "${GITHUB_REF_NAME}" --draft=false --verify-tag
+          gh release edit "${release_tag}" --draft=false --verify-tag
