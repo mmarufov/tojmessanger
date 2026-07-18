@@ -322,20 +322,30 @@ export async function revokeDevice(
   sql: SQL,
   accountId: string,
   deviceId: string,
+  options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
 ): Promise<{ revoked: true }> {
-  const rows = await sql`
-    UPDATE devices SET
-      revoked_at = COALESCE(revoked_at, now()),
-      push_token_hash = NULL,
-      push_token_ciphertext = NULL,
-      push_token_nonce = NULL,
-      push_token_key_id = NULL,
-      push_environment = NULL,
-      push_updated_at = now()
-    WHERE id = ${deviceId} AND account_id = ${accountId}
-    RETURNING id`;
-  if (rows.length === 0) throw new AuthError("device not found", 404);
-  return { revoked: true };
+  return await sql.begin(async (tx) => {
+    const rows = await tx`
+      UPDATE devices SET
+        revoked_at = COALESCE(revoked_at, now()),
+        push_token_hash = NULL,
+        push_token_ciphertext = NULL,
+        push_token_nonce = NULL,
+        push_token_key_id = NULL,
+        push_environment = NULL,
+        push_updated_at = now(),
+        voip_push_token_hash = NULL,
+        voip_push_token_ciphertext = NULL,
+        voip_push_token_nonce = NULL,
+        voip_push_token_key_id = NULL,
+        voip_push_environment = NULL,
+        voip_push_updated_at = now()
+      WHERE id = ${deviceId} AND account_id = ${accountId}
+      RETURNING id`;
+    if (rows.length === 0) throw new AuthError("device not found", 404);
+    await options.beforeCommit?.(tx);
+    return { revoked: true };
+  });
 }
 
 type AccountDeletionStartOptions = {
@@ -375,6 +385,7 @@ export async function deleteAccount(
   sql: SQL,
   accountId: string,
   code: string,
+  options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
 ): Promise<{ deleted: true }> {
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   const result: { deleted: true } | AuthError = await sql.begin(async (tx) => {
@@ -433,8 +444,18 @@ export async function deleteAccount(
         push_token_nonce = NULL,
         push_token_key_id = NULL,
         push_environment = NULL,
-        push_updated_at = now()
+        push_updated_at = now(),
+        voip_push_token_hash = NULL,
+        voip_push_token_ciphertext = NULL,
+        voip_push_token_nonce = NULL,
+        voip_push_token_key_id = NULL,
+        voip_push_environment = NULL,
+        voip_push_updated_at = now()
       WHERE account_id = ${accountId}`;
+    // Device rows are revoked and locked before call rows, matching call-mutation lock order.
+    // The injected call cleanup therefore commits atomically with account deletion without letting
+    // an in-flight device mutation recreate state after the termination scan.
+    await options.beforeCommit?.(tx);
     await tx`DELETE FROM otp_challenges WHERE phone_lookup_hash = ${originalLookup}`;
     return { deleted: true };
   });

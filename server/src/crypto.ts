@@ -53,6 +53,11 @@ export function pushTokenAAD(deviceId: string): Buffer {
   return Buffer.from(`toj/apns-token|${deviceId}`, "utf8");
 }
 
+/** Separately binds a PushKit VoIP token so the two APNs token fields cannot be swapped. */
+export function voipPushTokenAAD(deviceId: string): Buffer {
+  return Buffer.from(`toj/apns-voip-token|${deviceId}`, "utf8");
+}
+
 /** Binds an encrypted media chunk to its upload and exact plaintext offset. */
 export function mediaChunkAAD(mediaId: string, offset: number | bigint): Buffer {
   return Buffer.from(`toj/media|${mediaId}|${offset}`, "utf8");

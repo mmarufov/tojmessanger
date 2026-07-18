@@ -10,7 +10,11 @@
     "restore-drill": "bash scripts/restore-drill.sh",
     "test": "bun test"
   },
+  "dependencies": {
+    "pg": "^8.16.3"
+  },
   "devDependencies": {
-    "@types/bun": "^1.2.0"
+    "@types/bun": "^1.2.0",
+    "@types/pg": "^8.15.5"
   }
 }
