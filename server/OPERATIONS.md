@@ -101,3 +101,60 @@ with non-identifying values, changes the profile name to `Deleted Account`, dest
 credential hash and device name, removes push tokens, kills pending push work, removes OTP rows, and
 revokes all sessions. Existing message rows remain so other participants do not lose their history and
 foreign-key integrity is preserved. A later registration with the same phone creates a new account ID.
+
+## Voice calls and TURN readiness
+
+`voice_calls_v1` is advertised only when all of the following are configured:
+
+- `TOJ_VOICE_CALLS_ENABLED=1`
+- APNs credentials are configured, including the PushKit topic when it differs from `<TOJ_APNS_TOPIC>.voip`
+- `TOJ_TURN_URLS` contains the comma-separated TURN UDP/TCP/TLS endpoints
+- `TOJ_TURN_SHARED_SECRET` contains the coturn REST-auth shared secret
+- `TOJ_TURN_READY=1` is set by deployment automation only after TURN allocation and relay health probes pass
+
+The APNs provider settings are:
+
+- `TOJ_APNS_TEAM_ID` and `TOJ_APNS_KEY_ID` from the Apple Developer account
+- `TOJ_APNS_PRIVATE_KEY_BASE64`, containing the complete APNs `.p8` key encoded as base64
+- `TOJ_APNS_TOPIC` (defaults to `com.toj.Toj`)
+- `TOJ_APNS_VOIP_TOPIC` (defaults to `<TOJ_APNS_TOPIC>.voip`)
+
+All of the first three values must be set together. The app identifier, provisioning profile, and
+signed `aps-environment` entitlement must match the APNs topic and environment. A partial APNs
+configuration fails server startup; no APNs configuration keeps calls unavailable.
+
+For two TURN nodes, include all usable client transports in measured-preference order, for example:
+
+```text
+TOJ_TURN_URLS=turn:turn-a.example.com:3478?transport=udp,turn:turn-a.example.com:3478?transport=tcp,turns:turn-a.example.com:443?transport=tcp,turn:turn-b.example.com:3478?transport=udp,turn:turn-b.example.com:3478?transport=tcp,turns:turn-b.example.com:443?transport=tcp
+TOJ_STUN_URLS=stun:turn-a.example.com:3478,stun:turn-b.example.com:3478
+```
+
+`TOJ_STUN_URLS` is optional, but configuring both nodes is recommended so ICE can discover direct
+server-reflexive paths before falling back to relay. Restart the call-control process after changing
+any APNs, TURN, STUN, or voice-readiness setting because capability readiness is calculated at
+startup.
+
+Clear `TOJ_TURN_READY` or `TOJ_VOICE_CALLS_ENABLED` and restart the process to stop advertising and
+accepting new calls. Existing call action, signaling, and termination routes remain available so
+in-progress calls can finish cleanly.
+
+For a first rollout, migrate PostgreSQL and deploy with both readiness flags off. Prove authenticated
+allocations through each advertised UDP/TCP/TLS path from outside the TURN networks, set
+`TOJ_TURN_READY=1` and `TOJ_VOICE_CALLS_ENABLED=1`, restart, then require
+`GET /v1/capabilities` to contain `voice_calls_v1` before distributing the calling build.
+
+Only active iOS devices with a complete encrypted PushKit registration are ring targets. TURN
+credentials are scoped to the initiating or first-answer device, live for 60 minutes, and are
+replaced when fewer than 15 minutes remain. Once key confirmation completes, each encrypted signal
+(including the client's periodic encrypted control heartbeat) renews a 120-second active-call lease.
+Clients heartbeat at roughly 30 seconds so a process crash, revoked device, or deleted account
+cannot strand an active call while ordinary transient network loss still has recovery room.
+
+Use `TOJ_CALL_NOTIFY_DATABASE_URL` for the dedicated PostgreSQL `LISTEN` connection when it differs
+from `DATABASE_URL`. Call events are durable database rows and notifications are only low-latency
+wake-ups, so clients recover a listener outage through `GET /v1/calls/active` and event catch-up.
+Encrypted signaling is removed no later than ten minutes after termination; sanitized call metadata
+is retained for 30 days. The terminal transition writes a `call_history_outbox` record atomically;
+request and cleanup workers retry its idempotent service message until delivered, preserving the
+original caller account identifier even when account deletion ended the call.

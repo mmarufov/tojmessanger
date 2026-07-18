@@ -1,0 +1,210 @@
+name: WebRTC XCFramework
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'webrtc-*'
+
+# Every permission not granted on a job is denied. In particular, untrusted
+# build and test steps never receive a token that can alter repository content.
+permissions: {}
+
+concurrency:
+  group: webrtc-xcframework-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release tag points to reviewed main history
+        if: startsWith(github.ref, 'refs/tags/webrtc-')
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+      - name: Reclaim hosted-runner disk for WebRTC
+        run: |
+          test -d "${DEVELOPER_DIR}"
+          for bundle in /Applications/Xcode_*.app; do
+            test "${bundle}/Contents/Developer" = "${DEVELOPER_DIR}" || sudo rm -rf -- "${bundle}"
+          done
+          df -h .
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/webrtc-')
+        run: |
+          revision="$(tr -d '[:space:]' < Dependencies/TojWebRTC/REVISION)"
+          test "${GITHUB_REF_NAME}" = "webrtc-${revision:0:12}"
+      - name: Build pinned upstream WebRTC
+        run: scripts/build-webrtc-xcframework.sh
+      - name: Verify framework slices and checksum
+        run: |
+          shasum -a 256 -c Dependencies/TojWebRTC/WebRTC.xcframework.zip.sha256
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          dependency_dir = Path("Dependencies/TojWebRTC")
+          sbom = json.loads((dependency_dir / "SBOM.spdx.json").read_text())
+          versions = {package["name"]: package["versionInfo"] for package in sbom["packages"]}
+          expected = {
+              "WebRTC": (dependency_dir / "REVISION").read_text().strip(),
+              "depot_tools": (dependency_dir / "DEPOT_TOOLS_REVISION").read_text().strip(),
+          }
+          pinned = {name: versions.get(name) for name in expected}
+          if pinned != expected:
+              raise SystemExit(f"SBOM pins {pinned!r} do not match build pins {expected!r}")
+          PY
+          binaries="$(find Dependencies/TojWebRTC/WebRTC.xcframework \
+            -type f -path '*/WebRTC.framework/WebRTC' -print)"
+          test "$(printf '%s\n' "${binaries}" | sed '/^$/d' | wc -l | tr -d ' ')" -ge 2
+          while IFS= read -r binary; do
+            test -z "${binary}" || xcrun dwarfdump --uuid "${binary}"
+          done <<< "${binaries}"
+          test "$(find Dependencies/TojWebRTC/WebRTC.xcframework \
+            -type d -name '*.dSYM' | wc -l | tr -d ' ')" -ge 2
+          plutil -lint Dependencies/TojWebRTC/WebRTC.xcframework/Info.plist
+          rm -rf -- "${GITHUB_WORKSPACE}/.webrtc-build"
+      - name: Link framework into Toj, compile Release, and run app tests
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/TojDerivedData
+          RESULT_BUNDLE: ${{ runner.temp }}/TojTests.xcresult
+        run: |
+          pod install
+          grep -Fq 'TojWebRTC' Podfile.lock
+
+          xcodebuild build \
+            -workspace Toj.xcworkspace \
+            -scheme Toj \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${DERIVED_DATA}" \
+            CODE_SIGNING_ALLOWED=NO
+
+          app_dir="$(find "${DERIVED_DATA}/Build/Products/Release-iphonesimulator" \
+            -type d -name 'Toj.app' -print -quit)"
+          test -n "${app_dir}"
+          : > "${RUNNER_TEMP}/toj-symbols.txt"
+          for binary in "${app_dir}/Toj"; do
+            if test -f "${binary}"; then
+              xcrun nm "${binary}" | xcrun swift-demangle >> "${RUNNER_TEMP}/toj-symbols.txt"
+            fi
+          done
+          grep -Fq 'Toj.WebRTCVoiceEngine' "${RUNNER_TEMP}/toj-symbols.txt"
+
+          destination_id="$(/usr/bin/python3 <<'PY'
+          import json
+          import re
+          import subprocess
+
+          payload = json.loads(subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"],
+              text=True,
+          ))
+
+          def version(runtime):
+              match = re.search(r"\.iOS-(\d+)-(\d+)(?:-(\d+))?$", runtime)
+              return tuple(map(int, match.groups(default="0"))) if match else (-1,)
+
+          runtimes = sorted(
+              (runtime for runtime in payload["devices"] if ".iOS-" in runtime),
+              key=version,
+              reverse=True,
+          )
+          for runtime in runtimes:
+              for device in payload["devices"][runtime]:
+                  if device.get("isAvailable") and device["name"].startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("No available iPhone simulator")
+          PY
+          )"
+
+          xcodebuild test \
+            -workspace Toj.xcworkspace \
+            -scheme Toj \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${destination_id}" \
+            -derivedDataPath "${DERIVED_DATA}" \
+            -resultBundlePath "${RESULT_BUNDLE}" \
+            -parallel-testing-enabled NO
+      - name: Stage immutable release inputs
+        run: |
+          mkdir -p release-assets
+          install -m 0644 \
+            Dependencies/TojWebRTC/WebRTC.xcframework.zip \
+            Dependencies/TojWebRTC/WebRTC.xcframework.zip.sha256 \
+            Dependencies/TojWebRTC/REVISION \
+            Dependencies/TojWebRTC/DEPOT_TOOLS_REVISION \
+            Dependencies/TojWebRTC/LICENSE \
+            Dependencies/TojWebRTC/README.md \
+            Dependencies/TojWebRTC/SBOM.spdx.json \
+            release-assets/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: TojWebRTC-release
+          path: release-assets/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/webrtc-')
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: TojWebRTC-release
+          path: release-assets
+      - name: Verify handoff and release identity
+        run: |
+          revision="$(tr -d '[:space:]' < release-assets/REVISION)"
+          test "${GITHUB_REF_NAME}" = "webrtc-${revision:0:12}"
+          (
+            cd release-assets
+            sha256sum -c WebRTC.xcframework.zip.sha256
+          )
+      - name: Attest release inputs
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: 'release-assets/*'
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            test "$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Pinned upstream WebRTC XCFramework for Toj. Verify provenance with gh attestation verify before use."
+          fi
+          gh release upload "${GITHUB_REF_NAME}" \
+            --clobber \
+            release-assets/WebRTC.xcframework.zip \
+            release-assets/WebRTC.xcframework.zip.sha256 \
+            release-assets/REVISION \
+            release-assets/DEPOT_TOOLS_REVISION \
+            release-assets/LICENSE \
+            release-assets/README.md \
+            release-assets/SBOM.spdx.json
+          gh release edit "${GITHUB_REF_NAME}" --draft=false --verify-tag

@@ -1,0 +1,34 @@
+groups:
+  - name: toj-coturn
+    rules:
+      - alert: TojTurnNodeDown
+        expr: up{job="toj-coturn"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Toj TURN node is unavailable'
+      - alert: TojTurnCapacityMetricsMissing
+        expr: |-
+          (up{job="toj-coturn"} == 1 unless on (instance) toj_turn_allocation_capacity > 0)
+          or
+          (up{job="toj-coturn"} == 1 unless on (instance) toj_turn_egress_capacity_bytes_per_second > 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Toj TURN provisioned-capacity metrics are missing'
+      - alert: TojTurnAllocationCapacityHigh
+        expr: sum by (instance) (turn_total_allocations) / on (instance) max by (instance) (toj_turn_allocation_capacity) >= 0.60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Toj TURN allocations exceed 60% of configured capacity'
+      - alert: TojTurnEgressCapacityHigh
+        expr: sum by (instance) (rate(turn_total_traffic_sentb[5m])) / on (instance) max by (instance) (toj_turn_egress_capacity_bytes_per_second) >= 0.60
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Toj TURN egress exceeds 60% of provisioned capacity'
