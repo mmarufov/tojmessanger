@@ -814,7 +814,7 @@ private struct ReplicaSyncBanner: View {
             }
         }
         .padding(.horizontal, 13)
-        .frame(minHeight: 40)
+        .frame(minHeight: 44)
         .tojGlass(in: Capsule(), interactive: state.showsRetry)
     }
 }

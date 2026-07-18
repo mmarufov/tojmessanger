@@ -597,7 +597,7 @@ private struct MediaAutoDownloadNetworkEditor: View {
                 .foregroundStyle(TojTheme.gold)
             }
         }
-        .frame(minHeight: 42)
+        .frame(minHeight: 44)
     }
 
     private var networkTitle: String {
