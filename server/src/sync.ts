@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
-import { loadMediaDTO, type MediaDTO } from "./media";
+import { mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
 import { lockAccountMutations } from "./locks";
 
@@ -65,34 +65,98 @@ async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> 
 }
 
 async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
-  const r = (await sql`
-    SELECT dialog_id, msg_id, sender_account_id, client_msg_id, kind,
-           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
-           forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-           media_id, edit_version, state, server_ts
-    FROM messages WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0];
-  if (!r) return null;
-  const text = r.state === "deleted_for_all"
-    ? ""
-    : open(
-        { keyId: r.body_key_id, nonce: buf(r.body_nonce), ciphertext: buf(r.body_ciphertext) },
-        bodyAAD(dialogId, n(r.msg_id), r.sender_account_id),
-      ).toString("utf8");
-  const reactions = await sql`
-    SELECT account_id, emoji FROM message_reactions
-    WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}
-    ORDER BY created_at, account_id`;
-  return {
-    dialog_id: dialogId, msg_id: n(r.msg_id), sender_account_id: r.sender_account_id,
-    client_msg_id: r.client_msg_id, kind: r.kind, text,
-    reply_to_msg_id: r.reply_to_msg_id == null ? null : n(r.reply_to_msg_id), edit_version: r.edit_version,
-    // Source identifiers stay server-side. Recipients only need the presentation marker; exposing
-    // source dialog/account ids would create a cross-dialog privacy leak.
-    forwarded: r.forwarded_from_dialog_id != null && r.forwarded_from_msg_id != null,
-    reactions: reactions.map((reaction) => ({ account_id: reaction.account_id, emoji: reaction.emoji })),
-    media: r.state === "deleted_for_all" ? null : await loadMediaDTO(sql, r.media_id),
-    state: r.state, server_ts: iso(r.server_ts),
-  };
+  return (await loadMessages(sql, [{ dialogId, msgId }])).get(`${dialogId}:${msgId}`) ?? null;
+}
+
+type MessageKey = { dialogId: string; msgId: number };
+
+/** Loads an arbitrary event page in two bounded queries: messages+media, then all reactions. */
+async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<string, MessageDTO>> {
+  const unique = new Map<string, MessageKey>();
+  for (const key of inputKeys) unique.set(`${key.dialogId}:${key.msgId}`, key);
+  const keys = [...unique.values()];
+  if (keys.length === 0) return new Map();
+  const dialogIds = sql.array(keys.map((key) => key.dialogId), "uuid");
+  const messageIds = sql.array(keys.map((key) => key.msgId), "int8");
+
+  const rows = await sql`
+    WITH wanted AS (
+      SELECT * FROM unnest(${dialogIds}::uuid[], ${messageIds}::bigint[])
+        AS key(dialog_id, msg_id)
+    )
+    SELECT m.dialog_id, m.msg_id, m.sender_account_id, m.client_msg_id, m.kind,
+           m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
+           m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
+           m.media_id, m.edit_version, m.state, m.server_ts,
+           media.id AS media_object_id, media.kind AS media_object_kind,
+           media.content_type AS media_content_type, media.file_name AS media_file_name,
+           media.file_name_key_id AS media_file_name_key_id,
+           media.file_name_nonce AS media_file_name_nonce,
+           media.file_name_ciphertext AS media_file_name_ciphertext,
+           media.byte_size AS media_byte_size, media.duration_ms AS media_duration_ms,
+           media.width AS media_width, media.height AS media_height,
+           media.thumbnail_ciphertext AS media_thumbnail_ciphertext
+    FROM wanted key
+    JOIN messages m ON m.dialog_id = key.dialog_id AND m.msg_id = key.msg_id
+    LEFT JOIN media_objects media ON media.id = m.media_id AND media.status = 'ready'`;
+
+  const reactionRows = await sql`
+    WITH wanted AS (
+      SELECT * FROM unnest(${dialogIds}::uuid[], ${messageIds}::bigint[])
+        AS key(dialog_id, msg_id)
+    )
+    SELECT reaction.dialog_id, reaction.msg_id, reaction.account_id, reaction.emoji
+    FROM wanted key
+    JOIN message_reactions reaction
+      ON reaction.dialog_id = key.dialog_id AND reaction.msg_id = key.msg_id
+    ORDER BY reaction.dialog_id, reaction.msg_id, reaction.created_at, reaction.account_id`;
+
+  const reactions = new Map<string, { account_id: string; emoji: string }[]>();
+  for (const reaction of reactionRows) {
+    const key = `${reaction.dialog_id}:${n(reaction.msg_id)}`;
+    const values = reactions.get(key) ?? [];
+    values.push({ account_id: reaction.account_id, emoji: reaction.emoji });
+    reactions.set(key, values);
+  }
+
+  const result = new Map<string, MessageDTO>();
+  for (const row of rows) {
+    const dialogId = row.dialog_id;
+    const msgId = n(row.msg_id);
+    const key = `${dialogId}:${msgId}`;
+    const text = row.state === "deleted_for_all"
+      ? ""
+      : open(
+          { keyId: row.body_key_id, nonce: buf(row.body_nonce), ciphertext: buf(row.body_ciphertext) },
+          bodyAAD(dialogId, msgId, row.sender_account_id),
+        ).toString("utf8");
+    const media = row.media_object_id == null ? null : mediaDTOFromRow({
+      id: row.media_object_id,
+      kind: row.media_object_kind,
+      content_type: row.media_content_type,
+      file_name: row.media_file_name,
+      file_name_key_id: row.media_file_name_key_id,
+      file_name_nonce: row.media_file_name_nonce,
+      file_name_ciphertext: row.media_file_name_ciphertext,
+      byte_size: row.media_byte_size,
+      duration_ms: row.media_duration_ms,
+      width: row.media_width,
+      height: row.media_height,
+      thumbnail_ciphertext: row.media_thumbnail_ciphertext,
+    });
+    result.set(key, {
+      dialog_id: dialogId, msg_id: msgId, sender_account_id: row.sender_account_id,
+      client_msg_id: row.client_msg_id, kind: row.kind, text,
+      reply_to_msg_id: row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id),
+      edit_version: row.edit_version,
+      // Source identifiers stay server-side. Recipients only need the marker.
+      forwarded: row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null,
+      reactions: reactions.get(key) ?? [],
+      media: row.state === "deleted_for_all" ? null : media,
+      state: row.state, server_ts: iso(row.server_ts),
+    });
+  }
+  return result;
 }
 
 const MAX_TEXT_BYTES = 16 * 1024;
@@ -530,6 +594,7 @@ export async function getDifference(
 
   const rows = await sql`
     SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
+           peer.id AS peer_account_id,
            CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title
     FROM account_events ae
     LEFT JOIN dialogs d ON d.id = ae.dialog_id
@@ -542,28 +607,40 @@ export async function getDifference(
     WHERE ae.account_id = ${accountId} AND ae.pts > ${sincePts}
     ORDER BY ae.pts ASC LIMIT ${maxEvents}`;
 
+  const messageKeys: MessageKey[] = rows.flatMap((event) =>
+    event.msg_id != null && [
+      "message.new", "message.edited", "message.deleted", "reaction.updated",
+    ].includes(event.type)
+      ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
+      : []
+  );
+  const messages = await loadMessages(sql, messageKeys);
+
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
   for (const ev of rows) {
     const pts = n(ev.pts);
     let update: any;
     if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
-      const message = await loadMessage(sql, ev.dialog_id, n(ev.msg_id));
+      const message = messages.get(`${ev.dialog_id}:${n(ev.msg_id)}`) ?? null;
       if (!message) {
         update = {
           pts, ptsCount: 1, type: "message.missing", dialog_id: ev.dialog_id,
-          dialog_title: ev.dialog_title ?? undefined, msg_id: n(ev.msg_id),
+          dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
+          msg_id: n(ev.msg_id),
         };
       } else {
         update = {
           pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
-          dialog_title: ev.dialog_title ?? undefined, message,
+          dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
+          message,
         };
       }
     } else {
       update = {
         pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
         dialog_title: ev.dialog_title ?? undefined,
+        peer_account_id: ev.peer_account_id ?? undefined,
         msg_id: ev.msg_id ? n(ev.msg_id) : undefined,
         actor_account_id: ev.actor_account_id, ...eventData(ev.data),
       };
@@ -611,7 +688,10 @@ export async function startBootstrap(sql: SQL, accountId: string): Promise<Boots
 
 export type BootstrapDialog = {
   dialog_id: string; type: string; title: string | null; last_msg_id: number;
-  updated_at: string; members: { account_id: string; role: string; last_read_msg_id: number }[];
+  updated_at: string; unread_count: number;
+  members: { account_id: string; role: string; last_read_msg_id: number }[];
+  profiles: { accountId: string; firstName: string; lastName: string; displayName: string; bio: string;
+    birthday: string | null; colorIndex: number; updatedAt: string }[];
   messages: MessageDTO[];
 };
 
@@ -678,6 +758,25 @@ export async function getBootstrapDialogsPage(
       FROM dialog_members
       WHERE dialog_id = ${row.dialog_id}
       ORDER BY account_id`;
+    const profiles = await sql`
+      SELECT a.id, a.first_name, a.last_name, a.display_name, a.bio, a.birthday,
+             a.profile_color, a.updated_at
+      FROM accounts a
+      JOIN dialog_members dm ON dm.account_id = a.id
+      WHERE dm.dialog_id = ${row.dialog_id} AND dm.left_at IS NULL
+      ORDER BY a.id`;
+    // The five-message preview is intentionally sparse. Carry the authoritative unread count
+    // separately so a new device can prioritize unread dialogs without first downloading history.
+    const unread = (await sql`
+      SELECT count(*)::int AS count
+      FROM messages m
+      JOIN dialog_members self
+        ON self.dialog_id = m.dialog_id AND self.account_id = ${accountId} AND self.left_at IS NULL
+      WHERE m.dialog_id = ${row.dialog_id}
+        AND m.msg_id <= ${n(row.ceiling_msg_id)}
+        AND m.msg_id > self.last_read_msg_id
+        AND m.sender_account_id <> ${accountId}
+        AND m.state = 'visible'`)[0];
     const msgRows = previewMessages === 0 ? [] : await sql`
       SELECT msg_id FROM messages
       WHERE dialog_id = ${row.dialog_id} AND msg_id <= ${n(row.ceiling_msg_id)}
@@ -691,7 +790,15 @@ export async function getBootstrapDialogsPage(
     dialogs.push({
       dialog_id: row.dialog_id, type: row.type, title: row.title, last_msg_id: n(row.ceiling_msg_id),
       updated_at: iso(row.updated_at),
+      unread_count: n(unread?.count),
       members: members.map((m) => ({ account_id: m.account_id, role: m.role, last_read_msg_id: n(m.last_read_msg_id) })),
+      profiles: profiles.map((p) => ({
+        accountId: p.id, firstName: p.first_name, lastName: p.last_name,
+        displayName: p.display_name, bio: p.bio,
+        birthday: p.birthday == null ? null : (p.birthday instanceof Date
+          ? p.birthday.toISOString().slice(0, 10) : String(p.birthday).slice(0, 10)),
+        colorIndex: n(p.profile_color), updatedAt: iso(p.updated_at),
+      })),
       messages,
     });
   }
@@ -704,18 +811,33 @@ export async function getBootstrapDialogsPage(
   };
 }
 
-export type HistoryPage = { dialogId: string; messages: MessageDTO[]; nextBeforeMsgId?: number; hasMore: boolean };
+export type HistoryPage = {
+  dialogId: string;
+  messages: MessageDTO[];
+  nextBeforeMsgId?: number;
+  nextAfterMsgId?: number;
+  hasMore: boolean;
+};
 
 export async function getHistory(
   sql: SQL,
   accountId: string,
   dialogId: string,
-  opts: { beforeMsgId?: number; limit?: number; maxBytes?: number } = {},
+  opts: { beforeMsgId?: number; afterMsgId?: number; limit?: number; maxBytes?: number } = {},
 ): Promise<HistoryPage> {
   await requireActiveMember(sql, accountId, dialogId);
+  if (opts.beforeMsgId !== undefined && opts.afterMsgId !== undefined) {
+    throw new SyncError("history cursors are mutually exclusive");
+  }
   const limit = clamp(opts.limit ?? 50, 1, 200);
   const maxBytes = opts.maxBytes ?? 512 * 1024;
-  const rows = opts.beforeMsgId
+  const rows = opts.afterMsgId !== undefined
+    ? await sql`
+        SELECT msg_id FROM messages
+        WHERE dialog_id = ${dialogId} AND msg_id > ${opts.afterMsgId}
+        ORDER BY msg_id ASC
+        LIMIT ${limit + 1}`
+    : opts.beforeMsgId
     ? await sql`
         SELECT msg_id FROM messages
         WHERE dialog_id = ${dialogId} AND msg_id < ${opts.beforeMsgId}
@@ -738,16 +860,21 @@ export async function getHistory(
     messages.push(msg);
     bytes += size;
   }
-  messages.reverse();
+  if (opts.afterMsgId === undefined) messages.reverse();
   return {
     dialogId, messages, hasMore,
-    nextBeforeMsgId: hasMore && messages.length ? messages[0].msg_id : undefined,
+    nextBeforeMsgId: opts.afterMsgId === undefined && hasMore && messages.length
+      ? messages[0].msg_id
+      : undefined,
+    nextAfterMsgId: opts.afterMsgId !== undefined && hasMore && messages.length
+      ? messages[messages.length - 1].msg_id
+      : undefined,
   };
 }
 
 export async function readHistory(sql: SQL, p: {
   accountId: string; deviceId?: string; dialogId: string; maxReadMsgId: number;
-}): Promise<{ dialogId: string; maxReadMsgId: number; pushes: Push[] }> {
+}): Promise<{ dialogId: string; maxReadMsgId: number; unreadCount: number; pushes: Push[] }> {
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, p.accountId);
     if (p.deviceId) await requireActiveDevice(tx, p.accountId, p.deviceId);
@@ -761,12 +888,34 @@ export async function readHistory(sql: SQL, p: {
       const current = (await tx`
         SELECT last_read_msg_id FROM dialog_members
         WHERE dialog_id = ${p.dialogId} AND account_id = ${p.accountId} AND left_at IS NULL`)[0];
-      return { dialogId: p.dialogId, maxReadMsgId: n(current.last_read_msg_id), pushes: [] };
+      const unread = (await tx`
+        SELECT count(*)::int AS count FROM messages
+        WHERE dialog_id = ${p.dialogId}
+          AND msg_id > ${n(current.last_read_msg_id)}
+          AND sender_account_id <> ${p.accountId}
+          AND state = 'visible'`)[0];
+      return {
+        dialogId: p.dialogId,
+        maxReadMsgId: n(current.last_read_msg_id),
+        unreadCount: n(unread?.count),
+        pushes: [],
+      };
     }
 
     const members = await tx`SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL ORDER BY account_id`;
     const pushes: Push[] = [];
-    const data = JSON.stringify({ reader_account_id: p.accountId, max_read_msg_id: n(member.last_read_msg_id) });
+    const unread = (await tx`
+      SELECT count(*)::int AS count FROM messages
+      WHERE dialog_id = ${p.dialogId}
+        AND msg_id > ${n(member.last_read_msg_id)}
+        AND sender_account_id <> ${p.accountId}
+        AND state = 'visible'`)[0];
+    const unreadCount = n(unread?.count);
+    const data = JSON.stringify({
+      reader_account_id: p.accountId,
+      max_read_msg_id: n(member.last_read_msg_id),
+      unread_count: unreadCount,
+    });
     for (const m of members) {
       const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${m.account_id} RETURNING pts`;
       const pts = n(upd[0].pts);
@@ -775,6 +924,6 @@ export async function readHistory(sql: SQL, p: {
         VALUES (${m.account_id}, ${pts}, 'read.updated', ${p.dialogId}, ${p.accountId}, ${data}::jsonb)`;
       pushes.push({ accountId: m.account_id, pts, ptsCount: 1 });
     }
-    return { dialogId: p.dialogId, maxReadMsgId: n(member.last_read_msg_id), pushes };
+    return { dialogId: p.dialogId, maxReadMsgId: n(member.last_read_msg_id), unreadCount, pushes };
   });
 }

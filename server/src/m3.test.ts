@@ -4,6 +4,8 @@ import {
   startVerification,
   checkVerification,
   lookupAccountByPhone,
+  getProfile,
+  updateProfile,
   startAccountDeletion,
   deleteAccount,
   resolveDevice,
@@ -529,14 +531,21 @@ describe("M3 cloud sync", () => {
 
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
+    const originalConsoleError = console.error;
+    const logged: string[] = [];
+    console.error = (...parts: unknown[]) => logged.push(parts.map(String).join(" "));
     try {
       await startVerification(db, testPhone(123), { delivery: new FailingOTPDelivery() });
     } catch (value) {
       error = value;
+    } finally {
+      console.error = originalConsoleError;
     }
     expect(error).toBeInstanceOf(AuthError);
     expect((error as AuthError).status).toBe(503);
     expect((await db`SELECT consumed_at FROM otp_challenges`)[0].consumed_at).not.toBeNull();
+    expect(logged.join(" ")).not.toContain("provider unavailable");
+    expect(logged.join(" ")).toContain("Error");
   });
 
   test("APNs token registration encrypts at rest and transfers a reused token", async () => {
@@ -1144,6 +1153,36 @@ describe("M3 cloud sync", () => {
     expect(firstSlice.updates[0].pts).toBeLessThan(rest.updates.at(-1).pts);
   });
 
+  test("a 200-event difference page uses at most four SQL calls", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    for (let i = 0; i < 200; i++) {
+      await sendMessage(db, {
+        senderAccountId: alice.accountId,
+        senderDeviceId: alice.deviceId,
+        dialogId,
+        clientMsgId: crypto.randomUUID(),
+        body: `bulk message ${i}`,
+      });
+    }
+
+    let calls = 0;
+    const countedDB = new Proxy(db, {
+      apply(target, _thisArg, argumentsList) {
+        calls += 1;
+        return Reflect.apply(target, target, argumentsList);
+      },
+    });
+    const difference = await getDifference(
+      countedDB,
+      bob.accountId,
+      1,
+      { maxEvents: 200, maxBytes: 512 * 1024 },
+    );
+
+    expect(difference.updates).toHaveLength(200);
+    expect(calls).toBeLessThanOrEqual(4);
+  });
+
   test("pruned event floor returns difference_too_long instead of a fake partial catch-up", async () => {
     const { alice, bob, dialogId } = await makePair();
     await sendMessage(db, {
@@ -1188,6 +1227,7 @@ describe("M3 cloud sync", () => {
     expect(page.dialogs).toHaveLength(1);
     expect(page.dialogs[0].title).toBe("Alice");
     expect(page.dialogs[0].messages.map((m) => m.text)).toEqual(["before snapshot"]);
+    expect(page.dialogs[0].unread_count).toBe(1);
 
     const diff = await getDifference(db, bob.accountId, bootstrap.state.pts);
     expect(diff.kind).toBe("difference");
@@ -1213,6 +1253,13 @@ describe("M3 cloud sync", () => {
 
     const page = await getHistory(db, alice.accountId, dialogId, { limit: 50 });
     expect(page.messages.map((m) => m.text)).toEqual(["one", "two"]);
+
+    const forwardPage = await getHistory(db, alice.accountId, dialogId, {
+      afterMsgId: page.messages[0].msg_id,
+      limit: 1,
+    });
+    expect(forwardPage.messages.map((m) => m.text)).toEqual(["two"]);
+    expect(forwardPage.nextBeforeMsgId).toBeUndefined();
   });
 
   test("read receipts advance member state and emit sync updates", async () => {
@@ -1227,13 +1274,16 @@ describe("M3 cloud sync", () => {
 
     const read = await readHistory(db, { accountId: bob.accountId, dialogId, maxReadMsgId: sent.msgId });
     expect(read.maxReadMsgId).toBe(sent.msgId);
+    expect(read.unreadCount).toBe(0);
 
     const diff = await getDifference(db, alice.accountId, sent.senderPts);
     expect(diff.kind).toBe("difference");
-    expect(diff.updates.some((u) => u.type === "read.updated" && u.max_read_msg_id === sent.msgId)).toBe(true);
+    expect(diff.updates.some((u) => u.type === "read.updated"
+      && u.max_read_msg_id === sent.msgId && u.unread_count === 0)).toBe(true);
 
     const repeat = await readHistory(db, { accountId: bob.accountId, dialogId, maxReadMsgId: sent.msgId });
     expect(repeat.pushes).toHaveLength(0);
+    expect(repeat.unreadCount).toBe(0);
     const afterRepeat = await getDifference(db, alice.accountId, diff.state.pts);
     expect(afterRepeat.kind).toBe("difference");
     expect(afterRepeat.updates).toEqual([]);
@@ -1686,6 +1736,46 @@ describe("M3 cloud sync", () => {
     expect(found?.accountId).toBe(session.accountId);
     expect(found?.displayName).toBe("Muhammad");
     expect(await lookupAccountByPhone(db, requester.accountId, "+16505559999")).toBeNull();
+  });
+
+  test("profile updates persist and sync to every active chat partner", async () => {
+    const owner = await makeAccount(testPhone(145), "Old Name");
+    const requester = await makeAccount(testPhone(146), "Requester");
+    const direct = await getOrCreateDirectDialog(db, owner.accountId, requester.accountId);
+    const requesterPts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${requester.accountId}`)[0].pts);
+    const result = await updateProfile(db, owner.accountId, owner.deviceId, {
+      firstName: "New", lastName: "Name", bio: "Building Toj",
+      birthday: "1995-04-18", colorIndex: 4,
+    });
+    expect(result.profile).toMatchObject({
+      accountId: owner.accountId, firstName: "New", lastName: "Name",
+      displayName: "New Name", bio: "Building Toj", birthday: "1995-04-18", colorIndex: 4,
+    });
+    expect(await getProfile(db, owner.accountId)).toEqual(result.profile);
+    expect((await lookupAccountByPhone(db, requester.accountId, testPhone(145)))?.displayName)
+      .toBe("New Name");
+
+    const difference = await getDifference(db, requester.accountId, requesterPts);
+    expect(difference.kind).toBe("difference");
+    if (difference.kind === "difference") {
+      expect(difference.updates).toContainEqual(expect.objectContaining({
+        type: "profile.updated", subject_account_id: owner.accountId,
+        display_name: "New Name", bio: "Building Toj", birthday: "1995-04-18", color_index: 4,
+        shared_dialog_ids: [direct.dialogId],
+      }));
+    }
+    const snapshot = await startBootstrap(db, requester.accountId);
+    const page = await getBootstrapDialogsPage(db, requester.accountId, snapshot.token);
+    expect(page.dialogs[0].profiles).toContainEqual(expect.objectContaining({
+      accountId: owner.accountId, displayName: "New Name", colorIndex: 4,
+    }));
+
+    await revokeDevice(db, owner.accountId, owner.deviceId);
+    await expect(updateProfile(db, owner.accountId, owner.deviceId, {
+      firstName: "Another", lastName: "Name", bio: "", birthday: null, colorIndex: 0,
+    }))
+      .rejects.toMatchObject({ status: 401 });
   });
 
   test("contact discovery is persistently bounded per authenticated account", async () => {

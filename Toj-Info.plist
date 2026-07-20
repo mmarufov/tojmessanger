@@ -18,6 +18,11 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.toj.Toj.app-refresh</string>
+		<string>com.toj.Toj.processing</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -29,6 +34,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Toj uses the microphone when you record a voice message or join an encrypted voice call.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>Toj uses your contacts to help you find people you know and invite friends who are not on Toj yet.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Toj saves a photo only when you choose Save to Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
@@ -36,6 +43,8 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>fetch</string>
+		<string>processing</string>
 		<string>remote-notification</string>
 		<string>voip</string>
 	</array>

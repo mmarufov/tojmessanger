@@ -86,6 +86,135 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(ready.first?.retryCount, 1)
     }
 
+    func testPendingReadReceiptSurvivesReopenAndFailureUntilAcknowledged() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("durable-read-receipt-key".utf8)
+        let dialogId = "dialog-read-receipt"
+        let accountId = "account-me"
+
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            try await store.saveMembers(dialogId: dialogId, members: [
+                BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
+            ])
+            try await store.queueReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                maxReadMsgId: 10
+            )
+        }
+
+        do {
+            let reopened = try CloudLocalStore(path: path, key: key)
+            let ready = try await reopened.pendingReadReceiptsReady()
+            XCTAssertEqual(ready.map(\.dialogId), [dialogId])
+            XCTAssertEqual(ready.first?.maxReadMsgId, 10)
+            try await reopened.failReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                retryAfter: 3_600,
+                error: "offline"
+            )
+        }
+
+        do {
+            let reopenedAfterFailure = try CloudLocalStore(path: path, key: key)
+            let failedReady = try await reopenedAfterFailure.pendingReadReceiptsReady()
+            XCTAssertTrue(failedReady.isEmpty)
+
+            // A newly visible message advances the durable watermark and makes the coalesced
+            // acknowledgement immediately eligible again.
+            try await reopenedAfterFailure.queueReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                maxReadMsgId: 12
+            )
+            let retried = try await reopenedAfterFailure.pendingReadReceiptsReady()
+            XCTAssertEqual(retried.first?.maxReadMsgId, 12)
+            XCTAssertEqual(retried.first?.retryCount, 0)
+
+            // An older request may fail after this row was coalesced to a newer visible watermark.
+            // That stale failure must not put the newer acknowledgement behind a retry timer.
+            try await reopenedAfterFailure.failReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                retryAfter: 3_600,
+                error: "stale network failure",
+                attemptedMsgId: 10
+            )
+            let readyAfterStaleFailure = try await reopenedAfterFailure.pendingReadReceiptsReady()
+            XCTAssertEqual(readyAfterStaleFailure.first?.maxReadMsgId, 12)
+            XCTAssertEqual(readyAfterStaleFailure.first?.retryCount, 0)
+
+            try await reopenedAfterFailure.completeReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                acknowledgedMsgId: 11
+            )
+            let afterStaleAcknowledgement = try await reopenedAfterFailure.pendingReadReceiptsReady()
+            XCTAssertEqual(
+                afterStaleAcknowledgement.first?.maxReadMsgId,
+                12,
+                "A stale acknowledgement must not delete a newer read watermark"
+            )
+            try await reopenedAfterFailure.completeReadReceipt(
+                dialogId: dialogId,
+                accountId: accountId,
+                acknowledgedMsgId: 12
+            )
+        }
+
+        let finalReopen = try CloudLocalStore(path: path, key: key)
+        let finalReady = try await finalReopen.pendingReadReceiptsReady()
+        XCTAssertTrue(finalReady.isEmpty)
+    }
+
+    func testHistoryRequestEncodesAfterCursorAndDecodesNextAfterCursor() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/history")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer session-token")
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(json["dialogId"] as? String, "dialog-history")
+            XCTAssertNil(json["beforeMsgId"])
+            XCTAssertEqual(json["afterMsgId"] as? Int, 20)
+            XCTAssertEqual(json["limit"] as? Int, 100)
+            XCTAssertEqual(json["maxBytes"] as? Int, 512 * 1_024)
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"dialogId":"dialog-history","messages":[],"nextBeforeMsgId":null,
+                 "nextAfterMsgId":42,"hasMore":true}
+                """.utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let page = try await api.getHistory(
+            dialogId: "dialog-history",
+            beforeMsgId: nil,
+            afterMsgId: 20,
+            limit: 100,
+            token: "session-token"
+        )
+        XCTAssertEqual(page.nextAfterMsgId, 42)
+        XCTAssertTrue(page.hasMore)
+    }
+
     func testAccountDeletionRequestUsesBearerAndPurposeCodeBody() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
@@ -109,6 +238,87 @@ final class CloudLocalStoreTests: XCTestCase {
         let response = try await api.deleteAccount(code: "123456", token: "session-token")
         let deleted = response.deleted
         XCTAssertTrue(deleted)
+    }
+
+    func testProfileUpdateUsesAuthenticatedPutAndDecodesSavedName() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/profile")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer session-token")
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(json["firstName"] as? String, "Mehron")
+            XCTAssertEqual(json["lastName"] as? String, "Sharifov")
+            XCTAssertEqual(json["bio"] as? String, "Hello")
+            XCTAssertEqual(json["birthday"] as? String, "1995-04-18")
+            XCTAssertEqual(json["colorIndex"] as? Int, 4)
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"accountId":"account-a","firstName":"Mehron","lastName":"Sharifov",\
+                "displayName":"Mehron Sharifov","bio":"Hello","birthday":"1995-04-18",\
+                "colorIndex":4,"updatedAt":"2026-07-16T10:00:00.000Z"}
+                """.utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 1995
+        components.month = 4
+        components.day = 18
+        let response = try await api.updateProfile(
+            StoredProfileDetails(
+                firstName: "Mehron", lastName: "Sharifov", bio: "Hello",
+                birthday: try XCTUnwrap(components.date), colorIndex: 4
+            ),
+            token: "session-token"
+        )
+        XCTAssertEqual(response.displayName, "Mehron Sharifov")
+    }
+
+    func testStoredProfileCombinesTrimmedFirstAndLastNames() {
+        let profile = StoredProfileDetails(
+            firstName: " Mehron ",
+            lastName: " Sharifov ",
+            bio: "Hello",
+            birthday: nil,
+            colorIndex: 2
+        )
+        XCTAssertEqual(profile.displayName, "Mehron Sharifov")
+    }
+
+    func testProfileDetailsPersistSeparatelyFromTheSession() async throws {
+        let accountId = "profile-test-\(UUID().uuidString)"
+        let store = TokenStore()
+        let birthday = try XCTUnwrap(Calendar(identifier: .gregorian).date(from: DateComponents(
+            year: 2000, month: 2, day: 16
+        )))
+        let profile = StoredProfileDetails(
+            firstName: "Mehron",
+            lastName: "Sharifov",
+            bio: "A few words",
+            birthday: birthday,
+            colorIndex: 4
+        )
+
+        try await store.saveProfile(profile, accountId: accountId)
+        let loaded = try await store.loadProfile(accountId: accountId)
+        XCTAssertEqual(loaded, profile)
+        try await store.clearProfile(accountId: accountId)
+        let cleared = try await store.loadProfile(accountId: accountId)
+        XCTAssertNil(cleared)
     }
 
     func testAPNsDeviceTokenUsesLowercaseTwoDigitHex() {
@@ -225,7 +435,7 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     func testPendingSessionRevocationTokenPersistsSeparately() async throws {
-        let store = TokenStore()
+        let store = TokenStore(service: "com.toj.tests.\(UUID().uuidString)")
         try? await store.clearPendingRevocationToken()
         try await store.savePendingRevocationToken("test-revocation-token")
         let loaded = try await store.loadPendingRevocationToken()
@@ -233,6 +443,37 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.clearPendingRevocationToken()
         let cleared = try await store.loadPendingRevocationToken()
         XCTAssertNil(cleared)
+    }
+
+    func testPendingLocalErasureSurvivesProfileCleanupUntilExplicitlyCleared() async throws {
+        let store = TokenStore(service: "com.toj.tests.\(UUID().uuidString)")
+        let profile = StoredProfileDetails(
+            firstName: "Mehron",
+            lastName: "Sharifov",
+            bio: "Private profile",
+            birthday: nil,
+            colorIndex: 2
+        )
+        try await store.saveProfile(profile, accountId: "account-a")
+        try await store.saveProfile(profile, accountId: "account-b")
+        try await store.savePendingRevocationToken("revocation-token")
+        try await store.savePendingLocalErasure(accountId: "account-a")
+
+        try await store.clearAllProfiles()
+
+        let firstProfile = try await store.loadProfile(accountId: "account-a")
+        let secondProfile = try await store.loadProfile(accountId: "account-b")
+        let revocationToken = try await store.loadPendingRevocationToken()
+        let erasurePending = try await store.hasPendingLocalErasure()
+        XCTAssertNil(firstProfile)
+        XCTAssertNil(secondProfile)
+        XCTAssertEqual(revocationToken, "revocation-token")
+        XCTAssertTrue(erasurePending)
+
+        try await store.clearPendingLocalErasure()
+        let erasureCleared = try await store.hasPendingLocalErasure()
+        XCTAssertFalse(erasureCleared)
+        try await store.clearPendingRevocationToken()
     }
 
     func testCloudConfigPersistsInjectedURLForManualRelaunch() throws {
@@ -463,6 +704,13 @@ final class CloudLocalStoreTests: XCTestCase {
                         BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
                         BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0)
                     ],
+                    profiles: [
+                        CloudProfile(
+                            accountId: peerId, firstName: "Alice", lastName: "", displayName: "Alice",
+                            bio: "Initial bio", birthday: "1995-04-18", colorIndex: 2,
+                            updatedAt: "2026-07-09T00:00:00Z"
+                        )
+                    ],
                     messages: [bootstrapMessage]
                 )
             ],
@@ -473,6 +721,14 @@ final class CloudLocalStoreTests: XCTestCase {
         try await store.savePts(17, accountId: accountId)
         try await store.beginBootstrap(accountId: accountId)
         try await store.applyBootstrapPage(page)
+        let bootstrapProgress = try await store.loadBootstrapState(accountId: accountId)
+        let firstPageDialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(bootstrapProgress?.mode, .initial)
+        XCTAssertEqual(
+            firstPageDialogs.map(\.dialogId),
+            [dialogId],
+            "A new device publishes its first committed page immediately"
+        )
         let olderMessage = CloudMessage(
             dialogId: dialogId,
             msgId: 3,
@@ -498,16 +754,140 @@ final class CloudLocalStoreTests: XCTestCase {
         let ptsBeforeFinish = try await store.loadPts(accountId: accountId)
         XCTAssertEqual(messages.map(\.text), ["older message", "snapshot message"])
         XCTAssertEqual(oldestMsgId, 3)
-        XCTAssertEqual(ptsBeforeFinish, 0)
+        XCTAssertEqual(ptsBeforeFinish, 17, "Bootstrap keeps the last live cursor until its snapshot commits")
 
         try await store.finishBootstrap(accountId: accountId, pts: page.state.pts)
         let ptsAfterFinish = try await store.loadPts(accountId: accountId)
+        let launchSnapshot = try await store.loadLaunchSnapshot(accountId: accountId)
         let latestDialogId = try await store.latestDialogId()
         let dialogs = try await store.dialogs(accountId: accountId)
         XCTAssertEqual(ptsAfterFinish, 44)
+        XCTAssertEqual(launchSnapshot.pts, 44)
+        XCTAssertEqual(launchSnapshot.dialogs.map(\.dialogId), [dialogId])
         XCTAssertEqual(latestDialogId, dialogId)
         XCTAssertEqual(dialogs.first?.title, "Alice")
         XCTAssertEqual(dialogs.first?.lastText, "snapshot message")
+        XCTAssertEqual(dialogs.first?.peerBio, "Initial bio")
+        XCTAssertEqual(dialogs.first?.peerBirthday, "1995-04-18")
+        XCTAssertEqual(dialogs.first?.peerColorIndex, 2)
+
+        let profileUpdate = CloudUpdate(
+            pts: 45, ptsCount: 1, type: "profile.updated", dialogId: nil,
+            dialogTitle: nil, message: nil, readerAccountId: nil, maxReadMsgId: nil,
+            subjectAccountId: peerId, firstName: "Alicia", lastName: "Karimova",
+            displayName: "Alicia Karimova", bio: "Updated everywhere",
+            birthday: "1996-05-19", colorIndex: 6,
+            profileUpdatedAt: "2026-07-16T10:00:00Z", sharedDialogIds: [dialogId]
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference", state: .init(pts: 45),
+                updates: [profileUpdate], hasMore: false
+            ),
+            accountId: accountId
+        )
+        let refreshed = try await store.dialogs(accountId: accountId).first
+        XCTAssertEqual(refreshed?.title, "Alicia Karimova")
+        XCTAssertEqual(refreshed?.peerBio, "Updated everywhere")
+        XCTAssertEqual(refreshed?.peerBirthday, "1996-05-19")
+        XCTAssertEqual(refreshed?.peerColorIndex, 6)
+    }
+
+    @MainActor
+    func testFreshReplicaBootstrapPersistsInitializationAndAuthoritativeUnreadCount() async throws {
+        let store = try makeStore()
+        let accountId = "account-fresh"
+        let peerId = "account-peer"
+        let dialogId = "dialog-sparse-unread"
+        let initializedBeforeBootstrap = try await store.isReplicaInitialized(accountId: accountId)
+        XCTAssertFalse(initializedBeforeBootstrap)
+
+        let recent = CloudMessage(
+            dialogId: dialogId,
+            msgId: 100,
+            senderAccountId: peerId,
+            clientMsgId: "bootstrap-recent-100",
+            kind: "text",
+            text: "recent",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:01:40Z"
+        )
+        let page = BootstrapDialogsPage(
+            token: "fresh-token",
+            state: .init(pts: 90),
+            dialogs: [
+                BootstrapDialog(
+                    dialogId: dialogId,
+                    type: "direct",
+                    title: "Peer",
+                    lastMsgId: 100,
+                    updatedAt: "2026-07-16T10:01:40Z",
+                    unreadCount: 37,
+                    members: [
+                        .init(accountId: accountId, role: "member", lastReadMsgId: 20),
+                        .init(accountId: peerId, role: "member", lastReadMsgId: 0),
+                    ],
+                    messages: [recent]
+                )
+            ],
+            nextCursor: nil,
+            hasMore: false
+        )
+
+        try await store.beginBootstrap(
+            accountId: accountId,
+            token: page.token,
+            snapshotPts: page.state.pts,
+            mode: .initial
+        )
+        try await store.applyBootstrapPage(page)
+        let firstPageUnread = try await store.dialogs(accountId: accountId).first?.unreadCount
+        let initializedAfterFirstPage = try await store.isReplicaInitialized(accountId: accountId)
+        XCTAssertEqual(firstPageUnread, 37)
+        XCTAssertFalse(initializedAfterFirstPage)
+
+        // Filling a sparse historical page must not replace the server's exact count with the
+        // number of rows that happen to be cached locally.
+        try await store.applyHistoryPage(
+            .init(
+                dialogId: dialogId,
+                messages: [
+                    CloudMessage(
+                        dialogId: dialogId,
+                        msgId: 95,
+                        senderAccountId: peerId,
+                        clientMsgId: "hydrated-95",
+                        kind: "text",
+                        text: "hydrated",
+                        editVersion: 0,
+                        state: "visible",
+                        serverTs: "2026-07-16T10:01:35Z"
+                    )
+                ],
+                nextBeforeMsgId: 95,
+                hasMore: true
+            )
+        )
+        let unreadAfterHydration = try await store.dialogs(accountId: accountId).first?.unreadCount
+        let prioritizedHydration = try await store.historyStatesReady(dialogIds: [dialogId])
+        XCTAssertEqual(unreadAfterHydration, 37)
+        XCTAssertEqual(prioritizedHydration.map(\.dialogId), [dialogId])
+
+        try await store.finishBootstrap(accountId: accountId, pts: page.state.pts)
+        let initializedAfterFinish = try await store.isReplicaInitialized(accountId: accountId)
+        let unreadAfterFinish = try await store.dialogs(accountId: accountId).first?.unreadCount
+        XCTAssertTrue(initializedAfterFinish)
+        XCTAssertEqual(unreadAfterFinish, 37)
+
+        try await store.markRead(
+            dialogId: dialogId,
+            accountId: accountId,
+            maxReadMsgId: 96,
+            exactUnreadCount: 4
+        )
+        let exactAcknowledgedUnread = try await store.dialogs(accountId: accountId).first?.unreadCount
+        XCTAssertEqual(exactAcknowledgedUnread, 4)
     }
 
     @MainActor
@@ -1223,6 +1603,1664 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(completedTransfer?.uploadOffset, Int64(payload.count))
         XCTAssertEqual(progress.snapshot().last, 1)
         XCTAssertTrue(progress.snapshot().allSatisfy { (0...1).contains($0) })
+    }
+
+    func testTelegramStyleMediaPoliciesUseExpectedDefaultsAndUserOverride() throws {
+        let megabyte: Int64 = 1024 * 1024
+        let policy = MediaAutoDownloadPolicy.default
+        let photo = CloudMedia(
+            id: UUID().uuidString, kind: "photo", contentType: "image/jpeg",
+            fileName: nil, byteSize: 3 * megabyte, durationMs: nil,
+            width: 1_000, height: 1_000, hasThumbnail: true
+        )
+        let largePhoto = CloudMedia(
+            id: UUID().uuidString, kind: "photo", contentType: "image/jpeg",
+            fileName: nil, byteSize: 3 * megabyte + 1, durationMs: nil,
+            width: 1_000, height: 1_000, hasThumbnail: true
+        )
+        let voice = CloudMedia(
+            id: UUID().uuidString, kind: "voice", contentType: "audio/mp4",
+            fileName: nil, byteSize: 10 * megabyte, durationMs: 1_000,
+            width: nil, height: nil, hasThumbnail: false
+        )
+        let video = CloudMedia(
+            id: UUID().uuidString, kind: "video", contentType: "video/mp4",
+            fileName: nil, byteSize: 10 * megabyte, durationMs: 1_000,
+            width: 1_000, height: 1_000, hasThumbnail: true
+        )
+        let file = CloudMedia(
+            id: UUID().uuidString, kind: "file", contentType: "application/octet-stream",
+            fileName: "file.bin", byteSize: 5 * megabyte, durationMs: nil,
+            width: nil, height: nil, hasThumbnail: false
+        )
+
+        XCTAssertTrue(policy.directive(for: photo, chat: .privateChat, network: .cellular).downloadsFullMedia)
+        XCTAssertFalse(policy.directive(for: largePhoto, chat: .privateChat, network: .cellular).downloadsFullMedia)
+        XCTAssertTrue(policy.directive(for: voice, chat: .group, network: .cellular).downloadsFullMedia)
+        XCTAssertTrue(policy.directive(for: video, chat: .group, network: .cellular).downloadsFullMedia)
+        XCTAssertTrue(policy.directive(for: file, chat: .privateChat, network: .cellular).downloadsFullMedia)
+        XCTAssertFalse(policy.directive(for: video, chat: .privateChat, network: .constrained).downloadsFullMedia)
+        XCTAssertTrue(policy.directive(for: voice, chat: .privateChat, network: .roaming).downloadsFullMedia)
+
+        let override = policy.directive(
+            for: largePhoto, chat: .group, network: .roaming, userInitiated: true
+        )
+        XCTAssertTrue(override.downloadsFullMedia)
+        XCTAssertEqual(override.priority, .userInitiated)
+        XCTAssertEqual(MediaCachePolicy.default.sizeLimit, .unlimited)
+        XCTAssertEqual(MediaCachePolicy.default.retention, .forever)
+        XCTAssertEqual(MediaCachePolicy.minimumFreeSpaceBytes(totalCapacity: 10 * 1024 * 1024 * 1024), 1 * 1024 * 1024 * 1024)
+        XCTAssertEqual(MediaCachePolicy.minimumFreeSpaceBytes(totalCapacity: 200 * 1024 * 1024 * 1024), 5 * 1024 * 1024 * 1024)
+
+        let roundTrip = try JSONDecoder().decode(
+            MediaAutoDownloadPolicy.self, from: JSONEncoder().encode(policy)
+        )
+        XCTAssertEqual(roundTrip, policy)
+    }
+
+    func testRoamingSignalUsesRoamingMediaPolicyEvenWithLowDataMode() {
+        let snapshot = ReplicaNetworkSnapshot(
+            networkClass: .constrained,
+            isExpensive: true,
+            isConstrained: true,
+            isRoaming: true
+        )
+        XCTAssertEqual(snapshot.mediaNetworkClass, .roaming)
+        XCTAssertFalse(snapshot.allowsDiscretionaryHydration)
+    }
+
+    func testMediaRetryUsesBoundedExponentialFullJitter() {
+        XCTAssertEqual(
+            CloudMediaTransferEngine.automaticRetryDelay(retryCount: 1, randomUnit: 0),
+            0
+        )
+        XCTAssertEqual(
+            CloudMediaTransferEngine.automaticRetryDelay(retryCount: 1, randomUnit: 1),
+            2
+        )
+        XCTAssertEqual(
+            CloudMediaTransferEngine.automaticRetryDelay(retryCount: 3, randomUnit: 0.5),
+            4
+        )
+        XCTAssertEqual(
+            CloudMediaTransferEngine.automaticRetryDelay(retryCount: 20, randomUnit: 1),
+            300
+        )
+    }
+
+    func testMediaPoliciesPersistWithSafeDefaultsAndQueueThumbnailsFirst() async throws {
+        let suiteName = "TojTests.MediaPolicy.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = MediaPolicyStore(defaults: defaults)
+        XCTAssertEqual(store.loadAutoDownloadPolicy(), .default)
+        XCTAssertEqual(store.loadCachePolicy(), .default)
+
+        var customAutoDownload = MediaAutoDownloadPolicy.default
+        customAutoDownload.groupChats.cellular = MediaAutoDownloadLimits(
+            photoBytes: 1024, voiceBytes: 2048, videoBytes: 4096, fileBytes: 8192
+        )
+        let customCache = MediaCachePolicy(sizeLimit: .unlimited, retention: .forever)
+        try store.saveAutoDownloadPolicy(customAutoDownload)
+        try store.saveCachePolicy(customCache)
+        XCTAssertEqual(store.loadAutoDownloadPolicy(), customAutoDownload)
+        XCTAssertEqual(store.loadCachePolicy(), customCache)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x41, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache, policyStore: store)
+        let video = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "video", contentType: "video/mp4",
+            fileName: nil, byteSize: 10_000, durationMs: 1_000,
+            width: 100, height: 100, hasThumbnail: true
+        )
+
+        let automatic = await engine.enqueueAutoDownload(
+            media: video, chat: .group, network: .cellular
+        )
+        let automaticQueue = await engine.queuedAutoDownloads()
+        XCTAssertFalse(automatic.downloadsFullMedia)
+        XCTAssertEqual(automaticQueue.map(\.component), [.thumbnail])
+
+        let user = await engine.enqueueAutoDownload(
+            media: video, chat: .group, network: .roaming, userInitiated: true
+        )
+        let queued = await engine.queuedAutoDownloads()
+        XCTAssertTrue(user.downloadsFullMedia)
+        XCTAssertEqual(queued.map(\.component), [.thumbnail, .fullMedia])
+        XCTAssertTrue(queued.allSatisfy { $0.priority == .userInitiated })
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                [MediaDownloadQueueItem].self, from: JSONEncoder().encode(queued)
+            ),
+            queued
+        )
+
+        defaults.set(Data("corrupt".utf8), forKey: "toj.media.cache-policy.v1")
+        XCTAssertEqual(store.loadCachePolicy(), .default)
+    }
+
+    func testCompletedUploadIsPromotedToEncryptedDownloadCacheBeforeSourceRemoval() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x63, count: 32), limitBytes: 4 * 1024 * 1024
+        )
+        let payload = Data((0..<(700 * 1024)).map { UInt8($0 % 251) })
+        let thumbnail = Data("sent-media-thumbnail".utf8)
+        let prepared = try await cache.prepareUpload(
+            data: payload, kind: "video", contentType: "video/mp4",
+            fileName: "sent.mp4", durationMs: 2_000, width: 640, height: 480,
+            thumbnail: thumbnail
+        )
+        let mediaId = UUID().uuidString.lowercased()
+        let transfer = MediaTransferRecord(
+            transferId: prepared.transferId, dialogId: "dialog-sent", clientMsgId: UUID().uuidString,
+            caption: "", replyToMsgId: nil, kind: prepared.kind, contentType: prepared.contentType,
+            fileName: prepared.fileName, byteSize: prepared.byteSize, sha256: prepared.sha256,
+            durationMs: prepared.durationMs, width: prepared.width, height: prepared.height,
+            encryptedSourcePath: prepared.encryptedSourcePath,
+            encryptedThumbnailPath: prepared.encryptedThumbnailPath, mediaId: mediaId,
+            uploadOffset: prepared.byteSize, state: "ready_to_send", retryCount: 0,
+            nextRetryAt: nil, lastError: nil, terminal: false
+        )
+
+        try await cache.finishUpload(transfer)
+
+        let promoted = try await cache.downloadedData(mediaId: mediaId, expectedSize: prepared.byteSize)
+        let promotedThumbnail = try await cache.thumbnail(mediaId: mediaId)
+        let state = try await cache.downloadState(mediaId: mediaId, expectedSize: prepared.byteSize)
+        let usage = try await cache.usageSnapshot()
+        XCTAssertEqual(promoted, payload)
+        XCTAssertEqual(promotedThumbnail, thumbnail)
+        XCTAssertTrue(state.isComplete)
+        XCTAssertTrue(state.hasThumbnail)
+        XCTAssertEqual(usage.protectedUploadBytes, 0)
+        XCTAssertGreaterThan(usage.downloadedBytes, prepared.byteSize)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.encryptedSourcePath))
+        XCTAssertGreaterThan(
+            try FileManager.default.contentsOfDirectory(
+                at: directory.appending(path: "downloads/\(mediaId)"),
+                includingPropertiesForKeys: nil
+            ).count,
+            1
+        )
+    }
+
+    func testActiveMediaAndPendingUploadsAreProtectedDuringLRUEviction() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x71, count: 32), limitBytes: 700
+        )
+        let first = UUID().uuidString.lowercased()
+        let second = UUID().uuidString.lowercased()
+        let third = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(Data(repeating: 0x01, count: 250), mediaId: first, offset: 0)
+        try await cache.beginAccess(mediaId: first)
+        try await cache.storeDownloadChunk(Data(repeating: 0x02, count: 250), mediaId: second, offset: 0)
+        try await cache.storeDownloadChunk(Data(repeating: 0x03, count: 250), mediaId: third, offset: 0)
+
+        let firstOffset = try await cache.contiguousDownloadOffset(mediaId: first)
+        let secondOffset = try await cache.contiguousDownloadOffset(mediaId: second)
+        let thirdOffset = try await cache.contiguousDownloadOffset(mediaId: third)
+        let activeState = try await cache.downloadState(mediaId: first, expectedSize: 250)
+        XCTAssertEqual(firstOffset, 250)
+        XCTAssertEqual(secondOffset, 0)
+        XCTAssertEqual(thirdOffset, 250)
+        XCTAssertTrue(activeState.isActive)
+        await cache.endAccess(mediaId: first)
+        let inactiveState = try await cache.downloadState(mediaId: first, expectedSize: 250)
+        XCTAssertFalse(inactiveState.isActive)
+    }
+
+    func testDynamicCachePolicyAndSelectiveClearEvictOnlyDownloadedMedia() async throws {
+        let suiteName = "TojTests.DynamicMediaPolicy.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let cache = try EncryptedMediaCache(
+            root: directory, keyData: Data(repeating: 0x51, count: 32), limitBytes: 1_000
+        )
+        let engine = CloudMediaTransferEngine(
+            cache: cache, policyStore: MediaPolicyStore(defaults: defaults)
+        )
+        let first = UUID().uuidString.lowercased()
+        let second = UUID().uuidString.lowercased()
+        try await cache.storeDownloadChunk(Data(repeating: 0x01, count: 250), mediaId: first, offset: 0)
+        try await cache.storeDownloadChunk(Data(repeating: 0x02, count: 250), mediaId: second, offset: 0)
+
+        let smaller = MediaCachePolicy(sizeLimit: .custom(400), retention: .forever)
+        try await engine.updateCachePolicy(smaller)
+        let afterLimit = try await cache.usageSnapshot()
+        let currentPolicy = await engine.currentCachePolicy()
+        XCTAssertLessThanOrEqual(afterLimit.downloadedBytes, 400)
+        XCTAssertEqual(currentPolicy, smaller)
+
+        await engine.clearMediaCache(mediaIds: [first, second])
+        let afterClear = try await cache.usageSnapshot()
+        XCTAssertEqual(afterClear.downloadedBytes, 0)
+    }
+
+    func testStoreBackedMediaQueuePersistsJobsAndCacheLedgerWithoutFilesystemBootstrap() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("durable-media-ledger-test-key".utf8)
+        )
+        let cache = try EncryptedMediaCache(
+            root: directory.appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x61, count: 32), limitBytes: 1_000_000
+        )
+        let payload = Data("durable media payload".utf8)
+        let media = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "file",
+            contentType: "application/octet-stream", fileName: "durable.bin",
+            byteSize: Int64(payload.count), durationMs: nil, width: nil, height: nil,
+            hasThumbnail: true
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            let offset = Int64(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "offset" })?.value ?? "0") ?? 0
+            let bytes = Data(payload[Int(offset)..<payload.count])
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "content-type": "application/octet-stream",
+                        "x-media-next-offset": String(payload.count),
+                        "x-media-total-size": String(payload.count),
+                    ]
+                )),
+                bytes
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            cache: cache,
+            session: URLSession(configuration: configuration)
+        )
+
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: "dialog-durable",
+            messages: [CloudMessage(
+                dialogId: "dialog-durable", msgId: 1, senderAccountId: "account-peer",
+                clientMsgId: "durable-media-message", kind: "file", text: "",
+                media: media, editVersion: 0, state: "visible",
+                serverTs: "2026-07-16T10:00:00Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+
+        _ = await engine.enqueueAutoDownload(
+            media: media, chat: .privateChat, network: .wifi,
+            dialogId: "dialog-durable", localStore: store
+        )
+        let jobs = try await store.mediaDownloadJobsReady()
+        XCTAssertEqual(jobs.map(\.variant), ["thumbnail", "full"])
+        XCTAssertEqual(jobs.map(\.priority), [11, 10])
+        XCTAssertEqual(jobs.first?.dialogId, "dialog-durable")
+        let expectedComponents: [MediaDownloadComponent] = [.thumbnail, .fullMedia]
+        for expected in expectedComponents {
+            let dequeued = await engine.dequeueAutoDownload(localStore: store)
+            let item = try XCTUnwrap(dequeued)
+            XCTAssertEqual(item.component, expected)
+            try await engine.performAutoDownload(item, token: "session-token", localStore: store)
+        }
+
+        let ledger = try await store.mediaCacheEntry(mediaId: media.id, variant: "full")
+        let thumbnailLedger = try await store.mediaCacheEntry(mediaId: media.id, variant: "thumbnail")
+        let remainingJobs = try await store.mediaDownloadJobsReady()
+        let durableUsage = try await store.downloadedMediaUsageBytes()
+        XCTAssertEqual(ledger?.contiguousOffset, Int64(payload.count))
+        XCTAssertEqual(ledger?.state, "complete")
+        XCTAssertEqual(thumbnailLedger?.state, "complete")
+        XCTAssertTrue(remainingJobs.isEmpty)
+        XCTAssertGreaterThan(durableUsage, Int64(payload.count))
+    }
+
+    func testDurableMediaQueueSkipsOrphansAndRechecksActualGroupPolicy() async throws {
+        let suiteName = "TojTests.MediaRecheck.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        var policy = MediaAutoDownloadPolicy.default
+        policy.groupChats.wifi = MediaAutoDownloadLimits(
+            photoBytes: 0, voiceBytes: 0, videoBytes: 0, fileBytes: 0
+        )
+        let policyStore = MediaPolicyStore(defaults: defaults)
+        try policyStore.saveAutoDownloadPolicy(policy)
+
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("media-policy-recheck-store-key".utf8)
+        )
+        let cache = try EncryptedMediaCache(
+            root: directory.appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x28, count: 32), limitBytes: 1_000_000
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTFail("A policy-deferred job must not start a network request")
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 500, httpVersion: "HTTP/1.1", headerFields: nil
+                )),
+                Data()
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            cache: cache,
+            session: URLSession(configuration: configuration),
+            policyStore: policyStore
+        )
+        let dialogId = "dialog-group-policy"
+        let media = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "file",
+            contentType: "application/octet-stream", fileName: "group.bin",
+            byteSize: 128, durationMs: nil, width: nil, height: nil, hasThumbnail: false
+        )
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: [CloudMessage(
+                dialogId: dialogId, msgId: 1, senderAccountId: "account-peer",
+                clientMsgId: "group-media-message", kind: "file", text: "", media: media,
+                editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:00Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        try await store.upsertDialog(dialogId: dialogId, type: "group")
+        // Generic message/history upserts use the direct default; they must not erase a known
+        // group classification that media policy depends on.
+        try await store.upsertDialog(dialogId: dialogId, lastMsgId: 2)
+        try await store.upsertMediaDownloadJob(MediaDownloadJobRecord(
+            mediaId: "deleted-media", variant: "full", dialogId: dialogId,
+            priority: 1_000, state: .queued, userInitiated: false, retryCount: 0,
+            nextRetryAt: nil, lastError: nil,
+            updatedAt: CloudLocalStore.sqliteTimestamp(Date())
+        ))
+        _ = await engine.enqueueAutoDownload(
+            media: media, chat: .privateChat, network: .wifi,
+            dialogId: dialogId, localStore: store
+        )
+
+        let dequeued = await engine.dequeueAutoDownload(localStore: store)
+        let item = try XCTUnwrap(dequeued)
+        XCTAssertEqual(item.media.id, media.id)
+        let chatClass = try await store.mediaChatClass(dialogId: dialogId)
+        let readyAfterDequeue = try await store.mediaDownloadJobsReady()
+        XCTAssertEqual(chatClass, .group)
+        XCTAssertFalse(readyAfterDequeue.contains { $0.mediaId == "deleted-media" })
+        do {
+            try await engine.performAutoDownload(item, token: "session-token", localStore: store)
+            XCTFail("Group policy must be re-evaluated immediately before transfer")
+        } catch let error as MediaCacheError {
+            guard case .automaticDownloadDeferred = error else {
+                return XCTFail("Unexpected media error: \(error)")
+            }
+        }
+        let nextPolicyRetry = try await store.nextMediaDownloadRetryDate()
+        XCTAssertNotNil(nextPolicyRetry)
+    }
+
+    func testLowDiskReserveSuspendsAutomaticDownloadAndPersistsRetry() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("media-low-disk-store-key".utf8)
+        )
+        let cacheRoot = directory.appending(path: "cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot,
+            keyData: Data(repeating: 0x29, count: 32), limitBytes: 1_000_000
+        )
+        let evictedMediaId = UUID().uuidString.lowercased()
+        let evictedPayload = Data(repeating: 0x2a, count: 250)
+        try await cache.storeDownloadChunk(evictedPayload, mediaId: evictedMediaId, offset: 0)
+        try await store.upsertMediaCacheEntry(MediaCacheEntry(
+            mediaId: evictedMediaId, variant: "full",
+            encryptedPath: cacheRoot.appending(path: "downloads/\(evictedMediaId)").path,
+            byteSize: Int64(evictedPayload.count), cachedBytes: Int64(evictedPayload.count + 28),
+            contiguousOffset: Int64(evictedPayload.count), state: "complete",
+            lastAccessedAt: CloudLocalStore.sqliteTimestamp(.distantPast), protectedUntil: nil
+        ))
+        let engine = CloudMediaTransferEngine(
+            cache: cache,
+            volumeCapacityProvider: {
+                MediaVolumeCapacity(
+                    availableBytes: 0,
+                    totalCapacityBytes: 10 * 1024 * 1024 * 1024
+                )
+            }
+        )
+        let dialogId = "dialog-low-disk"
+        let media = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "file",
+            contentType: "application/octet-stream", fileName: "deferred.bin",
+            byteSize: 256, durationMs: nil, width: nil, height: nil, hasThumbnail: false
+        )
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: [CloudMessage(
+                dialogId: dialogId, msgId: 1, senderAccountId: "account-peer",
+                clientMsgId: "low-disk-media-message", kind: "file", text: "", media: media,
+                editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:00Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        _ = await engine.enqueueAutoDownload(
+            media: media, chat: .privateChat, network: .wifi,
+            dialogId: dialogId, localStore: store
+        )
+        let dequeued = await engine.dequeueAutoDownload(localStore: store)
+        let item = try XCTUnwrap(dequeued)
+
+        do {
+            try await engine.performAutoDownload(
+                item, token: "session-token", localStore: store,
+                chat: .privateChat, network: .wifi
+            )
+            XCTFail("Automatic download must stop below the free-space reserve")
+        } catch let error as MediaCacheError {
+            guard case .automaticDownloadDeferred = error else {
+                return XCTFail("Unexpected media error: \(error)")
+            }
+        }
+        let suspended = await engine.areAutomaticDownloadsSuspendedForLowDisk()
+        let nextLowDiskRetry = try await store.nextMediaDownloadRetryDate()
+        let evictedLedger = try await store.mediaCacheEntry(
+            mediaId: evictedMediaId,
+            variant: "full"
+        )
+        XCTAssertTrue(suspended)
+        XCTAssertNotNil(nextLowDiskRetry)
+        XCTAssertNil(evictedLedger)
+    }
+
+    func testSelectiveClearKeepsActiveMediaAndItsExactLedgerEntry() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("media-selective-clear-store-key".utf8)
+        )
+        let cacheRoot = directory.appending(path: "cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot, keyData: Data(repeating: 0x30, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let activeId = UUID().uuidString.lowercased()
+        let inactiveId = UUID().uuidString.lowercased()
+        let payload = Data(repeating: 0x31, count: 250)
+        try await cache.storeDownloadChunk(payload, mediaId: activeId, offset: 0)
+        try await cache.storeDownloadChunk(payload, mediaId: inactiveId, offset: 0)
+        for mediaId in [activeId, inactiveId] {
+            try await store.upsertMediaCacheEntry(MediaCacheEntry(
+                mediaId: mediaId, variant: "full",
+                encryptedPath: cacheRoot.appending(path: "downloads/\(mediaId)").path,
+                byteSize: Int64(payload.count), cachedBytes: Int64(payload.count + 28),
+                contiguousOffset: Int64(payload.count), state: "complete",
+                lastAccessedAt: CloudLocalStore.sqliteTimestamp(Date()), protectedUntil: nil
+            ))
+        }
+        try await engine.warmCache(localStore: store)
+        try await cache.beginAccess(mediaId: activeId)
+
+        await engine.clearMediaCache(mediaIds: [activeId, inactiveId], localStore: store)
+
+        let activeLedger = try await store.mediaCacheEntry(mediaId: activeId, variant: "full")
+        let inactiveLedger = try await store.mediaCacheEntry(mediaId: inactiveId, variant: "full")
+        let activeOffset = try await cache.contiguousDownloadOffset(mediaId: activeId)
+        let inactiveOffset = try await cache.contiguousDownloadOffset(mediaId: inactiveId)
+        XCTAssertNotNil(activeLedger)
+        XCTAssertNil(inactiveLedger)
+        XCTAssertEqual(activeOffset, Int64(payload.count))
+        XCTAssertEqual(inactiveOffset, 0)
+        await cache.endAccess(mediaId: activeId)
+    }
+
+    func testStreamingByteRangePersistsEncryptedChunkLedger() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data("media-stream-ledger-store-key".utf8)
+        )
+        let cache = try EncryptedMediaCache(
+            root: directory.appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x32, count: 32), limitBytes: 1_000_000
+        )
+        let payload = Data("streamed encrypted bytes".utf8)
+        let media = CloudMedia(
+            id: UUID().uuidString.lowercased(), kind: "video", contentType: "video/mp4",
+            fileName: "clip.mp4", byteSize: Int64(payload.count), durationMs: 1_000,
+            width: 320, height: 180, hasThumbnail: false
+        )
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: "dialog-stream",
+            messages: [CloudMessage(
+                dialogId: "dialog-stream", msgId: 1, senderAccountId: "account-peer",
+                clientMsgId: "stream-media-message", kind: "video", text: "", media: media,
+                editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:00Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        CloudAPIMockURLProtocol.handler = { request in
+            let offset = Int64(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "offset" })?.value ?? "0") ?? 0
+            let bytes = Data(payload[Int(offset)..<payload.count])
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "x-media-next-offset": String(payload.count),
+                        "x-media-total-size": String(payload.count),
+                    ]
+                )),
+                bytes
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        let engine = CloudMediaTransferEngine(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            cache: cache,
+            session: URLSession(configuration: configuration)
+        )
+
+        let range = try await engine.byteRange(
+            media: media, token: "session-token", offset: 0, length: 8, localStore: store
+        )
+
+        XCTAssertEqual(range, Data(payload.prefix(8)))
+        let entry = try await store.mediaCacheEntry(mediaId: media.id, variant: "full")
+        XCTAssertEqual(entry?.contiguousOffset, Int64(payload.count))
+        XCTAssertEqual(entry?.state, "complete")
+    }
+
+    func testTimelineReadsAreBoundedKeysetWindowsAndOpeningAnchorIsDeterministic() async throws {
+        let store = try makeStore()
+        let journalMode = try await store.databaseJournalMode()
+        XCTAssertEqual(journalMode.lowercased(), "wal")
+        let dialogId = "dialog-window"
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        try await store.saveMembers(dialogId: dialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 220),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+        let history = (1...250).map { value in
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: Int64(value),
+                senderAccountId: peerId,
+                clientMsgId: "window-\(value)",
+                kind: "text",
+                text: "message \(value)",
+                editVersion: 0,
+                state: "visible",
+                serverTs: String(format: "2026-07-16T10:%02d:%02dZ", (value / 60) % 60, value % 60)
+            )
+        }
+        try await store.applyHistoryPage(
+            HistoryPageResponse(
+                dialogId: dialogId,
+                messages: history,
+                nextBeforeMsgId: nil,
+                hasMore: false
+            )
+        )
+
+        let latest = try await store.messages(dialogId: dialogId, limit: TimelineWindow.initialLimit)
+        XCTAssertEqual(latest.count, 120)
+        XCTAssertEqual(latest.first?.msgId, 131)
+        XCTAssertEqual(latest.last?.msgId, 250)
+
+        let earlier = try await store.messages(
+            dialogId: dialogId,
+            limit: TimelineWindow.pageLimit,
+            beforeMsgId: 131
+        )
+        XCTAssertEqual(earlier.count, 80)
+        XCTAssertEqual(earlier.first?.msgId, 51)
+        XCTAssertEqual(earlier.last?.msgId, 130)
+
+        let aroundAnchor = try await store.messageWindow(
+            dialogId: dialogId,
+            anchorMsgId: 150,
+            beforeCount: 2,
+            afterCount: 2
+        )
+        XCTAssertEqual(aroundAnchor.compactMap(\.msgId), [148, 149, 150, 151, 152])
+        let aroundSnapshot = try await store.timelineWindow(
+            dialogId: dialogId,
+            anchorMsgId: 150,
+            beforeCount: 2,
+            afterCount: 2
+        )
+        XCTAssertEqual(aroundSnapshot.messages.compactMap(\.msgId), [148, 149, 150, 151, 152])
+        XCTAssertTrue(aroundSnapshot.hasEarlierLocalMessages)
+        XCTAssertTrue(aroundSnapshot.hasLaterLocalMessages)
+
+        let snapshot = try await store.timeline(dialogId: dialogId)
+        XCTAssertEqual(snapshot.oldestServerMsgId, 131)
+        XCTAssertEqual(snapshot.newestServerMsgId, 250)
+        XCTAssertTrue(snapshot.hasEarlierLocalMessages)
+        XCTAssertFalse(
+            snapshot.hasLaterLocalMessages,
+            "The latest keyset page must represent the real local end of the conversation"
+        )
+
+        let earlierSnapshot = try await store.timeline(
+            dialogId: dialogId,
+            window: .earlier(beforeMsgId: 131)
+        )
+        XCTAssertEqual(earlierSnapshot.messages.compactMap(\.msgId), Array(51...130).map(Int64.init))
+        XCTAssertTrue(earlierSnapshot.hasEarlierLocalMessages)
+        XCTAssertTrue(
+            earlierSnapshot.hasLaterLocalMessages,
+            "An older keyset page must not present its retained last row as the chat bottom"
+        )
+
+        let centeredSnapshot = try await store.timeline(
+            dialogId: dialogId,
+            window: TimelineWindow(afterMsgId: 147, limit: 5)
+        )
+        XCTAssertEqual(centeredSnapshot.messages.compactMap(\.msgId), [148, 149, 150, 151, 152])
+        XCTAssertTrue(centeredSnapshot.hasEarlierLocalMessages)
+        XCTAssertTrue(
+            centeredSnapshot.hasLaterLocalMessages,
+            "A centered window must expose that newer local rows exist beyond its rendered edge"
+        )
+        let timelineStream = await store.observeTimeline(dialogId: dialogId)
+        var timelineIterator = timelineStream.makeAsyncIterator()
+        let observedValue = try await timelineIterator.next()
+        let observed = try XCTUnwrap(observedValue)
+        XCTAssertEqual(observed.messages.count, 120)
+        XCTAssertEqual(observed.newestServerMsgId, 250)
+        let firstUnread = try await store.firstUnreadMessageId(dialogId: dialogId, accountId: accountId)
+        XCTAssertEqual(firstUnread, 221)
+
+        let viewport = ChatViewportState(
+            dialogId: dialogId,
+            accountId: accountId,
+            topVisibleMsgId: 180,
+            wasAtBottom: false,
+            updatedAt: "2026-07-16 10:00:00"
+        )
+        try await store.saveViewportState(viewport)
+        let unreadAnchor = try await store.resolveOpeningAnchor(dialogId: dialogId, accountId: accountId)
+        XCTAssertEqual(unreadAnchor, .firstUnread(msgId: 221))
+        try await store.markRead(dialogId: dialogId, accountId: accountId, maxReadMsgId: 250)
+        let savedAnchor = try await store.resolveOpeningAnchor(dialogId: dialogId, accountId: accountId)
+        let loadedViewport = try await store.loadViewportState(dialogId: dialogId, accountId: accountId)
+        XCTAssertEqual(savedAnchor, .saved(msgId: 180))
+        XCTAssertEqual(loadedViewport, viewport)
+    }
+
+    func testSparseBootstrapUsesSemanticUnreadAnchorAndTargetedPagePreservesBackfillCursor() async throws {
+        let store = try makeStore()
+        let dialogId = "dialog-sparse-bootstrap"
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        try await store.saveMembers(dialogId: dialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 20),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+
+        let recentMessages = (96...100).map { msgId in
+            CloudMessage(
+                dialogId: dialogId,
+                msgId: Int64(msgId),
+                senderAccountId: peerId,
+                clientMsgId: "recent-\(msgId)",
+                kind: "text",
+                text: "recent \(msgId)",
+                editVersion: 0,
+                state: "visible",
+                serverTs: "2026-07-16T10:00:\(msgId - 40)Z"
+            )
+        }
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: recentMessages,
+            nextBeforeMsgId: 96,
+            hasMore: true
+        ))
+
+        let semanticAnchor = try await store.resolveOpeningAnchor(
+            dialogId: dialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            semanticAnchor,
+            .provisionalFirstUnread(msgId: 21),
+            "A five-message bootstrap preview must not mistake its first cached row for first unread"
+        )
+        let historyStateBeforeTargetedFetch = try await store.loadHistoryState(dialogId: dialogId)
+        let cursorBeforeTargetedFetch = try XCTUnwrap(historyStateBeforeTargetedFetch)
+
+        let outgoingCandidate = CloudMessage(
+            dialogId: dialogId,
+            msgId: 21,
+            senderAccountId: accountId,
+            clientMsgId: "targeted-outgoing-21",
+            kind: "text",
+            text: "sent from another device",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T09:00:21Z"
+        )
+        let firstIncoming = CloudMessage(
+            dialogId: dialogId,
+            msgId: 22,
+            senderAccountId: peerId,
+            clientMsgId: "targeted-incoming-22",
+            kind: "text",
+            text: "actual first incoming",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T09:00:22Z"
+        )
+        try await store.applyTargetedHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: [outgoingCandidate, firstIncoming],
+            nextBeforeMsgId: 21,
+            nextAfterMsgId: 22,
+            hasMore: true
+        ))
+
+        let targetedMessages = try await store.messages(
+            dialogId: dialogId,
+            limit: 10,
+            afterMsgId: 20
+        )
+        let historyStateAfterTargetedFetch = try await store.loadHistoryState(dialogId: dialogId)
+        let cursorAfterTargetedFetch = try XCTUnwrap(historyStateAfterTargetedFetch)
+        let firstUnreadAfterTargetedFetch = try await store.firstUnreadMessageId(
+            dialogId: dialogId,
+            accountId: accountId
+        )
+        let resolvedAnchorAfterTargetedFetch = try await store.resolveOpeningAnchor(
+            dialogId: dialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(targetedMessages.compactMap(\.msgId).prefix(2), [21, 22])
+        XCTAssertEqual(firstUnreadAfterTargetedFetch, 22)
+        XCTAssertEqual(
+            resolvedAnchorAfterTargetedFetch,
+            .firstUnread(msgId: 22),
+            "A resumed launch must not finalize a cached outgoing semantic candidate as first unread"
+        )
+        XCTAssertEqual(cursorAfterTargetedFetch, cursorBeforeTargetedFetch)
+        XCTAssertEqual(cursorAfterTargetedFetch.nextBeforeMsgId, 96)
+    }
+
+    func testOpeningAnchorRejectsMissingOrDeletedSavedRows() async throws {
+        let store = try makeStore()
+        let dialogId = "dialog-invalid-saved-anchor"
+        let accountId = "account-me"
+        let peerId = "account-peer"
+        try await store.saveMembers(dialogId: dialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 30),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId,
+            messages: [
+                CloudMessage(
+                    dialogId: dialogId, msgId: 10, senderAccountId: peerId,
+                    clientMsgId: "saved-visible-10", kind: "text", text: "visible before",
+                    editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:10Z"
+                ),
+                CloudMessage(
+                    dialogId: dialogId, msgId: 19, senderAccountId: peerId,
+                    clientMsgId: "saved-deleted-19", kind: "text", text: "deleted anchor",
+                    editVersion: 0, state: "deleted", serverTs: "2026-07-16T10:00:19Z"
+                ),
+                CloudMessage(
+                    dialogId: dialogId, msgId: 30, senderAccountId: peerId,
+                    clientMsgId: "saved-visible-30", kind: "text", text: "visible after",
+                    editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:30Z"
+                ),
+            ],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        try await store.saveViewportState(ChatViewportState(
+            dialogId: dialogId,
+            accountId: accountId,
+            topVisibleMsgId: 19,
+            wasAtBottom: false
+        ))
+
+        let deletedFallback = try await store.resolveOpeningAnchor(
+            dialogId: dialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            deletedFallback,
+            .saved(msgId: 30),
+            "A deleted viewport row must prefer the next visible semantic row"
+        )
+
+        try await store.saveViewportState(ChatViewportState(
+            dialogId: dialogId,
+            accountId: accountId,
+            topVisibleMsgId: 999,
+            wasAtBottom: false
+        ))
+        let missingFallback = try await store.resolveOpeningAnchor(
+            dialogId: dialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            missingFallback,
+            .saved(msgId: 30),
+            "A missing viewport row must resolve to the nearest remaining visible message"
+        )
+
+        let deletedOnlyDialogId = "dialog-saved-anchor-without-visible-row"
+        try await store.saveMembers(dialogId: deletedOnlyDialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 1),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: deletedOnlyDialogId,
+            messages: [CloudMessage(
+                dialogId: deletedOnlyDialogId, msgId: 1, senderAccountId: peerId,
+                clientMsgId: "only-deleted-row", kind: "text", text: "deleted",
+                editVersion: 0, state: "deleted", serverTs: "2026-07-16T10:00:01Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        try await store.saveViewportState(ChatViewportState(
+            dialogId: deletedOnlyDialogId,
+            accountId: accountId,
+            topVisibleMsgId: 1,
+            wasAtBottom: false
+        ))
+        let noVisibleFallback = try await store.resolveOpeningAnchor(
+            dialogId: deletedOnlyDialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(noVisibleFallback, .bottom)
+
+        let outgoingOnlyDialogId = "dialog-saved-anchor-outgoing-only"
+        try await store.saveMembers(dialogId: outgoingOnlyDialogId, members: [
+            BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
+            BootstrapDialogMember(accountId: peerId, role: "member", lastReadMsgId: 0),
+        ])
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: outgoingOnlyDialogId,
+            messages: [CloudMessage(
+                dialogId: outgoingOnlyDialogId, msgId: 5, senderAccountId: accountId,
+                clientMsgId: "outgoing-only-5", kind: "text", text: "sent on another device",
+                editVersion: 0, state: "visible", serverTs: "2026-07-16T10:00:05Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
+        try await store.saveViewportState(ChatViewportState(
+            dialogId: outgoingOnlyDialogId,
+            accountId: accountId,
+            topVisibleMsgId: 5,
+            wasAtBottom: false
+        ))
+        let outgoingOnlySavedAnchor = try await store.resolveOpeningAnchor(
+            dialogId: outgoingOnlyDialogId,
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            outgoingOnlySavedAnchor,
+            .saved(msgId: 5),
+            "A server ceiling made only of outgoing rows must not invent an unread divider"
+        )
+    }
+
+    func testDestructiveLogoutCountIncludesTextMutationsAndMediaUploads() async throws {
+        let store = try makeStore()
+        let dialogId = "dialog-pending-logout"
+        _ = try await store.insertSending(
+            dialogId: dialogId,
+            clientMsgId: "pending-text",
+            text: "unsent text",
+            senderAccountId: "account-me"
+        )
+        try await store.enqueueMessageMutation(
+            clientMutationId: "pending-edit",
+            operation: "edit",
+            dialogId: dialogId,
+            msgId: 1,
+            body: "unsynced edit",
+            expectedEditVersion: 0
+        )
+        try await store.insertMediaTransfer(
+            prepared: PreparedMediaUpload(
+                transferId: "pending-media",
+                kind: "photo",
+                contentType: "image/jpeg",
+                fileName: "pending.jpg",
+                byteSize: 128,
+                sha256: String(repeating: "a", count: 64),
+                durationMs: nil,
+                width: 10,
+                height: 10,
+                encryptedSourcePath: "/private/pending-media.tojmedia",
+                encryptedThumbnailPath: nil
+            ),
+            dialogId: dialogId,
+            clientMsgId: "pending-media-message",
+            caption: "",
+            replyToMsgId: nil
+        )
+
+        let destructiveLogoutCount = try await store.pendingDestructiveLogoutItemCount()
+        XCTAssertEqual(destructiveLogoutCount, 3)
+    }
+
+    func testBootstrapAndDifferenceTooLongPreserveReplicaAndEveryDurableOutbox() async throws {
+        let store = try makeStore()
+        let accountId = "account-me"
+        let existingDialogId = "dialog-existing"
+        let existing = CloudMessage(
+            dialogId: existingDialogId,
+            msgId: 1,
+            senderAccountId: "account-peer",
+            clientMsgId: "existing-message",
+            kind: "text",
+            text: "keep local history",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:00Z"
+        )
+        try await store.applyHistoryPage(
+            HistoryPageResponse(
+                dialogId: existingDialogId,
+                messages: [existing],
+                nextBeforeMsgId: nil,
+                hasMore: false
+            )
+        )
+        try await store.upsertDialog(
+            dialogId: existingDialogId,
+            type: "direct",
+            title: "Old title",
+            lastMsgId: 1,
+            updatedAt: existing.serverTs
+        )
+        let staleRecentMessage = CloudMessage(
+            dialogId: existingDialogId,
+            msgId: 8,
+            senderAccountId: "account-peer",
+            clientMsgId: "stale-recent-message",
+            kind: "text",
+            text: "stale snapshot-owned row",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:07Z"
+        )
+        try await store.applyHistoryPage(
+            HistoryPageResponse(
+                dialogId: existingDialogId,
+                messages: [staleRecentMessage],
+                nextBeforeMsgId: nil,
+                hasMore: false
+            )
+        )
+        let staleDialogId = "dialog-stale"
+        let staleMessage = CloudMessage(
+            dialogId: staleDialogId,
+            msgId: 4,
+            senderAccountId: "account-gone",
+            clientMsgId: "stale-message",
+            kind: "text",
+            text: "hydrated history remains recoverable",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-15T09:00:00Z"
+        )
+        try await store.applyHistoryPage(
+            HistoryPageResponse(
+                dialogId: staleDialogId,
+                messages: [staleMessage],
+                nextBeforeMsgId: nil,
+                hasMore: false
+            )
+        )
+        try await store.savePts(17, accountId: accountId)
+        let pendingClientId = "pending-message"
+        _ = try await store.insertSending(
+            dialogId: existingDialogId,
+            clientMsgId: pendingClientId,
+            text: "still sending",
+            senderAccountId: accountId
+        )
+        try await store.enqueueMessageMutation(
+            clientMutationId: "pending-mutation",
+            operation: "edit",
+            dialogId: existingDialogId,
+            msgId: 1,
+            body: "edited locally",
+            expectedEditVersion: 0
+        )
+        let transfer = PreparedMediaUpload(
+            transferId: "pending-transfer",
+            kind: "photo",
+            contentType: "image/jpeg",
+            fileName: "pending.jpg",
+            byteSize: 42,
+            sha256: String(repeating: "c", count: 64),
+            durationMs: nil,
+            width: 10,
+            height: 10,
+            encryptedSourcePath: "/private/pending-transfer.tojmedia",
+            encryptedThumbnailPath: "/private/pending-transfer.thumb"
+        )
+        try await store.insertMediaTransfer(
+            prepared: transfer,
+            dialogId: existingDialogId,
+            clientMsgId: "pending-media-message",
+            caption: "pending",
+            replyToMsgId: nil
+        )
+        let viewport = ChatViewportState(
+            dialogId: existingDialogId,
+            accountId: accountId,
+            topVisibleMsgId: 1,
+            wasAtBottom: false
+        )
+        try await store.saveViewportState(viewport)
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference_too_long",
+                state: .init(pts: 44),
+                updates: nil,
+                hasMore: nil
+            ),
+            accountId: accountId
+        )
+        let rebuildState = try await store.loadBootstrapState(accountId: accountId)
+        XCTAssertEqual(rebuildState?.status, "needs_rebuild")
+        XCTAssertEqual(rebuildState?.mode, .replacement)
+        try await store.beginBootstrap(accountId: accountId, token: "bootstrap-token", snapshotPts: 44)
+        let concurrentDialogId = "dialog-created-after-snapshot"
+        let concurrentMessage = CloudMessage(
+            dialogId: concurrentDialogId,
+            msgId: 12,
+            senderAccountId: accountId,
+            clientMsgId: "post-snapshot-message",
+            kind: "text",
+            text: "arrived after bootstrap began",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:12Z"
+        )
+        try await store.applyHistoryPage(
+            HistoryPageResponse(
+                dialogId: concurrentDialogId,
+                messages: [concurrentMessage],
+                nextBeforeMsgId: nil,
+                hasMore: false
+            )
+        )
+        let refreshedEarlierMessage = CloudMessage(
+            dialogId: existingDialogId,
+            msgId: 7,
+            senderAccountId: "account-peer",
+            clientMsgId: "replacement-earlier-message",
+            kind: "text",
+            text: "replacement earlier row",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:07Z"
+        )
+        let refreshedMessage = CloudMessage(
+            dialogId: existingDialogId,
+            msgId: 9,
+            senderAccountId: "account-peer",
+            clientMsgId: "replacement-message",
+            kind: "text",
+            text: "replacement recent row",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:08Z"
+        )
+        let newMessage = CloudMessage(
+            dialogId: "dialog-new",
+            msgId: 9,
+            senderAccountId: "account-other",
+            clientMsgId: "snapshot-message",
+            kind: "text",
+            text: "new snapshot row",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-16T10:00:09Z"
+        )
+        try await store.applyBootstrapPage(
+            BootstrapDialogsPage(
+                token: "bootstrap-token",
+                state: .init(pts: 44),
+                dialogs: [
+                    BootstrapDialog(
+                        dialogId: existingDialogId,
+                        type: "direct",
+                        title: "Refreshed title",
+                        lastMsgId: 9,
+                        updatedAt: "2026-07-16T10:00:08Z",
+                        members: [
+                            BootstrapDialogMember(
+                                accountId: accountId,
+                                role: "member",
+                                lastReadMsgId: 0
+                            ),
+                            BootstrapDialogMember(
+                                accountId: "account-peer",
+                                role: "member",
+                                lastReadMsgId: 0
+                            )
+                        ],
+                        messages: [refreshedEarlierMessage, refreshedMessage]
+                    ),
+                    BootstrapDialog(
+                        dialogId: "dialog-new",
+                        type: "direct",
+                        title: "Other",
+                        lastMsgId: 9,
+                        updatedAt: "2026-07-16T10:00:09Z",
+                        members: [],
+                        messages: [newMessage]
+                    )
+                ],
+                nextCursor: "cursor-2",
+                hasMore: true
+            )
+        )
+
+        let retainedMessages = try await store.messages(dialogId: existingDialogId)
+        let retainedDialogs = try await store.dialogs(accountId: accountId)
+        let retainedOutbox = try await store.pendingOutboxReady()
+        let retainedMutations = try await store.pendingMessageMutationsReady()
+        let retainedTransfer = try await store.mediaTransfer(id: transfer.transferId)
+        let retainedViewport = try await store.loadViewportState(dialogId: existingDialogId, accountId: accountId)
+        let retainedHistory = try await store.loadHistoryState(dialogId: existingDialogId)
+        let ptsDuringBootstrap = try await store.loadPts(accountId: accountId)
+        let progressValue = try await store.loadBootstrapState(accountId: accountId)
+        let progress = try XCTUnwrap(progressValue)
+        XCTAssertEqual(
+            retainedMessages.map(\.text),
+            ["keep local history", "stale snapshot-owned row", "still sending"]
+        )
+        XCTAssertEqual(
+            Set(retainedDialogs.map(\.dialogId)),
+            [existingDialogId, staleDialogId, concurrentDialogId]
+        )
+        XCTAssertEqual(
+            retainedDialogs.first(where: { $0.dialogId == existingDialogId })?.title,
+            "Old title"
+        )
+        XCTAssertFalse(retainedDialogs.contains(where: { $0.dialogId == "dialog-new" }))
+        XCTAssertEqual(retainedOutbox.map(\.clientMsgId), [pendingClientId])
+        XCTAssertEqual(retainedMutations.map(\.clientMutationId), ["pending-mutation"])
+        XCTAssertNotNil(retainedTransfer)
+        XCTAssertEqual(retainedViewport, viewport)
+        XCTAssertTrue(try XCTUnwrap(retainedHistory).historyComplete)
+        XCTAssertEqual(ptsDuringBootstrap, 17)
+        XCTAssertEqual(progress.token, "bootstrap-token")
+        XCTAssertEqual(progress.nextCursor, "cursor-2")
+        XCTAssertEqual(progress.snapshotPts, 44)
+        XCTAssertEqual(progress.mode, .replacement)
+
+        try await store.finishBootstrap(accountId: accountId, pts: 44)
+        let finishedPts = try await store.loadPts(accountId: accountId)
+        let finishedBootstrap = try await store.loadBootstrapState(accountId: accountId)
+        let finishedDialogs = try await store.dialogs(accountId: accountId)
+        let finishedMessages = try await store.messages(dialogId: existingDialogId)
+        let retainedStaleHistory = try await store.messages(dialogId: staleDialogId)
+        let finishedOutbox = try await store.pendingOutboxReady()
+        let finishedMutations = try await store.pendingMessageMutationsReady()
+        let finishedTransfer = try await store.mediaTransfer(id: transfer.transferId)
+        let finishedViewport = try await store.loadViewportState(
+            dialogId: existingDialogId,
+            accountId: accountId
+        )
+        let finishedHistory = try await store.loadHistoryState(dialogId: existingDialogId)
+        XCTAssertEqual(finishedPts, 44)
+        XCTAssertNil(finishedBootstrap)
+        XCTAssertEqual(
+            Set(finishedDialogs.map(\.dialogId)),
+            [existingDialogId, "dialog-new", concurrentDialogId]
+        )
+        XCTAssertEqual(
+            finishedDialogs.first(where: { $0.dialogId == existingDialogId })?.title,
+            "Refreshed title"
+        )
+        XCTAssertEqual(
+            finishedMessages.map(\.text),
+            [
+                "keep local history", "replacement earlier row",
+                "replacement recent row", "still sending"
+            ]
+        )
+        XCTAssertEqual(retainedStaleHistory.map(\.text), ["hydrated history remains recoverable"])
+        XCTAssertEqual(finishedOutbox.map(\.clientMsgId), [pendingClientId])
+        XCTAssertEqual(finishedMutations.map(\.clientMutationId), ["pending-mutation"])
+        XCTAssertNotNil(finishedTransfer)
+        XCTAssertEqual(finishedViewport, viewport)
+        XCTAssertTrue(try XCTUnwrap(finishedHistory).historyComplete)
+    }
+
+    func testWrongSQLCipherKeyDoesNotDeleteExistingReplica() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let correctKey = Data("correct-replica-key".utf8)
+        do {
+            let store = try CloudLocalStore(path: path, key: correctKey)
+            _ = try await store.insertSending(
+                dialogId: "dialog-preserved",
+                clientMsgId: "preserved-client-id",
+                text: "must survive",
+                senderAccountId: "account-me"
+            )
+        }
+        let sizeBefore = try XCTUnwrap(
+            try FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber
+        ).int64Value
+
+        XCTAssertThrowsError(try CloudLocalStore(path: path, key: Data("wrong-replica-key".utf8)))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        let sizeAfter = try XCTUnwrap(
+            try FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber
+        ).int64Value
+        XCTAssertEqual(sizeAfter, sizeBefore)
+
+        let reopened = try CloudLocalStore(path: path, key: correctKey)
+        let reopenedMessages = try await reopened.messages(dialogId: "dialog-preserved")
+        XCTAssertEqual(reopenedMessages.first?.text, "must survive")
+    }
+
+    func testPostLaunchIntegrityCheckRejectsCorruptReplicaWithoutDeletion() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("corrupt-replica-key".utf8)
+
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            for index in 0..<200 {
+                _ = try await store.insertSending(
+                    dialogId: "dialog-corruption",
+                    clientMsgId: "corruption-\(index)",
+                    text: String(repeating: "encrypted payload \(index) ", count: 20),
+                    senderAccountId: "account-me"
+                )
+            }
+        }
+
+        var corruptedBytes = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertGreaterThan(corruptedBytes.count, 8_192)
+        // Damage a late data page, not SQLite's schema/migration pages. Opening and migrations
+        // should remain on the fast launch path; the deferred whole-store scan must find this.
+        let corruptedOffset = corruptedBytes.count - 128
+        corruptedBytes[corruptedOffset] ^= 0xff
+        try corruptedBytes.write(to: URL(fileURLWithPath: path), options: .atomic)
+
+        let reopened = try CloudLocalStore(path: path, key: key)
+        do {
+            try await reopened.verifyIntegrity()
+            XCTFail("The post-launch integrity check should reject a corrupt encrypted page")
+        } catch {
+            // Expected: the file remains in place for authenticated quarantine/recovery.
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        let preservedBytes = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertGreaterThanOrEqual(preservedBytes.count, corruptedBytes.count)
+        XCTAssertEqual(preservedBytes[corruptedOffset], corruptedBytes[corruptedOffset])
+    }
+
+    func testQuarantinePreservesSQLiteDatabaseAndSidecarsWithoutDeleting() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let payloads: [String: Data] = [
+            "": Data("database".utf8),
+            "-wal": Data("write-ahead-log".utf8),
+            "-shm": Data("shared-memory".utf8),
+        ]
+        for (suffix, data) in payloads {
+            try data.write(to: URL(fileURLWithPath: path + suffix))
+        }
+
+        let quarantined = try XCTUnwrap(
+            CloudLocalStore.quarantineStore(
+                at: path,
+                now: Date(timeIntervalSince1970: 1_700_000_000)
+            )
+        )
+
+        XCTAssertTrue(quarantined.lastPathComponent.hasPrefix("cloud-20231114-221320-"))
+        for (suffix, expected) in payloads {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: path + suffix))
+            let moved = quarantined.appending(path: "cloud.sqlite\(suffix)")
+            XCTAssertEqual(try Data(contentsOf: moved), expected)
+        }
+        let values = try quarantined.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(values.isExcludedFromBackup, true)
+    }
+
+    func testMediaDownloadClaimIsAtomicAndReenqueueDoesNotDuplicateInflightWork() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("atomic-media-claim-key".utf8)
+        let firstStore = try CloudLocalStore(path: path, key: key)
+        let secondStore = try CloudLocalStore(path: path, key: key)
+        let mediaId = UUID().uuidString.lowercased()
+        let enqueuedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        try await firstStore.enqueueMediaDownloadJob(MediaDownloadJobRecord(
+            mediaId: mediaId, variant: "full", dialogId: "dialog-claim",
+            priority: 10, state: .queued, userInitiated: false, retryCount: 0,
+            nextRetryAt: nil, lastError: nil,
+            updatedAt: CloudLocalStore.sqliteTimestamp(enqueuedAt)
+        ))
+
+        async let firstClaim = firstStore.claimNextMediaDownloadJob(now: enqueuedAt.addingTimeInterval(1))
+        async let secondClaim = secondStore.claimNextMediaDownloadJob(now: enqueuedAt.addingTimeInterval(1))
+        let (claimedByFirst, claimedBySecond) = try await (firstClaim, secondClaim)
+        let claims = [claimedByFirst, claimedBySecond].compactMap { $0 }
+        XCTAssertEqual(claims.count, 1)
+        XCTAssertEqual(claims.first?.mediaId, mediaId)
+        XCTAssertEqual(claims.first?.state, .downloading)
+
+        try await secondStore.enqueueMediaDownloadJob(MediaDownloadJobRecord(
+            mediaId: mediaId, variant: "full", dialogId: "dialog-claim",
+            priority: 100, state: .queued, userInitiated: true, retryCount: 0,
+            nextRetryAt: nil, lastError: nil,
+            updatedAt: CloudLocalStore.sqliteTimestamp(enqueuedAt.addingTimeInterval(2))
+        ))
+        let inflight = try await firstStore.mediaDownloadJob(mediaId: mediaId, variant: "full")
+        XCTAssertEqual(inflight?.state, .downloading)
+        XCTAssertEqual(inflight?.priority, 100)
+        XCTAssertEqual(inflight?.userInitiated, true)
+        let readyAfterReenqueue = try await firstStore.mediaDownloadJobsReady()
+        XCTAssertTrue(readyAfterReenqueue.isEmpty)
+    }
+
+    func testWarmCacheRecoversInterruptedDownloadingJobsForNewProcess() async throws {
+        let store = try makeStore()
+        let mediaId = UUID().uuidString.lowercased()
+        try await store.upsertMediaDownloadJob(MediaDownloadJobRecord(
+            mediaId: mediaId, variant: "full", dialogId: "dialog-recovery",
+            priority: 10, state: .downloading, userInitiated: false, retryCount: 2,
+            nextRetryAt: nil, lastError: nil,
+            updatedAt: CloudLocalStore.sqliteTimestamp(Date().addingTimeInterval(-60))
+        ))
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let cache = try EncryptedMediaCache(
+            root: cacheDirectory, keyData: Data(repeating: 0x71, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+
+        try await engine.warmCache(localStore: store)
+
+        let recovered = try await store.mediaDownloadJob(mediaId: mediaId, variant: "full")
+        XCTAssertEqual(recovered?.state, .queued)
+        XCTAssertEqual(recovered?.retryCount, 2)
+        XCTAssertEqual(recovered?.lastError, "interrupted")
+        let readyAfterRecovery = try await store.mediaDownloadJobsReady()
+        XCTAssertEqual(readyAfterRecovery.map(\.mediaId), [mediaId])
+    }
+
+    func testSelectiveAndAllCacheClearsCancelOnlyInactiveDurableJobs() async throws {
+        let store = try makeStore()
+        let cacheDirectory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let cache = try EncryptedMediaCache(
+            root: cacheDirectory, keyData: Data(repeating: 0x72, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let activeId = UUID().uuidString.lowercased()
+        let inactiveId = UUID().uuidString.lowercased()
+        let inflightId = UUID().uuidString.lowercased()
+        let uncachedId = UUID().uuidString.lowercased()
+        let payload = Data(repeating: 0x73, count: 64)
+        try await cache.storeDownloadChunk(payload, mediaId: activeId, offset: 0)
+        try await cache.storeDownloadChunk(payload, mediaId: inactiveId, offset: 0)
+        for mediaId in [activeId, inactiveId] {
+            try await store.upsertMediaCacheEntry(MediaCacheEntry(
+                mediaId: mediaId, variant: "full",
+                encryptedPath: cacheDirectory.appending(path: "downloads/\(mediaId)").path,
+                byteSize: Int64(payload.count), cachedBytes: Int64(payload.count + 28),
+                contiguousOffset: Int64(payload.count), state: "complete",
+                lastAccessedAt: CloudLocalStore.sqliteTimestamp(Date()), protectedUntil: nil
+            ))
+        }
+        try await engine.warmCache(localStore: store)
+        try await cache.beginAccess(mediaId: activeId)
+        for (mediaId, state) in [
+            (activeId, MediaDownloadJobState.queued),
+            (inactiveId, .queued),
+            (inflightId, .downloading),
+        ] {
+            try await store.upsertMediaDownloadJob(MediaDownloadJobRecord(
+                mediaId: mediaId, variant: "full", dialogId: "dialog-clear",
+                priority: 10, state: state, userInitiated: false, retryCount: 0,
+                nextRetryAt: nil, lastError: nil,
+                updatedAt: CloudLocalStore.sqliteTimestamp(Date())
+            ))
+        }
+
+        await engine.clearMediaCache(
+            mediaIds: [activeId, inactiveId, inflightId],
+            localStore: store
+        )
+
+        let activeLedgerAfterSelectiveClear = try await store.mediaCacheEntry(
+            mediaId: activeId, variant: "full"
+        )
+        let inactiveLedgerAfterSelectiveClear = try await store.mediaCacheEntry(
+            mediaId: inactiveId, variant: "full"
+        )
+        let activeJobAfterSelectiveClear = try await store.mediaDownloadJob(
+            mediaId: activeId, variant: "full"
+        )
+        let inactiveJobAfterSelectiveClear = try await store.mediaDownloadJob(
+            mediaId: inactiveId, variant: "full"
+        )
+        let inflightJobAfterSelectiveClear = try await store.mediaDownloadJob(
+            mediaId: inflightId, variant: "full"
+        )
+        XCTAssertNotNil(activeLedgerAfterSelectiveClear)
+        XCTAssertNil(inactiveLedgerAfterSelectiveClear)
+        XCTAssertNotNil(activeJobAfterSelectiveClear)
+        XCTAssertNil(inactiveJobAfterSelectiveClear)
+        XCTAssertEqual(inflightJobAfterSelectiveClear?.state, .downloading)
+
+        try await store.enqueueMediaDownloadJob(MediaDownloadJobRecord(
+            mediaId: uncachedId, variant: "full", dialogId: "dialog-clear",
+            priority: 10, state: .queued, userInitiated: false, retryCount: 0,
+            nextRetryAt: nil, lastError: nil,
+            updatedAt: CloudLocalStore.sqliteTimestamp(Date())
+        ))
+        await engine.clearDownloadedCache(localStore: store)
+
+        let activeJobAfterClearAll = try await store.mediaDownloadJob(
+            mediaId: activeId, variant: "full"
+        )
+        let uncachedJobAfterClearAll = try await store.mediaDownloadJob(
+            mediaId: uncachedId, variant: "full"
+        )
+        let inflightJobAfterClearAll = try await store.mediaDownloadJob(
+            mediaId: inflightId, variant: "full"
+        )
+        XCTAssertNotNil(activeJobAfterClearAll)
+        XCTAssertNil(uncachedJobAfterClearAll)
+        XCTAssertEqual(inflightJobAfterClearAll?.state, .downloading)
+        await cache.endAccess(mediaId: activeId)
+    }
+
+    func testConversationObservationFirstEmissionIsAuthoritativeAndOwnsLaterUpdates() async throws {
+        let store = try makeStore()
+        _ = try await store.insertSending(
+            dialogId: "dialog-observed",
+            clientMsgId: "first-local-message",
+            text: "already saved",
+            senderAccountId: "account-me"
+        )
+
+        let stream = await store.observeConversation(dialogId: "dialog-observed")
+        var iterator = stream.makeAsyncIterator()
+        let firstValue = try await iterator.next()
+        let first = try XCTUnwrap(firstValue)
+        XCTAssertEqual(first.timeline.messages.map(\.text), ["already saved"])
+        XCTAssertTrue(first.mutations.isEmpty)
+        XCTAssertTrue(first.transfers.isEmpty)
+
+        _ = try await store.insertSending(
+            dialogId: "dialog-observed",
+            clientMsgId: "second-local-message",
+            text: "arrived through the same observation",
+            senderAccountId: "account-me"
+        )
+        let secondValue = try await iterator.next()
+        let second = try XCTUnwrap(secondValue)
+        XCTAssertEqual(
+            second.timeline.messages.map(\.text),
+            ["already saved", "arrived through the same observation"]
+        )
+    }
+
+    func testEncryptedRepresentationsPersistAcrossRelaunchCorruptionAndClearing() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let key = Data(repeating: 0x7a, count: 32)
+        let mediaId = UUID().uuidString.lowercased()
+        let payload = Data("durable prepared bubble representation".utf8)
+        let representationURL = directory.appending(
+            path: "representations/\(mediaId)/bubble-720.tojrep"
+        )
+
+        let firstCache = try EncryptedMediaCache(
+            root: directory,
+            keyData: key,
+            policy: MediaCachePolicy(sizeLimit: .unlimited, retention: .forever)
+        )
+        try await firstCache.storeRepresentation(
+            payload,
+            mediaId: mediaId,
+            variant: .bubble720
+        )
+        let ledgerStore = try makeStore()
+        let media = CloudMedia(
+            id: mediaId,
+            kind: "photo",
+            contentType: "image/jpeg",
+            fileName: nil,
+            byteSize: Int64(payload.count),
+            durationMs: nil,
+            width: 64,
+            height: 64,
+            hasThumbnail: false
+        )
+        for entry in try await firstCache.durableEntries(media: media) {
+            try await ledgerStore.upsertMediaCacheEntry(entry)
+        }
+        let representationLedger = try await ledgerStore.mediaCacheEntry(
+            mediaId: mediaId,
+            variant: MediaPresentationVariant.bubble720.rawValue
+        )
+        XCTAssertEqual(representationLedger?.state, "complete")
+        let encryptedBytes = try Data(contentsOf: representationURL)
+        XCTAssertNotEqual(encryptedBytes, payload)
+        XCTAssertNil(encryptedBytes.range(of: payload))
+
+        let relaunchedCache = try EncryptedMediaCache(
+            root: directory,
+            keyData: key,
+            policy: MediaCachePolicy(sizeLimit: .unlimited, retention: .forever)
+        )
+        let relaunchedRepresentation = try await relaunchedCache.representation(
+            mediaId: mediaId,
+            variant: .bubble720
+        )
+        XCTAssertEqual(relaunchedRepresentation, payload)
+
+        try Data("corrupt".utf8).write(to: representationURL, options: .atomic)
+        let corruptRepresentation = try await relaunchedCache.representation(
+            mediaId: mediaId,
+            variant: .bubble720
+        )
+        XCTAssertNil(corruptRepresentation)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: representationURL.path))
+
+        try await relaunchedCache.storeRepresentation(
+            payload,
+            mediaId: mediaId,
+            variant: .bubble720
+        )
+        _ = try await relaunchedCache.clearDownloaded()
+        let clearedRepresentation = try await relaunchedCache.representation(
+            mediaId: mediaId,
+            variant: .bubble720
+        )
+        XCTAssertNil(clearedRepresentation)
     }
 
     private func makeStore() throws -> CloudLocalStore {

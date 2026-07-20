@@ -5,6 +5,8 @@ import {
   checkVerification,
   resolveDevice,
   lookupAccountByPhone,
+  getProfile,
+  updateProfile,
   otpDeliveryFromEnvironment,
   listDevices,
   startAccountDeletion,
@@ -91,7 +93,7 @@ const jsonHeaders = { "content-type": "application/json", "cache-control": "no-s
 const MAX_JSON_BYTES = 64 * 1024;
 
 export const CLOUD_CAPABILITIES = {
-  api_version: 3,
+  api_version: 4,
   capabilities: [
     "core_text",
     "replies",
@@ -101,6 +103,7 @@ export const CLOUD_CAPABILITIES = {
     "media_uploads",
     "media_multipart_v2",
     "voice_notes",
+    "profiles",
   ],
 } as const;
 
@@ -562,6 +565,16 @@ export function startCloudServer(
           response = json(found ?? { found: false });
         }
 
+        if (url.pathname === "/v1/profile" && req.method === "GET") {
+          response = json(await getProfile(db, session.accountId));
+        }
+
+        if (url.pathname === "/v1/profile" && req.method === "PUT") {
+          const result = await updateProfile(db, session.accountId, session.deviceId, body);
+          pushHints(sockets, result.pushes);
+          response = json(result.profile);
+        }
+
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
           if (!body.peerAccountId) throw new SyncError("peerAccountId required");
           response = json(await getOrCreateDirectDialog(
@@ -630,6 +643,7 @@ export function startCloudServer(
         if (url.pathname === "/v1/history" && req.method === "POST") {
           response = json(await getHistory(db, session.accountId, body.dialogId, {
             beforeMsgId: body.beforeMsgId,
+            afterMsgId: body.afterMsgId,
             limit: body.limit,
             maxBytes: body.maxBytes,
           }));

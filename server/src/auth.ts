@@ -3,6 +3,7 @@ import { randomBytes, randomInt } from "node:crypto";
 import {
   seal, open, PHONE_AAD, phoneLookupHash, codeHash, hashToken, normalizePhone, constantTimeEqual,
 } from "./crypto";
+import { enqueuePushDeliveries } from "./push";
 
 const OTP_TTL_MS = 5 * 60_000;
 const OTP_RESEND_COOLDOWN_SECONDS = 30;
@@ -176,7 +177,7 @@ export async function startVerification(
     } catch (error) {
       await sql`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challengeId}`;
       console.error(new Date().toISOString(), "auth.otp.delivery_failed",
-        error instanceof Error ? error.message.replace(/[\r\n]+/g, " ").slice(0, 200) : "unknown error");
+        error instanceof Error ? error.name : "UnknownError");
       throw new AuthError("verification service temporarily unavailable", 503);
     }
   }
@@ -185,6 +186,56 @@ export async function startVerification(
 }
 
 export type Session = { accountId: string; deviceId: string; token: string };
+
+export type ProfileDTO = {
+  accountId: string;
+  firstName: string;
+  lastName: string;
+  displayName: string;
+  bio: string;
+  birthday: string | null;
+  colorIndex: number;
+  updatedAt: string;
+};
+
+type ProfilePush = { accountId: string; pts: number; ptsCount: number };
+
+const profileDate = (value: unknown): string | null => {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new AuthError("invalid birthday", 400);
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw new AuthError("invalid birthday", 400);
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const oldest = new Date();
+  oldest.setUTCFullYear(oldest.getUTCFullYear() - 120);
+  if (value > today || value < oldest.toISOString().slice(0, 10)) {
+    throw new AuthError("invalid birthday", 400);
+  }
+  return value;
+};
+
+function profileDTO(row: any): ProfileDTO {
+  const birthday = birthdayString(row.birthday);
+  return {
+    accountId: row.id,
+    firstName: row.first_name,
+    lastName: row.last_name,
+    displayName: row.display_name,
+    bio: row.bio,
+    birthday,
+    colorIndex: Number(row.profile_color),
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
+  };
+}
+
+function birthdayString(value: unknown): string | null {
+  if (value == null) return null;
+  return value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
+}
 
 export async function checkVerification(
   sql: SQL, phone: string, code: string, platform = "ios", deviceName?: string, displayName?: string,
@@ -219,8 +270,8 @@ export async function checkVerification(
     const sealed = seal(normalizedPhone, PHONE_AAD);
     const name = cleanLabel(displayName, 80) ?? "";
     const created = await tx`
-      INSERT INTO accounts (phone_lookup_hash, phone_e164_ciphertext, phone_nonce, phone_key_id, display_name)
-      VALUES (${lookup}, ${sealed.ciphertext}, ${sealed.nonce}, ${sealed.keyId}, ${name})
+      INSERT INTO accounts (phone_lookup_hash, phone_e164_ciphertext, phone_nonce, phone_key_id, first_name, display_name)
+      VALUES (${lookup}, ${sealed.ciphertext}, ${sealed.nonce}, ${sealed.keyId}, ${name}, ${name})
       ON CONFLICT (phone_lookup_hash) DO NOTHING
       RETURNING id`;
     let accountId: string;
@@ -235,7 +286,12 @@ export async function checkVerification(
         return new AuthError("account unavailable", 403);
       }
       accountId = existing.id;
-      if (name) await tx`UPDATE accounts SET display_name = ${name}, updated_at = now() WHERE id = ${accountId}`;
+      if (name) await tx`
+        UPDATE accounts
+        SET first_name = CASE WHEN first_name = '' AND last_name = '' THEN ${name} ELSE first_name END,
+            display_name = CASE WHEN first_name = '' AND last_name = '' THEN ${name} ELSE display_name END,
+            updated_at = now()
+        WHERE id = ${accountId}`;
     }
 
     const device = await tx`
@@ -251,7 +307,7 @@ export async function checkVerification(
 /** Contact discovery: resolve a phone number to an account so the client can open a direct dialog. */
 export async function lookupAccountByPhone(
   sql: SQL, requesterAccountId: string, phone: string,
-): Promise<{ accountId: string; displayName: string } | null> {
+): Promise<ProfileDTO | null> {
   const normalizedPhone = validPhone(phone);
   const targetHash = phoneLookupHash(normalizedPhone);
   return await sql.begin(async (tx) => {
@@ -278,14 +334,107 @@ export async function lookupAccountByPhone(
     }
 
     const row = (await tx`
-      SELECT id, display_name FROM accounts
+      SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at FROM accounts
       WHERE phone_lookup_hash = ${targetHash} AND status IN ('active','limited')`)[0];
     if (!repeated.length) {
       await tx`
         INSERT INTO contact_lookup_attempts (requester_account_id, target_phone_hash)
         VALUES (${requesterAccountId}, ${targetHash})`;
     }
-    return row ? { accountId: row.id, displayName: row.display_name } : null;
+    return row ? profileDTO(row) : null;
+  });
+}
+
+/** Return the canonical account profile for this authenticated account. */
+export async function getProfile(sql: SQL, accountId: string): Promise<ProfileDTO> {
+  const row = (await sql`
+    SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+    FROM accounts WHERE id = ${accountId} AND status IN ('active','limited')`)[0];
+  if (!row) throw new AuthError("account unavailable", 403);
+  return profileDTO(row);
+}
+
+/** Persist a profile and fan a silent sync event out to every device and active chat partner. */
+export async function updateProfile(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  input: { firstName?: unknown; lastName?: unknown; bio?: unknown; birthday?: unknown; colorIndex?: unknown },
+): Promise<{ profile: ProfileDTO; pushes: ProfilePush[] }> {
+  const firstName = typeof input.firstName === "string" ? input.firstName.trim().slice(0, 48) : "";
+  const lastName = typeof input.lastName === "string" ? input.lastName.trim().slice(0, 48) : "";
+  const bio = typeof input.bio === "string" ? input.bio.trim().slice(0, 120) : "";
+  const birthday = profileDate(input.birthday);
+  const colorIndex = Number(input.colorIndex);
+  if (!firstName) throw new AuthError("first name required", 400);
+  if (!Number.isSafeInteger(colorIndex) || colorIndex < 0 || colorIndex > 7) {
+    throw new AuthError("invalid profile color", 400);
+  }
+  const displayName = [firstName, lastName].filter(Boolean).join(" ");
+  return await sql.begin(async (tx) => {
+    const current = (await tx`
+      SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+      FROM accounts WHERE id = ${accountId} AND status IN ('active','limited') FOR UPDATE`)[0];
+    if (!current) throw new AuthError("account unavailable", 403);
+    await requireActiveDevice(tx, accountId, deviceId);
+    const currentBirthday = birthdayString(current.birthday);
+    const changed = current.first_name !== firstName || current.last_name !== lastName
+      || current.bio !== bio || currentBirthday !== birthday || Number(current.profile_color) !== colorIndex;
+    if (!changed) return { profile: profileDTO(current), pushes: [] };
+
+    const updated = (await tx`
+      UPDATE accounts SET first_name = ${firstName}, last_name = ${lastName},
+        display_name = ${displayName}, bio = ${bio}, birthday = ${birthday}::date,
+        profile_color = ${colorIndex}, updated_at = now()
+      WHERE id = ${accountId}
+      RETURNING id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at`)[0];
+
+    const recipientRows = await tx`
+      SELECT DISTINCT peer.account_id
+      FROM dialog_members mine
+      JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id AND peer.left_at IS NULL
+      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+      UNION SELECT ${accountId}::uuid AS account_id`;
+    const recipients = recipientRows.map((row) => String(row.account_id)).sort();
+    const profile = profileDTO(updated);
+    const baseData = {
+      subject_account_id: profile.accountId,
+      first_name: profile.firstName,
+      last_name: profile.lastName,
+      display_name: profile.displayName,
+      bio: profile.bio,
+      birthday: profile.birthday,
+      color_index: profile.colorIndex,
+      updated_at: profile.updatedAt,
+    };
+    const pushes: ProfilePush[] = [];
+    for (const recipient of recipients) {
+      const sharedRows = recipient === accountId ? [] : await tx`
+        SELECT mine.dialog_id
+        FROM dialog_members mine
+        JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id
+        JOIN dialogs d ON d.id = mine.dialog_id AND d.type = 'direct'
+        WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+          AND peer.account_id = ${recipient} AND peer.left_at IS NULL
+        ORDER BY mine.dialog_id`;
+      const data = JSON.stringify({
+        ...baseData,
+        shared_dialog_ids: sharedRows.map((row) => String(row.dialog_id)),
+      });
+      const state = (await tx`
+        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
+        WHERE account_id = ${recipient} RETURNING pts`)[0];
+      const pts = Number(state.pts);
+      await tx`
+        INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
+        VALUES (${recipient}, ${pts}, 'profile.updated', ${accountId}, ${data}::jsonb)`;
+      await enqueuePushDeliveries(tx, {
+        accountId: recipient, pts, senderAccountId: accountId,
+        sourceDeviceId: deviceId, alertRecipients: false,
+      });
+      pushes.push({ accountId: recipient, pts, ptsCount: 1 });
+    }
+    return { profile, pushes };
   });
 }
 
@@ -426,7 +575,12 @@ export async function deleteAccount(
         phone_e164_ciphertext = ${anonymizedPhone.ciphertext},
         phone_nonce = ${anonymizedPhone.nonce},
         phone_key_id = ${anonymizedPhone.keyId},
+        first_name = 'Deleted Account',
+        last_name = '',
         display_name = 'Deleted Account',
+        bio = '',
+        birthday = NULL,
+        profile_color = 0,
         status = 'deleted',
         updated_at = now()
       WHERE id = ${accountId}`;
