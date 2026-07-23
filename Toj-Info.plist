@@ -34,6 +34,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Toj uses the microphone when you record a voice message or join an encrypted voice call.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Toj uses the camera only when you choose to share video in an encrypted call.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Toj uses your contacts to help you find people you know and invite friends who are not on Toj yet.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>

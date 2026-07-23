@@ -7,10 +7,12 @@ PODS:
   - SQLCipher/common (4.10.0)
   - SQLCipher/standard (4.10.0):
     - SQLCipher/common
+  - TojWebRTC (1.0.0)
 
 DEPENDENCIES:
   - GRDB.swift/SQLCipher
   - LibSignalClient (from `https://github.com/signalapp/libsignal.git`, tag `v0.96.4`)
+  - TojWebRTC (from `Dependencies/TojWebRTC`)
 
 SPEC REPOS:
   trunk:
@@ -21,6 +23,8 @@ EXTERNAL SOURCES:
   LibSignalClient:
     :git: https://github.com/signalapp/libsignal.git
     :tag: v0.96.4
+  TojWebRTC:
+    :path: Dependencies/TojWebRTC
 
 CHECKOUT OPTIONS:
   LibSignalClient:
@@ -31,6 +35,7 @@ SPEC CHECKSUMS:
   GRDB.swift: 136dcb5d8dddca50aae3ba7d77475f79e7232cd8
   LibSignalClient: 3f510b4274fccf02d365f51c3e06d18725d9fba1
   SQLCipher: eb79c64049cb002b4e9fcb30edb7979bf4706dfc
+  TojWebRTC: 5ccbf6a3aed8ced1ced38fc24ead1de9ac0b9763
 
 PODFILE CHECKSUM: 31eb78e642fbc9fa9d047e1b7551e0c71985312e
 

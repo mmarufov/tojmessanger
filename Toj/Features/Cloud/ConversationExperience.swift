@@ -268,6 +268,18 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Call \(model.dialogTitle(dialogId))")
                 }
 
+                if model.capabilities.contains(.videoCalls) {
+                    Button {
+                        Task { await model.startVideoCall(dialogId: dialogId) }
+                    } label: {
+                        Image(systemName: "video.fill")
+                            .frame(width: 46, height: 46)
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(model.callCoordinator.state.isInProgress)
+                    .accessibilityLabel("Video call \(model.dialogTitle(dialogId))")
+                }
+
                 Button { showingProfile = model.capabilities.contains(.profiles) || model.capabilities.contains(.calls) } label: {
                     TojAvatar(
                         title: model.dialogTitle(dialogId),

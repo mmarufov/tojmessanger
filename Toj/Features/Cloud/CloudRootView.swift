@@ -1187,6 +1187,34 @@ private struct CloudSettingsView: View {
                         .padding(.horizontal, 15)
                         .frame(minHeight: 68)
                         .disabled(model.callCoordinator.state.isInProgress)
+
+                        Divider()
+                            .overlay(Color.white.opacity(0.08))
+                            .padding(.leading, 15)
+
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Label("Use less data for video calls", systemImage: "antenna.radiowaves.left.and.right")
+                                    .font(.body.weight(.medium))
+                                Text("Audio always has priority. Low Data Mode and roaming use the lowest video tier.")
+                                    .font(.caption)
+                                    .foregroundStyle(TojTheme.secondaryText)
+                            }
+                            Spacer(minLength: 8)
+                            Picker("Video call data usage", selection: Binding(
+                                get: { model.callPreferences.dataUsagePolicy },
+                                set: { model.callPreferences.dataUsagePolicy = $0 }
+                            )) {
+                                Text("Never").tag(CallDataUsagePolicy.never)
+                                Text("Cellular Only").tag(CallDataUsagePolicy.cellularOnly)
+                                Text("Always").tag(CallDataUsagePolicy.always)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                        }
+                        .padding(.horizontal, 15)
+                        .frame(minHeight: 78)
+                        .disabled(model.callCoordinator.state.isInProgress)
                     }
 
                     TojSectionCard("Info") {
