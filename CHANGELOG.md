@@ -5,6 +5,53 @@ All notable changes to Toj are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to a `MAJOR.MINOR.PATCH.BUILD` version scheme.
 
+## [0.4.0.0] — 2026-07-23
+
+Adds one-to-one encrypted camera video calls on top of Toj's existing voice-call
+handshake and recovery stack. Production enablement remains disabled until Apple
+provisioning, APNs, two-region TURN capacity, and physical-device release gates pass.
+
+### Added
+
+- Authenticated media profile 2 with Opus audio, strict H264 video, transcript-bound
+  DTLS fingerprints, permanent camera transceivers, and camera toggling without SDP
+  renegotiation.
+- Video-first and audio-first call flows, front/rear switching, local and remote
+  renderers, Picture in Picture plumbing, CallKit video state, data-saver controls,
+  and permission-safe camera lifecycle handling.
+- Audio-priority network and thermal adaptation with high, medium, low, and automatic
+  pause tiers driven by interval WebRTC statistics and encrypted peer receive caps.
+- Device capability registration, immutable voice/video start intent, video-aware
+  multi-device targeting, and lifecycle-only projections for losing ring targets.
+- A public release report separating automated evidence from provisioning,
+  infrastructure, and physical-device gates.
+
+### Changed
+
+- Renamed the concrete WebRTC implementation to `WebRTCCallEngine` and extended the
+  injectable engine contract with one-shot media-profile configuration and independent
+  renderer handles.
+- Raised the coturn allocation starting cap to 512,000 bytes per second and added
+  aggregate allocation, egress, and transport-probe alerts for video readiness.
+- Backfilled retained calls in bounded transactions before enforcing the selected
+  media-profile invariant, avoiding a long migration transaction on the calls table.
+- Made the required iOS pull-request check download and attest the pinned WebRTC
+  artifact, compile the real Release implementation, and run the signed test suite.
+
+### Security
+
+- Bound the original media offer, selected profile, call intent, and DTLS fingerprint
+  into the existing encrypted call transcript and rejected signal-kind/SDP-type
+  mismatches.
+- Scoped call reads, events, active-call lists, WebSocket hints, and terminal cleanup
+  to the initiating device and explicit ring targets; unrelated same-account devices
+  receive no setup or encrypted signaling data.
+- Prevented camera capture and permission prompts before authenticated acceptance,
+  fenced late callbacks by call generation, and kept camera state encrypted from the
+  server.
+- Kept the restricted multitasking-camera entitlement opt-in so ordinary signed builds
+  remain merge-safe until a matching Apple provisioning profile is available.
+
 ## [0.3.0.0] — 2026-07-19
 
 Makes saved chats and downloaded media open immediately from encrypted local storage,
@@ -130,6 +177,7 @@ messaging presentation layer on top of the milestone M1–M4 cloud skeleton.
 - Updated project configuration, Info.plist, and prep tooling to bundle fonts,
   icons, and localized resources.
 
+[0.4.0.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.4.0.0
 [0.3.0.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.3.0.0
 [0.2.0.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.2.0.0
 [0.1.1.0]: https://github.com/mmarufov/tojmessanger/releases/tag/v0.1.1.0

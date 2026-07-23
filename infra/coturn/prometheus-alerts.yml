@@ -32,3 +32,24 @@ groups:
           severity: warning
         annotations:
           summary: 'Toj TURN egress exceeds 60% of provisioned capacity'
+      - alert: TojTurnAllocationCapacityCritical
+        expr: sum by (instance) (turn_total_allocations) / on (instance) max by (instance) (toj_turn_allocation_capacity) >= 0.80
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Toj TURN allocations exceed 80% of configured capacity'
+      - alert: TojTurnEgressCapacityCritical
+        expr: sum by (instance) (rate(turn_total_traffic_sentb[5m])) / on (instance) max by (instance) (toj_turn_egress_capacity_bytes_per_second) >= 0.80
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Toj TURN egress exceeds 80% of provisioned capacity'
+      - alert: TojTurnAllocationProbeFailed
+        expr: min by (instance, transport) (probe_success{job="toj-turn-allocation",transport=~"udp|tcp|tls"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Toj TURN authenticated allocation probe failed'

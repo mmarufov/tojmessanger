@@ -9,6 +9,10 @@ runs the app test suite. That build job has read-only repository access. A separ
 downloads the workflow artifact, creates GitHub/Sigstore provenance attestations, and uploads
 immutable release assets.
 
+The required `ios-debug-tests` pull-request check downloads and verifies that immutable artifact,
+compiles Toj in Release configuration through the real `canImport(WebRTC)` path, asserts the
+`Toj.WebRTCCallEngine` symbol, and then runs the signed serialized app test suite.
+
 Install the pinned release with:
 
 ```sh

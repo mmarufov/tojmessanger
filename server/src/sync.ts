@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import { Client } from "pg";
 import { seal, open, bodyAAD } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
 import { mediaDTOFromRow, type MediaDTO } from "./media";
@@ -20,6 +21,17 @@ export type MessageDTO = {
   state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
+export type SyncWakeup = Push;
+
+const SYNC_NOTIFY_CHANNEL = "toj_sync_events";
+const ACCOUNT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function notifySyncWakeups(sql: SQL, pushes: Push[]): Promise<void> {
+  for (const push of pushes) {
+    const payload = JSON.stringify(push);
+    await sql`SELECT pg_notify(${SYNC_NOTIFY_CHANNEL}, ${payload})`;
+  }
+}
 
 const n = (v: unknown) => Number(v as any);
 const buf = (v: unknown) => Buffer.from(v as Uint8Array);
@@ -361,12 +373,77 @@ export async function sendMessage(sql: SQL, p: {
 
     // complete the idempotency row so retries return this exact result
     await tx`UPDATE send_requests SET status = 'completed', msg_id = ${msgId}, sender_pts = ${senderPts} WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}`;
+    // A bounded PostgreSQL wake-up keeps connected clients on every server process current. The
+    // account_events rows remain authoritative, so local immediate and cross-process hints may
+    // safely be delivered more than once.
+    await notifySyncWakeups(tx, pushes);
 
     return {
       dialogId: p.dialogId, clientMsgId: p.clientMsgId, msgId, senderPts, duplicate: false,
       serverTs: iso(inserted[0].server_ts), text: body, senderAccountId: p.senderAccountId, pushes,
     };
   });
+}
+
+/** Listen for bounded account-sync wake-ups emitted transactionally with message events. */
+export function startSyncNotificationListener(
+  databaseUrl: string | null,
+  onWakeup: (wakeup: SyncWakeup) => void | Promise<void>,
+): () => void {
+  if (!databaseUrl) return () => {};
+  let stopped = false;
+  let client: Client | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let attempts = 0;
+
+  const schedule = () => {
+    if (stopped || retry) return;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(attempts, 6));
+    attempts += 1;
+    retry = setTimeout(() => { retry = null; void connect(); }, delay);
+    retry.unref?.();
+  };
+  const connect = async () => {
+    if (stopped) return;
+    const next = new Client({ connectionString: databaseUrl, application_name: "toj-sync-notify" });
+    client = next;
+    next.on("notification", (notification) => {
+      if (notification.channel !== SYNC_NOTIFY_CHANNEL || !notification.payload) return;
+      try {
+        const value = JSON.parse(notification.payload) as SyncWakeup;
+        if (!ACCOUNT_UUID_PATTERN.test(value.accountId) || !Number.isSafeInteger(value.pts)
+          || value.pts < 0 || !Number.isSafeInteger(value.ptsCount)
+          || value.ptsCount < 1 || value.ptsCount > 1_000) return;
+        void onWakeup(value);
+      } catch { /* notification hints are never authoritative */ }
+    });
+    let handledDisconnect = false;
+    const disconnected = () => {
+      if (handledDisconnect) return;
+      handledDisconnect = true;
+      if (client !== next) return;
+      client = null;
+      schedule();
+    };
+    next.once("error", disconnected);
+    next.once("end", disconnected);
+    try {
+      await next.connect();
+      await next.query(`LISTEN ${SYNC_NOTIFY_CHANNEL}`);
+      attempts = 0;
+    } catch {
+      try { await next.end(); } catch { /* already closed */ }
+      disconnected();
+    }
+  };
+  void connect();
+  return () => {
+    stopped = true;
+    if (retry) clearTimeout(retry);
+    retry = null;
+    if (client) void client.end().catch(() => {});
+    client = null;
+  };
 }
 
 export type MessageMutationResult = {

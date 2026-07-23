@@ -36,7 +36,10 @@ interface, and `prometheus-address` to a private address. For a node behind port
 NAT, use coturn's `PUBLIC_IP/PRIVATE_IP` form when an explicit mapping is required. Coturn 4.14
 already requires TLS 1.2 or newer; never add the `tlsv1` or `tlsv1_1` compatibility switches.
 Set `total-quota`, `bps-capacity`, and the two exported capacity gauges from load-tested node
-limits; `bps-capacity` and the egress gauge are bytes per second.
+limits; `bps-capacity` and the egress gauge are bytes per second. Video deployments begin with
+`max-bps=512000` bytes per second per allocation (about 4.096 Mbps aggregate) while Toj caps a
+single outbound camera stream at 1.5 Mbps. Do not copy one node's measured capacity to another
+region without an independent load test.
 
 Use an external authenticated TURN allocation probe for health. Container process liveness alone
 does not prove that public UDP/TCP/TLS paths or credentials work. Generate a short-lived coturn
@@ -80,7 +83,7 @@ benchmark, IPv6 ULA/link-local, and multicast peers receive a forbidden-peer res
 that allocations work over `turn:host:3478?transport=tcp` and
 `turns:host:443?transport=tcp`; `no-tcp-relay` must not remove those client paths.
 
-## Release gate
+## Voice release gate
 
 Before advertising `voice_calls_v1`, verify from physical iPhones on independent carriers:
 
@@ -92,6 +95,14 @@ Before advertising `voice_calls_v1`, verify from physical iPhones on independent
 6. Metrics contain aggregate allocation/traffic data only; raw client IP logs expire within 24 hours.
 7. Attempts to create permissions for every denied address class fail from outside the deployment,
    and provider flow logs show no route from relay ports to VPC or metadata/control-plane services.
+
+## Video release gate
+
+Before advertising `video_calls_v1`, complete every voice gate above, then prove that a mixed
+audio/video load remains below 60% of allocation and egress capacity at the intended rollout
+percentage. External allocation probes must continue passing independently over UDP, TCP, and TLS
+443 throughout the test. Complete the repository's
+[Video Calls v1 release report](../../VIDEO_CALLS_RELEASE_REPORT.md) before setting video readiness.
 
 The control plane should return both regions in measured-preference order. WebRTC connectivity
 checks, not GeoIP alone, select the final route.

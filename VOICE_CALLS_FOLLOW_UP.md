@@ -26,9 +26,10 @@ This file contains work intentionally excluded from the bootstrap merge. Items u
 
 ## After the first immutable WebRTC release
 
-- [ ] Add a normal PR check that fetches the pinned immutable artifact and performs
-  Release compilation. This cannot be mandatory before the bootstrap artifact
-  exists.
+- [x] **Required real-WebRTC PR gate.** The existing required iOS check now fetches
+  and verifies the pinned immutable artifact, compiles the Release implementation,
+  asserts `Toj.WebRTCCallEngine`, and runs the signed suite.
+  **Completed:** v0.4.0.0 (2026-07-23).
 - [ ] Add negative-path tests for `scripts/fetch-webrtc-xcframework.sh`: missing
   release, wrong revision, bad checksum, unsafe archive path, untrusted attestation,
   and self-hosted provenance.

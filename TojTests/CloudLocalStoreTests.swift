@@ -1857,6 +1857,10 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     func testStoreBackedMediaQueuePersistsJobsAndCacheLedgerWithoutFilesystemBootstrap() async throws {
+        let suiteName = "TojTests.DurableMediaLedger.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1898,7 +1902,8 @@ final class CloudLocalStoreTests: XCTestCase {
         let engine = CloudMediaTransferEngine(
             config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
             cache: cache,
-            session: URLSession(configuration: configuration)
+            session: URLSession(configuration: configuration),
+            policyStore: MediaPolicyStore(defaults: defaults)
         )
 
         try await store.applyHistoryPage(HistoryPageResponse(
@@ -1926,7 +1931,12 @@ final class CloudLocalStoreTests: XCTestCase {
             let dequeued = await engine.dequeueAutoDownload(localStore: store)
             let item = try XCTUnwrap(dequeued)
             XCTAssertEqual(item.component, expected)
-            try await engine.performAutoDownload(item, token: "session-token", localStore: store)
+            try await engine.performAutoDownload(
+                item,
+                token: "session-token",
+                localStore: store,
+                network: .wifi
+            )
         }
 
         let ledger = try await store.mediaCacheEntry(mediaId: media.id, variant: "full")
