@@ -7,6 +7,7 @@ on:
       - main
 
 permissions:
+  attestations: read
   contents: read
 
 concurrency:
@@ -62,14 +63,35 @@ jobs:
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+      - name: Fetch and verify pinned WebRTC artifact
+        run: scripts/fetch-webrtc-xcframework.sh
       - name: Install CocoaPods dependencies
         run: |
           test -d "${DEVELOPER_DIR}"
           pod install
+      - name: Compile real WebRTC Release path
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/TojDerivedData
+        run: |
+          xcodebuild build \
+            -workspace Toj.xcworkspace \
+            -scheme Toj \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${DERIVED_DATA}" \
+            CODE_SIGNING_ALLOWED=NO
+
+          app_dir="$(find "${DERIVED_DATA}/Build/Products/Release-iphonesimulator" \
+            -type d -name 'Toj.app' -print -quit)"
+          test -n "${app_dir}"
+          symbols_file="${RUNNER_TEMP}/toj-release-symbols.txt"
+          xcrun nm "${app_dir}/Toj" | xcrun swift-demangle > "${symbols_file}"
+          grep -Fq 'Toj.WebRTCCallEngine' "${symbols_file}"
       - name: Select available iPhone simulator
         run: |
           destination_id="$(/usr/bin/python3 <<'PY'
@@ -126,8 +148,13 @@ jobs:
           import plistlib
           from pathlib import Path
 
-          with Path("Toj-Info.plist").open("rb") as source:
-              plistlib.load(source)
+          for path in (
+              Path("Toj-Info.plist"),
+              Path("Toj/Toj.entitlements"),
+              Path("Toj/Toj-MultitaskingCamera.entitlements"),
+          ):
+              with path.open("rb") as source:
+                  plistlib.load(source)
           PY
       - name: Require immutable action references
         run: |
