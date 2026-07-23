@@ -152,6 +152,10 @@ release gates pass. Roll back by setting the percentage to zero and restarting: 
 rejected, new audio calls select media profile 1, and in-flight profile-2 calls retain the immutable
 selection policy stored when they were created.
 
+The repository's [Video Calls v1 release report](../VIDEO_CALLS_RELEASE_REPORT.md) is the
+authoritative checklist for provisioning, two-region TURN capacity, physical-device coverage, and
+quantitative rollout gates. Do not set either video readiness flag based on simulator evidence alone.
+
 Clear `TOJ_TURN_READY` or `TOJ_VOICE_CALLS_ENABLED` and restart the process to stop advertising and
 accepting new calls. Clear either video readiness flag to stop advertising video globally, or set
 the video rollout percentage to zero for a staged rollback. Existing call action, signaling, and

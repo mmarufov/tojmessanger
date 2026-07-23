@@ -35,6 +35,8 @@ provisioning, APNs, two-region TURN capacity, and physical-device release gates 
   aggregate allocation, egress, and transport-probe alerts for video readiness.
 - Backfilled retained calls in bounded transactions before enforcing the selected
   media-profile invariant, avoiding a long migration transaction on the calls table.
+- Made the required iOS pull-request check download and attest the pinned WebRTC
+  artifact, compile the real Release implementation, and run the signed test suite.
 
 ### Security
 

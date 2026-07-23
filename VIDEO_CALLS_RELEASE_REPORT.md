@@ -37,7 +37,8 @@ iPhones. A release owner must complete every unchecked gate before enabling a ge
       validation.
 - [ ] A signed build succeeds with the distribution provisioning profile that contains the
       multitasking-camera capability and selects `Toj/Toj-MultitaskingCamera.entitlements`.
-- [ ] CI downloads the attested XCFramework and repeats the real-WebRTC Release build and tests.
+- [x] The required iOS PR check downloads and verifies the attested XCFramework, compiles the
+      real-WebRTC Release path, asserts `Toj.WebRTCCallEngine`, and repeats the signed tests.
 
 Automated tests do not establish camera hardware, encoder power, radio, TURN capacity, APNs, or
 thermal behavior. Simulator success must not be used to check any physical-device gate below.
