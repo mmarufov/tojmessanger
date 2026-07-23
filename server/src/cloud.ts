@@ -36,6 +36,7 @@ import {
   deleteMessage,
   setReaction,
   startBootstrap,
+  startSyncNotificationListener,
   SyncError,
   type Push,
 } from "./sync";
@@ -76,12 +77,15 @@ import {
   getCallEvents,
   getIceConfig,
   recordCallTelemetry,
+  resolveCallHintTargets,
   revealCallKey,
   revokeDeviceAndTerminateCalls,
   sendEncryptedCallEvent,
   startCallCleanupWorker,
   startCallNotificationListener,
   unblockAccount,
+  videoCallsEnabledForAccount,
+  videoCallsConfigured,
   voiceCallsConfigured,
   type CallHint,
 } from "./calls";
@@ -107,10 +111,11 @@ export const CLOUD_CAPABILITIES = {
   ],
 } as const;
 
-function cloudCapabilities(voiceCalls: boolean) {
-  return voiceCalls
-    ? { ...CLOUD_CAPABILITIES, capabilities: [...CLOUD_CAPABILITIES.capabilities, "voice_calls_v1"] }
-    : CLOUD_CAPABILITIES;
+function cloudCapabilities(voiceCalls: boolean, videoCalls: boolean) {
+  const capabilities = [...CLOUD_CAPABILITIES.capabilities];
+  if (voiceCalls) capabilities.push("voice_calls_v1");
+  if (videoCalls) capabilities.push("video_calls_v1");
+  return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
 function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
@@ -191,7 +196,7 @@ function pushCallHints(sockets: Map<string, Set<ServerWebSocket<SocketData>>>, h
       type: "call_hint", callId: hint.callId, latestEventSeq: hint.latestEventSeq,
     });
     for (const ws of sockets.get(hint.accountId) ?? []) {
-      if (ws.readyState === 1) ws.send(payload);
+      if (ws.data.deviceId === hint.deviceId && ws.readyState === 1) ws.send(payload);
     }
   }
 }
@@ -230,12 +235,22 @@ export function startCloudServer(
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const metrics = new OperationalMetrics();
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
+  const videoAvailable = videoCallsConfigured(callsAvailable);
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
+  const stopSyncNotifications = startSyncNotificationListener(
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
+    (wakeup) => pushHints(sockets, [wakeup]),
+  );
   const stopCallNotifications = startCallNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
-    (hint) => pushCallHints(sockets, [hint]),
+    async (wakeup) => {
+      const localDeviceIds = [...sockets.values()]
+        .flatMap((set) => [...set].map((socket) => socket.data.deviceId));
+      const hints = await resolveCallHintTargets(db, wakeup, [...new Set(localDeviceIds)]);
+      pushCallHints(sockets, hints);
+    },
   );
 
   const server = Bun.serve<SocketData>({
@@ -257,7 +272,11 @@ export function startCloudServer(
         }
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
-          response = json(cloudCapabilities(callsAvailable));
+          const capabilityToken = bearer(req);
+          const accountVideoAvailable = capabilityToken
+            ? videoCallsEnabledForAccount((await resolveDevice(db, capabilityToken)).accountId, videoAvailable)
+            : false;
+          response = json(cloudCapabilities(callsAvailable, accountVideoAvailable));
         }
 
         else if (url.pathname === "/metrics") {
@@ -365,7 +384,15 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/devices/voip-push" && req.method === "PUT") {
           if (!body.token || !body.environment) throw new PushError("token and environment required");
-          response = json(await registerVoIPPushToken(db, session.deviceId, body.token, body.environment));
+          response = json(await registerVoIPPushToken(
+            db,
+            session.deviceId,
+            body.token,
+            body.environment,
+            body.supportedCallProtocolVersions,
+            body.supportedCallMediaProfileVersions,
+            body.callViewVersion,
+          ));
         }
 
         if (url.pathname === "/v1/devices/voip-push" && req.method === "DELETE") {
@@ -394,17 +421,19 @@ export function startCloudServer(
             supportedProtocolVersions: body.supportedProtocolVersions,
             offeredMediaProfileVersions: body.offeredMediaProfileVersions,
             networkKey: networkKey(req, server),
+            videoEnabled: videoCallsEnabledForAccount(session.accountId, videoAvailable),
+            videoRolloutReady: videoAvailable,
           });
           pushCallHints(sockets, result.hints);
           response = json({ call: result.call, ringTargetCount: result.ringTargetCount }, 201);
         }
 
         if (url.pathname === "/v1/calls/active" && req.method === "GET") {
-          response = json(await getActiveCalls(db, session.accountId));
+          response = json(await getActiveCalls(db, session.accountId, session.deviceId));
         }
 
         if (callMatch && req.method === "GET") {
-          response = json(await getCall(db, session.accountId, callMatch[1]));
+          response = json(await getCall(db, session.accountId, session.deviceId, callMatch[1]));
         }
 
         if (callActionMatch?.[2] === "accept" && req.method === "POST") {
@@ -476,7 +505,7 @@ export function startCloudServer(
 
         if (callActionMatch?.[2] === "events" && req.method === "GET") {
           response = json(await getCallEvents(
-            db, session.accountId, callActionMatch[1],
+            db, session.accountId, session.deviceId, callActionMatch[1],
             url.searchParams.get("after") ?? 0, url.searchParams.get("limit") ?? 100,
           ));
         }
@@ -739,6 +768,7 @@ export function startCloudServer(
     stopPushWorker();
     stopMaintenanceWorker();
     stopCallCleanupWorker();
+    stopSyncNotifications();
     stopCallNotifications();
     return originalStop(closeActiveConnections);
   }) as typeof server.stop;

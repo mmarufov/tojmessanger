@@ -9,9 +9,15 @@ import {
 } from "./auth";
 import { sendMessage, type Push } from "./sync";
 import { lockAccountMutations, lockMutationKeys } from "./locks";
+import {
+  CallVersionCapabilityError,
+  normalizeCallVersionCapabilities as normalizeVersionCapabilities,
+} from "./call-versions";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
+const SUPPORTED_PROTOCOLS = [1] as const;
+const SUPPORTED_MEDIA_PROFILES = [1, 2] as const;
 const MAX_SIGNAL_BYTES = 64 * 1024 + 28; // 64 KiB plaintext plus ChaChaPoly nonce/tag overhead.
 const MAX_CANDIDATE_SIGNAL_BYTES = 8 * 1024;
 const MAX_CONTROL_SIGNAL_BYTES = 2 * 1024;
@@ -60,6 +66,8 @@ function clampCount(value: unknown, max: number): number {
 }
 
 export type CallState = "requested" | "accepted" | "key_exchange" | "active" | "ended";
+export type CallInitialKind = "voice" | "video";
+export type CallViewKind = "full" | "invitation" | "lifecycle";
 
 export class CallError extends Error {
   constructor(
@@ -75,6 +83,7 @@ export class CallError extends Error {
 }
 
 export type CallSnapshot = {
+  view: CallViewKind;
   id: string;
   dialogId: string;
   callerAccountId: string;
@@ -83,9 +92,11 @@ export type CallSnapshot = {
   state: CallState;
   offeredProtocolVersions: number[];
   offeredMediaProfileVersions: number[];
+  selectableMediaProfileVersions: number[];
+  initialKind: CallInitialKind;
   protocolVersion: number | null;
   mediaProfileVersion: number | null;
-  callerCommitment: string;
+  callerCommitment: string | null;
   calleeCommitment: string | null;
   callerFingerprint: string | null;
   acceptedDeviceId: string | null;
@@ -100,6 +111,7 @@ export type CallSnapshot = {
   confirmedAt: string | null;
   endedAt: string | null;
   endReason: string | null;
+  localRingStatus: string | null;
   latestEventSeq: number;
 };
 
@@ -120,9 +132,12 @@ export type CallEventDTO = {
 
 export type CallHint = {
   accountId: string;
+  deviceId: string;
   callId: string;
   latestEventSeq: number;
 };
+
+export type CallWakeup = { callId: string; latestEventSeq: number };
 
 type CallRow = Record<string, any>;
 type MutationResult = { call: CallSnapshot; hints: CallHint[]; syncPushes?: Push[] };
@@ -130,6 +145,12 @@ type MutationResult = { call: CallSnapshot; hints: CallHint[]; syncPushes?: Push
 const iso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
 const nullableIso = (value: unknown): string | null => value == null ? null : iso(value);
 const base64 = (value: unknown): string | null => value == null ? null : Buffer.from(value as Uint8Array).toString("base64");
+// Bun's PostgreSQL driver returns INT4[] columns as Int32Array. Calling `.map(Number)`
+// preserves that typed-array shape, which JSON encodes as an object instead of an array.
+// Normalize at the database boundary so public DTOs and version comparisons always use
+// ordinary JavaScript arrays.
+const numericArray = (value: unknown, fallback: number[] = []): number[] =>
+  Array.from((value ?? fallback) as ArrayLike<unknown>, Number);
 
 function decodeBase64(value: unknown, field: string, exactBytes?: number): Buffer {
   if (typeof value !== "string" || value.length === 0 || value.length > 100_000
@@ -150,19 +171,34 @@ function requireUUID(value: unknown, field: string): string {
   return value.toLowerCase();
 }
 
-function requireProtocols(value: unknown): number[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 16
-    || value.some((entry) => !Number.isSafeInteger(entry) || Number(entry) <= 0 || Number(entry) > 0xffff)) {
-    throw new CallError("version offer is invalid", "invalid_request");
+export function normalizeCallVersionCapabilities(value: unknown, fallback: number[] = [1]): number[] {
+  try {
+    return normalizeVersionCapabilities(value, fallback);
+  } catch (error) {
+    if (error instanceof CallVersionCapabilityError) {
+      throw new CallError(error.message, "invalid_request");
+    }
+    throw error;
   }
-  const protocols = value.map(Number);
-  if (protocols.some((entry, index) => index > 0 && entry <= protocols[index - 1])) {
-    throw new CallError("version offers must be sorted and unique", "invalid_request");
-  }
-  if (!protocols.includes(CURRENT_PROTOCOL)) {
-    throw new CallError("no supported version", "unsupported_protocol", 409);
+}
+
+function requireProtocolOffer(value: unknown): number[] {
+  if (value == null) throw new CallError("protocol offer is required", "invalid_request");
+  const protocols = normalizeCallVersionCapabilities(value);
+  if (!protocols.some((entry) => SUPPORTED_PROTOCOLS.includes(entry as 1))) {
+    throw new CallError("no supported protocol", "unsupported_protocol", 409);
   }
   return protocols;
+}
+
+function requireMediaOffer(value: unknown): number[] {
+  if (value == null) throw new CallError("media profile offer is required", "invalid_request");
+  const profiles = normalizeCallVersionCapabilities(value);
+  if (profiles.some((entry) => !SUPPORTED_MEDIA_PROFILES.includes(entry as 1 | 2))
+    || !(["1", "1,2", "2"] as string[]).includes(profiles.join(","))) {
+    throw new CallError("unsupported media profile offer", "unsupported_media_profile", 409);
+  }
+  return profiles;
 }
 
 export type CallCommitmentContextV1 = {
@@ -242,39 +278,65 @@ function commitmentContext(row: CallRow): CallCommitmentContextV1 {
     callerAccountId: row.caller_account_id,
     callerDeviceId: row.caller_device_id,
     calleeAccountId: row.callee_account_id,
-    offeredProtocolVersions: (row.supported_protocols ?? []).map(Number),
-    offeredMediaProfileVersions: (row.offered_media_profiles ?? []).map(Number),
+    offeredProtocolVersions: numericArray(row.supported_protocols),
+    offeredMediaProfileVersions: numericArray(row.offered_media_profiles),
   };
 }
 
-function snapshot(row: CallRow): CallSnapshot {
+function snapshot(
+  row: CallRow,
+  view: CallViewKind = "full",
+  localRingStatus: string | null = null,
+  selectableMediaOverride: number[] | null = null,
+  localRespondedAt: unknown | null = null,
+): CallSnapshot {
+  const exposesInvitation = view === "full" || view === "invitation";
+  const exposesSetup = view === "full";
+  const lifecycle = view === "lifecycle";
+  const lifecycleEndReason = localRingStatus === "expired"
+    ? "unanswered"
+    : localRingStatus === "ended"
+      ? row.end_reason ?? "local_ended"
+      : localRingStatus;
+  const invitationExpiresAt = new Date(new Date(row.created_at).getTime() + RING_SECONDS * 1_000);
   return {
+    view,
     id: row.id,
     dialogId: row.dialog_id,
     callerAccountId: row.caller_account_id,
     callerDeviceId: row.caller_device_id,
     calleeAccountId: row.callee_account_id,
-    state: row.state,
-    offeredProtocolVersions: (row.supported_protocols ?? []).map(Number),
-    offeredMediaProfileVersions: (row.offered_media_profiles ?? []).map(Number),
-    protocolVersion: row.protocol_version == null ? null : Number(row.protocol_version),
-    mediaProfileVersion: row.media_profile_version == null ? null : Number(row.media_profile_version),
-    callerCommitment: base64(row.caller_commitment)!,
-    calleeCommitment: base64(row.callee_commitment),
-    callerFingerprint: base64(row.caller_fingerprint),
-    acceptedDeviceId: row.accepted_device_id ?? null,
-    calleePublicKey: base64(row.callee_public_key),
-    calleeNonce: base64(row.callee_nonce),
-    calleeFingerprint: base64(row.callee_fingerprint),
-    callerPublicKey: base64(row.caller_public_key),
-    callerNonce: base64(row.caller_nonce),
+    // A losing target's local call is over. Do not expose whether the winning devices are in
+    // acceptance, key exchange, or active media setup.
+    state: lifecycle ? "ended" : row.state,
+    offeredProtocolVersions: exposesInvitation ? numericArray(row.supported_protocols) : [],
+    offeredMediaProfileVersions: exposesInvitation ? numericArray(row.offered_media_profiles) : [],
+    selectableMediaProfileVersions: exposesInvitation
+      ? numericArray(selectableMediaOverride ?? row.selectable_media_profiles, [1]) : [],
+    initialKind: row.initial_kind === "video" ? "video" : "voice",
+    protocolVersion: exposesSetup && row.protocol_version != null ? Number(row.protocol_version) : null,
+    mediaProfileVersion: exposesSetup && row.media_profile_version != null ? Number(row.media_profile_version) : null,
+    callerCommitment: exposesInvitation ? base64(row.caller_commitment) : null,
+    calleeCommitment: exposesSetup ? base64(row.callee_commitment) : null,
+    callerFingerprint: exposesSetup ? base64(row.caller_fingerprint) : null,
+    acceptedDeviceId: exposesSetup ? row.accepted_device_id ?? null : null,
+    calleePublicKey: exposesSetup ? base64(row.callee_public_key) : null,
+    calleeNonce: exposesSetup ? base64(row.callee_nonce) : null,
+    calleeFingerprint: exposesSetup ? base64(row.callee_fingerprint) : null,
+    callerPublicKey: exposesSetup ? base64(row.caller_public_key) : null,
+    callerNonce: exposesSetup ? base64(row.caller_nonce) : null,
     createdAt: iso(row.created_at),
-    expiresAt: iso(row.expires_at),
-    acceptedAt: nullableIso(row.accepted_at),
-    confirmedAt: nullableIso(row.confirmed_at),
-    endedAt: nullableIso(row.ended_at),
-    endReason: row.end_reason ?? null,
-    latestEventSeq: Number(row.latest_event_seq),
+    // Lifecycle views retain the immutable invitation deadline instead of the active call lease,
+    // which changes during key exchange, heartbeats, and ICE recovery.
+    expiresAt: lifecycle ? invitationExpiresAt.toISOString() : iso(row.expires_at),
+    acceptedAt: exposesSetup ? nullableIso(row.accepted_at) : null,
+    confirmedAt: exposesSetup ? nullableIso(row.confirmed_at) : null,
+    endedAt: lifecycle ? nullableIso(localRespondedAt) : nullableIso(row.ended_at),
+    endReason: lifecycle ? lifecycleEndReason : row.end_reason ?? null,
+    localRingStatus,
+    // Lifecycle clients reconcile exclusively from this projection. A zero cursor prevents the
+    // encrypted signaling count from becoming a side channel after first-answer-wins.
+    latestEventSeq: lifecycle ? 0 : Number(row.latest_event_seq),
   };
 }
 
@@ -295,11 +357,127 @@ function eventDTO(row: Record<string, any>): CallEventDTO {
   };
 }
 
-function hints(row: CallRow): CallHint[] {
-  return [row.caller_account_id, row.callee_account_id].map((accountId) => ({
-    accountId,
+async function hints(sql: SQL, row: CallRow, includeLosingTargets = false): Promise<CallHint[]> {
+  const targets = await sql`
+    SELECT d.account_id, d.id AS device_id,
+      CASE
+        WHEN d.id = ${row.caller_device_id} OR d.id = ${row.accepted_device_id}
+          OR (${row.accepted_device_id == null && row.state === "requested"} AND rt.status = 'ringing')
+          THEN ${Number(row.latest_event_seq)}
+        ELSE 0
+      END AS projected_event_seq
+    FROM devices d
+    LEFT JOIN call_ring_targets rt ON rt.call_id = ${row.id} AND rt.device_id = d.id
+    WHERE d.revoked_at IS NULL AND (
+      (d.account_id = ${row.caller_account_id} AND d.id = ${row.caller_device_id})
+      OR (d.account_id = ${row.callee_account_id} AND d.id = ${row.accepted_device_id})
+      OR EXISTS (
+        SELECT 1 FROM call_ring_targets eligible_rt
+        WHERE eligible_rt.call_id = ${row.id} AND eligible_rt.device_id = d.id AND (
+          (${row.accepted_device_id == null && row.state === "requested"} AND eligible_rt.status = 'ringing')
+          OR (${row.accepted_device_id == null && row.state === "ended"}
+            AND eligible_rt.status IN ('ended', 'expired'))
+          OR (${includeLosingTargets} AND eligible_rt.status = 'answered_elsewhere')
+        )
+      )
+    )`;
+  return targets.map((target: { account_id: string; device_id: string; projected_event_seq: number }) => ({
+    accountId: target.account_id,
+    deviceId: target.device_id,
     callId: row.id,
-    latestEventSeq: Number(row.latest_event_seq),
+    latestEventSeq: Number(target.projected_event_seq),
+  }));
+}
+
+async function hintsForRows(sql: SQL, rows: CallRow[]): Promise<CallHint[]> {
+  const result: CallHint[] = [];
+  for (const row of rows) result.push(...await hints(sql, row));
+  return result;
+}
+
+async function callAccess(sql: SQL, row: CallRow, accountId: string, deviceId: string): Promise<{
+  view: CallViewKind;
+  localRingStatus: string | null;
+  selectableMediaProfiles: number[] | null;
+  localRespondedAt: unknown | null;
+}> {
+  if (row.caller_account_id === accountId && row.caller_device_id === deviceId) {
+    return { view: "full", localRingStatus: null, selectableMediaProfiles: null, localRespondedAt: null };
+  }
+  if (row.callee_account_id !== accountId) {
+    throw new CallError("call not found", "not_found", 404);
+  }
+  const target = (await sql`
+    SELECT status, selectable_media_profiles, responded_at
+    FROM call_ring_targets WHERE call_id = ${row.id} AND device_id = ${deviceId}`)[0];
+  if (!target) throw new CallError("call not found", "not_found", 404);
+  const selectableMediaProfiles = numericArray(target.selectable_media_profiles, [1]);
+  if (row.accepted_device_id === deviceId) {
+    return {
+      view: "full", localRingStatus: target.status, selectableMediaProfiles,
+      localRespondedAt: target.responded_at,
+    };
+  }
+  if (row.state === "requested" && target.status === "ringing") {
+    return {
+      view: "invitation", localRingStatus: target.status, selectableMediaProfiles,
+      localRespondedAt: target.responded_at,
+    };
+  }
+  return {
+    view: "lifecycle", localRingStatus: target.status, selectableMediaProfiles: [],
+    localRespondedAt: target.responded_at,
+  };
+}
+
+async function scopedSnapshot(
+  sql: SQL,
+  row: CallRow,
+  accountId: string,
+  deviceId: string,
+): Promise<CallSnapshot> {
+  const access = await callAccess(sql, row, accountId, deviceId);
+  return snapshot(
+    row,
+    access.view,
+    access.localRingStatus,
+    access.selectableMediaProfiles,
+    access.localRespondedAt,
+  );
+}
+
+export async function resolveCallHintTargets(
+  sql: SQL,
+  wakeup: CallWakeup,
+  localDeviceIds: string[],
+): Promise<CallHint[]> {
+  if (!UUID_PATTERN.test(wakeup.callId) || !Number.isSafeInteger(wakeup.latestEventSeq)
+    || wakeup.latestEventSeq < 0 || localDeviceIds.length === 0) return [];
+  const rows = await sql`
+    SELECT d.account_id, d.id AS device_id,
+      CASE
+        WHEN d.id = c.caller_device_id OR d.id = c.accepted_device_id
+          OR (c.accepted_device_id IS NULL AND c.state = 'requested' AND rt.status = 'ringing')
+          THEN ${wakeup.latestEventSeq}
+        ELSE 0
+      END AS projected_event_seq
+    FROM calls c
+    JOIN call_events wake ON wake.call_id = c.id AND wake.event_seq = ${wakeup.latestEventSeq}
+    JOIN devices d ON d.id = ANY(${sql.array(localDeviceIds, "UUID")}) AND d.revoked_at IS NULL
+    LEFT JOIN call_ring_targets rt ON rt.call_id = c.id AND rt.device_id = d.id
+    WHERE c.id = ${wakeup.callId} AND (
+      (d.id = c.caller_device_id)
+      OR (d.id = c.accepted_device_id)
+      OR (c.accepted_device_id IS NULL AND c.state = 'requested' AND rt.status = 'ringing')
+      OR (c.accepted_device_id IS NULL AND wake.event_type = 'ended'
+        AND rt.status IN ('ended', 'expired'))
+      OR (rt.status = 'answered_elsewhere' AND wake.event_type = 'accepted')
+    )`;
+  return rows.map((row: { account_id: string; device_id: string; projected_event_seq: number }) => ({
+    accountId: row.account_id,
+    deviceId: row.device_id,
+    callId: wakeup.callId,
+    latestEventSeq: Number(row.projected_event_seq),
   }));
 }
 
@@ -328,12 +506,6 @@ function requireOwningDevice(row: CallRow, accountId: string, deviceId: string):
   }
 }
 
-function requireParticipant(row: CallRow, accountId: string): void {
-  if (row.caller_account_id !== accountId && row.callee_account_id !== accountId) {
-    throw new CallError("call not found", "not_found", 404);
-  }
-}
-
 async function appendControlEvent(
   sql: SQL,
   row: CallRow,
@@ -359,7 +531,6 @@ async function notify(sql: SQL, row: CallRow): Promise<void> {
   const payload = JSON.stringify({
     callId: row.id,
     latestEventSeq: Number(row.latest_event_seq),
-    accountIds: [row.caller_account_id, row.callee_account_id],
   });
   await sql`SELECT pg_notify('toj_call_events', ${payload})`;
 }
@@ -386,8 +557,8 @@ async function finishCallTx(sql: SQL, row: CallRow, reason: string, actorAccount
     WHERE call_id = ${row.id}`;
   await sql`
     INSERT INTO call_history_outbox
-      (call_id, dialog_id, caller_account_id, outcome, duration_seconds)
-    VALUES (${finalized.id}, ${finalized.dialog_id}, ${finalized.caller_account_id},
+      (call_id, dialog_id, caller_account_id, initial_kind, outcome, duration_seconds)
+    VALUES (${finalized.id}, ${finalized.dialog_id}, ${finalized.caller_account_id}, ${finalized.initial_kind},
       ${historyOutcome(finalized)}, ${historyDurationSeconds(finalized)})
     ON CONFLICT (call_id) DO NOTHING`;
   return finalized;
@@ -413,6 +584,7 @@ type ClaimedCallHistory = {
   history_client_msg_id: string;
   dialog_id: string;
   caller_account_id: string;
+  initial_kind: CallInitialKind;
   outcome: string;
   duration_seconds: number;
   attempts: number;
@@ -432,7 +604,7 @@ async function claimCallHistory(sql: SQL, limit: number, onlyCallId?: string): P
       )
       UPDATE call_history_outbox o SET status = 'sending', claimed_at = now()
       FROM picked p WHERE o.call_id = p.call_id
-      RETURNING o.call_id, o.history_client_msg_id, o.dialog_id, o.caller_account_id, o.outcome,
+      RETURNING o.call_id, o.history_client_msg_id, o.dialog_id, o.caller_account_id, o.initial_kind, o.outcome,
         o.duration_seconds, o.attempts` as ClaimedCallHistory[];
   }
 
@@ -449,7 +621,7 @@ async function claimCallHistory(sql: SQL, limit: number, onlyCallId?: string): P
     )
     UPDATE call_history_outbox o SET status = 'sending', claimed_at = now()
     FROM picked p WHERE o.call_id = p.call_id
-    RETURNING o.call_id, o.history_client_msg_id, o.dialog_id, o.caller_account_id, o.outcome,
+    RETURNING o.call_id, o.history_client_msg_id, o.dialog_id, o.caller_account_id, o.initial_kind, o.outcome,
       o.duration_seconds, o.attempts` as ClaimedCallHistory[];
 }
 
@@ -471,7 +643,7 @@ export async function processCallHistoryOutbox(sql: SQL, limit = 50, onlyCallId?
         internalService: true,
         body: JSON.stringify({
           v: 1,
-          type: "voice_call",
+          type: row.initial_kind === "video" ? "video_call" : "voice_call",
           callId: row.call_id,
           callerAccountId: row.caller_account_id,
           outcome: row.outcome,
@@ -520,20 +692,29 @@ export async function createCall(sql: SQL, p: {
   supportedProtocolVersions: unknown;
   offeredMediaProfileVersions: unknown;
   networkKey?: string | null;
+  videoEnabled?: boolean;
+  videoRolloutReady?: boolean;
 }): Promise<MutationResult & { ringTargetCount: number }> {
   const callId = requireUUID(p.callId, "callId");
   const dialogId = requireUUID(p.dialogId, "dialogId");
   const callerCommitment = decodeBase64(p.callerCommitment, "callerCommitment", 32);
-  const protocols = requireProtocols(p.supportedProtocolVersions);
-  const mediaProfiles = requireProtocols(p.offeredMediaProfileVersions);
+  const protocols = requireProtocolOffer(p.supportedProtocolVersions);
+  const mediaProfiles = requireMediaOffer(p.offeredMediaProfileVersions);
+  const initialKind: CallInitialKind = mediaProfiles.length === 1 && mediaProfiles[0] === 2
+    ? "video" : "voice";
+  const callerVideoEnabled = p.videoEnabled ?? videoCallsEnabledForAccount(p.callerAccountId);
   await expireStaleCalls(sql, p.callerAccountId, 10);
 
   return await sql.begin(async (tx) => {
+    // A call UUID is the idempotency key. Serialize before the first lookup so a concurrent retry
+    // observes the winner's committed row instead of falling through into busy/unique failures.
+    await lockMutationKeys(tx, [`call-id:${callId}`]);
     await requireActiveDevice(tx, p.callerAccountId, p.callerDeviceId);
     const duplicate = (await tx`SELECT * FROM calls WHERE id = ${callId} FOR UPDATE`)[0];
     if (duplicate) {
-      const sameProtocols = JSON.stringify((duplicate.supported_protocols ?? []).map(Number)) === JSON.stringify(protocols);
-      const sameMediaProfiles = JSON.stringify((duplicate.offered_media_profiles ?? []).map(Number))
+      const sameProtocols = JSON.stringify(Array.from(duplicate.supported_protocols ?? [], Number))
+        === JSON.stringify(protocols);
+      const sameMediaProfiles = JSON.stringify(Array.from(duplicate.offered_media_profiles ?? [], Number))
         === JSON.stringify(mediaProfiles);
       if (duplicate.caller_account_id !== p.callerAccountId || duplicate.caller_device_id !== p.callerDeviceId
         || duplicate.dialog_id !== dialogId || !Buffer.from(duplicate.caller_commitment).equals(callerCommitment)
@@ -559,6 +740,21 @@ export async function createCall(sql: SQL, p: {
       FOR SHARE`)[0];
     if (!pair) throw new CallError("eligible direct dialog required", "ineligible", 403);
     const calleeAccountId = pair.account_low === p.callerAccountId ? pair.account_high : pair.account_low;
+    // Both accounts must be inside an account-scoped rollout. Direct unit callers can omit
+    // `videoRolloutReady` and provide an explicit videoEnabled value for deterministic fixtures.
+    const recipientVideoEnabled = p.videoRolloutReady == null
+      ? callerVideoEnabled
+      : videoCallsEnabledForAccount(calleeAccountId, p.videoRolloutReady);
+    const videoEnabled = callerVideoEnabled && recipientVideoEnabled;
+    const selectableMediaProfiles = mediaProfiles.filter((profile) => profile === 1 || videoEnabled);
+    // Rollout policy is sampled only for a genuinely new call. The duplicate path above retains
+    // the call's persisted creation-time selection even if either account leaves the rollout.
+    if (initialKind === "video" && !videoEnabled) {
+      throw new CallError("video calls are unavailable", "video_unavailable", 409);
+    }
+    if (selectableMediaProfiles.length === 0) {
+      throw new CallError("video calls are unavailable", "video_unavailable", 409);
+    }
     const participants = [p.callerAccountId, calleeAccountId].sort();
     await lockAccountMutations(tx, participants);
 
@@ -623,8 +819,10 @@ export async function createCall(sql: SQL, p: {
         maySeeExistingCall ? { existingCallId: busy.call_id } : {});
     }
 
-    const targets = await tx`
-      SELECT id, voip_push_token_hash FROM devices
+    const candidateTargets = await tx`
+      SELECT id, voip_push_token_hash, supported_call_protocol_versions,
+        supported_call_media_profile_versions, call_view_version
+      FROM devices
       WHERE account_id = ${calleeAccountId} AND platform = 'ios' AND revoked_at IS NULL
         AND voip_push_token_hash IS NOT NULL
         AND voip_push_token_ciphertext IS NOT NULL
@@ -632,14 +830,28 @@ export async function createCall(sql: SQL, p: {
         AND voip_push_token_key_id IS NOT NULL
         AND voip_push_environment IS NOT NULL
       ORDER BY id FOR SHARE`;
+    const targets = candidateTargets.flatMap((target: CallRow) => {
+      const targetProtocols = numericArray(target.supported_call_protocol_versions, [1]);
+      const targetMedia = numericArray(target.supported_call_media_profile_versions, [1]);
+      const viewVersion = Number(target.call_view_version ?? 1);
+      const selectableProtocols = protocols.filter((version) =>
+        SUPPORTED_PROTOCOLS.includes(version as 1) && targetProtocols.includes(version));
+      const selectableForTarget = selectableMediaProfiles.filter((profile) =>
+        targetMedia.includes(profile) && (profile !== 2 || viewVersion >= 2));
+      if (!selectableProtocols.length || !selectableForTarget.length) return [];
+      if (initialKind === "video" && (!selectableForTarget.includes(2) || viewVersion < 2)) return [];
+      return [{ ...target, selectableProtocols, selectableMediaProfiles: selectableForTarget, viewVersion }];
+    });
     if (!targets.length) throw new CallError("recipient has no eligible device", "callee_unavailable", 409);
 
     let row = (await tx`
       INSERT INTO calls
         (id, dialog_id, caller_account_id, caller_device_id, callee_account_id,
-         supported_protocols, offered_media_profiles, caller_commitment, expires_at)
+         supported_protocols, offered_media_profiles, initial_kind, selectable_media_profiles,
+         caller_commitment, expires_at)
       VALUES (${callId}, ${dialogId}, ${p.callerAccountId}, ${p.callerDeviceId}, ${calleeAccountId},
-        ${tx.array(protocols, "INT4")}, ${tx.array(mediaProfiles, "INT4")}, ${callerCommitment},
+        ${tx.array(protocols, "INT4")}, ${tx.array(mediaProfiles, "INT4")}, ${initialKind},
+        ${tx.array(selectableMediaProfiles, "INT4")}, ${callerCommitment},
         now() + (${RING_SECONDS} * interval '1 second'))
       RETURNING *`)[0];
     for (const accountId of participants) {
@@ -647,31 +859,24 @@ export async function createCall(sql: SQL, p: {
         INSERT INTO call_participant_leases (account_id, call_id, expires_at)
         VALUES (${accountId}, ${callId}, ${row.expires_at})`;
     }
-    await tx`
-      INSERT INTO call_ring_targets (call_id, device_id)
-      SELECT ${callId}, id FROM devices
-      WHERE account_id = ${calleeAccountId} AND platform = 'ios' AND revoked_at IS NULL
-        AND voip_push_token_hash IS NOT NULL
-        AND voip_push_token_ciphertext IS NOT NULL
-        AND voip_push_token_nonce IS NOT NULL
-        AND voip_push_token_key_id IS NOT NULL
-        AND voip_push_environment IS NOT NULL`;
-    await tx`
-      INSERT INTO voip_push_deliveries (call_id, caller_account_id, device_id, expires_at)
-      SELECT ${callId}, ${p.callerAccountId}, id, ${row.expires_at}
-      FROM devices
-      WHERE account_id = ${calleeAccountId} AND platform = 'ios' AND revoked_at IS NULL
-        AND voip_push_token_hash IS NOT NULL
-        AND voip_push_token_ciphertext IS NOT NULL
-        AND voip_push_token_nonce IS NOT NULL
-        AND voip_push_token_key_id IS NOT NULL
-        AND voip_push_environment IS NOT NULL`;
+    for (const target of targets) {
+      await tx`
+        INSERT INTO call_ring_targets
+          (call_id, device_id, selectable_protocols, selectable_media_profiles, call_view_version)
+        VALUES (${callId}, ${target.id}, ${tx.array(target.selectableProtocols, "INT4")},
+          ${tx.array(target.selectableMediaProfiles, "INT4")}, ${target.viewVersion})`;
+      await tx`
+        INSERT INTO voip_push_deliveries
+          (call_id, caller_account_id, initial_kind, device_id, expires_at)
+        VALUES (${callId}, ${p.callerAccountId}, ${initialKind}, ${target.id}, ${row.expires_at})`;
+    }
     row = await appendControlEvent(tx, row, "requested", p.callerAccountId, p.callerDeviceId, {
       callerCommitment: callerCommitment.toString("base64"),
       supportedProtocolVersions: protocols,
       offeredMediaProfileVersions: mediaProfiles,
+      initialKind,
     });
-    return { call: snapshot(row), ringTargetCount: targets.length, hints: hints(row) };
+    return { call: snapshot(row), ringTargetCount: targets.length, hints: await hints(tx, row) };
   });
 }
 
@@ -683,13 +888,19 @@ export async function acceptCall(sql: SQL, p: {
   const calleeCommitment = decodeBase64(p.calleeCommitment, "calleeCommitment", 32);
   const protocolVersion = Number(p.protocolVersion);
   const mediaProfileVersion = Number(p.selectedMediaProfileVersion);
-  if (protocolVersion !== CURRENT_PROTOCOL) throw new CallError("unsupported protocol", "unsupported_protocol", 409);
-  if (mediaProfileVersion !== CURRENT_PROTOCOL) throw new CallError("unsupported media profile", "unsupported_media_profile", 409);
+  if (!Number.isSafeInteger(protocolVersion)
+    || !SUPPORTED_PROTOCOLS.includes(protocolVersion as 1)) {
+    throw new CallError("unsupported protocol", "unsupported_protocol", 409);
+  }
+  if (!Number.isSafeInteger(mediaProfileVersion)
+    || !SUPPORTED_MEDIA_PROFILES.includes(mediaProfileVersion as 1 | 2)) {
+    throw new CallError("unsupported media profile", "unsupported_media_profile", 409);
+  }
   await expireStaleCalls(sql, p.accountId, 10);
   return await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     let row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     requireUnexpired(row);
     if (row.callee_account_id !== p.accountId) throw new CallError("only the recipient can accept", "invalid_state", 409);
     if (row.accepted_device_id) {
@@ -704,13 +915,35 @@ export async function acceptCall(sql: SQL, p: {
       return { call: snapshot(row), hints: [] };
     }
     if (row.state !== "requested") throw new CallError("call cannot be accepted", "invalid_state", 409);
-    if (!(row.supported_protocols ?? []).map(Number).includes(protocolVersion)
-      || !(row.offered_media_profiles ?? []).map(Number).includes(mediaProfileVersion)) {
+    if (!numericArray(row.supported_protocols).includes(protocolVersion)
+      || !numericArray(row.offered_media_profiles).includes(mediaProfileVersion)) {
       throw new CallError("selected versions were not offered", "downgrade_detected", 409);
     }
-    const target = await tx`
-      SELECT 1 FROM call_ring_targets WHERE call_id = ${callId} AND device_id = ${p.deviceId} FOR UPDATE`;
-    if (!target.length) throw new CallError("device was not rung", "not_ring_target", 403);
+    if (!numericArray(row.selectable_media_profiles, [1]).includes(mediaProfileVersion)) {
+      throw new CallError("media profile is unavailable for this call", "video_unavailable", 409);
+    }
+    const target = (await tx`
+      SELECT rt.*, d.supported_call_protocol_versions, d.supported_call_media_profile_versions,
+        rt.call_view_version AS ring_call_view_version,
+        d.call_view_version AS device_call_view_version
+      FROM call_ring_targets rt JOIN devices d ON d.id = rt.device_id
+      WHERE rt.call_id = ${callId} AND rt.device_id = ${p.deviceId}
+      FOR UPDATE OF rt, d`)[0];
+    if (!target) throw new CallError("device was not rung", "not_ring_target", 403);
+    if (target.status !== "ringing") {
+      throw new CallError("device is no longer ringing", "invalid_state", 409);
+    }
+    const registeredProtocols = numericArray(target.supported_call_protocol_versions, [1]);
+    const registeredMedia = numericArray(target.supported_call_media_profile_versions, [1]);
+    const targetProtocols = numericArray(target.selectable_protocols, [1]);
+    const targetMedia = numericArray(target.selectable_media_profiles, [1]);
+    if (!registeredProtocols.includes(protocolVersion) || !targetProtocols.includes(protocolVersion)
+      || !registeredMedia.includes(mediaProfileVersion) || !targetMedia.includes(mediaProfileVersion)
+      || (mediaProfileVersion === 2
+        && (Number(target.ring_call_view_version ?? 1) < 2
+          || Number(target.device_call_view_version ?? 1) < 2))) {
+      throw new CallError("device did not advertise the selected media profile", "unsupported_media_profile", 409);
+    }
     row = (await tx`
       UPDATE calls SET state = 'accepted', protocol_version = ${protocolVersion},
         media_profile_version = ${mediaProfileVersion},
@@ -720,8 +953,17 @@ export async function acceptCall(sql: SQL, p: {
     await tx`
       UPDATE call_participant_leases SET expires_at = ${row.expires_at} WHERE call_id = ${callId}`;
     await tx`
-      UPDATE call_ring_targets SET status = CASE WHEN device_id = ${p.deviceId} THEN 'accepted' ELSE 'answered_elsewhere' END,
-        responded_at = now() WHERE call_id = ${callId}`;
+      UPDATE call_ring_targets SET
+        status = CASE
+          WHEN device_id = ${p.deviceId} THEN 'accepted'
+          WHEN status = 'ringing' THEN 'answered_elsewhere'
+          ELSE status
+        END,
+        responded_at = CASE
+          WHEN device_id = ${p.deviceId} OR status = 'ringing' THEN now()
+          ELSE responded_at
+        END
+      WHERE call_id = ${callId}`;
     await tx`
       UPDATE voip_push_deliveries SET status = 'dead', claimed_at = NULL,
         last_error = CASE WHEN device_id = ${p.deviceId} THEN 'answered' ELSE 'answered elsewhere' END
@@ -730,7 +972,7 @@ export async function acceptCall(sql: SQL, p: {
       calleeCommitment: calleeCommitment.toString("base64"), protocolVersion,
       selectedMediaProfileVersion: mediaProfileVersion,
     });
-    return { call: snapshot(row), hints: hints(row) };
+    return { call: snapshot(row), hints: await hints(tx, row, true) };
   });
 }
 
@@ -746,7 +988,7 @@ export async function revealCallKey(sql: SQL, p: {
   return await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     let row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     requireUnexpired(row);
     const callerRole = row.caller_account_id === p.accountId;
     if (callerRole && row.caller_device_id !== p.deviceId) {
@@ -806,7 +1048,7 @@ export async function revealCallKey(sql: SQL, p: {
       fingerprint: fingerprint.toString("base64"),
       ...(callerRole ? {} : { confirmation: Buffer.from(row.callee_confirmation).toString("base64") }),
     });
-    return { call: snapshot(row), hints: hints(row) };
+    return { call: snapshot(row), hints: await hints(tx, row) };
   });
 }
 
@@ -819,7 +1061,7 @@ export async function confirmCallKey(sql: SQL, p: {
   return await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     let row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     requireUnexpired(row);
     if (row.caller_account_id !== p.accountId || row.caller_device_id !== p.deviceId) {
       throw new CallError("only the initiating caller device can confirm", "invalid_state", 409);
@@ -841,7 +1083,7 @@ export async function confirmCallKey(sql: SQL, p: {
     row = await appendControlEvent(tx, row, "confirmed", p.accountId, p.deviceId, {
       confirmation: confirmation.toString("base64"),
     });
-    return { call: snapshot(row), hints: hints(row) };
+    return { call: snapshot(row), hints: await hints(tx, row) };
   });
 }
 
@@ -883,7 +1125,7 @@ export async function sendEncryptedCallEvent(sql: SQL, p: {
   const result = await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     let row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     requireUnexpired(row);
     if (row.caller_account_id === p.accountId && row.caller_device_id !== p.deviceId) {
       throw new CallError("only the initiating caller device may signal", "invalid_device", 403);
@@ -962,7 +1204,7 @@ export async function sendEncryptedCallEvent(sql: SQL, p: {
     } else {
       await notify(tx, row);
     }
-    return { event: eventDTO(event), hints: hints(row), terminal: signalKind === "hangup", row };
+    return { event: eventDTO(event), hints: await hints(tx, row), terminal: signalKind === "hangup", row };
   });
   const history = result.terminal
     ? await processCallHistoryOutbox(sql, 1, result.row.id)
@@ -970,7 +1212,7 @@ export async function sendEncryptedCallEvent(sql: SQL, p: {
   return { event: result.event, hints: result.hints, syncPushes: history.pushes };
 }
 
-export async function getCallEvents(sql: SQL, accountId: string, rawCallId: unknown,
+export async function getCallEvents(sql: SQL, accountId: string, deviceId: string, rawCallId: unknown,
   rawAfter: unknown = 0, rawLimit: unknown = 100): Promise<{
     callId: string; events: CallEventDTO[]; latestEventSeq: number; hasMore: boolean;
   }> {
@@ -982,9 +1224,16 @@ export async function getCallEvents(sql: SQL, accountId: string, rawCallId: unkn
   await expireStaleCalls(sql, accountId, 10);
   const row = (await sql`SELECT * FROM calls WHERE id = ${callId}`)[0];
   if (!row) throw new CallError("call not found", "not_found", 404);
-  requireParticipant(row, accountId);
+  const access = await callAccess(sql, row, accountId, deviceId);
+  if (access.view === "lifecycle") {
+    return { callId, events: [], latestEventSeq: 0, hasMore: false };
+  }
+  const allowedTypes = access.view === "full"
+    ? ["requested", "accepted", "revealed", "confirmed", "encrypted", "ended"]
+    : access.view === "invitation" ? ["requested", "ended"] : ["ended"];
   const events = await sql`
     SELECT * FROM call_events WHERE call_id = ${callId} AND event_seq > ${after}
+      AND event_type = ANY(${sql.array(allowedTypes, "TEXT")})
       AND (event_type <> 'encrypted' OR envelope_expires_at > now())
     ORDER BY event_seq LIMIT ${limit + 1}`;
   return {
@@ -995,22 +1244,39 @@ export async function getCallEvents(sql: SQL, accountId: string, rawCallId: unkn
   };
 }
 
-export async function getActiveCalls(sql: SQL, accountId: string): Promise<{ calls: CallSnapshot[] }> {
+export async function getActiveCalls(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+): Promise<{ calls: CallSnapshot[] }> {
   await expireStaleCalls(sql, accountId, 50);
   const rows = await sql`
     SELECT * FROM calls
-    WHERE state <> 'ended' AND (caller_account_id = ${accountId} OR callee_account_id = ${accountId})
+    WHERE state <> 'ended' AND (
+      (caller_account_id = ${accountId} AND caller_device_id = ${deviceId})
+      OR (callee_account_id = ${accountId} AND EXISTS (
+        SELECT 1 FROM call_ring_targets rt WHERE rt.call_id = calls.id AND rt.device_id = ${deviceId}
+      ))
+    )
     ORDER BY created_at DESC`;
-  return { calls: rows.map(snapshot) };
+  const calls: CallSnapshot[] = [];
+  for (const row of rows) {
+    calls.push(await scopedSnapshot(sql, row, accountId, deviceId));
+  }
+  return { calls };
 }
 
-export async function getCall(sql: SQL, accountId: string, rawCallId: unknown): Promise<{ call: CallSnapshot }> {
+export async function getCall(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  rawCallId: unknown,
+): Promise<{ call: CallSnapshot }> {
   const callId = requireUUID(rawCallId, "callId");
   await expireStaleCalls(sql, accountId, 10);
   const row = (await sql`SELECT * FROM calls WHERE id = ${callId}`)[0];
   if (!row) throw new CallError("call not found", "not_found", 404);
-  requireParticipant(row, accountId);
-  return { call: snapshot(row) };
+  return { call: await scopedSnapshot(sql, row, accountId, deviceId) };
 }
 
 async function terminalAction(sql: SQL, p: {
@@ -1021,7 +1287,7 @@ async function terminalAction(sql: SQL, p: {
   const result = await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     const row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     if (p.action === "cancel" && (row.caller_account_id !== p.accountId || row.caller_device_id !== p.deviceId)) {
       throw new CallError("only the initiating device can cancel", "invalid_state", 409);
     }
@@ -1034,7 +1300,7 @@ async function terminalAction(sql: SQL, p: {
     const requestedReason = typeof p.reason === "string" && allowedReasons.has(p.reason) ? p.reason : "local_ended";
     const reason = p.action === "cancel" ? "cancelled" : requestedReason;
     const ended = await finishCallTx(tx, row, reason, p.accountId, p.deviceId);
-    return { row: ended, call: snapshot(ended), hints: hints(ended) };
+    return { row: ended, call: snapshot(ended), hints: await hints(tx, ended) };
   });
   const history = await processCallHistoryOutbox(sql, 1, result.row.id);
   return { call: result.call, hints: result.hints, syncPushes: history.pushes };
@@ -1048,7 +1314,7 @@ export async function declineCall(sql: SQL, p: {
   const result = await sql.begin(async (tx) => {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     let row = await lockedCall(tx, callId);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     if (row.callee_account_id !== p.accountId) {
       throw new CallError("only the recipient can decline", "invalid_state", 409);
     }
@@ -1057,10 +1323,20 @@ export async function declineCall(sql: SQL, p: {
       WHERE call_id = ${callId} AND device_id = ${p.deviceId} FOR UPDATE`)[0];
     if (!target) throw new CallError("device was not rung", "not_ring_target", 403);
     if (target.status === "declined") {
-      return { row, call: snapshot(row), hints: [] as CallHint[], terminal: row.state === "ended" };
+      return {
+        row,
+        call: await scopedSnapshot(tx, row, p.accountId, p.deviceId),
+        hints: [] as CallHint[],
+        terminal: row.state === "ended",
+      };
     }
     if (row.state === "ended") {
-      return { row, call: snapshot(row), hints: [] as CallHint[], terminal: true };
+      return {
+        row,
+        call: await scopedSnapshot(tx, row, p.accountId, p.deviceId),
+        hints: [] as CallHint[],
+        terminal: true,
+      };
     }
     requireUnexpired(row);
     if (row.state !== "requested" || target.status !== "ringing") {
@@ -1078,10 +1354,20 @@ export async function declineCall(sql: SQL, p: {
       SELECT 1 FROM call_ring_targets
       WHERE call_id = ${callId} AND status = 'ringing' LIMIT 1`;
     if (remaining.length) {
-      return { row, call: snapshot(row), hints: [] as CallHint[], terminal: false };
+      return {
+        row,
+        call: await scopedSnapshot(tx, row, p.accountId, p.deviceId),
+        hints: [] as CallHint[],
+        terminal: false,
+      };
     }
     row = await finishCallTx(tx, row, "declined", p.accountId, p.deviceId);
-    return { row, call: snapshot(row), hints: hints(row), terminal: true };
+    return {
+      row,
+      call: await scopedSnapshot(tx, row, p.accountId, p.deviceId),
+      hints: await hints(tx, row),
+      terminal: true,
+    };
   });
   const history = result.terminal
     ? await processCallHistoryOutbox(sql, 1, result.row.id)
@@ -1118,7 +1404,7 @@ async function terminateMatchingCalls(sql: SQL, where: "device" | "account", acc
   deviceId?: string): Promise<{ hints: CallHint[]; syncPushes: Push[] }> {
   const ended = await sql.begin((tx) => terminateMatchingCallsTx(tx, where, accountId, deviceId));
   const syncPushes = await flushCallHistory(sql, ended);
-  return { hints: ended.flatMap(hints), syncPushes };
+  return { hints: await hintsForRows(sql, ended), syncPushes };
 }
 
 export function terminateCallsForDevice(sql: SQL, accountId: string, deviceId: string) {
@@ -1142,7 +1428,7 @@ export async function revokeDeviceAndTerminateCalls(
     },
   });
   const syncPushes = await flushCallHistory(sql, ended);
-  return { ...revoked, hints: ended.flatMap(hints), syncPushes };
+  return { ...revoked, hints: await hintsForRows(sql, ended), syncPushes };
 }
 
 /** Account status, device revocation, and call termination commit or roll back as one unit. */
@@ -1156,7 +1442,7 @@ export async function deleteAccountAndTerminateCalls(sql: SQL, accountId: string
     },
   });
   const syncPushes = await flushCallHistory(sql, ended);
-  return { ...deleted, hints: ended.flatMap(hints), syncPushes };
+  return { ...deleted, hints: await hintsForRows(sql, ended), syncPushes };
 }
 
 export async function getIceConfig(sql: SQL, accountId: string, deviceId: string, rawCallId: unknown): Promise<{
@@ -1167,7 +1453,6 @@ export async function getIceConfig(sql: SQL, accountId: string, deviceId: string
   const turnUrls = (process.env.TOJ_TURN_URLS ?? "").split(",").map((v) => v.trim()).filter(Boolean);
   const stunUrls = (process.env.TOJ_STUN_URLS ?? "").split(",").map((v) => v.trim()).filter(Boolean);
   const secret = process.env.TOJ_TURN_SHARED_SECRET;
-  if (!turnUrls.length || !secret) throw new CallError("TURN is unavailable", "turn_unavailable", 503);
   const credentialTTLSeconds = 60 * 60;
   const username = await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`turn:${callId}:${accountId}`}, 0))`;
@@ -1176,10 +1461,13 @@ export async function getIceConfig(sql: SQL, accountId: string, deviceId: string
       SELECT *, expires_at <= now() AS deadline_elapsed
       FROM calls WHERE id = ${callId} FOR SHARE`)[0];
     if (!row) throw new CallError("call not found", "not_found", 404);
-    requireParticipant(row, accountId);
+    await callAccess(tx, row, accountId, deviceId);
+    // Authorization precedes every global lifecycle/configuration check so a losing ring target
+    // cannot poll this endpoint to learn whether the winning call is still active or TURN is up.
+    requireOwningDevice(row, accountId, deviceId);
     if (row.state === "ended") throw new CallError("call has ended", "expired", 410);
     requireUnexpired(row);
-    requireOwningDevice(row, accountId, deviceId);
+    if (!turnUrls.length || !secret) throw new CallError("TURN is unavailable", "turn_unavailable", 503);
     const existing = (await tx`
       SELECT username FROM turn_allocations
       WHERE call_id = ${callId} AND account_id = ${accountId}
@@ -1243,7 +1531,7 @@ export async function recordCallTelemetry(sql: SQL, p: {
     await requireActiveDevice(tx, p.accountId, p.deviceId);
     const row = (await tx`SELECT * FROM calls WHERE id = ${callId} FOR SHARE`)[0];
     if (!row) throw new CallError("call not found", "not_found", 404);
-    requireParticipant(row, p.accountId);
+    await callAccess(tx, row, p.accountId, p.deviceId);
     const ownsCall = row.caller_account_id === p.accountId && row.caller_device_id === p.deviceId
       || row.callee_account_id === p.accountId && row.accepted_device_id === p.deviceId;
     const wasRingTarget = ownsCall ? true : (await tx`
@@ -1300,7 +1588,7 @@ export async function blockAccount(sql: SQL, blockerAccountId: string, rawBlocke
     return terminated;
   });
   const syncPushes = await flushCallHistory(sql, ended);
-  return { blocked: true, hints: ended.flatMap(hints), syncPushes };
+  return { blocked: true, hints: await hintsForRows(sql, ended), syncPushes };
 }
 
 export async function unblockAccount(sql: SQL, blockerAccountId: string, rawBlockedAccountId: unknown): Promise<{
@@ -1410,18 +1698,46 @@ export function voiceCallsConfigured(pushConfigured = true): boolean {
     && sharedSecret.length > 0;
 }
 
+export function videoCallsConfigured(voiceReady = voiceCallsConfigured()): boolean {
+  return voiceReady
+    && process.env.TOJ_VIDEO_CALLS_ENABLED === "1"
+    && process.env.TOJ_TURN_VIDEO_READY === "1";
+}
+
+/**
+ * Stable rollout selection. Internal accounts always win; every other account remains in the
+ * same percentage bucket across processes and deploys. Zero is the safe default and rollback.
+ */
+export function videoCallsEnabledForAccount(
+  accountId: string,
+  videoReady = videoCallsConfigured(),
+): boolean {
+  if (!videoReady) return false;
+  const normalizedAccountId = accountId.trim().toLowerCase();
+  const allowlist = new Set((process.env.TOJ_VIDEO_CALLS_ALLOWLIST ?? "")
+    .split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
+  if (allowlist.has(normalizedAccountId)) return true;
+  const configuredPercent = Number(process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT ?? "0");
+  if (!Number.isFinite(configuredPercent) || configuredPercent <= 0) return false;
+  if (configuredPercent >= 100) return true;
+  const digest = createHash("sha256").update(`toj-video-rollout-v1|${normalizedAccountId}`).digest();
+  const bucket = digest.readUInt32BE(0) / 0x1_0000_0000 * 100;
+  return bucket < configuredPercent;
+}
+
 /**
  * PostgreSQL NOTIFY is only a wake-up. Durable call_events plus REST catch-up remain authoritative.
  * The listener reconnects forever with bounded backoff; same-process handlers also send hints
  * immediately, so duplicate hints are intentionally harmless.
  */
 export function startCallNotificationListener(databaseUrl: string | null,
-  onHint: (hint: CallHint) => void): () => void {
+  onWakeup: (wakeup: CallWakeup) => void | Promise<void>): () => void {
   if (!databaseUrl) return () => {};
   let stopped = false;
   let client: Client | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let attempts = 0;
+  const wakeupRetries = new Set<ReturnType<typeof setTimeout>>();
 
   const schedule = () => {
     if (stopped || retry) return;
@@ -1430,6 +1746,23 @@ export function startCallNotificationListener(databaseUrl: string | null,
     retry = setTimeout(() => { retry = null; void connect(); }, delay);
     retry.unref?.();
   };
+  const deliverWakeup = (wakeup: CallWakeup, attempt = 0) => {
+    void Promise.resolve()
+      .then(() => onWakeup(wakeup))
+      .catch(() => {
+        if (stopped) return;
+        if (attempt >= 2) {
+          console.error("call notification wake-up failed after bounded retries");
+          return;
+        }
+        const wakeupRetry = setTimeout(() => {
+          wakeupRetries.delete(wakeupRetry);
+          deliverWakeup(wakeup, attempt + 1);
+        }, 250 * 2 ** attempt);
+        wakeupRetry.unref?.();
+        wakeupRetries.add(wakeupRetry);
+      });
+  };
   const connect = async () => {
     if (stopped) return;
     const next = new Client({ connectionString: databaseUrl, application_name: "toj-call-notify" });
@@ -1437,14 +1770,10 @@ export function startCallNotificationListener(databaseUrl: string | null,
     next.on("notification", (notification) => {
       if (notification.channel !== "toj_call_events" || !notification.payload) return;
       try {
-        const value = JSON.parse(notification.payload) as {
-          callId: string; latestEventSeq: number; accountIds: string[];
-        };
+        const value = JSON.parse(notification.payload) as CallWakeup;
         if (!UUID_PATTERN.test(value.callId) || !Number.isSafeInteger(value.latestEventSeq)
-          || !Array.isArray(value.accountIds)) return;
-        for (const accountId of value.accountIds) {
-          if (UUID_PATTERN.test(accountId)) onHint({ accountId, callId: value.callId, latestEventSeq: value.latestEventSeq });
-        }
+          || value.latestEventSeq < 0) return;
+        deliverWakeup(value);
       } catch { /* an invalid notification is never authoritative */ }
     });
     let handledDisconnect = false;
@@ -1471,6 +1800,8 @@ export function startCallNotificationListener(databaseUrl: string | null,
     stopped = true;
     if (retry) clearTimeout(retry);
     retry = null;
+    for (const wakeupRetry of wakeupRetries) clearTimeout(wakeupRetry);
+    wakeupRetries.clear();
     if (client) void client.end().catch(() => {});
     client = null;
   };
