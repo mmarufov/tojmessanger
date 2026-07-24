@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { Client } from "pg";
 import { makeSql } from "./db";
 import { checkVerification, revokeDevice, startAccountDeletion, startVerification } from "./auth";
 import { hashToken, open, pushTokenAAD, voipPushTokenAAD } from "./crypto";
@@ -18,12 +19,16 @@ import {
   deleteAccountAndTerminateCalls,
   endCall,
   getIceConfig,
+  getActiveCalls,
+  getCall,
   getCallEvents,
   processCallHistoryOutbox,
   recordCallTelemetry,
+  resolveCallHintTargets,
   revokeDeviceAndTerminateCalls,
   revealCallKey,
   sendEncryptedCallEvent,
+  videoCallsEnabledForAccount,
   voiceCallsConfigured,
   type CallCommitmentContextV1,
   type CallKeyMaterialV1,
@@ -95,6 +100,16 @@ function context(callId: string, dialogId: string, alice: any, bob: any): CallCo
     offeredProtocolVersions: [1],
     offeredMediaProfileVersions: [1],
   };
+}
+
+function contextWithMedia(
+  callId: string,
+  dialogId: string,
+  alice: any,
+  bob: any,
+  offeredMediaProfileVersions: number[],
+): CallCommitmentContextV1 {
+  return { ...context(callId, dialogId, alice, bob), offeredMediaProfileVersions };
 }
 
 class StubSender implements PushSender {
@@ -210,6 +225,429 @@ describe("E2EE voice-call control plane", () => {
     }
   });
 
+  test("video rollout is readiness-gated, deterministic, allowlistable, and zero is rollback", () => {
+    const saved = {
+      percent: process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT,
+      allowlist: process.env.TOJ_VIDEO_CALLS_ALLOWLIST,
+    };
+    const accountId = "00000000-0000-0000-0000-000000000123";
+    try {
+      process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = "100";
+      expect(videoCallsEnabledForAccount(accountId, false)).toBe(false);
+      expect(videoCallsEnabledForAccount(accountId, true)).toBe(true);
+      process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = "0";
+      expect(videoCallsEnabledForAccount(accountId, true)).toBe(false);
+      process.env.TOJ_VIDEO_CALLS_ALLOWLIST = ` ${accountId.toUpperCase()} `;
+      expect(videoCallsEnabledForAccount(accountId, true)).toBe(true);
+      delete process.env.TOJ_VIDEO_CALLS_ALLOWLIST;
+      process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = "37";
+      expect(videoCallsEnabledForAccount(accountId, true))
+        .toBe(videoCallsEnabledForAccount(accountId, true));
+    } finally {
+      if (saved.percent === undefined) delete process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT;
+      else process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = saved.percent;
+      if (saved.allowlist === undefined) delete process.env.TOJ_VIDEO_CALLS_ALLOWLIST;
+      else process.env.TOJ_VIDEO_CALLS_ALLOWLIST = saved.allowlist;
+    }
+  });
+
+  test("media-profile negotiation preserves video intent and the kill switch snapshot", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "a1".repeat(32), "sandbox", [1], [1, 2], 2);
+
+    await expect(createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: crypto.randomUUID(), dialogId, callerCommitment: bytes(90).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: undefined,
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: crypto.randomUUID(), dialogId, callerCommitment: bytes(91).toString("base64"),
+      supportedProtocolVersions: undefined, offeredMediaProfileVersions: [1],
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: crypto.randomUUID(), dialogId, callerCommitment: bytes(92).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [1, 2, 3],
+    })).rejects.toMatchObject({ code: "unsupported_media_profile" });
+
+    const audioCallId = crypto.randomUUID();
+    const audioContext = contextWithMedia(audioCallId, dialogId, alice, bob, [1, 2]);
+    const audioMaterial = { publicKey: bytes(1), nonce: bytes(33), fingerprint: bytes(65) };
+    const audio = await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: audioCallId, dialogId,
+      callerCommitment: callerCommitmentV1(audioContext, audioMaterial).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [1, 2], videoEnabled: false,
+    });
+    expect(audio.call.initialKind).toBe("voice");
+    expect(Array.from(audio.call.offeredMediaProfileVersions)).toEqual([1, 2]);
+    expect(Array.from(audio.call.selectableMediaProfileVersions)).toEqual([1]);
+    const encodedAudio = JSON.parse(JSON.stringify(audio.call));
+    expect(encodedAudio.offeredMediaProfileVersions).toEqual([1, 2]);
+    expect(encodedAudio.selectableMediaProfileVersions).toEqual([1]);
+    await expect(acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId: audioCallId,
+      calleeCommitment: bytes(96).toString("base64"), protocolVersion: 1,
+      selectedMediaProfileVersion: 2,
+    })).rejects.toMatchObject({ code: "video_unavailable" });
+    await acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId: audioCallId,
+      calleeCommitment: bytes(96).toString("base64"), protocolVersion: 1,
+      selectedMediaProfileVersion: 1,
+    });
+    await endCall(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId: audioCallId, reason: "local_ended",
+    });
+
+    const rejectedVideoId = crypto.randomUUID();
+    const rejectedContext = contextWithMedia(rejectedVideoId, dialogId, alice, bob, [2]);
+    await expect(createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: rejectedVideoId, dialogId,
+      callerCommitment: callerCommitmentV1(rejectedContext, audioMaterial).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [2], videoEnabled: false,
+    })).rejects.toMatchObject({ code: "video_unavailable" });
+    expect(await db`SELECT id FROM calls WHERE id = ${rejectedVideoId}`).toHaveLength(0);
+
+    const inFlightId = crypto.randomUUID();
+    const videoContext = contextWithMedia(inFlightId, dialogId, alice, bob, [2]);
+    const createdVideo = await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: inFlightId, dialogId,
+      callerCommitment: callerCommitmentV1(videoContext, audioMaterial).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [2], videoEnabled: true,
+    });
+    expect(createdVideo.call.initialKind).toBe("video");
+    expect(Array.from(createdVideo.call.selectableMediaProfileVersions)).toEqual([2]);
+    const retriedAfterRollback = await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: inFlightId, dialogId,
+      callerCommitment: callerCommitmentV1(videoContext, audioMaterial).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [2], videoEnabled: false,
+    });
+    expect(retriedAfterRollback.call.id).toBe(inFlightId);
+    expect(Array.from(retriedAfterRollback.call.selectableMediaProfileVersions)).toEqual([2]);
+    const acceptedAfterRollback = await acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId: inFlightId,
+      calleeCommitment: bytes(97).toString("base64"), protocolVersion: 1,
+      selectedMediaProfileVersion: 2,
+    });
+    expect(acceptedAfterRollback.call.mediaProfileVersion).toBe(2);
+  });
+
+  test("concurrent identical call creation retries return the same persisted call", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "a6".repeat(32), "sandbox");
+    const holderSql = makeSql(TEST_URL);
+    const firstSql = makeSql(TEST_URL);
+    const secondSql = makeSql(TEST_URL);
+    let releaseLocks!: () => void;
+    let announceLocks!: () => void;
+    const locksHeld = new Promise<void>((resolve) => { announceLocks = resolve; });
+    const released = new Promise<void>((resolve) => { releaseLocks = resolve; });
+    const holder = holderSql.begin(async (tx) => {
+      await lockAccountMutations(tx, [alice.accountId, bob.accountId]);
+      announceLocks();
+      await released;
+    });
+    await locksHeld;
+    const callId = crypto.randomUUID();
+    const ctx = context(callId, dialogId, alice, bob);
+    const parameters = {
+      callerAccountId: alice.accountId,
+      callerDeviceId: alice.deviceId,
+      callId,
+      dialogId,
+      callerCommitment: callerCommitmentV1(ctx, {
+        publicKey: bytes(7), nonce: bytes(39), fingerprint: bytes(71),
+      }).toString("base64"),
+      supportedProtocolVersions: [1],
+      offeredMediaProfileVersions: [1],
+    };
+    try {
+      const first = createCall(firstSql, parameters);
+      const second = createCall(secondSql, parameters);
+      await waitForAdvisoryWaiters(2);
+      releaseLocks();
+      await holder;
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult.call.id).toBe(callId);
+      expect(secondResult.call.id).toBe(callId);
+      expect(firstResult.ringTargetCount).toBe(1);
+      expect(secondResult.ringTargetCount).toBe(1);
+      expect(await db`SELECT id FROM calls WHERE id = ${callId}`).toHaveLength(1);
+      expect(await db`SELECT id FROM call_invite_attempts WHERE caller_account_id = ${alice.accountId}`)
+        .toHaveLength(1);
+    } finally {
+      releaseLocks();
+      await holder;
+      await Promise.all([holderSql.close(), firstSql.close(), secondSql.close()]);
+    }
+  }, 15_000);
+
+  test("account rollout requires both participants and keeps audio available", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "a5".repeat(32), "sandbox", [1], [1, 2], 2);
+    const savedAllowlist = process.env.TOJ_VIDEO_CALLS_ALLOWLIST;
+    const savedPercent = process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT;
+    try {
+      process.env.TOJ_VIDEO_CALLS_ALLOWLIST = alice.accountId;
+      process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = "0";
+
+      const videoCallId = crypto.randomUUID();
+      const videoContext = contextWithMedia(videoCallId, dialogId, alice, bob, [2]);
+      const material = { publicKey: bytes(3), nonce: bytes(35), fingerprint: bytes(67) };
+      await expect(createCall(db, {
+        callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+        callId: videoCallId, dialogId,
+        callerCommitment: callerCommitmentV1(videoContext, material).toString("base64"),
+        supportedProtocolVersions: [1], offeredMediaProfileVersions: [2],
+        videoRolloutReady: true,
+      })).rejects.toMatchObject({ code: "video_unavailable" });
+      expect(await db`SELECT id FROM calls WHERE id = ${videoCallId}`).toHaveLength(0);
+
+      const audioCallId = crypto.randomUUID();
+      const audioContext = contextWithMedia(audioCallId, dialogId, alice, bob, [1, 2]);
+      const audio = await createCall(db, {
+        callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+        callId: audioCallId, dialogId,
+        callerCommitment: callerCommitmentV1(audioContext, material).toString("base64"),
+        supportedProtocolVersions: [1], offeredMediaProfileVersions: [1, 2],
+        videoRolloutReady: true,
+      });
+      expect(audio.call.initialKind).toBe("voice");
+      expect(audio.call.selectableMediaProfileVersions).toEqual([1]);
+    } finally {
+      if (savedAllowlist === undefined) delete process.env.TOJ_VIDEO_CALLS_ALLOWLIST;
+      else process.env.TOJ_VIDEO_CALLS_ALLOWLIST = savedAllowlist;
+      if (savedPercent === undefined) delete process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT;
+      else process.env.TOJ_VIDEO_CALLS_ROLLOUT_PERCENT = savedPercent;
+    }
+  });
+
+  test("call reads and wakeups are device scoped before and after first answer", async () => {
+    const { alice, bob, dialogId } = await pair();
+    const unrelatedAliceDevice = await addDevice(alice.accountId);
+    const losingBobDevice = await addDevice(bob.accountId);
+    await registerVoIPPushToken(db, bob.deviceId, "a2".repeat(32), "sandbox", [1], [1, 2], 2);
+    await registerVoIPPushToken(db, losingBobDevice, "a3".repeat(32), "sandbox", [1], [1, 2], 2);
+    const callId = crypto.randomUUID();
+    const ctx = contextWithMedia(callId, dialogId, alice, bob, [2]);
+    const callerMaterial = { publicKey: bytes(2), nonce: bytes(34), fingerprint: bytes(66) };
+    const calleeMaterial = { publicKey: bytes(99), nonce: bytes(131), fingerprint: bytes(163) };
+    const callerCommitment = callerCommitmentV1(ctx, callerMaterial);
+    const created = await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId, callId, dialogId,
+      callerCommitment: callerCommitment.toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [2], videoEnabled: true,
+    });
+    expect(created.ringTargetCount).toBe(2);
+    // Ring-target eligibility is immutable for the invitation view even if the device later
+    // re-registers. Acceptance separately validates the current registration and fails closed.
+    await registerVoIPPushToken(db, losingBobDevice, "a3".repeat(32), "sandbox");
+
+    const invitation = (await getCall(db, bob.accountId, losingBobDevice, callId)).call;
+    expect(invitation.view).toBe("invitation");
+    expect(invitation.initialKind).toBe("video");
+    expect(Array.from(invitation.selectableMediaProfileVersions)).toEqual([2]);
+    expect(invitation.callerCommitment).not.toBeNull();
+    expect(invitation.calleeCommitment).toBeNull();
+    await expect(getCall(db, alice.accountId, unrelatedAliceDevice, callId))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(getCallEvents(db, alice.accountId, unrelatedAliceDevice, callId))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    expect((await getActiveCalls(db, alice.accountId, unrelatedAliceDevice)).calls).toEqual([]);
+    const unrelatedMutation = { accountId: alice.accountId, deviceId: unrelatedAliceDevice, callId };
+    await expect(acceptCall(db, {
+      ...unrelatedMutation, calleeCommitment: bytes(200).toString("base64"),
+      protocolVersion: 1, selectedMediaProfileVersion: 2,
+    })).rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(revealCallKey(db, {
+      ...unrelatedMutation, publicKey: bytes(201).toString("base64"),
+      nonce: bytes(202).toString("base64"), fingerprint: bytes(203).toString("base64"),
+    })).rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(confirmCallKey(db, {
+      ...unrelatedMutation, confirmation: bytes(204).toString("base64"),
+    })).rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(sendEncryptedCallEvent(db, {
+      ...unrelatedMutation, version: 1, kind: "control", senderSequence: 1,
+      ciphertext: Buffer.from("encrypted").toString("base64"),
+      expiresAtMilliseconds: Date.now() + 30_000,
+    })).rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(cancelCall(db, { ...unrelatedMutation, reason: "cancelled" }))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(endCall(db, { ...unrelatedMutation, reason: "failed" }))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(declineCall(db, { ...unrelatedMutation, reason: "declined" }))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    await expect(recordCallTelemetry(db, { ...unrelatedMutation, outcome: "failed" }))
+      .rejects.toMatchObject({ code: "not_found", status: 404 });
+    const savedTurnURLs = process.env.TOJ_TURN_URLS;
+    const savedTurnSecret = process.env.TOJ_TURN_SHARED_SECRET;
+    try {
+      process.env.TOJ_TURN_URLS = "turn:turn.example.test:3478";
+      process.env.TOJ_TURN_SHARED_SECRET = "test-secret";
+      await expect(getIceConfig(db, alice.accountId, unrelatedAliceDevice, callId))
+        .rejects.toMatchObject({ code: "not_found", status: 404 });
+    } finally {
+      if (savedTurnURLs === undefined) delete process.env.TOJ_TURN_URLS;
+      else process.env.TOJ_TURN_URLS = savedTurnURLs;
+      if (savedTurnSecret === undefined) delete process.env.TOJ_TURN_SHARED_SECRET;
+      else process.env.TOJ_TURN_SHARED_SECRET = savedTurnSecret;
+    }
+
+    const calleeCommitment = calleeCommitmentV1(
+      ctx, callerCommitment, bob.deviceId, 1, 2, calleeMaterial,
+    );
+    const accepted = await acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId,
+      calleeCommitment: calleeCommitment.toString("base64"), protocolVersion: 1,
+      selectedMediaProfileVersion: 2,
+    });
+    const acceptanceTargets = await resolveCallHintTargets(db, {
+      callId, latestEventSeq: accepted.call.latestEventSeq,
+    }, [alice.deviceId, unrelatedAliceDevice, bob.deviceId, losingBobDevice]);
+    expect(new Set(acceptanceTargets.map((target) => target.deviceId)))
+      .toEqual(new Set([alice.deviceId, bob.deviceId, losingBobDevice]));
+    expect(acceptanceTargets.find((target) => target.deviceId === losingBobDevice)?.latestEventSeq)
+      .toBe(0);
+    expect(acceptanceTargets.filter((target) => target.deviceId !== losingBobDevice)
+      .every((target) => target.latestEventSeq === accepted.call.latestEventSeq)).toBe(true);
+
+    const lifecycle = (await getCall(db, bob.accountId, losingBobDevice, callId)).call;
+    expect(lifecycle.view).toBe("lifecycle");
+    expect(lifecycle.state).toBe("ended");
+    expect(lifecycle.endReason).toBe("answered_elsewhere");
+    expect(lifecycle.localRingStatus).toBe("answered_elsewhere");
+    expect(lifecycle.offeredProtocolVersions).toEqual([]);
+    expect(lifecycle.offeredMediaProfileVersions).toEqual([]);
+    expect(lifecycle.callerCommitment).toBeNull();
+    expect(lifecycle.acceptedAt).toBeNull();
+    expect(lifecycle.confirmedAt).toBeNull();
+    expect(lifecycle.latestEventSeq).toBe(0);
+    const lifecycleEvents = await getCallEvents(db, bob.accountId, losingBobDevice, callId);
+    expect(lifecycleEvents).toMatchObject({ events: [], latestEventSeq: 0, hasMore: false });
+
+    await revealCallKey(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId,
+      publicKey: callerMaterial.publicKey.toString("base64"),
+      nonce: callerMaterial.nonce.toString("base64"),
+      fingerprint: callerMaterial.fingerprint.toString("base64"),
+    });
+    await revealCallKey(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId,
+      publicKey: calleeMaterial.publicKey.toString("base64"),
+      nonce: calleeMaterial.nonce.toString("base64"),
+      fingerprint: calleeMaterial.fingerprint.toString("base64"),
+      confirmation: bytes(195).toString("base64"),
+    });
+    await confirmCallKey(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId,
+      confirmation: bytes(227).toString("base64"),
+    });
+
+    const signal = await sendEncryptedCallEvent(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId,
+      version: 1, kind: "offer", senderSequence: 1,
+      ciphertext: Buffer.from("encrypted").toString("base64"),
+      expiresAtMilliseconds: Date.now() + 30_000,
+    });
+    const setupTargets = await resolveCallHintTargets(db, {
+      callId, latestEventSeq: signal.event.eventSeq,
+    }, [alice.deviceId, unrelatedAliceDevice, bob.deviceId, losingBobDevice]);
+    expect(new Set(setupTargets.map((target) => target.deviceId)))
+      .toEqual(new Set([alice.deviceId, bob.deviceId]));
+    const delayedAcceptanceTargets = await resolveCallHintTargets(db, {
+      callId, latestEventSeq: accepted.call.latestEventSeq,
+    }, [alice.deviceId, unrelatedAliceDevice, bob.deviceId, losingBobDevice]);
+    expect(new Set(delayedAcceptanceTargets.map((target) => target.deviceId)))
+      .toEqual(new Set([alice.deviceId, bob.deviceId, losingBobDevice]));
+    expect(delayedAcceptanceTargets.find((target) => target.deviceId === losingBobDevice)?.latestEventSeq)
+      .toBe(0);
+    const lifecycleAfterSetup = (await getCall(db, bob.accountId, losingBobDevice, callId)).call;
+    expect(lifecycleAfterSetup).toMatchObject({
+      view: "lifecycle", state: "ended", localRingStatus: "answered_elsewhere",
+      endReason: "answered_elsewhere", latestEventSeq: 0,
+      acceptedAt: null, confirmedAt: null,
+    });
+  });
+
+  test("first answer preserves explicit declines and wakes only devices still losing the ring", async () => {
+    const { alice, bob, dialogId } = await pair();
+    const declinedDevice = await addDevice(bob.accountId);
+    const losingDevice = await addDevice(bob.accountId);
+    await registerVoIPPushToken(db, bob.deviceId, "b1".repeat(32), "sandbox");
+    await registerVoIPPushToken(db, declinedDevice, "b2".repeat(32), "sandbox");
+    await registerVoIPPushToken(db, losingDevice, "b3".repeat(32), "sandbox");
+    const callId = crypto.randomUUID();
+    const ctx = context(callId, dialogId, alice, bob);
+    const callerMaterial = { publicKey: bytes(4), nonce: bytes(36), fingerprint: bytes(68) };
+    const callerCommitment = callerCommitmentV1(ctx, callerMaterial);
+    await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId, dialogId, callerCommitment: callerCommitment.toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [1],
+    });
+    const declined = await declineCall(db, {
+      accountId: bob.accountId, deviceId: declinedDevice, callId,
+    });
+    expect(declined.call).toMatchObject({
+      view: "lifecycle", state: "ended", localRingStatus: "declined",
+      endReason: "declined", latestEventSeq: 0,
+      callerCommitment: null, calleeCommitment: null, acceptedDeviceId: null,
+    });
+
+    const calleeMaterial = { publicKey: bytes(100), nonce: bytes(132), fingerprint: bytes(164) };
+    const accepted = await acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId,
+      calleeCommitment: calleeCommitmentV1(
+        ctx, callerCommitment, bob.deviceId, 1, 1, calleeMaterial,
+      ).toString("base64"),
+      protocolVersion: 1,
+      selectedMediaProfileVersion: 1,
+    });
+    const statuses = await db`
+      SELECT device_id, status FROM call_ring_targets WHERE call_id = ${callId}`;
+    expect(new Map(statuses.map((row) => [row.device_id, row.status]))).toEqual(new Map([
+      [bob.deviceId, "accepted"],
+      [declinedDevice, "declined"],
+      [losingDevice, "answered_elsewhere"],
+    ]));
+    expect((await getCall(db, bob.accountId, declinedDevice, callId)).call.localRingStatus)
+      .toBe("declined");
+    const declinedRetry = await declineCall(db, {
+      accountId: bob.accountId, deviceId: declinedDevice, callId,
+    });
+    expect(declinedRetry.call).toMatchObject({
+      view: "lifecycle", state: "ended", localRingStatus: "declined",
+      endReason: "declined", latestEventSeq: 0,
+      offeredProtocolVersions: [], offeredMediaProfileVersions: [],
+      callerCommitment: null, calleeCommitment: null, callerFingerprint: null,
+      acceptedDeviceId: null, calleePublicKey: null, callerPublicKey: null,
+      acceptedAt: null, confirmedAt: null,
+    });
+    const targets = await resolveCallHintTargets(db, {
+      callId, latestEventSeq: accepted.call.latestEventSeq,
+    }, [alice.deviceId, bob.deviceId, declinedDevice, losingDevice]);
+    expect(new Set(targets.map((target) => target.deviceId)))
+      .toEqual(new Set([alice.deviceId, bob.deviceId, losingDevice]));
+  });
+
+  test("legacy VoIP registration clears stale video capability", async () => {
+    const { bob } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "a4".repeat(32), "sandbox", [1], [1, 2], 2);
+    const upgraded = (await db`
+      SELECT supported_call_media_profile_versions, call_view_version
+      FROM devices WHERE id = ${bob.deviceId}`)[0];
+    expect(Array.from(upgraded.supported_call_media_profile_versions)).toEqual([1, 2]);
+    expect(upgraded.call_view_version).toBe(2);
+    const legacy = await registerVoIPPushToken(db, bob.deviceId, "a4".repeat(32), "sandbox");
+    expect(legacy).toMatchObject({
+      supportedCallProtocolVersions: [1], supportedCallMediaProfileVersions: [1], callViewVersion: 1,
+    });
+  });
+
   test("two-sided commitments, first-answer-wins, signaling, and history are durable", async () => {
     const { alice, bob, dialogId } = await pair();
     const otherBobDevice = await addDevice(bob.accountId);
@@ -306,7 +744,7 @@ describe("E2EE voice-call control plane", () => {
     const renewedLease = Number((await db`
       SELECT EXTRACT(EPOCH FROM (expires_at - now())) AS seconds FROM calls WHERE id = ${callId}`)[0].seconds);
     expect(renewedLease).toBeGreaterThan(100);
-    expect((await getCallEvents(db, bob.accountId, callId)).events.at(-1)?.ciphertext)
+    expect((await getCallEvents(db, bob.accountId, bob.deviceId, callId)).events.at(-1)?.ciphertext)
       .toBe(Buffer.alloc(65_564, 7).toString("base64"));
 
     // Exact transport retries are idempotent and do not consume the rolling signaling budget.
@@ -379,6 +817,19 @@ describe("E2EE voice-call control plane", () => {
     expect(await db`SELECT account_id FROM call_participant_leases WHERE call_id = ${callId}`)
       .toHaveLength(0);
     await expect(smallSignal("control", 5)).rejects.toMatchObject({ code: "invalid_state", status: 409 });
+    const postEndTurnURLs = process.env.TOJ_TURN_URLS;
+    const postEndTurnSecret = process.env.TOJ_TURN_SHARED_SECRET;
+    try {
+      delete process.env.TOJ_TURN_URLS;
+      delete process.env.TOJ_TURN_SHARED_SECRET;
+      await expect(getIceConfig(db, bob.accountId, otherBobDevice, callId))
+        .rejects.toMatchObject({ code: "invalid_device", status: 403 });
+    } finally {
+      if (postEndTurnURLs === undefined) delete process.env.TOJ_TURN_URLS;
+      else process.env.TOJ_TURN_URLS = postEndTurnURLs;
+      if (postEndTurnSecret === undefined) delete process.env.TOJ_TURN_SHARED_SECRET;
+      else process.env.TOJ_TURN_SHARED_SECRET = postEndTurnSecret;
+    }
 
     const server = startCloudServer(0, db, null, null);
     try {
@@ -443,6 +894,100 @@ describe("E2EE voice-call control plane", () => {
     expect(stored.push_token_ciphertext).toBeNull();
   });
 
+  test("push and history preserve immutable video versus voice start intent", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "ce".repeat(32), "sandbox", [1], [1, 2], 2);
+    const material = { publicKey: bytes(4), nonce: bytes(36), fingerprint: bytes(68) };
+
+    const videoCallId = crypto.randomUUID();
+    const videoContext = contextWithMedia(videoCallId, dialogId, alice, bob, [2]);
+    await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: videoCallId, dialogId,
+      callerCommitment: callerCommitmentV1(videoContext, material).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [2], videoEnabled: true,
+    });
+    const sender = new StubSender();
+    expect(await processVoIPPushBatch(db, sender)).toBe(1);
+    const videoRequest = sender.requests[0];
+    if (videoRequest?.kind !== "voip") throw new Error("expected VoIP request");
+    expect(buildVoIPAPNsPayload(videoRequest).toj.type).toBe("video_call");
+    await cancelCall(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId: videoCallId,
+    });
+
+    const audioCallId = crypto.randomUUID();
+    const audioContext = contextWithMedia(audioCallId, dialogId, alice, bob, [1, 2]);
+    await createCall(db, {
+      callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+      callId: audioCallId, dialogId,
+      callerCommitment: callerCommitmentV1(audioContext, material).toString("base64"),
+      supportedProtocolVersions: [1], offeredMediaProfileVersions: [1, 2], videoEnabled: true,
+    });
+    await acceptCall(db, {
+      accountId: bob.accountId, deviceId: bob.deviceId, callId: audioCallId,
+      calleeCommitment: bytes(100).toString("base64"), protocolVersion: 1,
+      selectedMediaProfileVersion: 2,
+    });
+    await endCall(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId, callId: audioCallId,
+      reason: "local_ended",
+    });
+
+    const history = await getHistory(db, alice.accountId, dialogId);
+    const historyType = (callId: string) => {
+      const message = history.messages.find((candidate) => {
+        if (candidate.kind !== "service") return false;
+        return JSON.parse(candidate.text).callId === callId;
+      });
+      return message ? JSON.parse(message.text).type : null;
+    };
+    expect(historyType(videoCallId)).toBe("video_call");
+    // Selecting media profile 2 for an audio-start call never rewrites its history intent.
+    expect(historyType(audioCallId)).toBe("voice_call");
+  });
+
+  test("call-history delivery emits a bounded cross-process sync wake-up", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerVoIPPushToken(db, bob.deviceId, "cf".repeat(32), "sandbox");
+    const listener = new Client({ connectionString: TEST_URL });
+    await listener.connect();
+    await listener.query("LISTEN toj_sync_events");
+    try {
+      const callId = crypto.randomUUID();
+      const ctx = context(callId, dialogId, alice, bob);
+      const material = { publicKey: bytes(6), nonce: bytes(38), fingerprint: bytes(70) };
+      await createCall(db, {
+        callerAccountId: alice.accountId, callerDeviceId: alice.deviceId,
+        callId, dialogId,
+        callerCommitment: callerCommitmentV1(ctx, material).toString("base64"),
+        supportedProtocolVersions: [1], offeredMediaProfileVersions: [1],
+      });
+      const wakeup = new Promise<{ accountId: string; pts: number; ptsCount: number }>(
+        (resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("sync wake-up timed out")), 2_000);
+          listener.on("notification", (notification) => {
+            if (notification.channel !== "toj_sync_events" || !notification.payload) return;
+            const decoded = JSON.parse(notification.payload);
+            if (![alice.accountId, bob.accountId].includes(decoded.accountId)) return;
+            clearTimeout(timeout);
+            resolve(decoded);
+          });
+        },
+      );
+      await cancelCall(db, {
+        accountId: alice.accountId, deviceId: alice.deviceId, callId,
+      });
+      const decoded = await wakeup;
+      expect(Object.keys(decoded).sort()).toEqual(["accountId", "pts", "ptsCount"]);
+      expect([alice.accountId, bob.accountId]).toContain(decoded.accountId);
+      expect(decoded.pts).toBeGreaterThan(0);
+      expect(decoded.ptsCount).toBe(1);
+    } finally {
+      await listener.end();
+    }
+  });
+
   test("VoIP delivery uses bounded concurrency so one slow APNs request cannot stall the batch", async () => {
     const { alice, bob, dialogId } = await pair();
     const targetDevices = [bob.deviceId];
@@ -494,7 +1039,9 @@ describe("E2EE voice-call control plane", () => {
     const firstDecline = await declineCall(db, {
       accountId: bob.accountId, deviceId: bob.deviceId, callId,
     });
-    expect(firstDecline.call.state).toBe("requested");
+    expect(firstDecline.call).toMatchObject({
+      view: "lifecycle", state: "ended", localRingStatus: "declined", latestEventSeq: 0,
+    });
     expect((await db`
       SELECT status FROM call_ring_targets WHERE call_id = ${callId} AND device_id = ${bob.deviceId}`)[0].status)
       .toBe("declined");

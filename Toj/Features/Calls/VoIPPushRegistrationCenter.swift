@@ -4,7 +4,20 @@ import Foundation
 nonisolated struct VoIPPushInvitation: Equatable, Sendable {
     let callId: UUID
     let callerAccountId: String
+    let initialKind: CallInitialKind
     let expiresAt: Date?
+
+    nonisolated init(
+        callId: UUID,
+        callerAccountId: String,
+        initialKind: CallInitialKind,
+        expiresAt: Date?
+    ) {
+        self.callId = callId
+        self.callerAccountId = callerAccountId
+        self.initialKind = initialKind
+        self.expiresAt = expiresAt
+    }
 
     nonisolated init?(payload: [AnyHashable: Any], now: Date = Date()) {
         let values = (payload["toj"] as? [String: Any]).map {
@@ -15,10 +28,14 @@ nonisolated struct VoIPPushInvitation: Equatable, Sendable {
             (values[snakeCase] as? String) ?? (values[camelCase] as? String)
         }
 
-        guard
-            (values["v"] as? NSNumber)?.intValue == 1,
-            string("type", "type") == "voice_call"
-        else { return nil }
+        guard (values["v"] as? NSNumber)?.intValue == 1,
+              let type = string("type", "type") else { return nil }
+        let initialKind: CallInitialKind
+        switch type {
+        case "voice_call": initialKind = .voice
+        case "video_call": initialKind = .video
+        default: return nil
+        }
 
         guard
             let rawCallId = string("call_id", "callId"),
@@ -41,6 +58,7 @@ nonisolated struct VoIPPushInvitation: Equatable, Sendable {
         }
         self.callId = callId
         self.callerAccountId = callerAccountId
+        self.initialKind = initialKind
         self.expiresAt = expiresAt
     }
 

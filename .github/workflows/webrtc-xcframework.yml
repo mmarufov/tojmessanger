@@ -90,6 +90,8 @@ jobs:
         run: |
           pod install
           grep -Fq 'TojWebRTC' Podfile.lock
+          plutil -lint Toj-Info.plist Toj/Toj.entitlements \
+            Toj/Toj-MultitaskingCamera.entitlements
 
           xcodebuild build \
             -workspace Toj.xcworkspace \
@@ -108,7 +110,7 @@ jobs:
               xcrun nm "${binary}" | xcrun swift-demangle >> "${RUNNER_TEMP}/toj-symbols.txt"
             fi
           done
-          grep -Fq 'Toj.WebRTCVoiceEngine' "${RUNNER_TEMP}/toj-symbols.txt"
+          grep -Fq 'Toj.WebRTCCallEngine' "${RUNNER_TEMP}/toj-symbols.txt"
 
           destination_id="$(/usr/bin/python3 <<'PY'
           import json

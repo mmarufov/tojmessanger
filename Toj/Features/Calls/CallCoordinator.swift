@@ -2,6 +2,46 @@ import AVFoundation
 import CallKit
 import Foundation
 import Observation
+import UIKit
+
+nonisolated enum CallServerEndReasonPolicy {
+    static func resolve(_ raw: String?) -> CallEndReason {
+        switch raw {
+        case "declined": .declined
+        case "cancelled", "caller_cancelled": .cancelled
+        case "busy": .busy
+        case "unanswered", "expired": .unanswered
+        case "answered_elsewhere": .answeredElsewhere
+        case "network_lost": .networkLost
+        case "security_error": .securityError
+        default: .remoteEnded
+        }
+    }
+}
+
+nonisolated enum CallLifecycleProjectionPolicy {
+    static func terminalReason(
+        view: CloudCallViewKind?,
+        state: String,
+        endReason: String?
+    ) -> CallEndReason? {
+        guard view == .lifecycle, state == "ended" else { return nil }
+        return CallServerEndReasonPolicy.resolve(endReason)
+    }
+}
+
+nonisolated enum CallSignalDescriptionPolicy {
+    static func accepts(kind: CallSignalKind, descriptionType: CallSDPType) -> Bool {
+        switch kind {
+        case .offer, .iceRestart:
+            descriptionType == .offer
+        case .answer:
+            descriptionType == .answer
+        case .iceCandidate, .hangup, .control:
+            false
+        }
+    }
+}
 
 @MainActor
 @Observable
@@ -20,16 +60,41 @@ final class CallCoordinator {
     private(set) var securityVerified = false
     private(set) var connectedAt: Date?
     private(set) var failureMessage: String?
+    private(set) var initialKind: CallInitialKind = .voice
+    private(set) var selectedMediaProfile: UInt16?
+    private(set) var isCameraEnabled = false
+    private(set) var localVideoState: CallVideoEffectiveState = .inactive
+    private(set) var remoteVideoState: CallVideoEffectiveState = .inactive
+    private(set) var remoteVideoPauseReason: CallVideoGenericPauseReason?
+    private(set) var localVideoRenderer: CallVideoRendererHandle?
+    private(set) var remoteVideoRenderer: CallVideoRendererHandle?
+    private(set) var pictureInPictureVideoRenderer: CallVideoRendererHandle?
+    private(set) var remoteVideoTrackAvailable = false
+    private(set) var videoQualityTier: CallVideoQualityTier = .high
+    private(set) var videoIsAutomaticallyPaused = false
+    private(set) var hasVideoExperience = false
     var isPresented = false
 
     var hasCall: Bool { state != .idle }
     var canVerifySecurity: Bool { securityEmojis.count == 4 && state == .active }
+    var isVideoMediaAvailable: Bool {
+        selectedMediaProfile == CallMediaProfileVersion.cameraVideo
+    }
+    var isUsingFrontCamera: Bool { preferredCameraPosition == .front }
+    var cameraNeedsSettings: Bool {
+        permissions.cameraPermission == .denied || permissions.cameraPermission == .restricted
+    }
+    var canOfferAudioFallback: Bool { state == .ended && audioFallback != nil }
 
     @ObservationIgnored private var machine = CallStateMachine()
-    @ObservationIgnored private let callKit: CallKitAdapter
+    @ObservationIgnored private let callKit: any CallKitControlling
     @ObservationIgnored private let preferences: CallPrivacyPreferences
     @ObservationIgnored private let engineFactory: @MainActor @Sendable () -> any WebRTCEngine
-    @ObservationIgnored private var api: CloudAPI?
+    @ObservationIgnored private let permissions: any CallPermissionProviding
+    @ObservationIgnored private let sceneLifecycle: any CallSceneLifecycleProviding
+    @ObservationIgnored private let networkPath: any CallNetworkPathProviding
+    @ObservationIgnored private let clock: any CallClock
+    @ObservationIgnored private var api: (any CallAPITransport)?
     @ObservationIgnored private var session: CloudSession?
     @ObservationIgnored private var peerNameProvider: ((String, String) -> String)?
     @ObservationIgnored private var runtime: Runtime?
@@ -49,24 +114,40 @@ final class CallCoordinator {
     @ObservationIgnored private var reconcileTaskTokens: [UUID: UUID] = [:]
     @ObservationIgnored private var reconcilesPending: Set<UUID> = []
     @ObservationIgnored private var callKitAudioActive = false
+    @ObservationIgnored private var videoReducer = CallVideoStateReducer()
+    @ObservationIgnored private var videoQuality = CallVideoQualityReducer()
+    @ObservationIgnored let pictureInPicture = TojVideoPictureInPictureController()
+    @ObservationIgnored private var qualityTask: Task<Void, Never>?
+    @ObservationIgnored private var userSelectedAudioRoute = false
+    @ObservationIgnored private var preferredCameraPosition: CallCameraPosition = .front
+    @ObservationIgnored private var audioFallback: AudioFallback?
 
-    struct CallWirePayload: Codable {
+    private struct AudioFallback {
+        let dialogId: String
+        let peerAccountId: String
+        let displayName: String
+    }
+
+    nonisolated struct CallWirePayload: Codable, Sendable {
         let description: CallSessionDescription?
         let candidate: CallICECandidate?
         let control: CallControlAction?
+        let mediaState: CallMediaStateUpdateV1?
 
         init(
             description: CallSessionDescription?,
             candidate: CallICECandidate?,
-            control: CallControlAction? = nil
+            control: CallControlAction? = nil,
+            mediaState: CallMediaStateUpdateV1? = nil
         ) {
             self.description = description
             self.candidate = candidate
             self.control = control
+            self.mediaState = mediaState
         }
     }
 
-    enum CallControlAction: String, Codable {
+    nonisolated enum CallControlAction: String, Codable, Sendable {
         case requestICERestart = "request_ice_restart"
     }
 
@@ -79,6 +160,7 @@ final class CallCoordinator {
         let id: UUID
         let direction: CallDirection
         let privacyMode: CallPrivacyMode
+        let initialKind: CallInitialKind
         var dialogId: String
         var peerAccountId: String
         var snapshot: CloudCallSnapshot?
@@ -100,6 +182,17 @@ final class CallCoordinator {
         var mediaStarted = false
         var signalingReadyForCandidates = false
         var remoteDescriptionInstalled = false
+        var selectedMediaProfile: UInt16?
+        var mediaProfileConfigured = false
+        var localNextMediaRevision: UInt64 = 1
+        var remoteHighestMediaRevision: UInt64 = 0
+        var peerMaximumReceiveTier: CallVideoQualityTier = .high
+        var lastSentMediaState: CallMediaStateUpdateV1?
+        var lastNetworkPath: ReplicaNetworkSnapshot?
+        var lastMaximumVideoFramesPerSecond: Int?
+        var cameraGeneration: UInt64 = 0
+        var cameraApplyGeneration: UInt64 = 0
+        var owningSceneIdentifier: String?
         var iceRestartInFlight = false
         let signalOutbox = OrderedCallSignalOutbox()
 
@@ -115,24 +208,34 @@ final class CallCoordinator {
             id: UUID,
             direction: CallDirection,
             privacyMode: CallPrivacyMode,
+            initialKind: CallInitialKind,
             dialogId: String,
             peerAccountId: String
         ) {
             self.id = id
             self.direction = direction
             self.privacyMode = privacyMode
+            self.initialKind = initialKind
             self.dialogId = dialogId
             self.peerAccountId = peerAccountId
         }
     }
 
     init(
-        callKit: CallKitAdapter = .shared,
+        callKit: any CallKitControlling = CallKitAdapter.shared,
         preferences: CallPrivacyPreferences = .shared,
+        permissions: any CallPermissionProviding = SystemCallPermissionProvider(),
+        sceneLifecycle: any CallSceneLifecycleProviding = SystemCallSceneLifecycleProvider(),
+        networkPath: any CallNetworkPathProviding = ReplicaNetworkMonitor.shared,
+        clock: any CallClock = SystemCallClock(),
         engineFactory: @escaping @MainActor @Sendable () -> any WebRTCEngine = { WebRTCEngineFactory.production() }
     ) {
         self.callKit = callKit
         self.preferences = preferences
+        self.permissions = permissions
+        self.sceneLifecycle = sceneLifecycle
+        self.networkPath = networkPath
+        self.clock = clock
         self.engineFactory = engineFactory
 
         callKit.onStart = { [weak self] id in Task { await self?.beginOutgoing(id) } }
@@ -155,8 +258,8 @@ final class CallCoordinator {
             Task { await engine.setAudioSessionActive(false) }
         }
         callKit.onReset = { [weak self] in Task { await self?.terminate(.failed, reportCallKit: false) } }
-        callKit.audioSession.onRouteChanged = { [weak self] in self?.refreshAudioRoute() }
-        callKit.audioSession.onMediaServicesReset = { [weak self] in
+        callKit.callAudioSession.onRouteChanged = { [weak self] in self?.refreshAudioRoute() }
+        callKit.callAudioSession.onMediaServicesReset = { [weak self] in
             guard let self, self.callKitAudioActive, let engine = self.runtime?.engine else { return }
             Task {
                 await engine.setAudioSessionActive(true)
@@ -166,7 +269,7 @@ final class CallCoordinator {
     }
 
     func configure(
-        api: CloudAPI,
+        api: any CallAPITransport,
         session: CloudSession,
         peerNameProvider: @escaping (String, String) -> String
     ) {
@@ -195,9 +298,15 @@ final class CallCoordinator {
         }
     }
 
-    func startOutgoing(dialogId: String, peerAccountId: String, displayName: String) async {
+    func startOutgoing(
+        dialogId: String,
+        peerAccountId: String,
+        displayName: String,
+        initialKind: CallInitialKind = .voice
+    ) async {
         guard api != nil, let session, state == .idle || state == .ended else { return }
         if state == .ended { reset() }
+        audioFallback = nil
         let microphoneIsAllowed = await microphoneAllowed()
         guard self.session == session, api != nil else { return }
         guard microphoneIsAllowed else {
@@ -208,12 +317,37 @@ final class CallCoordinator {
             await terminate(.permissionDenied, reportCallKit: false)
             return
         }
+        if initialKind == .video {
+            guard WebRTCEngineFactory.supportsCameraVideoProfile else {
+                await presentVideoPreflightFailure(
+                    String(localized: "Video calling is unavailable on this build. You can still place an audio call."),
+                    reason: .failed,
+                    dialogId: dialogId,
+                    peerAccountId: peerAccountId,
+                    displayName: displayName
+                )
+                return
+            }
+            guard await cameraAllowedForOutgoing() else {
+                await presentVideoPreflightFailure(
+                    String(localized: "Camera access is required to start a video call. You can still place an audio call."),
+                    reason: .permissionDenied,
+                    dialogId: dialogId,
+                    peerAccountId: peerAccountId,
+                    displayName: displayName
+                )
+                return
+            }
+        }
 
         do {
             try transition(.startOutgoing)
             isPresented = true
             peerName = displayName
             failureMessage = nil
+            self.initialKind = initialKind
+            hasVideoExperience = initialKind == .video
+            isCameraEnabled = initialKind == .video
 
             let id = UUID()
             let engine = engineFactory()
@@ -240,13 +374,16 @@ final class CallCoordinator {
                     calleeAccountId: peerAccountId
                 ),
                 offeredProtocolVersions: CallProtocolVersion.supported,
-                offeredMediaProfileVersions: CallMediaProfileVersion.supported
+                offeredMediaProfileVersions: initialKind == .video
+                    ? [CallMediaProfileVersion.cameraVideo]
+                    : WebRTCEngineFactory.deviceCapabilities.supportedCallMediaProfileVersions
             )
             let commitment = try CallProtocolV1.callerCommitment(context: context, material: material)
             let runtime = Runtime(
                 id: id,
                 direction: .outgoing,
                 privacyMode: preferences.mode,
+                initialKind: initialKind,
                 dialogId: dialogId,
                 peerAccountId: peerAccountId
             )
@@ -255,10 +392,18 @@ final class CallCoordinator {
             runtime.localMaterial = material
             runtime.context = context
             runtime.callerCommitment = commitment
+            runtime.cameraGeneration = videoReducer.beginRuntime(
+                initialCameraIntent: initialKind == .video
+            )
             self.runtime = runtime
             activeCallId = id
             startEngineEvents(engine, runtime: runtime)
-            try await callKit.requestOutgoing(callId: id, peerAccountId: peerAccountId, displayName: displayName)
+            try await callKit.requestOutgoing(
+                callId: id,
+                peerAccountId: peerAccountId,
+                displayName: displayName,
+                initialKind: initialKind
+            )
             guard self.session == session, self.runtime === runtime else {
                 try? await callKit.requestEnd(callId: id)
                 await engine.stop()
@@ -277,13 +422,14 @@ final class CallCoordinator {
             return
         }
         if state == .ended { reset() }
-        if let expiresAt = invitation.expiresAt, expiresAt <= Date() {
+        if let expiresAt = invitation.expiresAt, expiresAt <= clock.now {
             reportedIncomingCallIds.insert(invitation.callId)
             do {
                 try await callKit.reportIncoming(
                     callId: invitation.callId,
                     callerAccountId: invitation.callerAccountId,
-                    displayName: String(localized: "Toj caller")
+                    displayName: String(localized: "Toj caller"),
+                    initialKind: invitation.initialKind
                 )
                 callKit.reportEnded(callId: invitation.callId, reason: .unanswered)
             } catch {}
@@ -303,7 +449,8 @@ final class CallCoordinator {
                 try? await callKit.reportIncoming(
                     callId: invitation.callId,
                     callerAccountId: invitation.callerAccountId,
-                    displayName: peerName
+                    displayName: peerName,
+                    initialKind: invitation.initialKind
                 )
                 return
             }
@@ -311,7 +458,8 @@ final class CallCoordinator {
             try? await callKit.reportIncoming(
                 callId: invitation.callId,
                 callerAccountId: invitation.callerAccountId,
-                displayName: String(localized: "Toj caller")
+                displayName: String(localized: "Toj caller"),
+                initialKind: invitation.initialKind
             )
             callKit.reportEnded(callId: invitation.callId, reason: .unanswered)
             if let api, let session {
@@ -331,16 +479,23 @@ final class CallCoordinator {
                 id: invitation.callId,
                 direction: .incoming,
                 privacyMode: preferences.mode,
+                initialKind: invitation.initialKind,
                 dialogId: "",
                 peerAccountId: invitation.callerAccountId
             )
             runtime = incoming
+            initialKind = invitation.initialKind
+            hasVideoExperience = invitation.initialKind == .video
+            isCameraEnabled = false
+            incoming.cameraGeneration = videoReducer.beginRuntime(
+                initialCameraIntent: false
+            )
             activeCallId = invitation.callId
             direction = .incoming
             peerName = String(localized: "Toj caller")
             scheduleRingDeadline(
                 for: incoming,
-                deadline: invitation.expiresAt ?? Date().addingTimeInterval(30)
+                deadline: invitation.expiresAt ?? clock.now.addingTimeInterval(30)
             )
         }
         do {
@@ -348,7 +503,8 @@ final class CallCoordinator {
             try await callKit.reportIncoming(
                 callId: invitation.callId,
                 callerAccountId: invitation.callerAccountId,
-                displayName: peerName
+                displayName: peerName,
+                initialKind: invitation.initialKind
             )
             Task { await reconcile(callId: invitation.callId) }
         } catch {
@@ -362,7 +518,8 @@ final class CallCoordinator {
             try await callKit.reportIncoming(
                 callId: id,
                 callerAccountId: "unknown",
-                displayName: String(localized: "Toj caller")
+                displayName: String(localized: "Toj caller"),
+                initialKind: .voice
             )
             callKit.reportEnded(callId: id, reason: .failed)
         } catch {}
@@ -387,6 +544,7 @@ final class CallCoordinator {
                     await receiveVoIPPush(VoIPPushInvitation(
                         callId: id,
                         callerAccountId: call.callerAccountId,
+                        initialKind: call.initialKind ?? .voice,
                         expiresAt: nil
                     ))
                 }
@@ -421,8 +579,9 @@ final class CallCoordinator {
 
     func toggleSpeaker() async {
         let enabled = !isSpeakerEnabled
+        userSelectedAudioRoute = true
         do {
-            try callKit.audioSession.setSpeakerEnabled(enabled)
+            try callKit.callAudioSession.setSpeakerEnabled(enabled)
             isSpeakerEnabled = enabled
             if let engine = runtime?.engine {
                 try await engine.setPreferredAudioRoute(enabled ? .speaker : .builtInReceiver)
@@ -432,17 +591,115 @@ final class CallCoordinator {
         }
     }
 
+    func markAudioRouteSelectionIntent() {
+        userSelectedAudioRoute = true
+    }
+
+    func toggleCamera() async {
+        guard let runtime, runtime.selectedMediaProfile == CallMediaProfileVersion.cameraVideo else {
+            failureMessage = String(localized: "Video is unavailable for this call.")
+            return
+        }
+        let wantsCamera = !isCameraEnabled
+        if wantsCamera {
+            let status = permissions.cameraPermission
+            if status == .notDetermined {
+                // Never surface a system camera prompt from a killed, locked, or background answer.
+                guard callOwningSceneIsForeground(runtime) else { return }
+                let allowed = await permissions.requestCameraAccess()
+                guard self.runtime === runtime else { return }
+                videoReducer.setPermission(
+                    allowed ? .authorized : .denied,
+                    generation: runtime.cameraGeneration
+                )
+                if !allowed {
+                    failureMessage = String(localized: "Camera access is off. Enable it in Settings to use video.")
+                    return
+                }
+            } else if status != .authorized {
+                videoReducer.setPermission(cameraPermissionState(), generation: runtime.cameraGeneration)
+                failureMessage = String(localized: "Camera access is off. Enable it in Settings to use video.")
+                return
+            }
+        }
+        failureMessage = nil
+        isCameraEnabled = wantsCamera
+        videoReducer.setUserWantsCamera(wantsCamera, generation: runtime.cameraGeneration)
+        if wantsCamera {
+            videoReducer.retryCaptureAfterRuntimeFailure(generation: runtime.cameraGeneration)
+            hasVideoExperience = true
+            videoQuality.resetBaselines()
+            callKit.updateHasVideo(callId: runtime.id, hasVideo: true)
+            try? callKit.callAudioSession.setVideoMode(true)
+            let route = callKit.callAudioSession.currentRoute
+            if !userSelectedAudioRoute,
+               CallKitVideoContract.shouldAutoEnableSpeaker(for: route) {
+                try? callKit.callAudioSession.setSpeakerEnabled(true)
+                isSpeakerEnabled = true
+            }
+        }
+        await applyVideoCaptureDecision(runtime: runtime)
+        try? await sendMediaState(runtime: runtime)
+    }
+
+    func switchCamera() async {
+        guard let runtime, isCameraEnabled, let engine = runtime.engine else { return }
+        preferredCameraPosition = preferredCameraPosition == .front ? .back : .front
+        videoReducer.setPreferredCameraPosition(preferredCameraPosition, generation: runtime.cameraGeneration)
+        do {
+            try await engine.switchCamera(to: preferredCameraPosition)
+            videoQuality.resetBaselines()
+            try? await sendMediaState(runtime: runtime, force: true)
+        } catch {
+            failureMessage = String(localized: "The selected camera is unavailable.")
+        }
+    }
+
+    func updateVideoScene(
+        sceneIdentifier: String,
+        isForeground: Bool,
+        pictureInPictureIsActive: Bool
+    ) async {
+        guard let runtime else { return }
+        if runtime.owningSceneIdentifier == nil {
+            runtime.owningSceneIdentifier = sceneIdentifier
+        }
+        guard runtime.owningSceneIdentifier == sceneIdentifier else { return }
+        let backgroundCameraIsAvailable = await runtime.engine?.supportsBackgroundCameraAccess() ?? false
+        guard self.runtime === runtime,
+              runtime.owningSceneIdentifier == sceneIdentifier else { return }
+        videoReducer.setScene(
+            foreground: isForeground && sceneLifecycle.isForeground(sceneIdentifier: sceneIdentifier),
+            pictureInPicture: pictureInPictureIsActive,
+            backgroundCameraAvailable: backgroundCameraIsAvailable,
+            generation: runtime.cameraGeneration
+        )
+        await applyVideoCaptureDecision(runtime: runtime)
+        try? await sendMediaState(runtime: runtime)
+    }
+
     func dismissEnded() {
         guard state == .ended else { return }
         isPresented = false
         reset()
     }
 
+    func startAudioFallback() async {
+        guard state == .ended, let fallback = audioFallback else { return }
+        reset()
+        await startOutgoing(
+            dialogId: fallback.dialogId,
+            peerAccountId: fallback.peerAccountId,
+            displayName: fallback.displayName,
+            initialKind: .voice
+        )
+    }
+
     /// Register incoming-call delivery before the first call without presenting a microphone
     /// permission prompt during sign-in. A previously denied installation cannot answer, so it
     /// stays unregistered until the user re-enables microphone access in Settings.
     var canRegisterForIncomingCalls: Bool {
-        AVAudioApplication.shared.recordPermission != .denied
+        !permissions.microphonePermissionDenied
     }
 }
 
@@ -455,7 +712,7 @@ private extension CallCoordinator {
     }
 
     func createCallReliably(
-        api: CloudAPI,
+        api: any CallAPITransport,
         session: CloudSession,
         runtime: Runtime,
         context: CallHandshakeContextV1,
@@ -517,12 +774,12 @@ private extension CallCoordinator {
                 let delay = retryAfter ?? (0.5 * pow(2, Double(retry)))
                 guard delay <= 2 else { throw error }
                 retry += 1
-                try await Task.sleep(for: .seconds(delay))
+                try await clock.sleep(for: .seconds(delay))
             }
         }
     }
 
-    func finishDeferredGlareInvitations(api: CloudAPI, session: CloudSession) {
+    func finishDeferredGlareInvitations(api: any CallAPITransport, session: CloudSession) {
         let deferred = deferredGlareInvitations.values
         deferredGlareInvitations.removeAll()
         for invitation in deferred {
@@ -540,7 +797,7 @@ private extension CallCoordinator {
     func pivotOutgoingGlare(
         existingCallId: String,
         runtime: Runtime,
-        api: CloudAPI,
+        api: any CallAPITransport,
         session: CloudSession
     ) async {
         guard self.runtime === runtime,
@@ -560,13 +817,14 @@ private extension CallCoordinator {
             await receiveVoIPPush(VoIPPushInvitation(
                 callId: callId,
                 callerAccountId: fallbackCaller,
+                initialKind: invitation?.initialKind ?? runtime.initialKind,
                 expiresAt: nil
             ))
         }
     }
 
     func acceptCallReliably(
-        api: CloudAPI,
+        api: any CallAPITransport,
         session: CloudSession,
         runtime: Runtime,
         body: AcceptCloudCallRequest
@@ -600,7 +858,7 @@ private extension CallCoordinator {
                 let delay = retryAfter ?? (0.5 * pow(2, Double(retry)))
                 guard delay <= 2 else { throw error }
                 retry += 1
-                try await Task.sleep(for: .seconds(delay))
+                try await clock.sleep(for: .seconds(delay))
             }
         }
     }
@@ -638,6 +896,14 @@ private extension CallCoordinator {
             await reconcile(callId: id)
         } catch {
             guard self.runtime === runtime, self.session == session else { return }
+            if runtime.initialKind == .video,
+               (error as? CloudAPIError)?.code == "video_unavailable" {
+                audioFallback = AudioFallback(
+                    dialogId: runtime.dialogId,
+                    peerAccountId: runtime.peerAccountId,
+                    displayName: peerName
+                )
+            }
             failureMessage = friendly(error)
             await terminate(callEndReason(error), reportCallKit: true)
         }
@@ -673,7 +939,7 @@ private extension CallCoordinator {
         guard !Task.isCancelled else { return false }
         guard self.runtime === runtime, self.session == session else { return false }
         do {
-            runtime.answeredAt = Date()
+            runtime.answeredAt = clock.now
             scheduleAnsweredDeadlines(for: runtime, acceptedAt: nil, expiresAt: nil)
             let engine = engineFactory()
             let identity = try await engine.prepareLocalIdentity()
@@ -695,12 +961,12 @@ private extension CallCoordinator {
                 offeredProtocolVersions: snapshot.offeredProtocolVersions.compactMap(UInt16.init(exactly:)),
                 offeredMediaProfileVersions: snapshot.offeredMediaProfileVersions.compactMap(UInt16.init(exactly:))
             )
-            guard let callerCommitment = Data(base64Encoded: snapshot.callerCommitment) else {
+            guard let callerCommitment = snapshot.callerCommitment.flatMap({ Data(base64Encoded: $0) }) else {
                 throw CallProtocolError.invalidCommitment
             }
             let callee = CallParty(accountId: session.accountId, deviceId: session.deviceId)
             let selectedProtocol = CallProtocolVersion.current
-            let selectedMedia = CallMediaProfileVersion.current
+            let selectedMedia = try selectedMediaProfile(for: snapshot)
             let commitment = try CallProtocolV1.calleeCommitment(
                 context: context,
                 callerCommitment: callerCommitment,
@@ -716,6 +982,8 @@ private extension CallCoordinator {
             runtime.context = context
             runtime.callerCommitment = callerCommitment
             runtime.calleeCommitment = commitment
+            runtime.selectedMediaProfile = selectedMedia
+            self.selectedMediaProfile = selectedMedia
             if callKitAudioActive { await engine.setAudioSessionActive(true) }
             startEngineEvents(engine, runtime: runtime)
             try Task.checkCancellation()
@@ -751,6 +1019,7 @@ private extension CallCoordinator {
             )
             isPresented = true
             try await installICE(for: runtime)
+            try await configureMediaProfileIfNeeded(runtime: runtime)
             startPolling(callId: id)
             await reconcile(callId: id)
             return self.runtime === runtime && state != .ended
@@ -807,19 +1076,38 @@ private extension CallCoordinator {
             try Task.checkCancellation()
             guard self.session == session, self.api != nil else { return }
 
+            if let terminalReason = CallLifecycleProjectionPolicy.terminalReason(
+                view: snapshot.view,
+                state: snapshot.state,
+                endReason: snapshot.endReason
+            ) {
+                callKit.reportEnded(callId: callId, reason: terminalReason.callKitReason)
+                if runtime?.id == callId {
+                    await terminate(terminalReason, reportCallKit: false)
+                }
+                return
+            }
+
             if runtime == nil, snapshot.calleeAccountId == session.accountId, snapshot.state == "requested" {
                 try transition(.receiveIncoming)
                 let incoming = Runtime(
                     id: callId,
                     direction: .incoming,
                     privacyMode: preferences.mode,
+                    initialKind: snapshot.initialKind ?? .voice,
                     dialogId: snapshot.dialogId,
                     peerAccountId: snapshot.callerAccountId
                 )
                 incoming.snapshot = snapshot
+                incoming.cameraGeneration = videoReducer.beginRuntime(
+                    initialCameraIntent: false
+                )
                 runtime = incoming
                 participatingRuntime = incoming
                 activeCallId = callId
+                initialKind = incoming.initialKind
+                hasVideoExperience = incoming.initialKind == .video
+                isCameraEnabled = false
                 peerName = peerNameProvider?(snapshot.dialogId, snapshot.callerAccountId)
                     ?? String(localized: "Toj caller")
                 let needsCallKitReport = !reportedIncomingCallIds.contains(callId)
@@ -828,7 +1116,8 @@ private extension CallCoordinator {
                     try await callKit.reportIncoming(
                         callId: callId,
                         callerAccountId: snapshot.callerAccountId,
-                        displayName: peerName
+                        displayName: peerName,
+                        initialKind: incoming.initialKind
                     )
                 }
                 try requireCurrent(incoming, session: session)
@@ -1050,7 +1339,7 @@ private extension CallCoordinator {
             let pair = runtime.keyPair,
             let localMaterial = runtime.localMaterial,
             let callerCommitment = runtime.callerCommitment
-                ?? Data(base64Encoded: snapshot.callerCommitment),
+                ?? snapshot.callerCommitment.flatMap({ Data(base64Encoded: $0) }),
             let calleeCommitment = runtime.calleeCommitment
                 ?? snapshot.calleeCommitment.flatMap({ Data(base64Encoded: $0) }),
             let selectedProtocol = snapshot.protocolVersion.flatMap(UInt16.init(exactly:)),
@@ -1122,6 +1411,64 @@ private extension CallCoordinator {
         )
     }
 
+    func selectedMediaProfile(for snapshot: CloudCallSnapshot) throws -> UInt16 {
+        let offered = Set(snapshot.offeredMediaProfileVersions.compactMap(UInt16.init(exactly:)))
+        let selectable = Set(
+            (snapshot.selectableMediaProfileVersions ?? snapshot.offeredMediaProfileVersions)
+                .compactMap(UInt16.init(exactly:))
+        )
+        let local = Set(WebRTCEngineFactory.deviceCapabilities.supportedCallMediaProfileVersions)
+        let common = offered.intersection(selectable).intersection(local)
+        if (snapshot.initialKind ?? .voice) == .video {
+            guard common.contains(CallMediaProfileVersion.cameraVideo) else {
+                throw CloudAPIError(
+                    status: 409,
+                    message: "Video is unavailable on this device",
+                    retryAfter: nil,
+                    code: "video_unavailable"
+                )
+            }
+            return CallMediaProfileVersion.cameraVideo
+        }
+        guard let selected = common.max() else {
+            throw CallProtocolError.unsupportedSelectedMediaProfileVersion(0)
+        }
+        return selected
+    }
+
+    func configureMediaProfileIfNeeded(runtime: Runtime) async throws {
+        guard let engine = runtime.engine, let profile = runtime.selectedMediaProfile else {
+            throw CallCryptoError.invalidTranscript
+        }
+        guard !runtime.mediaProfileConfigured else { return }
+        let permissionIsGranted = permissions.cameraPermission == .authorized
+        // Incoming setup may run before transcript verification so the answer contains the
+        // permanent disabled video track. Its one-shot intent must remain camera-off; the reducer
+        // enables capture only after startMedia authenticates the transcript.
+        let initialCameraIntent = runtime.direction == .outgoing
+            && runtime.initialKind == .video
+            && permissionIsGranted
+        try await engine.configureMediaProfile(profile, initialCameraIntent: initialCameraIntent)
+        try Task.checkCancellation()
+        guard self.runtime === runtime else { throw CancellationError() }
+        // An identical concurrent setup may have completed while the engine call was suspended.
+        guard !runtime.mediaProfileConfigured else { return }
+        runtime.mediaProfileConfigured = true
+        if profile == CallMediaProfileVersion.cameraVideo {
+            videoReducer.setPermission(
+                permissionIsGranted ? .authorized : cameraPermissionState(),
+                generation: runtime.cameraGeneration
+            )
+            if runtime.initialKind == .video, permissionIsGranted {
+                videoReducer.setUserWantsCamera(true, generation: runtime.cameraGeneration)
+                isCameraEnabled = true
+            }
+            try await installVideoRenderersIfNeeded(runtime: runtime)
+            try Task.checkCancellation()
+            guard self.runtime === runtime else { throw CancellationError() }
+        }
+    }
+
     @discardableResult
     func installICE(for runtime: Runtime, scheduleRefresh: Bool = true) async throws -> Int {
         guard let api, let session, let engine = runtime.engine else {
@@ -1147,7 +1494,7 @@ private extension CallCoordinator {
                 let delay = retryAfter ?? (0.5 * pow(2, Double(retry)))
                 guard delay <= 2 else { throw error }
                 retry += 1
-                try await Task.sleep(for: .seconds(delay))
+                try await clock.sleep(for: .seconds(delay))
             }
         }
         guard self.runtime === runtime, self.session == session else {
@@ -1170,6 +1517,26 @@ private extension CallCoordinator {
 
     func startMedia(runtime: Runtime) async throws {
         guard !runtime.mediaStarted, let engine = runtime.engine else { return }
+        try requireCurrent(runtime)
+        if let snapshot = runtime.snapshot,
+           let selected = snapshot.mediaProfileVersion.flatMap(UInt16.init(exactly:)) {
+            runtime.selectedMediaProfile = selected
+            selectedMediaProfile = selected
+        }
+        try await configureMediaProfileIfNeeded(runtime: runtime)
+        try requireCurrent(runtime)
+        videoReducer.setSecureMediaReady(true, generation: runtime.cameraGeneration)
+        let owningSceneIsForeground = runtime.owningSceneIdentifier.map {
+            sceneLifecycle.isForeground(sceneIdentifier: $0)
+        } ?? false
+        videoReducer.setScene(
+            foreground: owningSceneIsForeground,
+            pictureInPicture: false,
+            backgroundCameraAvailable: false,
+            generation: runtime.cameraGeneration
+        )
+        await applyVideoCaptureDecision(runtime: runtime)
+        try requireCurrent(runtime)
         if state == .keyExchange { try transition(.keysConfirmed) }
         keyExchangeDeadlineTask?.cancel()
         keyExchangeDeadlineTask = nil
@@ -1179,16 +1546,19 @@ private extension CallCoordinator {
             runtime.signalingReadyForCandidates = false
             let offer = try await engine.makeOffer(iceRestart: false)
             try await sendSignal(.offer, payload: CallWirePayload(description: offer, candidate: nil), runtime: runtime)
+            try requireCurrent(runtime)
             runtime.signalingReadyForCandidates = true
         }
         runtime.mediaStarted = true
         scheduleCandidateFlush(for: runtime)
+        startVideoQualityLoop(runtime: runtime)
+        try await sendMediaState(runtime: runtime, force: true)
     }
 
     func scheduleRingDeadline(for runtime: Runtime, expiresAt: String) {
         scheduleRingDeadline(
             for: runtime,
-            deadline: parseServerDate(expiresAt) ?? Date().addingTimeInterval(30)
+            deadline: parseServerDate(expiresAt) ?? clock.now.addingTimeInterval(30)
         )
     }
 
@@ -1196,8 +1566,9 @@ private extension CallCoordinator {
         guard runtime.answeredAt == nil else { return }
         ringDeadlineTask?.cancel()
         let callId = runtime.id
+        let scheduler = clock
         ringDeadlineTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow)))
+            try? await scheduler.sleep(for: .seconds(max(0, deadline.timeIntervalSince(scheduler.now))))
             guard
                 !Task.isCancelled,
                 self?.runtime?.id == callId,
@@ -1212,7 +1583,7 @@ private extension CallCoordinator {
         if let serverAcceptedAt {
             runtime.answeredAt = min(runtime.answeredAt ?? serverAcceptedAt, serverAcceptedAt)
         } else {
-            runtime.answeredAt = runtime.answeredAt ?? Date()
+            runtime.answeredAt = runtime.answeredAt ?? clock.now
         }
         ringDeadlineTask?.cancel()
         ringDeadlineTask = nil
@@ -1220,9 +1591,12 @@ private extension CallCoordinator {
         keyExchangeDeadlineTask?.cancel()
         let callId = runtime.id
         let keyDeadline = expiresAt.flatMap(parseServerDate)
-            ?? (runtime.answeredAt ?? Date()).addingTimeInterval(10)
+            ?? (runtime.answeredAt ?? clock.now).addingTimeInterval(10)
+        let keyScheduler = clock
         keyExchangeDeadlineTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(max(0, keyDeadline.timeIntervalSinceNow)))
+            try? await keyScheduler.sleep(
+                for: .seconds(max(0, keyDeadline.timeIntervalSince(keyScheduler.now)))
+            )
             guard
                 !Task.isCancelled,
                 self?.runtime?.id == callId,
@@ -1236,12 +1610,13 @@ private extension CallCoordinator {
 
     func scheduleConnectionDeadline(for runtime: Runtime) {
         connectionDeadlineTask?.cancel()
-        let answeredAt = runtime.answeredAt ?? Date()
+        let answeredAt = runtime.answeredAt ?? clock.now
         runtime.answeredAt = answeredAt
         let callId = runtime.id
+        let connectionScheduler = clock
         connectionDeadlineTask = Task { [weak self] in
-            let remaining = max(0, 20 - Date().timeIntervalSince(answeredAt))
-            try? await Task.sleep(for: .seconds(remaining))
+            let remaining = max(0, 20 - connectionScheduler.now.timeIntervalSince(answeredAt))
+            try? await connectionScheduler.sleep(for: .seconds(remaining))
             guard
                 !Task.isCancelled,
                 self?.runtime?.id == callId,
@@ -1282,7 +1657,7 @@ private extension CallCoordinator {
                 let cipher = runtime.cipher
             else { throw CancellationError() }
 
-            let expiry = Int64(Date().addingTimeInterval(60).timeIntervalSince1970 * 1_000)
+            let expiry = Int64(clock.now.addingTimeInterval(60).timeIntervalSince1970 * 1_000)
             let plaintext = try JSONEncoder().encode(payload)
             let envelope = try await cipher.seal(plaintext, kind: kind, expiresAtMilliseconds: expiry)
             guard let senderSequence = Int64(exactly: envelope.sequence) else {
@@ -1315,14 +1690,14 @@ private extension CallCoordinator {
                     }
                     attempt = min(attempt + 1, 4)
                     let delay = retryAfter ?? min(4, pow(2, Double(attempt - 1)))
-                    let remaining = Double(envelope.expiresAtMilliseconds) / 1_000 - Date().timeIntervalSince1970
+                    let remaining = Double(envelope.expiresAtMilliseconds) / 1_000 - clock.now.timeIntervalSince1970
                     guard remaining > delay + 1 else {
                         if await signalEventWasCommitted(body, runtime: runtime, api: api, session: session) {
                             return
                         }
                         throw error
                     }
-                    try await Task.sleep(for: .seconds(delay))
+                    try await clock.sleep(for: .seconds(delay))
                 }
             }
         }
@@ -1331,7 +1706,7 @@ private extension CallCoordinator {
     func signalEventWasCommitted(
         _ body: SendCloudCallEventRequest,
         runtime: Runtime,
-        api: CloudAPI,
+        api: any CallAPITransport,
         session: CloudSession
     ) async -> Bool {
         guard self.runtime === runtime, self.session == session else { return false }
@@ -1369,7 +1744,7 @@ private extension CallCoordinator {
                 runtime.pendingCandidates.removeFirst()
             } catch {
                 if case .transient = cloudFailureDisposition(error) {
-                    try await Task.sleep(for: .seconds(1))
+                    try await clock.sleep(for: .seconds(1))
                     continue
                 }
                 throw error
@@ -1433,7 +1808,7 @@ private extension CallCoordinator {
             )
             let plaintext = try await cipher.open(
                 envelope,
-                nowMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000)
+                nowMilliseconds: Int64(clock.now.timeIntervalSince1970 * 1_000)
             )
             guard let payload = try? JSONDecoder().decode(CallWirePayload.self, from: plaintext) else {
                 throw CallCryptoError.metadataMismatch
@@ -1447,7 +1822,13 @@ private extension CallCoordinator {
         let payload = decoded.payload
         switch kind {
         case .offer, .iceRestart:
-            guard runtime.direction == .incoming, let description = payload.description else {
+            guard runtime.direction == .incoming,
+                  let description = payload.description,
+                  CallSignalDescriptionPolicy.accepts(
+                    kind: kind,
+                    descriptionType: description.type
+                  )
+            else {
                 throw CallCryptoError.metadataMismatch
             }
             let fingerprint = try remoteMaterial(
@@ -1471,7 +1852,13 @@ private extension CallCoordinator {
             runtime.signalingReadyForCandidates = true
             scheduleCandidateFlush(for: runtime)
         case .answer:
-            guard runtime.direction == .outgoing, let description = payload.description else {
+            guard runtime.direction == .outgoing,
+                  let description = payload.description,
+                  CallSignalDescriptionPolicy.accepts(
+                    kind: kind,
+                    descriptionType: description.type
+                  )
+            else {
                 throw CallCryptoError.metadataMismatch
             }
             let fingerprint = try remoteMaterial(
@@ -1502,7 +1889,24 @@ private extension CallCoordinator {
         case .hangup:
             await terminate(.remoteEnded, reportCallKit: true)
         case .control:
-            if payload.control == .requestICERestart, runtime.direction == .outgoing {
+            if let mediaState = payload.mediaState {
+                guard mediaState.version == CallMediaStateUpdateV1.currentVersion else {
+                    throw CallCryptoError.metadataMismatch
+                }
+                if CallMediaRevisionPolicy.accepts(
+                    remote: mediaState.revision,
+                    highestAccepted: runtime.remoteHighestMediaRevision
+                ) {
+                    runtime.remoteHighestMediaRevision = mediaState.revision
+                    runtime.peerMaximumReceiveTier = mediaState.requestedMaximumReceiveTier
+                    remoteVideoState = mediaState.effectiveState
+                    remoteVideoPauseReason = mediaState.genericPauseReason
+                    if mediaState.desiredCameraState || mediaState.effectiveState == .active {
+                        hasVideoExperience = true
+                        callKit.updateHasVideo(callId: runtime.id, hasVideo: true)
+                    }
+                }
+            } else if payload.control == .requestICERestart, runtime.direction == .outgoing {
                 try await performICERestart(runtime: runtime)
             }
         }
@@ -1553,18 +1957,20 @@ private extension CallCoordinator {
                 connectionDeadlineTask = nil
                 if let recoveryStartedAt = runtime.recoveryStartedAt {
                     // Close out a recovery episode and keep the worst recovery time for telemetry.
-                    let elapsed = Date().timeIntervalSince(recoveryStartedAt)
+                    let elapsed = clock.now.timeIntervalSince(recoveryStartedAt)
                     runtime.maxRecoverySeconds = max(runtime.maxRecoverySeconds ?? 0, elapsed)
                     runtime.recoveryStartedAt = nil
                 }
                 if state == .connecting || state == .reconnecting {
                     try transition(.mediaConnected)
                 }
-                connectedAt = connectedAt ?? Date()
+                connectedAt = connectedAt ?? clock.now
                 startHeartbeat(runtime: runtime)
                 if runtime.direction == .outgoing {
                     callKit.reportOutgoingConnected(callId: runtime.id)
                 }
+                videoQuality.resetBaselines()
+                try? await sendMediaState(runtime: runtime, force: true)
             case .connectionStateChanged(.disconnected):
                 if state == .active {
                     try transition(.mediaDisconnected)
@@ -1572,7 +1978,7 @@ private extension CallCoordinator {
                     heartbeatTask = nil
                     // A fresh recovery episode begins the moment active media drops.
                     if runtime.recoveryStartedAt == nil {
-                        runtime.recoveryStartedAt = Date()
+                        runtime.recoveryStartedAt = clock.now
                         runtime.recoveryCount += 1
                     }
                 }
@@ -1583,7 +1989,7 @@ private extension CallCoordinator {
                     heartbeatTask?.cancel()
                     heartbeatTask = nil
                     if runtime.recoveryStartedAt == nil {
-                        runtime.recoveryStartedAt = Date()
+                        runtime.recoveryStartedAt = clock.now
                         runtime.recoveryCount += 1
                     }
                 }
@@ -1596,6 +2002,19 @@ private extension CallCoordinator {
             case .audioRouteChanged(let route):
                 audioRouteName = route.displayName
                 isSpeakerEnabled = route == .speaker
+            case .remoteVideoAvailabilityChanged(let available):
+                remoteVideoTrackAvailable = available
+                if !available, remoteVideoState == .active { remoteVideoState = .paused }
+            case .localVideoCaptureHealthChanged(let health):
+                videoReducer.setCaptureHealth(
+                    interrupted: health.interrupted,
+                    runtimeFailed: health.runtimeFailed,
+                    cameraAvailable: health.cameraAvailable,
+                    pressureCritical: health.pressureCritical,
+                    generation: runtime.cameraGeneration
+                )
+                await applyVideoCaptureDecision(runtime: runtime)
+                try? await sendMediaState(runtime: runtime)
             }
         } catch {
             guard self.runtime === runtime else { return }
@@ -1607,15 +2026,17 @@ private extension CallCoordinator {
         guard let runtime, state == .reconnecting else { return }
         let id = runtime.id
         if recoveryTask == nil {
+            let recoveryScheduler = clock
             recoveryTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(20))
+                try? await recoveryScheduler.sleep(for: .seconds(20))
                 guard !Task.isCancelled, self?.runtime?.id == id, self?.state == .reconnecting else { return }
                 await self?.terminate(.networkLost, reportCallKit: true)
             }
         }
         guard recoveryDebounceTask == nil else { return }
+        let debounceScheduler = clock
         recoveryDebounceTask = Task { @MainActor [weak self, weak runtime] in
-            try? await Task.sleep(for: .seconds(1))
+            try? await debounceScheduler.sleep(for: .seconds(1))
             guard
                 !Task.isCancelled,
                 let self,
@@ -1648,10 +2069,11 @@ private extension CallCoordinator {
 
     func startPolling(callId: UUID) {
         pollTask?.cancel()
+        let pollingScheduler = clock
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 let delay = self?.state == .active ? 5 : 1
-                try? await Task.sleep(for: .seconds(delay))
+                try? await pollingScheduler.sleep(for: .seconds(delay))
                 guard !Task.isCancelled else { return }
                 await self?.reconcile(callId: callId)
             }
@@ -1662,8 +2084,9 @@ private extension CallCoordinator {
         turnRefreshTask?.cancel()
         let delay = min(2_700, max(60, Int(Double(ttlSeconds) * 0.75)))
         let id = runtime.id
+        let refreshScheduler = clock
         turnRefreshTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
+            try? await refreshScheduler.sleep(for: .seconds(delay))
             guard !Task.isCancelled, let self, self.runtime?.id == id, let runtime = self.runtime else { return }
             do {
                 let ttl = try await self.installICE(for: runtime, scheduleRefresh: false)
@@ -1706,14 +2129,17 @@ private extension CallCoordinator {
         )
         runtime.signalingReadyForCandidates = true
         scheduleCandidateFlush(for: runtime)
+        videoQuality.resetBaselines()
+        try? await sendMediaState(runtime: runtime, force: true)
     }
 
     func startHeartbeat(runtime: Runtime) {
         heartbeatTask?.cancel()
         let id = runtime.id
+        let heartbeatScheduler = clock
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await heartbeatScheduler.sleep(for: .seconds(30))
                 guard
                     !Task.isCancelled,
                     let self,
@@ -1774,6 +2200,14 @@ private extension CallCoordinator {
         guard state != .idle else { return }
         let id = activeCallId
         let endingRuntime = runtime
+        let endingLocalVideoRenderer = localVideoRenderer
+        let endingRemoteVideoRenderer = remoteVideoRenderer
+        let endingPictureInPictureVideoRenderer = pictureInPictureVideoRenderer
+        // Detach shared ownership before the first await so a replacement call can never inherit
+        // or lose renderer handles that belong to this teardown.
+        localVideoRenderer = nil
+        remoteVideoRenderer = nil
+        pictureInPictureVideoRenderer = nil
         let shouldNotifyServer = [
             CallEndReason.networkLost, .securityError, .failed, .permissionDenied, .remoteEnded,
         ].contains(reason)
@@ -1795,6 +2229,7 @@ private extension CallCoordinator {
         connectionDeadlineTask?.cancel()
         turnRefreshTask?.cancel()
         heartbeatTask?.cancel()
+        qualityTask?.cancel()
         for task in reconcileTasks.values { task.cancel() }
         endingRuntime?.signalOutbox.cancel()
         pollTask = nil
@@ -1807,11 +2242,14 @@ private extension CallCoordinator {
         connectionDeadlineTask = nil
         turnRefreshTask = nil
         heartbeatTask = nil
+        qualityTask = nil
         reconcileTasks.removeAll()
         reconcileTaskTokens.removeAll()
         reconcilesPending.removeAll()
         if let id { reportedIncomingCallIds.remove(id) }
         runtime = nil // Erases all per-call private material and nonce state.
+        videoReducer.endRuntime()
+        pictureInPicture.stopAndReset()
         if state != .ended {
             try? transition(.terminated(reason))
         }
@@ -1838,10 +2276,31 @@ private extension CallCoordinator {
         securityVerified = false
         securityEmojis = []
         callKitAudioActive = false
+        isCameraEnabled = false
+        localVideoState = .inactive
+        remoteVideoState = .inactive
+        remoteVideoPauseReason = nil
+        remoteVideoTrackAvailable = false
+        selectedMediaProfile = nil
+        hasVideoExperience = false
+        videoQualityTier = .high
+        videoIsAutomaticallyPaused = false
+        userSelectedAudioRoute = false
 
         // Stop capture/playout immediately after detaching. Final telemetry deliberately omits a
         // potentially blocking last-moment WebRTC stats sample so teardown is privacy-first.
-        if let engine = endingRuntime?.engine { await engine.stop() }
+        if let engine = endingRuntime?.engine {
+            if let endingLocalVideoRenderer {
+                await engine.releaseVideoRenderer(endingLocalVideoRenderer)
+            }
+            if let endingRemoteVideoRenderer {
+                await engine.releaseVideoRenderer(endingRemoteVideoRenderer)
+            }
+            if let endingPictureInPictureVideoRenderer {
+                await engine.releaseVideoRenderer(endingPictureInPictureVideoRenderer)
+            }
+            await engine.stop()
+        }
 
         if shouldNotifyServer, let id, let endingAPI, let endingSession {
             Task {
@@ -1891,29 +2350,268 @@ private extension CallCoordinator {
         failureMessage = nil
         securityEmojis = []
         securityVerified = false
+        initialKind = .voice
+        selectedMediaProfile = nil
+        audioFallback = nil
+    }
+
+    func presentVideoPreflightFailure(
+        _ message: String,
+        reason: CallEndReason,
+        dialogId: String,
+        peerAccountId: String,
+        displayName: String
+    ) async {
+        try? transition(.startOutgoing)
+        initialKind = .video
+        peerName = displayName
+        failureMessage = message
+        audioFallback = AudioFallback(
+            dialogId: dialogId,
+            peerAccountId: peerAccountId,
+            displayName: displayName
+        )
+        isPresented = true
+        await terminate(reason, reportCallKit: false)
     }
 
     func refreshAudioRoute() {
-        audioRouteName = callKit.audioSession.currentRouteName
-        isSpeakerEnabled = callKit.audioSession.isSpeakerEnabled
+        audioRouteName = callKit.callAudioSession.currentRouteName
+        isSpeakerEnabled = callKit.callAudioSession.isSpeakerEnabled
     }
 
     func microphoneAllowed() async -> Bool {
-        switch AVAudioApplication.shared.recordPermission {
-        case .granted: return true
-        case .denied: return false
-        case .undetermined:
-            return await withCheckedContinuation { continuation in
-                AVAudioApplication.requestRecordPermission { continuation.resume(returning: $0) }
+        await permissions.microphoneAllowed()
+    }
+
+    func cameraAllowedForOutgoing() async -> Bool {
+        switch permissions.cameraPermission {
+        case .authorized: return true
+        case .denied, .restricted: return false
+        case .notDetermined:
+            guard sceneLifecycle.isForeground else { return false }
+            return await permissions.requestCameraAccess()
+        }
+    }
+
+    func callOwningSceneIsForeground(_ runtime: Runtime) -> Bool {
+        guard let sceneIdentifier = runtime.owningSceneIdentifier else { return false }
+        return sceneLifecycle.isForeground(sceneIdentifier: sceneIdentifier)
+    }
+
+    func cameraPermissionState() -> CallCameraPermissionState {
+        permissions.cameraPermission
+    }
+
+    func installVideoRenderersIfNeeded(runtime: Runtime) async throws {
+        guard let engine = runtime.engine,
+              runtime.selectedMediaProfile == CallMediaProfileVersion.cameraVideo else { return }
+        if localVideoRenderer == nil {
+            let handle = try await engine.makeVideoRenderer(source: .local)
+            guard self.runtime === runtime else {
+                await engine.releaseVideoRenderer(handle)
+                throw CancellationError()
             }
-        @unknown default: return false
+            if localVideoRenderer == nil {
+                localVideoRenderer = handle
+            } else {
+                await engine.releaseVideoRenderer(handle)
+            }
+        }
+        if remoteVideoRenderer == nil {
+            let handle = try await engine.makeVideoRenderer(source: .remote)
+            guard self.runtime === runtime else {
+                await engine.releaseVideoRenderer(handle)
+                throw CancellationError()
+            }
+            if remoteVideoRenderer == nil {
+                remoteVideoRenderer = handle
+            } else {
+                await engine.releaseVideoRenderer(handle)
+            }
+        }
+        if pictureInPictureVideoRenderer == nil {
+            let handle = try await engine.makeVideoRenderer(source: .remote)
+            guard self.runtime === runtime else {
+                await engine.releaseVideoRenderer(handle)
+                throw CancellationError()
+            }
+            if pictureInPictureVideoRenderer == nil {
+                pictureInPictureVideoRenderer = handle
+            } else {
+                await engine.releaseVideoRenderer(handle)
+            }
+        }
+    }
+
+    func applyVideoCaptureDecision(runtime: Runtime) async {
+        guard self.runtime === runtime,
+              let engine = runtime.engine,
+              runtime.selectedMediaProfile == CallMediaProfileVersion.cameraVideo else { return }
+        runtime.cameraApplyGeneration &+= 1
+        let applyGeneration = runtime.cameraApplyGeneration
+        let decision = videoReducer.decision()
+        localVideoState = decision.effectiveState
+        do {
+            try await engine.setCameraEnabled(
+                decision.shouldCapture,
+                position: decision.preferredCameraPosition
+            )
+            guard self.runtime === runtime,
+                  runtime.cameraApplyGeneration == applyGeneration else { return }
+        } catch {
+            guard self.runtime === runtime,
+                  runtime.cameraApplyGeneration == applyGeneration else { return }
+            videoReducer.setCaptureHealth(
+                interrupted: false,
+                runtimeFailed: true,
+                cameraAvailable: false,
+                pressureCritical: false,
+                generation: runtime.cameraGeneration
+            )
+            localVideoState = .paused
+        }
+    }
+
+    func sendMediaState(runtime: Runtime, force: Bool = false) async throws {
+        guard self.runtime === runtime,
+              runtime.mediaStarted,
+              runtime.cipher != nil,
+              runtime.selectedMediaProfile == CallMediaProfileVersion.cameraVideo else { return }
+        let followingRevision = try CallMediaRevisionPolicy.advanced(
+            after: runtime.localNextMediaRevision
+        )
+        let decision = videoReducer.decision()
+        let candidate = CallMediaStateUpdateV1(
+            version: CallMediaStateUpdateV1.currentVersion,
+            revision: runtime.localNextMediaRevision,
+            desiredCameraState: videoReducer.userWantsCamera,
+            effectiveState: decision.effectiveState,
+            genericPauseReason: decision.genericPauseReason,
+            requestedMaximumReceiveTier: videoQuality.requestedReceiveTier
+        )
+        if !force, let previous = runtime.lastSentMediaState,
+           previous.desiredCameraState == candidate.desiredCameraState,
+           previous.effectiveState == candidate.effectiveState,
+           previous.genericPauseReason == candidate.genericPauseReason,
+           previous.requestedMaximumReceiveTier == candidate.requestedMaximumReceiveTier {
+            return
+        }
+        runtime.localNextMediaRevision = followingRevision
+        try await sendSignal(
+            .control,
+            payload: CallWirePayload(
+                description: nil,
+                candidate: nil,
+                mediaState: candidate
+            ),
+            runtime: runtime
+        )
+        runtime.lastSentMediaState = candidate
+    }
+
+    func startVideoQualityLoop(runtime: Runtime) {
+        qualityTask?.cancel()
+        guard runtime.selectedMediaProfile == CallMediaProfileVersion.cameraVideo else { return }
+        let id = runtime.id
+        let qualityScheduler = clock
+        let qualityNetworkPath = networkPath
+        qualityTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await qualityScheduler.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self, let current = self.runtime,
+                      current.id == id, let engine = current.engine else { return }
+                let stats = await engine.statistics()
+                let now = qualityScheduler.uptime
+                let path = qualityNetworkPath.snapshot()
+                let pathChanged = current.lastNetworkPath.map { $0 != path } ?? false
+                if pathChanged { self.videoQuality.resetBaselines() }
+                current.lastNetworkPath = path
+                let pathPolicy = CallVideoPathPolicy(
+                    kind: path.networkClass == .cellular || path.networkClass == .roaming
+                        ? .cellular : path.networkClass == .wifi ? .wifi : .other,
+                    isConstrained: path.isConstrained,
+                    isLowDataMode: path.isConstrained,
+                    isRoaming: path.isRoaming
+                )
+                let thermal = self.currentThermalState()
+                self.videoReducer.setThermalState(
+                    thermal,
+                    now: qualityScheduler.now,
+                    generation: current.cameraGeneration
+                )
+                self.videoQuality.ingestSender(
+                    stats.map {
+                        CallVideoSenderStats(
+                            timestamp: now,
+                            packetsLost: $0.videoPacketsLost,
+                            packetsSent: $0.videoPacketsSent,
+                            roundTripTimeMilliseconds: $0.roundTripTimeMilliseconds,
+                            jitterMilliseconds: $0.jitterMilliseconds,
+                            availableOutgoingBitrate: $0.availableOutgoingBitrate
+                        )
+                    },
+                    policy: self.preferences.dataUsagePolicy,
+                    path: pathPolicy,
+                    thermal: thermal,
+                    peerMaximumReceiveTier: current.peerMaximumReceiveTier
+                )
+                self.videoQuality.ingestReceiver(
+                    stats.map {
+                        CallVideoReceiverStats(
+                            timestamp: now,
+                            packetsLost: $0.videoInboundPacketsLost,
+                            packetsReceived: $0.videoPacketsReceived,
+                            jitterMilliseconds: $0.videoJitterMilliseconds,
+                            totalFreezeMilliseconds: $0.videoTotalFreezeMilliseconds,
+                            totalFramesDecoded: $0.videoFramesDecoded
+                        )
+                    },
+                    policy: self.preferences.dataUsagePolicy,
+                    path: pathPolicy,
+                    thermal: thermal
+                )
+                let previousTier = self.videoQualityTier
+                self.videoQualityTier = self.videoQuality.senderTier
+                self.videoIsAutomaticallyPaused = self.videoQuality.outgoingVideoPaused
+                let frameRateCap = thermal == .serious ? 15 : nil
+                let captureConfigurationChanged = previousTier != self.videoQuality.senderTier
+                    || current.lastMaximumVideoFramesPerSecond != frameRateCap
+                try? await engine.setVideoQualityTier(
+                    self.videoQuality.senderTier,
+                    maximumFramesPerSecond: frameRateCap
+                )
+                current.lastMaximumVideoFramesPerSecond = frameRateCap
+                if captureConfigurationChanged {
+                    self.videoQuality.resetBaselines()
+                }
+                self.videoReducer.setNetworkStarved(
+                    self.videoQuality.outgoingVideoPaused,
+                    generation: current.cameraGeneration
+                )
+                await self.applyVideoCaptureDecision(runtime: current)
+                try? await self.sendMediaState(
+                    runtime: current,
+                    force: pathChanged || captureConfigurationChanged
+                )
+            }
+        }
+    }
+
+    func currentThermalState() -> CallVideoThermalState {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: .nominal
+        case .fair: .fair
+        case .serious: .serious
+        case .critical: .critical
+        @unknown default: .serious
         }
     }
 
     func waitForConfiguration() async -> Bool {
-        let deadline = Date().addingTimeInterval(8)
-        while (api == nil || session == nil), Date() < deadline, !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(100))
+        let deadline = clock.now.addingTimeInterval(8)
+        while (api == nil || session == nil), clock.now < deadline, !Task.isCancelled {
+            try? await clock.sleep(for: .milliseconds(100))
         }
         return api != nil && session != nil
     }
@@ -1925,6 +2623,11 @@ private extension CallCoordinator {
         }
     }
 
+    func requireCurrent(_ runtime: Runtime) throws {
+        try Task.checkCancellation()
+        guard self.runtime === runtime else { throw CancellationError() }
+    }
+
     func friendly(_ error: Error) -> String {
         if let apiError = error as? CloudAPIError {
             switch apiError.code {
@@ -1932,6 +2635,7 @@ private extension CallCoordinator {
             case "blocked", "ineligible": return String(localized: "Voice calls are not available in this conversation.")
             case "answered_elsewhere": return String(localized: "Answered on another device.")
             case "rate_limited": return String(localized: "Too many calls. Please try again shortly.")
+            case "video_unavailable": return String(localized: "Video is unavailable for this call. You can still place an audio call.")
             default: return apiError.localizedDescription
             }
         }
@@ -1968,16 +2672,7 @@ private extension CallCoordinator {
     }
 
     func endReason(_ raw: String?) -> CallEndReason {
-        switch raw {
-        case "declined": .declined
-        case "cancelled", "caller_cancelled": .cancelled
-        case "busy": .busy
-        case "unanswered", "expired": .unanswered
-        case "answered_elsewhere": .answeredElsewhere
-        case "network_lost": .networkLost
-        case "security_error": .securityError
-        default: .remoteEnded
-        }
+        CallServerEndReasonPolicy.resolve(raw)
     }
 }
 
@@ -2035,13 +2730,5 @@ private extension CallEndReason {
         case .remoteEnded, .declined: .remoteEnded
         case .busy, .networkLost, .securityError, .permissionDenied, .failed: .failed
         }
-    }
-}
-
-private extension VoIPPushInvitation {
-    init(callId: UUID, callerAccountId: String, expiresAt: Date?) {
-        self.callId = callId
-        self.callerAccountId = callerAccountId
-        self.expiresAt = expiresAt
     }
 }

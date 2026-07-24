@@ -523,8 +523,8 @@ struct CloudAPI: Sendable {
         try await post("v1/auth/start", body: ["phone": phone], token: nil)
     }
 
-    func capabilities() async throws -> CloudCapabilitiesResponse {
-        try await get("v1/capabilities", token: nil)
+    func capabilities(token: String? = nil) async throws -> CloudCapabilitiesResponse {
+        try await get("v1/capabilities", token: token)
     }
 
     func checkAuth(phone: String, code: String, displayName: String, deviceName: String) async throws -> CloudSession {
@@ -775,11 +775,18 @@ struct CloudAPI: Sendable {
     func registerVoIPPushToken(
         _ deviceToken: String,
         environment: String,
-        token: String
+        token: String,
+        capabilities: CallDeviceCapabilities = WebRTCEngineFactory.deviceCapabilities
     ) async throws -> PushRegistrationResponse {
         try await put(
             "v1/devices/voip-push",
-            body: PushRegistrationRequest(token: deviceToken, environment: environment),
+            body: VoIPPushRegistrationRequest(
+                token: deviceToken,
+                environment: environment,
+                supportedCallProtocolVersions: capabilities.supportedCallProtocolVersions.map(Int.init),
+                supportedCallMediaProfileVersions: capabilities.supportedCallMediaProfileVersions.map(Int.init),
+                callViewVersion: Int(capabilities.callViewVersion)
+            ),
             token: token
         )
     }

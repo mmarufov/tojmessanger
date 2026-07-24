@@ -23,10 +23,12 @@ nonisolated struct VoiceCallServicePresentation: Equatable, Sendable {
             let data = body.data(using: .utf8),
             let payload = try? JSONDecoder().decode(VoiceCallServicePayload.self, from: data),
             payload.v == 1,
-            payload.type == "voice_call"
+            payload.type == "voice_call" || payload.type == "video_call"
         else {
             return Self(title: String(localized: "Voice call"), systemImage: "phone.fill", duration: nil)
         }
+        let isVideo = payload.type == "video_call"
+        let callName = isVideo ? String(localized: "video call") : String(localized: "voice call")
         let callerIsCurrentAccount = currentAccountId.flatMap { current in
             payload.callerAccountId.map { $0 == current }
         } ?? fallbackCallerIsCurrentAccount
@@ -36,31 +38,32 @@ nonisolated struct VoiceCallServicePresentation: Equatable, Sendable {
         switch payload.outcome {
         case "completed":
             title = callerIsCurrentAccount
-                ? String(localized: "Outgoing voice call")
-                : String(localized: "Incoming voice call")
-            icon = callerIsCurrentAccount ? "phone.arrow.up.right.fill" : "phone.arrow.down.left.fill"
+                ? String(localized: "Outgoing \(callName)")
+                : String(localized: "Incoming \(callName)")
+            icon = isVideo ? "video.fill"
+                : callerIsCurrentAccount ? "phone.arrow.up.right.fill" : "phone.arrow.down.left.fill"
         case "declined":
             title = callerIsCurrentAccount
-                ? String(localized: "Voice call declined")
-                : String(localized: "Declined voice call")
+                ? String(localized: "\(callName.capitalized) declined")
+                : String(localized: "Declined \(callName)")
             icon = "phone.down.fill"
         case "missed":
             title = callerIsCurrentAccount
-                ? String(localized: "Unanswered voice call")
-                : String(localized: "Missed voice call")
+                ? String(localized: "Unanswered \(callName)")
+                : String(localized: "Missed \(callName)")
             icon = "phone.badge.xmark.fill"
         case "busy":
             title = String(localized: "Line busy")
             icon = "phone.down.fill"
         case "cancelled":
-            title = String(localized: "Cancelled voice call")
+            title = String(localized: "Cancelled \(callName)")
             icon = "phone.down.fill"
         case "failed":
-            title = String(localized: "Voice call failed")
+            title = String(localized: "\(callName.capitalized) failed")
             icon = "exclamationmark.phone.fill"
         default:
-            title = String(localized: "Voice call")
-            icon = "phone.fill"
+            title = callName.capitalized
+            icon = isVideo ? "video.fill" : "phone.fill"
         }
 
         let duration = payload.durationSeconds.flatMap { seconds -> String? in
@@ -79,7 +82,7 @@ nonisolated struct VoiceCallServicePresentation: Equatable, Sendable {
             let data = body.data(using: .utf8),
             let payload = try? JSONDecoder().decode(VoiceCallServicePayload.self, from: data),
             payload.v == 1,
-            payload.type == "voice_call",
+            (payload.type == "voice_call" || payload.type == "video_call"),
             let callerAccountId = payload.callerAccountId
         else { return nil }
         return callerAccountId == currentAccountId

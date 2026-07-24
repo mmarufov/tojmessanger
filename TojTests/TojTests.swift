@@ -425,6 +425,549 @@ final class WebRTCEngineContractTests: XCTestCase {
         let event = await iterator.next()
         XCTAssertNil(event)
     }
+
+    #if canImport(WebRTC)
+    @MainActor
+    func testProfileTwoConfigurationIsOneShotAndOwnsIndependentRenderers() async throws {
+        XCTAssertTrue(WebRTCEngineFactory.supportsCameraVideoProfile)
+        for _ in 0..<3 {
+            let engine = WebRTCCallEngine()
+            _ = try await engine.prepareLocalIdentity()
+            try await engine.updateICEConfiguration(CallICEConfiguration(
+                servers: [CallICEServer(
+                    urls: ["turn:turn.invalid:3478"],
+                    username: "test",
+                    credential: "test"
+                )],
+                transportPolicy: .all
+            ))
+            try await engine.configureMediaProfile(CallMediaProfileVersion.cameraVideo,
+                                                   initialCameraIntent: false)
+            try await engine.configureMediaProfile(CallMediaProfileVersion.cameraVideo,
+                                                   initialCameraIntent: false)
+            do {
+                try await engine.configureMediaProfile(CallMediaProfileVersion.cameraVideo,
+                                                       initialCameraIntent: true)
+                XCTFail("changing one-shot media configuration must fail closed")
+            } catch {
+                XCTAssertEqual(error as? WebRTCEngineError, .mediaProfileAlreadyConfigured)
+            }
+
+            let local = try await engine.makeVideoRenderer(source: .local)
+            let remoteMain = try await engine.makeVideoRenderer(source: .remote)
+            let remotePiP = try await engine.makeVideoRenderer(source: .remote)
+            XCTAssertEqual(Set([local.id, remoteMain.id, remotePiP.id]).count, 3)
+            await engine.releaseVideoRenderer(remotePiP)
+            await engine.releaseVideoRenderer(remoteMain)
+            await engine.releaseVideoRenderer(local)
+            await engine.stop()
+        }
+    }
+
+    @MainActor
+    func testPinnedArtifactPreservesStrictProfileOneOffer() async throws {
+        let engine = WebRTCCallEngine()
+        let identity = try await engine.prepareLocalIdentity()
+        try await engine.updateICEConfiguration(CallICEConfiguration(
+            servers: [CallICEServer(
+                urls: ["turn:turn.invalid:3478"],
+                username: "test",
+                credential: "test"
+            )],
+            transportPolicy: .all
+        ))
+        try await engine.configureMediaProfile(
+            CallMediaProfileVersion.voice,
+            initialCameraIntent: false
+        )
+        let offer = try await engine.makeOffer(iceRestart: false)
+        XCTAssertTrue(WebRTCCallEngine.validatesMediaSDPForTesting(
+            offer.sdp,
+            profile: CallMediaProfileVersion.voice,
+            type: .offer,
+            expectedFingerprint: identity.dtlsFingerprintSHA256
+        ))
+        XCTAssertFalse(offer.sdp.contains("m=video "))
+        await engine.stop()
+    }
+
+    @MainActor
+    func testPinnedArtifactGeneratesAndAcceptsStrictProfileTwoOfferAndAnswer() async throws {
+        let caller = WebRTCCallEngine()
+        let callee = WebRTCCallEngine()
+        let callerIdentity = try await caller.prepareLocalIdentity()
+        let calleeIdentity = try await callee.prepareLocalIdentity()
+        let ice = CallICEConfiguration(
+            servers: [CallICEServer(
+                urls: ["turn:turn.invalid:3478"],
+                username: "test",
+                credential: "test"
+            )],
+            transportPolicy: .all
+        )
+        try await caller.updateICEConfiguration(ice)
+        try await callee.updateICEConfiguration(ice)
+        try await caller.configureMediaProfile(
+            CallMediaProfileVersion.cameraVideo,
+            initialCameraIntent: false
+        )
+        try await callee.configureMediaProfile(
+            CallMediaProfileVersion.cameraVideo,
+            initialCameraIntent: false
+        )
+
+        let offer: CallSessionDescription
+        do {
+            offer = try await caller.makeOffer(iceRestart: false)
+        } catch {
+            XCTFail("Generated profile-2 offer was rejected: \(error); validator: \(WebRTCCallEngine.lastSDPValidationFailureForTesting ?? "unknown")\n\(WebRTCCallEngine.lastGeneratedSDPForTesting ?? "missing SDP")")
+            await caller.stop()
+            await callee.stop()
+            return
+        }
+        XCTAssertTrue(WebRTCCallEngine.validatesMediaSDPForTesting(
+            offer.sdp,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .offer,
+            expectedFingerprint: callerIdentity.dtlsFingerprintSHA256
+        ))
+        do {
+            try await callee.setRemoteDescription(
+                offer,
+                expectedDTLSFingerprintSHA256: callerIdentity.dtlsFingerprintSHA256
+            )
+        } catch {
+            XCTFail("Profile-2 offer could not be installed: \(error); media graph: \(WebRTCCallEngine.lastMediaReassertFailureForTesting ?? "unknown")")
+            await caller.stop()
+            await callee.stop()
+            return
+        }
+        let answer: CallSessionDescription
+        do {
+            answer = try await callee.makeAnswer()
+        } catch {
+            XCTFail("Generated profile-2 answer was rejected: \(error); validator: \(WebRTCCallEngine.lastSDPValidationFailureForTesting ?? "unknown")\n\(WebRTCCallEngine.lastGeneratedSDPForTesting ?? "missing SDP")")
+            await caller.stop()
+            await callee.stop()
+            return
+        }
+        XCTAssertTrue(WebRTCCallEngine.validatesMediaSDPForTesting(
+            answer.sdp,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .answer,
+            expectedFingerprint: calleeIdentity.dtlsFingerprintSHA256
+        ))
+        try await caller.setRemoteDescription(
+            answer,
+            expectedDTLSFingerprintSHA256: calleeIdentity.dtlsFingerprintSHA256
+        )
+
+        let restartOffer = try await caller.makeOffer(iceRestart: true)
+        XCTAssertTrue(WebRTCCallEngine.validatesMediaSDPForTesting(
+            restartOffer.sdp,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .offer,
+            expectedFingerprint: callerIdentity.dtlsFingerprintSHA256
+        ))
+
+        // The permanent video track can remain off after descriptions are installed; this
+        // exercises the same sender without producing another offer or answer.
+        try await caller.setCameraEnabled(false, position: .front)
+        try await callee.setCameraEnabled(false, position: .front)
+        await caller.stop()
+        await callee.stop()
+    }
+
+    @MainActor
+    func testProfileTwoStrictSDPRejectsDowngradesAndUnexpectedMedia() {
+        let fixture = profileTwoSDP(setup: "actpass")
+        XCTAssertTrue(WebRTCCallEngine.validatesMediaSDPForTesting(
+            fixture.sdp,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .offer,
+            expectedFingerprint: fixture.fingerprint
+        ))
+
+        let invalid: [String] = [
+            fixture.sdp.replacingOccurrences(of: "m=video 9", with: "m=video 0"),
+            fixture.sdp.replacingOccurrences(of: "m=video 9 UDP/TLS/RTP/SAVPF",
+                                             with: "m=video 9 RTP/SAVPF"),
+            fixture.sdp.replacingOccurrences(of: "a=group:BUNDLE 0 1", with: "a=group:BUNDLE 0"),
+            fixture.sdp.replacingOccurrences(
+                of: "a=group:BUNDLE 0 1",
+                with: "a=group:BUNDLE 0 1\r\na=group:BUNDLE 0 1"
+            ),
+            fixture.sdp.replacingOccurrences(of: "a=mid:1", with: "a=mid:0"),
+            fixture.sdp.replacingOccurrences(of: "a=ice-ufrag:bundle", with: "a=ice-ufrag:"),
+            fixture.sdp.replacingOccurrences(
+                of: "a=ice-ufrag:bundle\r\na=ice-pwd:bundle-password\r\na=setup:actpass\r\na=rtpmap:96",
+                with: "a=ice-ufrag:other\r\na=ice-pwd:other-password\r\na=setup:actpass\r\na=rtpmap:96"
+            ),
+            fixture.sdp.replacingOccurrences(of: "a=fmtp:97 apt=96", with: "a=fmtp:97 apt=120"),
+            fixture.sdp.replacingOccurrences(of: "profile-level-id=42e01f", with: "profile-level-id=42e0zz"),
+            fixture.sdp.replacingOccurrences(of: "profile-level-id=42e01f", with: "profile-level-id=42e0"),
+            fixture.sdp.replacingOccurrences(
+                of: "profile-level-id=42e01f",
+                with: "profile-level-id=42e01f;packetization-mode=1"
+            ),
+            fixture.sdp.replacingOccurrences(
+                of: "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+                with: "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\na=fmtp:96 packetization-mode=1"
+            ),
+            fixture.sdp + "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+            fixture.sdp + "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:secret\r\n",
+            fixture.sdp.replacingOccurrences(
+                of: "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99",
+                with: "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100"
+            ) + "a=rtpmap:100 VP8/90000\r\n",
+            fixture.sdp.replacingOccurrences(
+                of: "a=mid:1\r\na=sendrecv",
+                with: "a=mid:1\r\na=inactive"
+            ),
+        ]
+        for sdp in invalid {
+            XCTAssertFalse(WebRTCCallEngine.validatesMediaSDPForTesting(
+                sdp,
+                profile: CallMediaProfileVersion.cameraVideo,
+                type: .offer,
+                expectedFingerprint: fixture.fingerprint
+            ))
+        }
+        XCTAssertFalse(WebRTCCallEngine.validatesMediaSDPForTesting(
+            fixture.sdp,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .offer,
+            expectedFingerprint: Data(repeating: 0xFF, count: 32)
+        ))
+        let rejectedVideo = fixture.sdp.replacingOccurrences(
+            of: "m=video 9",
+            with: "m=video 0"
+        )
+        XCTAssertFalse(WebRTCCallEngine.validatesMediaSDPForTesting(
+            rejectedVideo,
+            profile: CallMediaProfileVersion.cameraVideo,
+            type: .offer,
+            expectedFingerprint: fixture.fingerprint
+        ))
+    }
+
+    private func profileTwoSDP(setup: String) -> (sdp: String, fingerprint: Data) {
+        let fingerprint = Data((0..<32).map(UInt8.init))
+        let fingerprintText = fingerprint.map { String(format: "%02X", $0) }.joined(separator: ":")
+        let lines = [
+            "v=0", "o=- 1 1 IN IP4 127.0.0.1", "s=-", "t=0 0",
+            "a=group:BUNDLE 0 1", "a=fingerprint:sha-256 \(fingerprintText)",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111", "c=IN IP4 0.0.0.0", "a=mid:0",
+            "a=sendrecv", "a=rtcp-mux", "a=ice-ufrag:bundle", "a=ice-pwd:bundle-password",
+            "a=setup:\(setup)", "a=rtpmap:111 opus/48000/2",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99", "c=IN IP4 0.0.0.0", "a=mid:1",
+            "a=sendrecv", "a=rtcp-mux", "a=ice-ufrag:bundle", "a=ice-pwd:bundle-password",
+            "a=setup:\(setup)", "a=rtpmap:96 H264/90000",
+            "a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+            "a=rtpmap:97 rtx/90000", "a=fmtp:97 apt=96", "a=rtpmap:98 red/90000",
+            "a=rtpmap:99 ulpfec/90000",
+        ]
+        return (lines.joined(separator: "\r\n") + "\r\n", fingerprint)
+    }
+    #endif
+}
+
+final class CallVideoStateReducerTests: XCTestCase {
+    @MainActor
+    func testCaptureRequiresAuthenticatedMediaPermissionAndOwningScene() {
+        var reducer = CallVideoStateReducer()
+        let generation = reducer.beginRuntime(initialCameraIntent: true)
+        XCTAssertEqual(reducer.decision().effectiveState, .inactive)
+        reducer.setPermission(.authorized, generation: generation)
+        reducer.setSecureMediaReady(true, generation: generation)
+        XCTAssertEqual(reducer.decision().genericPauseReason, .background)
+        reducer.setScene(
+            foreground: true,
+            pictureInPicture: false,
+            backgroundCameraAvailable: false,
+            generation: generation
+        )
+        XCTAssertEqual(reducer.decision(), CallVideoCaptureDecision(
+            shouldCapture: true,
+            effectiveState: .active,
+            genericPauseReason: nil,
+            preferredCameraPosition: .front
+        ))
+        reducer.setNetworkStarved(true, generation: generation)
+        XCTAssertEqual(reducer.decision().genericPauseReason, .network)
+        reducer.setUserWantsCamera(false, generation: generation)
+        XCTAssertEqual(reducer.decision().effectiveState, .inactive)
+    }
+
+    @MainActor
+    func testGenerationFenceIgnoresLatePermissionAndCaptureCallbacks() {
+        var reducer = CallVideoStateReducer()
+        let old = reducer.beginRuntime(initialCameraIntent: true)
+        let current = reducer.beginRuntime(initialCameraIntent: false)
+        reducer.setPermission(.authorized, generation: old)
+        reducer.setSecureMediaReady(true, generation: old)
+        reducer.setCaptureHealth(
+            interrupted: true,
+            runtimeFailed: true,
+            cameraAvailable: false,
+            pressureCritical: true,
+            generation: old
+        )
+        XCTAssertEqual(reducer.generation, current)
+        XCTAssertFalse(reducer.userWantsCamera)
+        XCTAssertEqual(reducer.permission, .notDetermined)
+        XCTAssertEqual(reducer.decision().effectiveState, .inactive)
+    }
+
+    @MainActor
+    func testCriticalThermalRecoveryRequiresTwentyStableSeconds() {
+        var reducer = CallVideoStateReducer()
+        let generation = reducer.beginRuntime(initialCameraIntent: true)
+        reducer.setPermission(.authorized, generation: generation)
+        reducer.setSecureMediaReady(true, generation: generation)
+        reducer.setScene(
+            foreground: true,
+            pictureInPicture: false,
+            backgroundCameraAvailable: false,
+            generation: generation
+        )
+        let now = Date(timeIntervalSince1970: 1_000)
+        reducer.setThermalState(.critical, now: now, generation: generation)
+        XCTAssertEqual(reducer.decision(now: now).effectiveState, .paused)
+        reducer.setThermalState(.serious, now: now.addingTimeInterval(1), generation: generation)
+        reducer.setThermalState(.fair, now: now.addingTimeInterval(2), generation: generation)
+        XCTAssertEqual(reducer.decision(now: now.addingTimeInterval(21.999)).effectiveState, .paused)
+        XCTAssertEqual(reducer.decision(now: now.addingTimeInterval(22)).effectiveState, .active)
+    }
+
+    @MainActor
+    func testForegroundUserRetryClearsOnlyLatchedRuntimeFailure() {
+        var reducer = CallVideoStateReducer()
+        let generation = reducer.beginRuntime(initialCameraIntent: true)
+        reducer.setPermission(.authorized, generation: generation)
+        reducer.setSecureMediaReady(true, generation: generation)
+        reducer.setScene(
+            foreground: true,
+            pictureInPicture: false,
+            backgroundCameraAvailable: false,
+            generation: generation
+        )
+        reducer.setCaptureHealth(
+            interrupted: true,
+            runtimeFailed: true,
+            cameraAvailable: true,
+            pressureCritical: false,
+            generation: generation
+        )
+        reducer.retryCaptureAfterRuntimeFailure(generation: generation)
+        XCTAssertFalse(reducer.captureRuntimeFailed)
+        XCTAssertTrue(reducer.captureIsInterrupted)
+        XCTAssertEqual(reducer.decision().effectiveState, .paused)
+    }
+
+    func testRevisionPolicyRejectsOverflowAndStaleRemoteUpdates() throws {
+        XCTAssertEqual(try CallMediaRevisionPolicy.advanced(after: 1), 2)
+        XCTAssertThrowsError(try CallMediaRevisionPolicy.advanced(after: .max)) { error in
+            XCTAssertEqual(error as? CallCryptoError, .sequenceExhausted)
+        }
+        XCTAssertTrue(CallMediaRevisionPolicy.accepts(remote: 4, highestAccepted: 3))
+        XCTAssertFalse(CallMediaRevisionPolicy.accepts(remote: 3, highestAccepted: 3))
+        XCTAssertFalse(CallMediaRevisionPolicy.accepts(remote: 2, highestAccepted: 3))
+    }
+}
+
+final class CallVideoQualityReducerTests: XCTestCase {
+    private let ordinaryWiFi = CallVideoPathPolicy(
+        kind: .wifi,
+        isConstrained: false,
+        isLowDataMode: false,
+        isRoaming: false
+    )
+
+    func testThreeBadIntervalSamplesReduceExactlyOneTier() {
+        var reducer = CallVideoQualityReducer()
+        ingestSender(&reducer, second: 0, lost: 0, sent: 0, bitrate: 2_000_000)
+        for second in 1...3 {
+            ingestSender(&reducer, second: second, lost: Int64(second * 100),
+                         sent: Int64(second * 900), bitrate: 500_000, rtt: 451, jitter: 61)
+        }
+        XCTAssertEqual(reducer.senderTier, .medium)
+    }
+
+    func testExactBadThresholdsAreNotTreatedAsBad() {
+        var reducer = CallVideoQualityReducer()
+        ingestSender(&reducer, second: 0, lost: 0, sent: 0, bitrate: 2_000_000)
+        for second in 1...3 {
+            ingestSender(&reducer, second: second, lost: Int64(second * 80),
+                         sent: Int64(second * 1_000), bitrate: 1_500_000 * 0.70,
+                         rtt: 450, jitter: 60)
+        }
+        XCTAssertEqual(reducer.senderTier, .high)
+    }
+
+    func testIncompleteSamplesBreakConsecutiveSenderAndReceiverRuns() {
+        var sender = CallVideoQualityReducer()
+        ingestSender(&sender, second: 0, lost: 0, sent: 0, bitrate: 2_000_000)
+        for second in 1...2 {
+            ingestSender(&sender, second: second, lost: Int64(second * 100),
+                         sent: Int64(second * 900), bitrate: 500_000, rtt: 451, jitter: 61)
+        }
+        sender.ingestSender(CallVideoSenderStats(
+            timestamp: 3,
+            packetsLost: nil,
+            packetsSent: nil,
+            roundTripTimeMilliseconds: 500,
+            jitterMilliseconds: 70,
+            availableOutgoingBitrate: 10_000
+        ), policy: .never, path: ordinaryWiFi, thermal: .nominal,
+        peerMaximumReceiveTier: .high)
+        ingestSender(&sender, second: 4, lost: 400, sent: 3_600,
+                     bitrate: 500_000, rtt: 451, jitter: 61)
+        XCTAssertEqual(sender.senderTier, .high)
+
+        var receiver = CallVideoQualityReducer()
+        receiver.ingestReceiver(receiverSample(
+            second: 0, lost: 0, received: 0, freeze: 0, frames: 0
+        ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        for second in 1...2 {
+            receiver.ingestReceiver(receiverSample(
+                second: second,
+                lost: Int64(second * 100),
+                received: Int64(second * 900),
+                freeze: Double(second * 600),
+                frames: Int64(second * 5)
+            ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        }
+        receiver.ingestReceiver(CallVideoReceiverStats(
+            timestamp: 3,
+            packetsLost: nil,
+            packetsReceived: nil,
+            jitterMilliseconds: nil,
+            totalFreezeMilliseconds: nil,
+            totalFramesDecoded: nil
+        ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        receiver.ingestReceiver(receiverSample(
+            second: 4, lost: 400, received: 3_600, freeze: 2_400, frames: 20
+        ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        XCTAssertEqual(receiver.requestedReceiveTier, .high)
+    }
+
+    func testMissingSamplesDataCapsStarvationAndRecovery() {
+        var missing = CallVideoQualityReducer()
+        for _ in 0..<3 {
+            missing.ingestSender(nil, policy: .never, path: ordinaryWiFi,
+                                 thermal: .nominal, peerMaximumReceiveTier: .high)
+        }
+        XCTAssertEqual(missing.senderTier, .low)
+
+        var capped = CallVideoQualityReducer()
+        capped.ingestSender(nil, policy: .always, path: ordinaryWiFi,
+                            thermal: .nominal, peerMaximumReceiveTier: .high)
+        XCTAssertEqual(capped.senderTier, .medium)
+        let constrained = CallVideoPathPolicy(
+            kind: .cellular, isConstrained: true, isLowDataMode: true, isRoaming: true
+        )
+        capped.ingestSender(nil, policy: .never, path: constrained,
+                            thermal: .nominal, peerMaximumReceiveTier: .high)
+        XCTAssertEqual(capped.senderTier, .low)
+
+        var receiveCapped = CallVideoQualityReducer()
+        receiveCapped.ingestReceiver(nil, policy: .always, path: ordinaryWiFi, thermal: .nominal)
+        XCTAssertEqual(receiveCapped.requestedReceiveTier, .medium)
+        receiveCapped.ingestReceiver(nil, policy: .never, path: constrained, thermal: .nominal)
+        XCTAssertEqual(receiveCapped.requestedReceiveTier, .low)
+
+        var missingReceiver = CallVideoQualityReducer()
+        for _ in 0..<3 {
+            missingReceiver.ingestReceiver(
+                nil,
+                policy: .never,
+                path: ordinaryWiFi,
+                thermal: .nominal
+            )
+        }
+        XCTAssertEqual(missingReceiver.requestedReceiveTier, .low)
+
+        var starving = CallVideoQualityReducer()
+        ingestSender(&starving, second: 0, lost: 0, sent: 0, bitrate: 70_000)
+        for second in 1...5 {
+            ingestSender(&starving, second: second, lost: 0,
+                         sent: Int64(second * 1_000), bitrate: 70_000)
+        }
+        XCTAssertTrue(starving.outgoingVideoPaused)
+        for second in 6...15 {
+            ingestSender(&starving, second: second, lost: 0,
+                         sent: Int64(second * 1_000), bitrate: 800_000, rtt: 200, jitter: 10)
+        }
+        XCTAssertFalse(starving.outgoingVideoPaused)
+    }
+
+    func testPeerCapAndReceiverHysteresisAreBidirectional() {
+        var sender = CallVideoQualityReducer()
+        sender.ingestSender(nil, policy: .never, path: ordinaryWiFi,
+                            thermal: .nominal, peerMaximumReceiveTier: .low)
+        XCTAssertEqual(sender.senderTier, .low)
+
+        var receiver = CallVideoQualityReducer()
+        receiver.ingestReceiver(receiverSample(second: 0, lost: 0, received: 0,
+                                               freeze: 0, frames: 0),
+                                policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        for second in 1...3 {
+            receiver.ingestReceiver(receiverSample(
+                second: second,
+                lost: Int64(second * 100),
+                received: Int64(second * 900),
+                freeze: Double(second * 600),
+                frames: Int64(second * 5)
+            ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        }
+        XCTAssertEqual(receiver.requestedReceiveTier, .medium)
+        receiver.resetBaselines()
+        receiver.ingestReceiver(receiverSample(second: 10, lost: 300, received: 2_700,
+                                               freeze: 1_800, frames: 15),
+                                policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        for second in 11...20 {
+            receiver.ingestReceiver(receiverSample(
+                second: second,
+                lost: 300,
+                received: 2_700 + Int64((second - 10) * 1_000),
+                freeze: 1_800,
+                frames: 15 + Int64((second - 10) * 24)
+            ), policy: .never, path: ordinaryWiFi, thermal: .nominal)
+        }
+        XCTAssertEqual(receiver.requestedReceiveTier, .high)
+    }
+
+    private func ingestSender(
+        _ reducer: inout CallVideoQualityReducer,
+        second: Int,
+        lost: Int64,
+        sent: Int64,
+        bitrate: Double,
+        rtt: Double = 200,
+        jitter: Double = 10
+    ) {
+        reducer.ingestSender(CallVideoSenderStats(
+            timestamp: Double(second), packetsLost: lost, packetsSent: sent,
+            roundTripTimeMilliseconds: rtt, jitterMilliseconds: jitter,
+            availableOutgoingBitrate: bitrate
+        ), policy: .never, path: ordinaryWiFi, thermal: .nominal,
+        peerMaximumReceiveTier: .high)
+    }
+
+    private func receiverSample(
+        second: Int,
+        lost: Int64,
+        received: Int64,
+        freeze: Double,
+        frames: Int64
+    ) -> CallVideoReceiverStats {
+        CallVideoReceiverStats(
+            timestamp: Double(second), packetsLost: lost, packetsReceived: received,
+            jitterMilliseconds: 10, totalFreezeMilliseconds: freeze,
+            totalFramesDecoded: frames
+        )
+    }
 }
 
 final class CallGlarePolicyTests: XCTestCase {
@@ -601,6 +1144,121 @@ final class CallPlatformContractTests: XCTestCase {
         XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains("request_ice_restart"))
     }
 
+    func testEncryptedMediaStatePayloadRoundTripsAndKeepsRevisionsIndependent() throws {
+        let update = CallMediaStateUpdateV1(
+            version: 1,
+            revision: 17,
+            desiredCameraState: true,
+            effectiveState: .paused,
+            genericPauseReason: .network,
+            requestedMaximumReceiveTier: .low
+        )
+        let encoded = try JSONEncoder().encode(CallCoordinator.CallWirePayload(
+            description: nil,
+            candidate: nil,
+            mediaState: update
+        ))
+        let decoded = try JSONDecoder().decode(CallCoordinator.CallWirePayload.self, from: encoded)
+        XCTAssertEqual(decoded.mediaState, update)
+        XCTAssertNil(decoded.control)
+    }
+
+    func testCallKitKeepsStartIntentImmutableWhileHasVideoMayUpgrade() {
+        XCTAssertFalse(CallKitVideoContract.immutableStartActionIsVideo(for: .voice))
+        XCTAssertFalse(CallKitVideoContract.initialUpdateHasVideo(for: .voice))
+        XCTAssertTrue(CallKitVideoContract.immutableStartActionIsVideo(for: .video))
+        XCTAssertTrue(CallKitVideoContract.initialUpdateHasVideo(for: .video))
+        XCTAssertTrue(CallKitVideoContract.shouldAutoEnableSpeaker(for: .builtInReceiver))
+        XCTAssertTrue(CallKitVideoContract.shouldAutoEnableSpeaker(for: .unknown))
+        XCTAssertFalse(CallKitVideoContract.shouldAutoEnableSpeaker(for: .wired))
+        XCTAssertFalse(CallKitVideoContract.shouldAutoEnableSpeaker(for: .bluetooth))
+        XCTAssertFalse(CallKitVideoContract.shouldAutoEnableSpeaker(for: .airPlay))
+    }
+
+    func testEveryTerminalLifecycleProjectionMapsToACallKitEndReason() {
+        let cases: [(String?, CallEndReason)] = [
+            ("answered_elsewhere", .answeredElsewhere),
+            ("declined", .declined),
+            ("unanswered", .unanswered),
+            ("expired", .unanswered),
+            ("cancelled", .cancelled),
+            ("caller_cancelled", .cancelled),
+            ("busy", .busy),
+            ("network_lost", .networkLost),
+            ("security_error", .securityError),
+            ("local_ended", .remoteEnded),
+            (nil, .remoteEnded),
+        ]
+
+        for (rawReason, expected) in cases {
+            XCTAssertEqual(
+                CallLifecycleProjectionPolicy.terminalReason(
+                    view: .lifecycle,
+                    state: "ended",
+                    endReason: rawReason
+                ),
+                expected
+            )
+        }
+        XCTAssertNil(CallLifecycleProjectionPolicy.terminalReason(
+            view: .full,
+            state: "ended",
+            endReason: "declined"
+        ))
+        XCTAssertNil(CallLifecycleProjectionPolicy.terminalReason(
+            view: .lifecycle,
+            state: "active",
+            endReason: "declined"
+        ))
+    }
+
+    func testEncryptedSignalKindMustAgreeWithInnerSDPType() {
+        XCTAssertTrue(CallSignalDescriptionPolicy.accepts(
+            kind: .offer,
+            descriptionType: .offer
+        ))
+        XCTAssertTrue(CallSignalDescriptionPolicy.accepts(
+            kind: .iceRestart,
+            descriptionType: .offer
+        ))
+        XCTAssertTrue(CallSignalDescriptionPolicy.accepts(
+            kind: .answer,
+            descriptionType: .answer
+        ))
+        XCTAssertFalse(CallSignalDescriptionPolicy.accepts(
+            kind: .offer,
+            descriptionType: .answer
+        ))
+        XCTAssertFalse(CallSignalDescriptionPolicy.accepts(
+            kind: .iceRestart,
+            descriptionType: .answer
+        ))
+        XCTAssertFalse(CallSignalDescriptionPolicy.accepts(
+            kind: .answer,
+            descriptionType: .offer
+        ))
+    }
+
+    func testLifecycleCallViewDecodesOnlyWithoutNegotiationSecrets() throws {
+        let response = try JSONDecoder().decode(CloudCallResponse.self, from: Data(#"""
+        {"call":{"view":"lifecycle","id":"call","dialogId":"dialog","callerAccountId":"alice","callerDeviceId":"alice-phone","calleeAccountId":"bob","state":"ended","offeredProtocolVersions":[],"offeredMediaProfileVersions":[],"selectableMediaProfileVersions":[],"initialKind":"video","protocolVersion":null,"mediaProfileVersion":null,"callerCommitment":null,"calleeCommitment":null,"callerFingerprint":null,"acceptedDeviceId":null,"calleePublicKey":null,"calleeNonce":null,"calleeFingerprint":null,"callerPublicKey":null,"callerNonce":null,"createdAt":"2026-01-01T00:00:00Z","expiresAt":"2026-01-01T00:01:00Z","acceptedAt":null,"confirmedAt":null,"endedAt":"2026-01-01T00:00:10Z","endReason":"answered_elsewhere","localRingStatus":"answered_elsewhere","latestEventSeq":0}}
+        """#.utf8))
+
+        guard case .lifecycle(let snapshot) = response.callView else {
+            return XCTFail("Expected a lifecycle projection")
+        }
+        XCTAssertEqual(snapshot.initialKind, .video)
+        XCTAssertEqual(snapshot.localRingStatus, "answered_elsewhere")
+    }
+
+    func testLifecycleCallViewFailsClosedIfServerLeaksNegotiationState() throws {
+        let leaked = Data(#"""
+        {"call":{"view":"lifecycle","id":"call","dialogId":"dialog","callerAccountId":"alice","callerDeviceId":"alice-phone","calleeAccountId":"bob","state":"ended","offeredProtocolVersions":[1],"offeredMediaProfileVersions":[],"selectableMediaProfileVersions":[],"initialKind":"video","protocolVersion":null,"mediaProfileVersion":null,"callerCommitment":"secret","calleeCommitment":null,"callerFingerprint":null,"acceptedDeviceId":null,"calleePublicKey":null,"calleeNonce":null,"calleeFingerprint":null,"callerPublicKey":null,"callerNonce":null,"createdAt":"2026-01-01T00:00:00Z","expiresAt":"2026-01-01T00:01:00Z","acceptedAt":null,"confirmedAt":null,"endedAt":"2026-01-01T00:00:10Z","endReason":"answered_elsewhere","localRingStatus":"answered_elsewhere","latestEventSeq":0}}
+        """#.utf8)
+
+        XCTAssertThrowsError(try JSONDecoder().decode(CloudCallResponse.self, from: leaked))
+    }
+
     @MainActor
     func testSignalOutboxPreservesSubmissionOrderAcrossSuspension() async throws {
         let outbox = OrderedCallSignalOutbox()
@@ -716,6 +1374,23 @@ final class CallPlatformContractTests: XCTestCase {
             ],
         ]))
         XCTAssertEqual(invitation.callId, id)
+        XCTAssertEqual(invitation.initialKind, .voice)
+    }
+
+    func testVoIPInvitationAuthenticatesVideoKindFromVersionedPayload() throws {
+        let id = UUID()
+        let invitation = try XCTUnwrap(VoIPPushInvitation(payload: [
+            "aps": ["content-available": 1],
+            "toj": [
+                "v": 1,
+                "type": "video_call",
+                "callId": id.uuidString.lowercased(),
+                "callerAccountId": UUID().uuidString.lowercased(),
+                "expiresAt": "2099-01-01T00:00:00Z",
+            ],
+        ]))
+        XCTAssertEqual(invitation.callId, id)
+        XCTAssertEqual(invitation.initialKind, .video)
     }
 
     func testVoIPInvitationPreservesExpiredCallForMandatoryCallKitReporting() throws {
@@ -747,6 +1422,18 @@ final class CallPlatformContractTests: XCTestCase {
         let payload = #"{"v":1,"type":"voice_call","callId":"call","outcome":"completed","durationSeconds":65}"#
         let presentation = VoiceCallServicePresentation.parse(body: payload, callerIsCurrentAccount: true)
         XCTAssertEqual(presentation.title, "Outgoing voice call")
+        XCTAssertEqual(presentation.duration, "01:05")
+    }
+
+    func testVideoCallHistoryUsesImmutableInitialKind() {
+        let payload = #"{"v":1,"type":"video_call","callId":"call","callerAccountId":"alice","outcome":"completed","durationSeconds":65}"#
+        let presentation = VoiceCallServicePresentation.parse(
+            body: payload,
+            callerIsCurrentAccount: false,
+            currentAccountId: "alice"
+        )
+        XCTAssertEqual(presentation.title, "Outgoing video call")
+        XCTAssertEqual(presentation.systemImage, "video.fill")
         XCTAssertEqual(presentation.duration, "01:05")
     }
 

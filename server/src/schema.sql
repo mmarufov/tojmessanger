@@ -76,6 +76,11 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_nonce BYTEA;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_token_key_id TEXT;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_environment TEXT;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_updated_at TIMESTAMPTZ;
+-- Call capabilities are device-scoped. Legacy registrations intentionally reset these
+-- values to profile 1 so a stale profile-2 advertisement cannot survive an app downgrade.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_protocol_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_media_profile_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS call_view_version INT NOT NULL DEFAULT 1;
 DO $$ BEGIN
   ALTER TABLE devices ADD CONSTRAINT devices_push_environment_check
     CHECK (push_environment IN ('sandbox','production'));
@@ -395,6 +400,9 @@ CREATE TABLE IF NOT EXISTS calls (
                               CHECK (state IN ('requested','accepted','key_exchange','active','ended')),
   supported_protocols       INT[] NOT NULL,
   offered_media_profiles    INT[] NOT NULL,
+  initial_kind              TEXT NOT NULL DEFAULT 'voice'
+                              CHECK (initial_kind IN ('voice','video')),
+  selectable_media_profiles INT[] NOT NULL DEFAULT ARRAY[1]::INT[],
   protocol_version          INT,
   media_profile_version     INT,
   caller_commitment         BYTEA NOT NULL CHECK (octet_length(caller_commitment) = 32),
@@ -417,6 +425,18 @@ CREATE TABLE IF NOT EXISTS calls (
   end_reason                TEXT,
   CHECK (caller_account_id <> callee_account_id)
 );
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS initial_kind TEXT NOT NULL DEFAULT 'voice';
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS selectable_media_profiles INT[];
+ALTER TABLE calls ALTER COLUMN selectable_media_profiles SET DEFAULT ARRAY[1]::INT[];
+DO $$ BEGIN
+  ALTER TABLE calls ADD CONSTRAINT calls_initial_kind_check CHECK (initial_kind IN ('voice','video'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE calls ADD CONSTRAINT calls_selectable_media_profiles_not_null
+    CHECK (selectable_media_profiles IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS calls_caller_active_idx ON calls(caller_account_id, created_at DESC)
   WHERE state <> 'ended';
 CREATE INDEX IF NOT EXISTS calls_callee_active_idx ON calls(callee_account_id, created_at DESC)
@@ -440,10 +460,16 @@ CREATE TABLE IF NOT EXISTS call_ring_targets (
   device_id   UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   status      TEXT NOT NULL DEFAULT 'ringing'
                 CHECK (status IN ('ringing','accepted','declined','answered_elsewhere','expired','ended')),
+  selectable_protocols INT[] NOT NULL DEFAULT ARRAY[1]::INT[],
+  selectable_media_profiles INT[] NOT NULL DEFAULT ARRAY[1]::INT[],
+  call_view_version INT NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   responded_at TIMESTAMPTZ,
   PRIMARY KEY (call_id, device_id)
 );
+ALTER TABLE call_ring_targets ADD COLUMN IF NOT EXISTS selectable_protocols INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
+ALTER TABLE call_ring_targets ADD COLUMN IF NOT EXISTS selectable_media_profiles INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
+ALTER TABLE call_ring_targets ADD COLUMN IF NOT EXISTS call_view_version INT NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS call_ring_targets_device_idx ON call_ring_targets(device_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS call_events (
@@ -498,6 +524,8 @@ CREATE TABLE IF NOT EXISTS call_history_outbox (
   history_client_msg_id UUID NOT NULL DEFAULT gen_random_uuid(),
   dialog_id          UUID NOT NULL REFERENCES dialogs(id),
   caller_account_id  UUID NOT NULL REFERENCES accounts(id),
+  initial_kind       TEXT NOT NULL DEFAULT 'voice'
+                       CHECK (initial_kind IN ('voice','video')),
   outcome            TEXT NOT NULL CHECK (outcome IN ('completed','declined','missed','busy','cancelled','failed')),
   duration_seconds   INT NOT NULL DEFAULT 0 CHECK (duration_seconds >= 0),
   status             TEXT NOT NULL DEFAULT 'pending'
@@ -509,6 +537,12 @@ CREATE TABLE IF NOT EXISTS call_history_outbox (
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   delivered_at       TIMESTAMPTZ
 );
+ALTER TABLE call_history_outbox ADD COLUMN IF NOT EXISTS initial_kind TEXT NOT NULL DEFAULT 'voice';
+DO $$ BEGIN
+  ALTER TABLE call_history_outbox ADD CONSTRAINT call_history_outbox_initial_kind_check
+    CHECK (initial_kind IN ('voice','video'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 ALTER TABLE call_history_outbox ADD COLUMN IF NOT EXISTS history_client_msg_id UUID DEFAULT gen_random_uuid();
 UPDATE call_history_outbox SET history_client_msg_id = gen_random_uuid()
 WHERE history_client_msg_id IS NULL;
@@ -539,6 +573,8 @@ CREATE TABLE IF NOT EXISTS voip_push_deliveries (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   call_id           UUID NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
   caller_account_id UUID NOT NULL REFERENCES accounts(id),
+  initial_kind      TEXT NOT NULL DEFAULT 'voice'
+                      CHECK (initial_kind IN ('voice','video')),
   device_id         UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   status            TEXT NOT NULL DEFAULT 'pending'
                       CHECK (status IN ('pending','sending','sent','dead')),
@@ -552,6 +588,12 @@ CREATE TABLE IF NOT EXISTS voip_push_deliveries (
   sent_at           TIMESTAMPTZ,
   UNIQUE (call_id, device_id)
 );
+ALTER TABLE voip_push_deliveries ADD COLUMN IF NOT EXISTS initial_kind TEXT NOT NULL DEFAULT 'voice';
+DO $$ BEGIN
+  ALTER TABLE voip_push_deliveries ADD CONSTRAINT voip_push_deliveries_initial_kind_check
+    CHECK (initial_kind IN ('voice','video'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS voip_push_deliveries_ready_idx
   ON voip_push_deliveries(available_at, created_at) WHERE status IN ('pending','sending');
 CREATE INDEX IF NOT EXISTS voip_push_deliveries_retention_idx

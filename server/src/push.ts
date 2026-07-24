@@ -7,6 +7,10 @@ import {
 } from "node:http2";
 import { createPrivateKey, sign } from "node:crypto";
 import { hashToken, open, pushTokenAAD, seal, voipPushTokenAAD } from "./crypto";
+import {
+  CallVersionCapabilityError,
+  normalizeCallVersionCapabilities,
+} from "./call-versions";
 
 export type PushEnvironment = "sandbox" | "production";
 
@@ -106,12 +110,33 @@ export async function registerVoIPPushToken(
   deviceId: string,
   rawToken: string,
   rawEnvironment: string,
-): Promise<{ registered: true }> {
+  rawSupportedCallProtocolVersions?: unknown,
+  rawSupportedCallMediaProfileVersions?: unknown,
+  rawCallViewVersion?: unknown,
+): Promise<{ registered: true; supportedCallProtocolVersions: number[];
+  supportedCallMediaProfileVersions: number[]; callViewVersion: number }> {
   const token = normalizeDeviceToken(rawToken);
   const environment = validateEnvironment(rawEnvironment);
   const tokenHash = hashToken(`apns-voip|${environment}|${token}`);
   const registrationLock = tokenHash.readBigInt64BE(0);
   const sealed = seal(token, voipPushTokenAAD(deviceId));
+  // Omitted values are a legacy registration, not a partial update. Resetting to profile 1
+  // prevents stale video capability from surviving an app downgrade or restore.
+  let supportedCallProtocolVersions: number[];
+  let supportedCallMediaProfileVersions: number[];
+  try {
+    supportedCallProtocolVersions = normalizeCallVersionCapabilities(rawSupportedCallProtocolVersions);
+    supportedCallMediaProfileVersions = normalizeCallVersionCapabilities(rawSupportedCallMediaProfileVersions);
+  } catch (error) {
+    if (error instanceof CallVersionCapabilityError) {
+      throw new PushError(error.message);
+    }
+    throw error;
+  }
+  const callViewVersion = rawCallViewVersion == null ? 1 : Number(rawCallViewVersion);
+  if (!Number.isSafeInteger(callViewVersion) || callViewVersion < 1 || callViewVersion > 0xffff) {
+    throw new PushError("invalid call view version");
+  }
 
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${registrationLock})`;
@@ -136,10 +161,18 @@ export async function registerVoIPPushToken(
       UPDATE devices SET
         voip_push_token_hash = ${tokenHash}, voip_push_token_ciphertext = ${sealed.ciphertext},
         voip_push_token_nonce = ${sealed.nonce}, voip_push_token_key_id = ${sealed.keyId},
-        voip_push_environment = ${environment}, voip_push_updated_at = now()
+        voip_push_environment = ${environment}, voip_push_updated_at = now(),
+        supported_call_protocol_versions = ${tx.array(supportedCallProtocolVersions, "INT4")},
+        supported_call_media_profile_versions = ${tx.array(supportedCallMediaProfileVersions, "INT4")},
+        call_view_version = ${callViewVersion}
       WHERE id = ${deviceId}`;
   });
-  return { registered: true };
+  return {
+    registered: true,
+    supportedCallProtocolVersions,
+    supportedCallMediaProfileVersions,
+    callViewVersion,
+  };
 }
 
 export async function unregisterVoIPPushToken(sql: SQL, deviceId: string): Promise<{ registered: false }> {
@@ -188,6 +221,7 @@ export type APNsVoIPSendRequest = {
   environment: PushEnvironment;
   callId: string;
   callerAccountId: string;
+  initialKind: "voice" | "video";
   expiresAt: string;
 };
 
@@ -214,13 +248,13 @@ export function buildAPNsPayload(request: Pick<APNsSyncSendRequest, "pts" | "ale
 }
 
 export function buildVoIPAPNsPayload(
-  request: Pick<APNsVoIPSendRequest, "callId" | "callerAccountId" | "expiresAt">,
+  request: Pick<APNsVoIPSendRequest, "callId" | "callerAccountId" | "initialKind" | "expiresAt">,
 ): Record<string, unknown> {
   return {
     aps: { "content-available": 1 },
     toj: {
       v: 1,
-      type: "voice_call",
+      type: request.initialKind === "video" ? "video_call" : "voice_call",
       callId: request.callId,
       callerAccountId: request.callerAccountId,
       expiresAt: request.expiresAt,
@@ -498,6 +532,7 @@ type ClaimedVoIPDelivery = {
   id: string;
   call_id: string;
   caller_account_id: string;
+  initial_kind: "voice" | "video";
   device_id: string;
   attempts: number;
   expires_at: Date | string;
@@ -532,7 +567,7 @@ async function claimVoIPDeliveries(sql: SQL, limit: number): Promise<ClaimedVoIP
     UPDATE voip_push_deliveries pd SET status = 'sending', claimed_at = now()
     FROM picked, devices d
     WHERE pd.id = picked.id AND d.id = pd.device_id
-    RETURNING pd.id, pd.call_id, pd.caller_account_id, pd.device_id, pd.attempts, pd.expires_at,
+    RETURNING pd.id, pd.call_id, pd.caller_account_id, pd.initial_kind, pd.device_id, pd.attempts, pd.expires_at,
       d.voip_push_token_ciphertext, d.voip_push_token_nonce, d.voip_push_token_key_id,
       d.voip_push_environment` as ClaimedVoIPDelivery[];
 }
@@ -609,6 +644,7 @@ async function processVoIPDelivery(sql: SQL, sender: PushSender, delivery: Claim
       environment: delivery.voip_push_environment,
       callId: delivery.call_id,
       callerAccountId: delivery.caller_account_id,
+      initialKind: delivery.initial_kind,
       expiresAt: new Date(delivery.expires_at).toISOString(),
     });
     if (result.status === 200) {

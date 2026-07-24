@@ -9,8 +9,10 @@ nonisolated enum CallProtocolVersion {
 /// Independently versioned from the cryptographic protocol so codec and
 /// transport behavior cannot be silently downgraded.
 nonisolated enum CallMediaProfileVersion {
-    static let current: UInt16 = 1
-    static let supported: [UInt16] = [current]
+    static let voice: UInt16 = 1
+    static let cameraVideo: UInt16 = 2
+    static let current = cameraVideo
+    static let supported: [UInt16] = [voice, cameraVideo]
 }
 
 nonisolated enum CallSignalKind: String, Codable, CaseIterable, Sendable {

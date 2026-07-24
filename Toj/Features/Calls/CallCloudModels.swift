@@ -1,5 +1,11 @@
 import Foundation
 
+nonisolated enum CloudCallViewKind: String, Codable, Sendable {
+    case full
+    case invitation
+    case lifecycle
+}
+
 nonisolated indirect enum CloudJSONValue: Codable, Equatable, Sendable {
     case string(String)
     case number(Double)
@@ -32,6 +38,7 @@ nonisolated indirect enum CloudJSONValue: Codable, Equatable, Sendable {
 }
 
 nonisolated struct CloudCallSnapshot: Codable, Identifiable, Equatable, Sendable {
+    let view: CloudCallViewKind?
     let id: String
     let dialogId: String
     let callerAccountId: String
@@ -40,9 +47,11 @@ nonisolated struct CloudCallSnapshot: Codable, Identifiable, Equatable, Sendable
     let state: String
     let offeredProtocolVersions: [Int]
     let offeredMediaProfileVersions: [Int]
+    let selectableMediaProfileVersions: [Int]?
+    let initialKind: CallInitialKind?
     let protocolVersion: Int?
     let mediaProfileVersion: Int?
-    let callerCommitment: String
+    let callerCommitment: String?
     let calleeCommitment: String?
     let callerFingerprint: String?
     let acceptedDeviceId: String?
@@ -57,7 +66,78 @@ nonisolated struct CloudCallSnapshot: Codable, Identifiable, Equatable, Sendable
     let confirmedAt: String?
     let endedAt: String?
     let endReason: String?
+    let localRingStatus: String?
     let latestEventSeq: Int64
+}
+
+/// A device-scoped call response. Decoding enforces that invitation and lifecycle projections do
+/// not accidentally grow setup secrets if the server projection regresses.
+nonisolated enum CallViewDTO: Codable, Equatable, Sendable {
+    case full(CloudCallSnapshot)
+    case invitation(CloudCallSnapshot)
+    case lifecycle(CloudCallSnapshot)
+
+    var snapshot: CloudCallSnapshot {
+        switch self {
+        case .full(let snapshot), .invitation(let snapshot), .lifecycle(let snapshot): snapshot
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let snapshot = try CloudCallSnapshot(from: decoder)
+        switch snapshot.view ?? .full {
+        case .full:
+            self = .full(snapshot)
+        case .invitation:
+            guard Self.excludesAcceptedSetup(snapshot) else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Invitation exposed accepted-call setup state")
+                )
+            }
+            self = .invitation(snapshot)
+        case .lifecycle:
+            guard Self.excludesAcceptedSetup(snapshot),
+                  snapshot.callerCommitment == nil,
+                  snapshot.offeredProtocolVersions.isEmpty,
+                  snapshot.offeredMediaProfileVersions.isEmpty,
+                  (snapshot.selectableMediaProfileVersions ?? []).isEmpty,
+                  snapshot.state == "ended",
+                  snapshot.acceptedAt == nil,
+                  snapshot.confirmedAt == nil,
+                  snapshot.latestEventSeq == 0
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Lifecycle projection exposed negotiation state")
+                )
+            }
+            self = .lifecycle(snapshot)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try snapshot.encode(to: encoder)
+    }
+
+    private static func excludesAcceptedSetup(_ snapshot: CloudCallSnapshot) -> Bool {
+        snapshot.protocolVersion == nil
+            && snapshot.mediaProfileVersion == nil
+            && snapshot.calleeCommitment == nil
+            && snapshot.callerFingerprint == nil
+            && snapshot.acceptedDeviceId == nil
+            && snapshot.calleePublicKey == nil
+            && snapshot.calleeNonce == nil
+            && snapshot.calleeFingerprint == nil
+            && snapshot.callerPublicKey == nil
+            && snapshot.callerNonce == nil
+    }
+}
+
+nonisolated struct VoIPPushRegistrationRequest: Codable, Equatable, Sendable {
+    let token: String
+    let environment: String
+    let supportedCallProtocolVersions: [Int]
+    let supportedCallMediaProfileVersions: [Int]
+    let callViewVersion: Int
 }
 
 nonisolated struct CloudCallEvent: Codable, Identifiable, Equatable, Sendable {
@@ -77,16 +157,57 @@ nonisolated struct CloudCallEvent: Codable, Identifiable, Equatable, Sendable {
 }
 
 nonisolated struct CloudCallResponse: Codable, Equatable, Sendable {
-    let call: CloudCallSnapshot
+    let callView: CallViewDTO
+    var call: CloudCallSnapshot { callView.snapshot }
+
+    private enum CodingKeys: String, CodingKey { case call }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callView = try container.decode(CallViewDTO.self, forKey: .call)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(callView, forKey: .call)
+    }
 }
 
 nonisolated struct CloudCallCreateResponse: Codable, Equatable, Sendable {
-    let call: CloudCallSnapshot
+    let callView: CallViewDTO
     let ringTargetCount: Int
+    var call: CloudCallSnapshot { callView.snapshot }
+
+    private enum CodingKeys: String, CodingKey { case call, ringTargetCount }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callView = try container.decode(CallViewDTO.self, forKey: .call)
+        ringTargetCount = try container.decode(Int.self, forKey: .ringTargetCount)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(callView, forKey: .call)
+        try container.encode(ringTargetCount, forKey: .ringTargetCount)
+    }
 }
 
 nonisolated struct CloudActiveCallsResponse: Codable, Equatable, Sendable {
-    let calls: [CloudCallSnapshot]
+    let callViews: [CallViewDTO]
+    var calls: [CloudCallSnapshot] { callViews.map(\.snapshot) }
+
+    private enum CodingKeys: String, CodingKey { case calls }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        callViews = try container.decode([CallViewDTO].self, forKey: .calls)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(callViews, forKey: .calls)
+    }
 }
 
 nonisolated struct CloudCallEventResponse: Codable, Equatable, Sendable {
@@ -174,3 +295,46 @@ nonisolated struct CallTelemetryRequest: Codable, Equatable, Sendable {
 nonisolated struct CloudCallTelemetryResponse: Codable, Equatable, Sendable {
     let recorded: Bool
 }
+
+/// The call coordinator depends only on this transport surface. Production uses `CloudAPI`;
+/// deterministic tests can provide an in-memory fake without opening sockets.
+protocol CallAPITransport {
+    func createCall(_ body: CreateCloudCallRequest, token: String) async throws -> CloudCallCreateResponse
+    func activeCalls(token: String) async throws -> CloudActiveCallsResponse
+    func call(id: String, token: String) async throws -> CloudCallResponse
+    func acceptCall(id: String, body: AcceptCloudCallRequest, token: String) async throws -> CloudCallResponse
+    func revealCall(id: String, body: RevealCloudCallRequest, token: String) async throws -> CloudCallResponse
+    func confirmCall(id: String, body: ConfirmCloudCallRequest, token: String) async throws -> CloudCallResponse
+    func declineCall(id: String, reason: String?, token: String) async throws -> CloudCallResponse
+    func cancelCall(id: String, reason: String?, token: String) async throws -> CloudCallResponse
+    func endCall(id: String, reason: String?, token: String) async throws -> CloudCallResponse
+    func sendCallEvent(
+        callId: String,
+        body: SendCloudCallEventRequest,
+        token: String
+    ) async throws -> CloudCallEventResponse
+    func callEvents(
+        callId: String,
+        after eventSequence: Int64,
+        limit: Int,
+        token: String
+    ) async throws -> CloudCallEventsResponse
+    func sendCallTelemetry(
+        callId: String,
+        body: CallTelemetryRequest,
+        token: String
+    ) async throws -> CloudCallTelemetryResponse
+    func callIceConfiguration(callId: String, token: String) async throws -> CloudCallIceConfiguration
+}
+
+extension CallAPITransport {
+    func callEvents(
+        callId: String,
+        after eventSequence: Int64,
+        token: String
+    ) async throws -> CloudCallEventsResponse {
+        try await callEvents(callId: callId, after: eventSequence, limit: 100, token: token)
+    }
+}
+
+extension CloudAPI: CallAPITransport {}

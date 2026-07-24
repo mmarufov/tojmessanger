@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 nonisolated enum CallICETransportPolicy: String, Codable, Sendable {
     case all
@@ -97,12 +98,84 @@ nonisolated struct CallNetworkStats: Equatable, Sendable {
     let packetsReceived: Int64?
     let availableOutgoingBitrate: Double?
     let audioBitrate: Double?
+    let videoPacketsSent: Int64?
+    let videoPacketsLost: Int64?
+    let videoPacketsReceived: Int64?
+    let videoInboundPacketsLost: Int64?
+    let videoJitterMilliseconds: Double?
+    let videoFramesDecoded: Int64?
+    let videoTotalFreezeMilliseconds: Double?
+    let videoDecodedFramesPerSecond: Double?
+
+    init(
+        roundTripTimeMilliseconds: Double?,
+        jitterMilliseconds: Double?,
+        packetsLost: Int64?,
+        packetsReceived: Int64?,
+        availableOutgoingBitrate: Double?,
+        audioBitrate: Double?,
+        videoPacketsSent: Int64? = nil,
+        videoPacketsLost: Int64? = nil,
+        videoPacketsReceived: Int64? = nil,
+        videoInboundPacketsLost: Int64? = nil,
+        videoJitterMilliseconds: Double? = nil,
+        videoFramesDecoded: Int64? = nil,
+        videoTotalFreezeMilliseconds: Double? = nil,
+        videoDecodedFramesPerSecond: Double? = nil
+    ) {
+        self.roundTripTimeMilliseconds = roundTripTimeMilliseconds
+        self.jitterMilliseconds = jitterMilliseconds
+        self.packetsLost = packetsLost
+        self.packetsReceived = packetsReceived
+        self.availableOutgoingBitrate = availableOutgoingBitrate
+        self.audioBitrate = audioBitrate
+        self.videoPacketsSent = videoPacketsSent
+        self.videoPacketsLost = videoPacketsLost
+        self.videoPacketsReceived = videoPacketsReceived
+        self.videoInboundPacketsLost = videoInboundPacketsLost
+        self.videoJitterMilliseconds = videoJitterMilliseconds
+        self.videoFramesDecoded = videoFramesDecoded
+        self.videoTotalFreezeMilliseconds = videoTotalFreezeMilliseconds
+        self.videoDecodedFramesPerSecond = videoDecodedFramesPerSecond
+    }
+}
+
+nonisolated enum CallVideoRendererSource: Equatable, Sendable {
+    case local
+    case remote
+}
+
+/// Coarse, device-local capture health. It deliberately carries no device name, camera format,
+/// resolution, or diagnostic text so it can be consumed by the lifecycle reducer without ever
+/// becoming signaling or telemetry payload.
+nonisolated struct CallVideoCaptureHealth: Equatable, Sendable {
+    let interrupted: Bool
+    let runtimeFailed: Bool
+    let cameraAvailable: Bool
+    let pressureCritical: Bool
+}
+
+/// Framework-neutral ownership token for the concrete RTC renderer. Two independent remote
+/// handles may be attached concurrently (main call UI and PiP) to the same remote track.
+@MainActor
+final class CallVideoRendererHandle: @unchecked Sendable, Identifiable {
+    let id: UUID
+    let view: UIView
+    let implementation: AnyObject
+
+    init(id: UUID = UUID(), view: UIView, implementation: AnyObject) {
+        self.id = id
+        self.view = view
+        self.implementation = implementation
+    }
 }
 
 nonisolated enum WebRTCEvent: Equatable, Sendable {
     case localCandidate(CallICECandidate)
     case connectionStateChanged(CallMediaConnectionState)
     case audioRouteChanged(CallAudioRoute)
+    case remoteVideoAvailabilityChanged(Bool)
+    case localVideoCaptureHealthChanged(CallVideoCaptureHealth)
 }
 
 nonisolated enum WebRTCEngineError: Error, Equatable {
@@ -110,6 +183,9 @@ nonisolated enum WebRTCEngineError: Error, Equatable {
     case notPrepared
     case invalidFingerprint
     case operationFailed
+    case mediaProfileAlreadyConfigured
+    case incompatibleMediaProfile
+    case cameraUnavailable
 }
 
 /// Framework-neutral seam around the official WebRTC implementation. All SDP
@@ -123,6 +199,9 @@ protocol WebRTCEngine: Sendable {
     /// Installs initial or renewed ICE/TURN configuration without replacing the
     /// retained DTLS identity. Used after call creation and at credential refresh.
     func updateICEConfiguration(_ configuration: CallICEConfiguration) async throws
+    /// One-shot media graph configuration. An identical retry is harmless; changing either
+    /// argument after configuration fails closed. It must complete before any local or remote SDP.
+    func configureMediaProfile(_ profile: UInt16, initialCameraIntent: Bool) async throws
     /// Creates the SDP and installs it as the peer connection's local description.
     func makeOffer(iceRestart: Bool) async throws -> CallSessionDescription
     /// Creates the SDP and installs it as the peer connection's local description.
@@ -137,6 +216,17 @@ protocol WebRTCEngine: Sendable {
     /// Called only from CallKit's audio-session activation/deactivation callbacks.
     func setAudioSessionActive(_ active: Bool) async
     func setMuted(_ muted: Bool) async
+    func setCameraEnabled(_ enabled: Bool, position: CallCameraPosition) async throws
+    func switchCamera(to position: CallCameraPosition) async throws
+    func setVideoQualityTier(
+        _ tier: CallVideoQualityTier,
+        maximumFramesPerSecond: Int?
+    ) async throws
+    func makeVideoRenderer(source: CallVideoRendererSource) async throws -> CallVideoRendererHandle
+    func releaseVideoRenderer(_ handle: CallVideoRendererHandle) async
+    /// True only when the concrete capture session and the signed app entitlement permit camera
+    /// capture while the owning scene is backgrounded in an active video-call PiP session.
+    func supportsBackgroundCameraAccess() async -> Bool
     func setPreferredAudioRoute(_ route: CallAudioRoute) async throws
     func statistics() async -> CallNetworkStats?
     func events() async -> AsyncStream<WebRTCEvent>
@@ -151,6 +241,10 @@ actor UnavailableWebRTCEngine: WebRTCEngine {
     }
 
     func updateICEConfiguration(_ configuration: CallICEConfiguration) async throws {
+        throw WebRTCEngineError.frameworkUnavailable
+    }
+
+    func configureMediaProfile(_ profile: UInt16, initialCameraIntent: Bool) async throws {
         throw WebRTCEngineError.frameworkUnavailable
     }
 
@@ -174,6 +268,29 @@ actor UnavailableWebRTCEngine: WebRTCEngine {
     }
 
     func setMuted(_ muted: Bool) async {}
+
+    func setCameraEnabled(_ enabled: Bool, position: CallCameraPosition) async throws {
+        throw WebRTCEngineError.frameworkUnavailable
+    }
+
+    func switchCamera(to position: CallCameraPosition) async throws {
+        throw WebRTCEngineError.frameworkUnavailable
+    }
+
+    func setVideoQualityTier(
+        _ tier: CallVideoQualityTier,
+        maximumFramesPerSecond: Int?
+    ) async throws {
+        throw WebRTCEngineError.frameworkUnavailable
+    }
+
+    func makeVideoRenderer(source: CallVideoRendererSource) async throws -> CallVideoRendererHandle {
+        throw WebRTCEngineError.frameworkUnavailable
+    }
+
+    func releaseVideoRenderer(_ handle: CallVideoRendererHandle) async {}
+
+    func supportsBackgroundCameraAccess() async -> Bool { false }
 
     func setAudioSessionActive(_ active: Bool) async {}
 

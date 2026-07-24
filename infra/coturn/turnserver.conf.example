@@ -19,7 +19,7 @@ pkey=/etc/coturn/certs/privkey.pem
 stale-nonce=600
 user-quota=4
 total-quota=REPLACE_PROVISIONED_ALLOCATION_CAPACITY
-max-bps=128000
+max-bps=512000
 bps-capacity=REPLACE_PROVISIONED_BYTES_PER_SECOND
 # Keep TURN-over-TCP and TURN-over-TLS client listeners enabled, but never
 # provide RFC 6062 TCP relay endpoints that can act as a generic TCP proxy.

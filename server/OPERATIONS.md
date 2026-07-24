@@ -138,9 +138,28 @@ server-reflexive paths before falling back to relay. Restart the call-control pr
 any APNs, TURN, STUN, or voice-readiness setting because capability readiness is calculated at
 startup.
 
+`video_calls_v1` additionally requires `TOJ_VIDEO_CALLS_ENABLED=1` and
+`TOJ_TURN_VIDEO_READY=1`. The latter may be set only after both failure-independent TURN regions
+pass sustained video-capacity tests with UDP, TCP, and TLS 443. Each allocation starts with
+`max-bps=512000` bytes/second (about 4.096 Mbps aggregate); the client still caps one outbound
+camera stream at 1.5 Mbps. Set `total-quota`, `bps-capacity`, and provider egress budgets from the
+measured node limit, not an estimate.
+
+Video eligibility is deterministic per account. `TOJ_VIDEO_CALLS_ALLOWLIST` is a comma-separated
+list of internal account UUIDs and always takes precedence. `TOJ_VIDEO_CALLS_ROLLOUT_PERCENT` accepts
+0 through 100 and defaults to zero. Use 5 for 48 hours, 25 for 72 hours, and then 100 only after all
+release gates pass. Roll back by setting the percentage to zero and restarting: new video calls are
+rejected, new audio calls select media profile 1, and in-flight profile-2 calls retain the immutable
+selection policy stored when they were created.
+
+The repository's [Video Calls v1 release report](../VIDEO_CALLS_RELEASE_REPORT.md) is the
+authoritative checklist for provisioning, two-region TURN capacity, physical-device coverage, and
+quantitative rollout gates. Do not set either video readiness flag based on simulator evidence alone.
+
 Clear `TOJ_TURN_READY` or `TOJ_VOICE_CALLS_ENABLED` and restart the process to stop advertising and
-accepting new calls. Existing call action, signaling, and termination routes remain available so
-in-progress calls can finish cleanly.
+accepting new calls. Clear either video readiness flag to stop advertising video globally, or set
+the video rollout percentage to zero for a staged rollback. Existing call action, signaling, and
+termination routes remain available so in-progress calls can finish cleanly.
 
 For a first rollout, migrate PostgreSQL and deploy with both readiness flags off. Prove authenticated
 allocations through each advertised UDP/TCP/TLS path from outside the TURN networks, set

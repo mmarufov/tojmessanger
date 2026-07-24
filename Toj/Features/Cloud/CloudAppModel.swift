@@ -353,9 +353,12 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return .demo }
         #endif
-        return WebRTCEngineFactory.isAvailable
+        guard WebRTCEngineFactory.isAvailable else {
+            return negotiatedCapabilities.subtracting([.calls, .videoCalls])
+        }
+        return WebRTCEngineFactory.supportsCameraVideoProfile
             ? negotiatedCapabilities
-            : negotiatedCapabilities.subtracting(.calls)
+            : negotiatedCapabilities.subtracting(.videoCalls)
     }
 
     var replicaSyncSnapshot: ReplicaSyncSnapshot {
@@ -407,7 +410,7 @@ final class CloudAppModel {
             forKey: "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
         ) as? NSNumber
         self.negotiatedCapabilities = cached.map {
-            MessagingCapabilities(rawValue: $0.uint16Value)
+            MessagingCapabilities(rawValue: $0.uint16Value).subtracting(.videoCalls)
         } ?? [.replies]
         self.localStore = injectedLocalStore
         voiceRecorder.onUnexpectedStop = { [weak self] in
@@ -1828,7 +1831,40 @@ final class CloudAppModel {
         await callCoordinator.startOutgoing(
             dialogId: dialogId,
             peerAccountId: peerAccountId,
-            displayName: dialogTitle(dialogId)
+            displayName: dialogTitle(dialogId),
+            initialKind: .voice
+        )
+    }
+
+    func startVideoCall(dialogId: String) async {
+        #if DEBUG
+        if isDemoMode {
+            presentNotice("Video calls", message: "Sign in to place a secure video call.")
+            return
+        }
+        #endif
+        guard capabilities.contains(.videoCalls) else {
+            presentNotice(
+                "Video calls unavailable",
+                message: "Encrypted video calling is not enabled for this account and device yet."
+            )
+            return
+        }
+        guard
+            let accountId = storedSession?.session.accountId,
+            let peerAccountId = try? await localStore?.peerAccountId(
+                dialogId: dialogId,
+                excluding: accountId
+            )
+        else {
+            presentNotice("Call unavailable", message: "The other participant could not be verified.")
+            return
+        }
+        await callCoordinator.startOutgoing(
+            dialogId: dialogId,
+            peerAccountId: peerAccountId,
+            displayName: dialogTitle(dialogId),
+            initialKind: .video
         )
     }
 
@@ -2866,7 +2902,7 @@ final class CloudAppModel {
 
     private func refreshServerCapabilities() async {
         do {
-            let response = try await api.capabilities()
+            let response = try await api.capabilities(token: storedSession?.session.token)
             var resolved: MessagingCapabilities = []
             let advertised = Set(response.capabilities)
             if advertised.contains("core_text") || advertised.contains("replies") {
@@ -2888,8 +2924,16 @@ final class CloudAppModel {
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
+            if advertised.contains("video_calls_v1"), WebRTCEngineFactory.supportsCameraVideoProfile {
+                resolved.insert(.videoCalls)
+            }
             negotiatedCapabilities = resolved
-            capabilityDefaults.set(Int(resolved.rawValue), forKey: capabilityCacheKey)
+            // Video rollout is account-scoped. Never let one signed-in account's bucket leak into
+            // another account through the server-wide capability cache.
+            capabilityDefaults.set(
+                Int(resolved.subtracting(.videoCalls).rawValue),
+                forKey: capabilityCacheKey
+            )
         } catch let error as CloudAPIError where error.status == 404 {
             negotiatedCapabilities = [.replies]
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
@@ -3049,10 +3093,22 @@ final class CloudAppModel {
             uploadedVoIPPushRegistration = nil
             return
         }
-        let registration = "\(environment):\(deviceToken)"
+        let capabilities = WebRTCEngineFactory.deviceCapabilities
+        let registration = [
+            environment,
+            deviceToken,
+            capabilities.supportedCallProtocolVersions.map(String.init).joined(separator: ","),
+            capabilities.supportedCallMediaProfileVersions.map(String.init).joined(separator: ","),
+            String(capabilities.callViewVersion),
+        ].joined(separator: ":")
         guard uploadedVoIPPushRegistration != registration else { return }
         do {
-            _ = try await api.registerVoIPPushToken(deviceToken, environment: environment, token: token)
+            _ = try await api.registerVoIPPushToken(
+                deviceToken,
+                environment: environment,
+                token: token,
+                capabilities: capabilities
+            )
             guard storedSession?.session.token == token,
                   callCoordinator.canRegisterForIncomingCalls else {
                 _ = try? await api.unregisterVoIPPushToken(token: token)
