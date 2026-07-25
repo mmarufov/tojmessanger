@@ -102,7 +102,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
     SELECT m.dialog_id, m.msg_id, m.sender_account_id, m.client_msg_id, m.kind,
            m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
            m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
-           m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
+           m.is_forwarded, m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
            media.id AS media_object_id, media.kind AS media_object_kind,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
            media.file_name_key_id AS media_file_name_key_id,
@@ -189,7 +189,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       reply_to_msg_id: row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id),
       edit_version: row.edit_version,
       // Source identifiers stay server-side. Recipients only need the marker.
-      forwarded: row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null,
+      forwarded: row.is_forwarded === true,
       reactions: reactions.get(key) ?? [],
       mentions: mentions.get(key) ?? [],
       media: row.state === "deleted_for_all" ? null : media,
@@ -421,11 +421,11 @@ export async function sendMessage(sql: SQL, p: {
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
                             forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-                            media_id)
+                            is_forwarded, media_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
-              ${mediaId})
+              ${p.forwardedFrom != null}, ${mediaId})
       RETURNING server_ts`;
     if (mentions.length) {
       await tx`

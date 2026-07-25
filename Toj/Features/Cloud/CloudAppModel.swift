@@ -242,7 +242,20 @@ final class CloudAppModel {
         var presentationIsLastInGroup = true
     }
 
-    private(set) var storedSession: StoredCloudSession?
+    private(set) var storedSession: StoredCloudSession? {
+        didSet {
+            let oldIdentity = oldValue.map {
+                "\($0.session.accountId)\u{0}\($0.session.deviceId)\u{0}\($0.session.token)"
+            }
+            let newIdentity = storedSession.map {
+                "\($0.session.accountId)\u{0}\($0.session.deviceId)\u{0}\($0.session.token)"
+            }
+            if oldIdentity != newIdentity {
+                savedMessagesSessionGeneration &+= 1
+                savedMessagesCapabilityState = .unknown
+            }
+        }
+    }
     private(set) var launchPhase: LaunchPhase = .restoringLocal
     private(set) var status = "Starting"
     private(set) var operationNotice: Notice?
@@ -261,6 +274,7 @@ final class CloudAppModel {
     private(set) var savedMessagesDialogId: String?
     private(set) var savedMessagesSetupInFlight = false
     private(set) var savedMessagesSetupFailure: String?
+    private(set) var savedMessagesCapabilityState: SavedMessagesCapabilityState = .unknown
     private(set) var groupMembersByDialog: [String: [GroupMember]] = [:]
     private(set) var lines: [Line] = []
     private(set) var openingTimelineAnchor: TimelineAnchor = .bottom
@@ -391,6 +405,7 @@ final class CloudAppModel {
     private var dialogSelectionGeneration: UInt64 = 0
     private var timelineLoadGeneration: UInt64 = 0
     private var openingAnchorHydrationGeneration: UInt64 = 0
+    private var savedMessagesSessionGeneration: UInt64 = 0
     private var appliedSyncBatches = 0
     private var lastForegroundSyncFailure: ReplicaSyncState?
     private var timelineForwardCursorByDialog: [String: Int64] = [:]
@@ -931,6 +946,9 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        // Prevent an old ensure from publishing while its exact task is cancelled and awaited.
+        savedMessagesSessionGeneration &+= 1
+        savedMessagesCapabilityState = .unknown
         let accountId = storedSession?.session.accountId
         var cleanupFailures: [String] = []
         do {
@@ -2115,30 +2133,48 @@ final class CloudAppModel {
             let token = storedSession?.session.token,
             let localStore
         else { return nil }
+        let generation = savedMessagesSessionGeneration
         if let savedMessagesDialogId { return savedMessagesDialogId }
         if let local = try? await savedMessagesService.localDialogId(
             store: localStore,
             accountId: accountId
         ) {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
             savedMessagesDialogId = local
             savedMessagesSetupFailure = nil
             return local
         }
-        guard capabilities.contains(.savedMessages) else {
+        guard savedMessagesCapabilityState != .unsupported else {
             savedMessagesSetupFailure = String(localized: "Unavailable on this server")
             return nil
         }
 
         savedMessagesSetupInFlight = true
         savedMessagesSetupFailure = nil
-        defer { savedMessagesSetupInFlight = false }
+        defer {
+            if savedMessagesSessionGeneration == generation {
+                savedMessagesSetupInFlight = false
+            }
+        }
         do {
             let dialogId = try await savedMessagesService.ensure(
                 api: api,
                 store: localStore,
                 accountId: accountId,
-                token: token
+                token: token,
+                generation: generation
             )
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
             savedMessagesDialogId = dialogId
             savedMessagesSetupFailure = nil
             await refreshDialogs()
@@ -2146,23 +2182,50 @@ final class CloudAppModel {
         } catch is CancellationError {
             return nil
         } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
             let message: String
-            switch cloudOperationFailureDisposition(error, serverAdvertisesFeature: true) {
-            case .transient:
-                message = String(localized: "Connect once to set up Saved Messages")
-            case .authenticationRequired:
-                message = String(localized: "Sign in again to set up Saved Messages")
-            case .unsupportedServer:
+            let apiStatus = (error as? CloudAPIError)?.status
+            savedMessagesCapabilityState = savedMessagesCapabilityState.resolvingEnsureFailure(
+                statusCode: apiStatus
+            )
+            if apiStatus == 404 {
+                negotiatedCapabilities.remove(.savedMessages)
                 message = String(localized: "Unavailable on this server")
-            case .permanent:
-                message = String(localized: "Saved Messages could not be set up")
+            } else {
+                switch cloudFailureDisposition(error) {
+                case .transient:
+                    message = String(localized: "Connect once to set up Saved Messages")
+                case .authenticationRequired:
+                    message = String(localized: "Sign in again to set up Saved Messages")
+                case .unsupportedServer:
+                    message = String(localized: "Unavailable on this server")
+                case .permanent:
+                    message = String(localized: "Saved Messages could not be set up")
+                }
             }
             savedMessagesSetupFailure = message
             if presentsFailure {
-                presentNotice("Saved Messages", message: message)
+                presentNotice(String(localized: "Saved Messages"), message: message)
             }
             return nil
         }
+    }
+
+    private func isCurrentSavedMessagesSession(
+        accountId: String,
+        token: String,
+        store: CloudLocalStore,
+        generation: UInt64
+    ) -> Bool {
+        savedMessagesSessionGeneration == generation
+            && storedSession?.session.accountId == accountId
+            && storedSession?.session.token == token
+            && localStore === store
     }
 
     func saveMessage(_ line: Line) async {
@@ -2174,7 +2237,7 @@ final class CloudAppModel {
         else { return }
         await forwardMessage(line, to: targetDialogId)
         if status == "Forwarded" {
-            status = "Saved to Saved Messages"
+            status = String(localized: "Saved to Saved Messages")
         }
     }
 
@@ -3185,7 +3248,7 @@ final class CloudAppModel {
             lines = []
             presentNotice(
                 "Group access ended",
-                message: "You are no longer a member of this group. Its offline copy was removed."
+                message: String(localized: "You are no longer a member of this group. Its offline copy was removed.")
             )
         }
     }
@@ -3341,8 +3404,14 @@ final class CloudAppModel {
     }
 
     private func refreshServerCapabilities() async {
+        let accountId = storedSession?.session.accountId
+        let token = storedSession?.session.token
+        let generation = savedMessagesSessionGeneration
         do {
-            let response = try await api.capabilities(token: storedSession?.session.token)
+            let response = try await api.capabilities(token: token)
+            guard savedMessagesSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.token == token else { return }
             var resolved: MessagingCapabilities = []
             let advertised = Set(response.capabilities)
             if advertised.contains("core_text") || advertised.contains("replies") {
@@ -3362,7 +3431,10 @@ final class CloudAppModel {
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
             if advertised.contains("groups_v1") { resolved.insert(.groups) }
-            if advertised.contains("saved_messages_v1") { resolved.insert(.savedMessages) }
+            savedMessagesCapabilityState = .advertised(in: advertised)
+            if savedMessagesCapabilityState == .supported {
+                resolved.insert(.savedMessages)
+            }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -3380,7 +3452,11 @@ final class CloudAppModel {
                 _ = await ensureSavedMessages(presentsFailure: false)
             }
         } catch let error as CloudAPIError where error.status == 404 {
+            guard savedMessagesSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.token == token else { return }
             negotiatedCapabilities = [.replies]
+            savedMessagesCapabilityState = .unsupported
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
             // Keep the last successfully negotiated set when the server cannot be reached.
@@ -3446,7 +3522,7 @@ final class CloudAppModel {
                 previous = snapshot.networkClass
                 if snapshot.networkClass == .offline {
                     self.setReplicaSyncState(.offline)
-                    self.status = "Offline. Showing downloaded conversations."
+                    self.status = String(localized: "Offline. Showing downloaded conversations.")
                     continue
                 }
                 guard recovered else { continue }
@@ -3666,7 +3742,7 @@ final class CloudAppModel {
         let initialNetwork = ReplicaNetworkMonitor.shared.snapshot()
         if initialNetwork.networkClass == .offline {
             setReplicaSyncState(.offline)
-            status = "Offline. Showing downloaded conversations."
+            status = String(localized: "Offline. Showing downloaded conversations.")
             return
         }
         let api = api
@@ -3697,7 +3773,7 @@ final class CloudAppModel {
             lastSuccessfulServerContact = Date()
             if remoteState.pts < pts {
                 setReplicaSyncState(.protocolFailure)
-                status = "Server update state moved backwards. Showing the offline copy."
+                status = String(localized: "Server update state moved backwards. Showing the offline copy.")
                 return
             }
             let replicaInitialized = if let localStore,
@@ -3737,7 +3813,7 @@ final class CloudAppModel {
             status = failure.title
         case .timedOut:
             setReplicaSyncState(.connectionSlow)
-            status = "Connection is slow. Showing the offline copy."
+            status = String(localized: "Connection is slow. Showing the offline copy.")
         case .cancelled:
             return
         }

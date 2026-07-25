@@ -957,7 +957,9 @@ actor CloudLocalStore {
         accountId: String,
         updatedAt: String?
     ) throws {
+        try Task.checkCancellation()
         try dbQueue.write { db in
+            try Task.checkCancellation()
             try ensureSavedDialog(
                 db,
                 dialogId: dialogId,

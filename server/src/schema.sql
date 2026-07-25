@@ -151,16 +151,8 @@ CREATE TABLE IF NOT EXISTS dialogs (
 );
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
-ALTER TABLE dialogs DROP CONSTRAINT IF EXISTS dialogs_type_check;
-ALTER TABLE dialogs ADD CONSTRAINT dialogs_type_check
-  CHECK (type IN ('direct','group','saved')) NOT VALID;
-ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_type_check;
-DO $$ BEGIN
-  ALTER TABLE dialogs ADD CONSTRAINT dialogs_saved_owner_check
-    CHECK (type <> 'saved' OR created_by IS NOT NULL) NOT VALID;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check;
+-- Existing deployments expand/validate/short-swap the dialog constraints after this transaction;
+-- see schema-dialogs-expand.sql and schema-dialogs-swap.sql.
 
 -- One direct dialog per unordered pair (idempotent 1:1 creation).
 CREATE TABLE IF NOT EXISTS direct_dialog_pairs (
@@ -298,6 +290,7 @@ CREATE TABLE IF NOT EXISTS messages (
   forwarded_from_account_id UUID REFERENCES accounts(id),
   forwarded_from_dialog_id UUID,
   forwarded_from_msg_id BIGINT,
+  is_forwarded       BOOLEAN NOT NULL DEFAULT FALSE,
   media_id          UUID REFERENCES media_objects(id),
   service_type      TEXT,
   service_data      JSONB,
@@ -312,6 +305,12 @@ CREATE TABLE IF NOT EXISTS messages (
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_account_id UUID REFERENCES accounts(id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_dialog_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_msg_id BIGINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE messages
+SET is_forwarded = TRUE
+WHERE is_forwarded = FALSE
+  AND forwarded_from_dialog_id IS NOT NULL
+  AND forwarded_from_msg_id IS NOT NULL;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_objects(id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_data JSONB;
@@ -392,6 +391,18 @@ CREATE TABLE IF NOT EXISTS send_requests (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
+
+CREATE TABLE IF NOT EXISTS saved_messages_backfill_claims (
+  account_id   UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  worker_id    UUID NOT NULL,
+  claimed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at TIMESTAMPTZ,
+  attempts     INT NOT NULL DEFAULT 1 CHECK (attempts > 0),
+  last_error   TEXT
+);
+CREATE INDEX IF NOT EXISTS saved_messages_backfill_pending_idx
+  ON saved_messages_backfill_claims(claimed_at, account_id)
+  WHERE completed_at IS NULL;
 
 -- Edit/delete retries use a client-generated mutation id just like sends use client_msg_id.
 -- The claim is taken before locking the message so a timed-out request can safely be repeated.

@@ -107,6 +107,11 @@ foreign-key integrity is preserved. A later registration with the same phone cre
 
 Saved Messages is the exception to retained conversation history: it has only the deleting account as
 an active member, so account deletion removes that dialog and its messages in the same transaction.
+Before removal, any direct/group copy forwarded from that archive has its source-account/dialog/message
+foreign keys cleared atomically. The copy retains its immutable `is_forwarded` classification,
+ciphertext, and media references, so recipients keep the forwarded content without retaining a dangling
+identity or a dependency on the deleted archive. Media owned by the deleted account is removed only
+when no retained message still references it.
 
 ## Saved Messages rollout
 
@@ -128,12 +133,30 @@ After the compatible client is stable at full rollout, provision existing accoun
 restart-safe batches:
 
 ```bash
-TOJ_SAVED_MESSAGES_BACKFILL_BATCH_SIZE=100 bun run backfill:saved-messages
+NODE_ENV=production \
+TOJ_SAVED_MESSAGES_V1_ENABLED=1 \
+TOJ_SAVED_MESSAGES_ROLLOUT_PERCENT=100 \
+TOJ_SAVED_MESSAGES_BACKFILL_CONFIRM=PROVISION_ALL_ACTIVE_ACCOUNTS \
+TOJ_SAVED_MESSAGES_BACKFILL_BATCH_SIZE=100 \
+TOJ_SAVED_MESSAGES_BACKFILL_THROTTLE_MS=25 \
+bun run backfill:saved-messages
 ```
 
-The command logs aggregate counts only, handles `SIGINT`/`SIGTERM` between accounts, and stops on a
-failed batch rather than hot-looping. Multiple workers are safe because provisioning is serialized
-per account and guarded by the unique partial index, though one worker is normally sufficient.
+The command fails closed unless production mode, the global switch, an explicit 100% rollout, and
+the exact confirmation value are all present. It logs aggregate counts only, handles
+`SIGINT`/`SIGTERM` between accounts, and stops on a failed batch rather than hot-looping. Durable
+worker-owned claims prevent concurrent workers from selecting the same account; abandoned claims
+become reclaimable after 15 minutes. A worker refreshes and verifies ownership immediately before
+each account, so a reclaimed lease is never processed by its former owner. The throttle is per
+processed account, defaults to 25 ms, and is bounded to 60 seconds.
+
+The dialog type constraint deploys in expand/validate/contract phases. `schema-dialogs-expand.sql`
+adds the wider constraint as `NOT VALID`, PostgreSQL validates it without blocking ordinary
+reads/writes, and `schema-dialogs-swap.sql` holds `ACCESS EXCLUSIVE` only for the short name swap.
+Keep Saved Messages at zero percent until the swap completes. Rolling application binaries back is
+safe after the swap: older binaries continue writing `direct` and `group`, while the database keeps
+accepting already-created `saved` rows. Do not roll the database constraint back while Saved rows
+exist; disable advertisement/ensure instead.
 
 Protected `/metrics` output includes `toj_saved_messages_ensure_total` by bounded result,
 ensure duration sum/count, and `toj_saved_messages_invariant_violation_total`. Page immediately on

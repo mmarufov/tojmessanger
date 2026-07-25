@@ -7,6 +7,20 @@ nonisolated enum LaunchPhase: Equatable, Sendable {
     case recoveringStore
 }
 
+nonisolated enum SavedMessagesCapabilityState: Equatable, Sendable {
+    case unknown
+    case supported
+    case unsupported
+
+    static func advertised(in capabilities: Set<String>) -> Self {
+        capabilities.contains("saved_messages_v1") ? .supported : .unsupported
+    }
+
+    func resolvingEnsureFailure(statusCode: Int?) -> Self {
+        statusCode == 404 ? .unsupported : self
+    }
+}
+
 nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     let rawValue: UInt64
 

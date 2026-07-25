@@ -1113,8 +1113,8 @@ private struct CloudSettingsView: View {
                         .accessibilityIdentifier("settings-saved-messages")
                         .accessibilityHint(
                             model.savedMessagesDialogId == nil
-                                ? "Sets up your private notes conversation"
-                                : "Opens your private notes conversation"
+                                ? String(localized: "Sets up your private notes conversation")
+                                : String(localized: "Opens your private notes conversation")
                         )
                         settingsLink(
                             title: "Recent Calls",
@@ -1398,6 +1398,16 @@ private struct CloudSettingsView: View {
         if model.savedMessagesSetupInFlight { return "Setting up…" }
         if let failure = model.savedMessagesSetupFailure {
             return LocalizedStringKey(failure)
+        }
+        if model.savedMessagesDialogId == nil {
+            switch model.savedMessagesCapabilityState {
+            case .unknown:
+                return "Connect to set up"
+            case .unsupported:
+                return "Unavailable"
+            case .supported:
+                break
+            }
         }
         return nil
     }

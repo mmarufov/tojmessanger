@@ -24,6 +24,11 @@ export type SavedMessagesResult = {
   pushes: FanoutPush[];
 };
 
+export type SavedMessagesBackfillClaim = {
+  accountId: string;
+  workerId: string;
+};
+
 const n = (value: unknown) => Number(value as any);
 const SYNC_NOTIFY_CHANNEL = "toj_sync_events";
 
@@ -155,24 +160,137 @@ export async function ensureSavedMessages(
   });
 }
 
-/** Bounded, restart-safe worker primitive used by the operational backfill command. */
-export async function savedMessagesBackfillCandidates(
+export function requireSavedMessagesBackfillAuthorization(
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (env.NODE_ENV !== "production") {
+    throw new SavedMessagesError(
+      "saved messages backfill requires NODE_ENV=production",
+      "backfill_not_production",
+      503,
+    );
+  }
+  if (env.TOJ_SAVED_MESSAGES_V1_ENABLED !== "1") {
+    throw new SavedMessagesError(
+      "saved messages backfill requires the global feature switch",
+      "backfill_feature_disabled",
+      503,
+    );
+  }
+  if (env.TOJ_SAVED_MESSAGES_ROLLOUT_PERCENT?.trim() !== "100") {
+    throw new SavedMessagesError(
+      "saved messages backfill requires an explicit 100 percent rollout",
+      "backfill_partial_rollout",
+      503,
+    );
+  }
+  if (env.TOJ_SAVED_MESSAGES_BACKFILL_CONFIRM !== "PROVISION_ALL_ACTIVE_ACCOUNTS") {
+    throw new SavedMessagesError(
+      "saved messages backfill production confirmation missing",
+      "backfill_confirmation_missing",
+      503,
+    );
+  }
+}
+
+export function savedMessagesBackfillThrottleMs(
+  value = process.env.TOJ_SAVED_MESSAGES_BACKFILL_THROTTLE_MS,
+): number {
+  const parsed = Number(value ?? "25");
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(Math.floor(parsed), 60_000)) : 25;
+}
+
+/** Claims bounded durable leases so multiple workers never provision the same account concurrently. */
+export async function claimSavedMessagesBackfillAccounts(
   sql: SQL,
+  workerId: string,
   limit = 100,
-): Promise<string[]> {
+  staleAfterSeconds = 15 * 60,
+): Promise<SavedMessagesBackfillClaim[]> {
   const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(limit, 1_000)) : 100;
+  const boundedStaleSeconds = Number.isSafeInteger(staleAfterSeconds)
+    ? Math.max(60, Math.min(staleAfterSeconds, 24 * 60 * 60))
+    : 15 * 60;
   return await sql.begin(async (tx) => {
     const rows = await tx`
-      SELECT account.id
-      FROM accounts account
-      WHERE account.status IN ('active','limited')
-        AND NOT EXISTS (
-          SELECT 1 FROM dialogs dialog
-          WHERE dialog.type = 'saved' AND dialog.created_by = account.id
-        )
-      ORDER BY account.id
-      LIMIT ${boundedLimit}
-      FOR UPDATE OF account SKIP LOCKED`;
-    return rows.map((row: any) => String(row.id));
+      WITH candidates AS MATERIALIZED (
+        SELECT account.id
+        FROM accounts account
+        LEFT JOIN saved_messages_backfill_claims claim ON claim.account_id = account.id
+        WHERE account.status IN ('active','limited')
+          AND NOT EXISTS (
+            SELECT 1 FROM dialogs dialog
+            WHERE dialog.type = 'saved' AND dialog.created_by = account.id
+          )
+          AND (
+            claim.account_id IS NULL
+            OR (
+              claim.completed_at IS NULL
+              AND claim.claimed_at < now() - make_interval(secs => ${boundedStaleSeconds})
+            )
+          )
+        ORDER BY account.id
+        LIMIT ${boundedLimit}
+        FOR UPDATE OF account SKIP LOCKED
+      )
+      INSERT INTO saved_messages_backfill_claims AS claim (
+        account_id, worker_id, claimed_at, completed_at, attempts, last_error
+      )
+      SELECT candidate.id, ${workerId}::uuid, now(), NULL, 1, NULL
+      FROM candidates candidate
+      ON CONFLICT (account_id) DO UPDATE SET
+        worker_id = EXCLUDED.worker_id,
+        claimed_at = now(),
+        completed_at = NULL,
+        attempts = claim.attempts + 1,
+        last_error = NULL
+      WHERE claim.completed_at IS NULL
+        AND claim.claimed_at < now() - make_interval(secs => ${boundedStaleSeconds})
+      RETURNING account_id`;
+    return rows.map((row: any) => ({ accountId: String(row.account_id), workerId }));
   });
+}
+
+export async function completeSavedMessagesBackfillClaim(
+  sql: SQL,
+  claim: SavedMessagesBackfillClaim,
+  outcome: "completed" | "account_unavailable" = "completed",
+): Promise<boolean> {
+  const rows = await sql`
+    UPDATE saved_messages_backfill_claims
+    SET completed_at = now(), last_error = ${outcome === "completed" ? null : outcome}
+    WHERE account_id = ${claim.accountId}
+      AND worker_id = ${claim.workerId}::uuid
+      AND completed_at IS NULL
+    RETURNING account_id`;
+  return rows.length === 1;
+}
+
+export async function refreshSavedMessagesBackfillClaim(
+  sql: SQL,
+  claim: SavedMessagesBackfillClaim,
+): Promise<boolean> {
+  const rows = await sql`
+    UPDATE saved_messages_backfill_claims
+    SET claimed_at = now()
+    WHERE account_id = ${claim.accountId}
+      AND worker_id = ${claim.workerId}::uuid
+      AND completed_at IS NULL
+    RETURNING account_id`;
+  return rows.length === 1;
+}
+
+export async function failSavedMessagesBackfillClaim(
+  sql: SQL,
+  claim: SavedMessagesBackfillClaim,
+  errorCode: string,
+): Promise<boolean> {
+  const rows = await sql`
+    UPDATE saved_messages_backfill_claims
+    SET last_error = ${errorCode.slice(0, 120)}
+    WHERE account_id = ${claim.accountId}
+      AND worker_id = ${claim.workerId}::uuid
+      AND completed_at IS NULL
+    RETURNING account_id`;
+  return rows.length === 1;
 }

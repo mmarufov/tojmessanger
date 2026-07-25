@@ -6,9 +6,15 @@ import { DEFAULT_URL } from "./db";
 const url = process.env.DATABASE_URL ?? DEFAULT_URL;
 const schema = new URL("./schema.sql", import.meta.url).pathname;
 const concurrentSchema = new URL("./schema-concurrent.sql", import.meta.url).pathname;
+const dialogExpandSchema = new URL("./schema-dialogs-expand.sql", import.meta.url).pathname;
+const dialogSwapSchema = new URL("./schema-dialogs-swap.sql", import.meta.url).pathname;
 const callMediaBackfillBatchSize = 1_000;
 
 await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -c "SET LOCAL lock_timeout = '5s'" -f ${schema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogExpandSchema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_type_check_saved_expand"`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check"`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogSwapSchema}`.quiet();
 let backfilledCallCount = 0;
 while (true) {
   const query = `

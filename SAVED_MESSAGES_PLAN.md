@@ -1,6 +1,8 @@
 # Saved Messages v1 - Engineering Plan
 
-Status: ready to implement
+Status: implementation and review-remediation complete on `mmarufov/saved-messages-plan`;
+automated backend, iOS unit/UI, exact forwarding/account-deletion, and Release build gates verified
+2026-07-25. Physical-device performance and production rollout/canary gates remain open.
 
 Baseline: `0df5aa9` (`origin/main`)
 
@@ -156,7 +158,8 @@ source of truth.
   local saved dialog exists.
 - Tapping the Settings row calls the same deduplicated ensure path.
 - Existing local saved dialogs open without any network call.
-- A resumable operations backfill materializes the invariant for dormant accounts after canary rollout.
+- A durably claimed operations backfill materializes the invariant for dormant accounts only after
+  the global switch and rollout are explicitly at 100% with production confirmation.
 
 This avoids exposing an unknown dialog type during the dark schema deploy while still converging every
 account to exactly one row.
@@ -422,21 +425,30 @@ Capability advertisement without route closure is a rollout bug.
 Add an idempotent, resumable backfill command that:
 
 1. reads active/limited accounts lacking a saved dialog in bounded batches;
-2. uses `FOR UPDATE SKIP LOCKED` so multiple workers are safe;
+2. writes worker-owned durable leases before provisioning so multiple workers cannot duplicate work;
 3. invokes the same ensure transaction used by the HTTP endpoint;
 4. emits one silent `dialog.created` event per changed account;
-5. checkpoints progress implicitly because completed accounts no longer match the query;
+5. records completion, unavailable accounts, attempts, and stale claims durably;
 6. stops safely on `SIGTERM` between accounts;
-7. reports only aggregate counts and timings.
+7. applies configurable bounded per-account throttling and reports only aggregate counts and timings.
 
-Run it only after the client canary succeeds. Do not log account ids, phone numbers, message content,
-tokens, or media paths.
+Run it only after the client canary succeeds, with `NODE_ENV=production`, the global switch enabled,
+an explicit `100` rollout, and `PROVISION_ALL_ACTIVE_ACCOUNTS` confirmation. Do not log account ids,
+phone numbers, message content, tokens, or media paths.
 
 ### 5.7 Account deletion
 
-Inside the existing account-deletion transaction:
+Inside the existing account-deletion transaction, first detach internal provenance from copies that
+point into the archive while preserving their immutable ciphertext, media reference, and
+`is_forwarded` marker:
 
 ```sql
+UPDATE messages SET
+  forwarded_from_account_id = NULL,
+  forwarded_from_dialog_id = NULL,
+  forwarded_from_msg_id = NULL
+WHERE is_forwarded = TRUE AND source_dialog_is_the_deleting_accounts_saved_dialog;
+
 DELETE FROM dialogs
 WHERE type = 'saved' AND created_by = $account_id;
 ```
@@ -487,10 +499,13 @@ Responsibilities:
 
 - return a local saved dialog immediately when one exists;
 - deduplicate concurrent auto-provision, Settings-tap, and Save-action calls into one task;
+- scope work by account, token, SQLCipher store identity, and session generation;
+- cancel and await the exact previous task before a new account/session can provision;
+- check cancellation immediately before SQLCipher persistence and revalidate scope before publishing;
 - call the ensure endpoint only when needed;
 - persist the returned dialog/member atomically through `CloudLocalStore`;
 - classify transient, authentication, unsupported-server, and permanent failures;
-- clear in-flight state on cancellation or completion;
+- clear only the matching in-flight task on cancellation or completion;
 - never own view state or user-facing copy.
 
 It does not own message sends, forwarding, uploads, search, drafts, or preferences.
@@ -599,8 +614,8 @@ ambiguous. Use **offline copy** or **conversation** for generic local-replica st
 
 ### 7.4 Accessibility, localization, and motion
 
-- Add localization keys for title, subtitle, setup/retry state, empty state, intro pill, Save action,
-  and deletion copy.
+- Add complete Russian and Tajik localization for title, subtitle, setup/retry state, empty state,
+  intro pill, Save action, accessibility hints, deletion copy, and stale-session errors.
 - Give the bookmark avatar and Settings row explicit VoiceOver labels.
 - Keep every target at least 44 by 44 points.
 - Preserve Dynamic Type, Reduce Motion, and Reduce Transparency behavior from shared components.
@@ -622,14 +637,15 @@ ambiguous. Use **offline copy** or **conversation** for generic local-replica st
 | Local upsert commits, event later replays | Idempotent dialog/member upsert | Replay test | No visible change |
 | First-ever setup while offline | No temporary id; service returns recoverable transient state | UI offline-first-provision test | "Connect once" plus Retry |
 | Already-provisioned app is offline | Read SQLCipher immediately; queue ordinary outbox writes | Offline relaunch UI test | Full cached experience |
-| Capability was cached but route rolled back | Refresh capabilities and surface server-unavailable state | Mock 404-after-advertisement test | Retry or server update message |
+| Capability is unknown on first offline launch | Preserve unknown; local rows still open, first provision asks to connect | Offline first-provision test | "Connect once" rather than false unavailable |
+| Ensure route returns 404 after advertisement | Mark unsupported immediately and withdraw the capability | 404-after-advertisement test | Server unavailable; existing local archive remains |
 | Saved membership is missing server-side | Ensure repairs it and emits one creation event | Repair integration test | Dialog returns |
 | Local event has `saved` type and no peer | Apply current account as owner member | Difference test | Correct row/title |
 | Forward source is deleted before an offline Save retries | Classify as permanent and retain a failed local row with Remove/Retry | Source-deleted outbox test | Clear failure, no infinite loop |
 | Media upload succeeds but message send times out | Existing media ledger and message idempotency retry | Existing media retry plus saved target test | Pending bubble becomes sent |
 | Difference cursor is pruned | Existing replacement bootstrap includes saved dialog/history | `difference_too_long` test | Old local copy stays readable during rebuild |
 | Low disk evicts full media | Existing metadata remains; redownload is available later | Cache policy regression test | Placeholder/retry, text remains |
-| Account is deleted | Saved dialog cascades; orphan media cleanup applies | Account-deletion integration test | Personal archive is gone |
+| Account is deleted | Detach forwarding provenance, cascade Saved rows, retain destination copies/media | Saved-to-direct/group deletion tests | Personal archive is gone; forwarded copies remain |
 | Old app build receives a `saved` type | String type decodes, fallback title supplied, no data corruption | legacy decoder fixture | Degraded UI only; rollout gate limits exposure |
 
 Any failure that would silently lose a locally queued note, file, or forward is a release blocker.
@@ -1038,23 +1054,24 @@ its ordinary `dialog_id`/message rows are the integration point for each later f
 
 Saved Messages v1 is done only when all statements are true:
 
-- [ ] PostgreSQL allows `saved` and enforces one per account.
-- [ ] Concurrent provisioning creates one dialog, one active owner membership, and one creation event.
-- [ ] Disabled capability means no advertisement and no reachable route.
-- [ ] Settings opens a real conversation, not `SettingsComingSoonView`.
-- [ ] The Chats list and Settings route resolve the same dialog UUID.
-- [ ] A previously provisioned saved dialog opens offline from SQLCipher with no network call.
-- [ ] Text, reply, edit, delete, reaction, forward, photo, video, file, and voice note reuse the existing
+- [x] PostgreSQL allows `saved` and enforces one per account.
+- [x] Concurrent provisioning creates one dialog, one active owner membership, and one creation event.
+- [x] Disabled capability means no advertisement and no reachable route.
+- [x] Settings opens a real conversation, not `SettingsComingSoonView`.
+- [x] The Chats list and Settings route resolve the same dialog UUID.
+- [x] A previously provisioned saved dialog opens offline from SQLCipher with no network call.
+- [x] Text, reply, edit, delete, reaction, forward, photo, video, file, and voice note reuse the existing
       production pipelines.
-- [ ] Optimistic sends and Saves survive process death and retry exactly once.
-- [ ] A second device receives changes through ordinary PTS difference sync.
-- [ ] Saved Messages never shows peer profile, presence, typing, calls, unread, mute, block, or false
+- [x] Optimistic sends and Saves survive process death and retry exactly once.
+- [x] A second device receives changes through ordinary PTS difference sync.
+- [x] Saved Messages never shows peer profile, presence, typing, calls, unread, mute, block, or false
       E2EE copy.
-- [ ] Generic "saved local copy" wording is no longer confused with the Saved Messages product name.
-- [ ] Account deletion removes the self-only archive and preserves still-referenced forwarded media.
-- [ ] Direct and group message regressions are green.
-- [ ] Backend migration, backend tests, Release WebRTC build, serialized iOS tests, UI tests, and
-      physical-device performance gates are green.
+- [x] Generic "saved local copy" wording is no longer confused with the Saved Messages product name.
+- [x] Account deletion removes the self-only archive and preserves forwarded direct/group text and media.
+- [x] Direct and group message regressions are green.
+- [x] Backend migration, backend tests, Release WebRTC build, serialized iOS tests, and UI tests are
+      green on the final review-remediation commit.
+- [ ] Representative physical-device performance gates are green.
 - [ ] Rollout dashboards show no invariant violation and no silent data loss.
 
 That is the release gate. The feature is not complete when the Settings row merely opens a chat; it is

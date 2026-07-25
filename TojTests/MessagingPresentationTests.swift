@@ -26,6 +26,27 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
     }
 
+    func testSavedCapabilityDistinguishesOfflineUnknownSupportAndWithdrawal() {
+        let firstOfflineLaunch = SavedMessagesCapabilityState.unknown
+        XCTAssertEqual(firstOfflineLaunch.resolvingEnsureFailure(statusCode: nil), .unknown)
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.advertised(in: ["core_text", "saved_messages_v1"]),
+            .supported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.advertised(in: ["core_text"]),
+            .unsupported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.supported.resolvingEnsureFailure(statusCode: 404),
+            .unsupported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.supported.resolvingEnsureFailure(statusCode: 503),
+            .supported
+        )
+    }
+
     func testMediaBubbleGeometryPreservesNormalRatiosAndBoundsExtremes() {
         XCTAssertEqual(MediaBubbleLayout.size(width: 1_000, height: 1_000), CGSize(width: 268, height: 268))
         XCTAssertEqual(MediaBubbleLayout.size(width: 1_600, height: 900).width, 268)

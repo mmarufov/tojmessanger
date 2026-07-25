@@ -203,8 +203,8 @@ struct TojConversationExperience: View {
         } message: {
             Text(
                 isSavedMessages
-                    ? "This removes the message from Saved Messages on all your devices."
-                    : "This removes the message for everyone in this conversation."
+                    ? String(localized: "This removes the message from Saved Messages on all your devices.")
+                    : String(localized: "This removes the message for everyone in this conversation.")
             )
         }
         .alert(item: Binding(
@@ -424,7 +424,7 @@ struct TojConversationExperience: View {
     private func serviceRow(for line: CloudAppModel.Line) -> some View {
         if isSavedMessages {
             timelinePill(
-                Text(line.text.isEmpty ? "Saved item" : line.text),
+                Text(line.text.isEmpty ? String(localized: "Saved item") : line.text),
                 icon: "bookmark.fill"
             )
         } else if isGroup {
@@ -579,17 +579,21 @@ struct TojConversationExperience: View {
         switch model.conversationOpenState {
         case .loadingLocal, .cached:
             savedMessageSkeleton
-                .accessibilityLabel("Loading offline conversation")
+                .accessibilityLabel(String(localized: "Loading offline conversation"))
         case .empty, .ready:
             VStack(spacing: 7) {
                 Image(systemName: isSavedMessages ? "bookmark.fill" : "bubble.left.and.bubble.right")
                     .font(.system(size: 22, weight: .medium))
-                Text(isSavedMessages ? "Save something for yourself" : "No messages yet")
+                Text(
+                    isSavedMessages
+                        ? String(localized: "Save something for yourself")
+                        : String(localized: "No messages yet")
+                )
                     .font(.subheadline.weight(.semibold))
                 Text(
                     isSavedMessages
-                        ? "Keep notes, media, links and files here. Downloaded items stay available offline."
-                        : "Messages you send will appear here and stay available offline."
+                        ? String(localized: "Keep notes, media, links and files here. Downloaded items stay available offline.")
+                        : String(localized: "Messages you send will appear here and stay available offline.")
                 )
                     .font(.caption)
                     .multilineTextAlignment(.center)
@@ -600,9 +604,14 @@ struct TojConversationExperience: View {
             .padding(.horizontal, 32)
         case .failedLocal:
             VStack(spacing: 10) {
-                Label("Offline conversation could not be opened", systemImage: "externaldrive.badge.exclamationmark")
+                Label(
+                    String(localized: "Offline conversation could not be opened"),
+                    systemImage: "externaldrive.badge.exclamationmark"
+                )
                     .font(.subheadline.weight(.semibold))
-                Button("Try offline copy again") { model.retryConversationLocalLoad() }
+                Button(String(localized: "Try offline copy again")) {
+                    model.retryConversationLocalLoad()
+                }
                     .buttonStyle(.glass)
             }
             .foregroundStyle(TojTheme.secondaryText)
