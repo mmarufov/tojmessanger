@@ -128,10 +128,17 @@ export async function loadMediaDTO(sql: SQL, mediaId: string | null): Promise<Me
 export async function createMediaUpload(sql: SQL, accountId: string, deviceId: string, input: {
   kind?: unknown; contentType?: unknown; fileName?: unknown; byteSize?: unknown;
   sha256?: unknown; durationMs?: unknown; width?: unknown; height?: unknown;
-  uploadProtocol?: unknown;
+  uploadProtocol?: unknown; purpose?: unknown;
 }) {
   const kind = String(input.kind ?? "") as MediaKind;
   if (!KINDS.has(kind)) throw new MediaError("unsupported media kind");
+  const purpose = input.purpose == null ? "message" : String(input.purpose);
+  if (purpose !== "message" && purpose !== "group_photo") {
+    throw new MediaError("invalid media purpose");
+  }
+  if (purpose === "group_photo" && kind !== "photo") {
+    throw new MediaError("group photo upload must be an image");
+  }
   const contentType = String(input.contentType ?? "").toLowerCase();
   if (!CONTENT_TYPE_PATTERN.test(contentType) || contentType.length > 127) {
     throw new MediaError("invalid content type");
@@ -213,12 +220,12 @@ export async function createMediaUpload(sql: SQL, accountId: string, deviceId: s
       INSERT INTO media_objects
         (id, owner_account_id, kind, content_type, file_name, file_name_key_id,
          file_name_nonce, file_name_ciphertext, byte_size, expected_sha256,
-         duration_ms, width, height, upload_protocol, part_size, total_parts)
+         duration_ms, width, height, upload_protocol, part_size, total_parts, purpose)
       VALUES (${mediaId}, ${accountId}, ${kind}, ${contentType}, NULL,
               ${sealedFileName?.keyId ?? null}, ${sealedFileName?.nonce ?? null},
               ${sealedFileName?.ciphertext ?? null}, ${byteSize},
               ${mediaDigestHMAC(Buffer.from(sha256, "hex"))}, ${durationMs}, ${width}, ${height},
-              ${uploadProtocol}, ${partSize}, ${totalParts})
+              ${uploadProtocol}, ${partSize}, ${totalParts}, ${purpose})
       RETURNING id, uploaded_bytes, expires_at`)[0];
     return {
       mediaId: row.id,
@@ -478,11 +485,19 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
            mo.thumbnail_key_id, mo.thumbnail_nonce, mo.thumbnail_ciphertext,
            mo.thumbnail_content_type
     FROM media_objects mo
-    WHERE mo.id = ${mediaId} AND EXISTS (
-      SELECT 1 FROM messages m
-      JOIN dialog_members dm ON dm.dialog_id = m.dialog_id
-      WHERE m.media_id = mo.id AND m.state = 'visible'
-        AND dm.account_id = ${accountId} AND dm.left_at IS NULL
+    WHERE mo.id = ${mediaId} AND (
+      EXISTS (
+        SELECT 1 FROM messages m
+        JOIN dialog_members dm ON dm.dialog_id = m.dialog_id
+        WHERE m.media_id = mo.id AND m.state = 'visible'
+          AND dm.account_id = ${accountId} AND dm.left_at IS NULL
+      )
+      OR EXISTS (
+        SELECT 1 FROM dialogs d
+        JOIN dialog_members dm ON dm.dialog_id = d.id
+        WHERE d.photo_media_id = mo.id
+          AND dm.account_id = ${accountId} AND dm.left_at IS NULL
+      )
     )
     FOR KEY SHARE OF mo`)[0];
   if (!row || row.status !== "ready") throw new MediaError("media not found", 404);
@@ -534,7 +549,11 @@ export async function cancelMediaUpload(sql: SQL, accountId: string, deviceId: s
     const row = (await tx`
       SELECT owner_account_id, status FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
     if (!row || row.owner_account_id !== accountId) throw new MediaError("upload not found", 404);
-    const referenced = await tx`SELECT 1 FROM messages WHERE media_id = ${mediaId} AND state = 'visible' LIMIT 1`;
+    const referenced = await tx`
+      SELECT 1 FROM messages WHERE media_id = ${mediaId} AND state = 'visible'
+      UNION ALL
+      SELECT 1 FROM dialogs WHERE photo_media_id = ${mediaId}
+      LIMIT 1`;
     if (referenced.length) throw new MediaError("media is already attached to a message", 409);
     await tx`DELETE FROM media_objects WHERE id = ${mediaId}`;
     return { mediaId, cancelled: true };

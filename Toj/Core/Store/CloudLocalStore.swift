@@ -10,6 +10,7 @@ nonisolated struct LocalMessage: Identifiable, Equatable, Sendable {
     let msgId: Int64?
     let clientMsgId: String
     let senderAccountId: String
+    let senderDisplayName: String?
     let kind: String
     let text: String
     let replyToMsgId: Int64?
@@ -18,7 +19,10 @@ nonisolated struct LocalMessage: Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     let isForwarded: Bool
     let reactions: [CloudReaction]
+    let mentions: [CloudMention]
     let media: CloudMedia?
+    let serviceType: String?
+    let serviceData: CloudServiceData?
     let editVersion: Int
     let state: String
     let serverTs: String?
@@ -30,6 +34,7 @@ nonisolated struct LocalDialog: Identifiable, Equatable, Sendable {
     var id: String { dialogId }
     let type: String
     let title: String?
+    let photo: CloudMedia?
     let lastMsgId: Int64
     let updatedAt: String
     let lastText: String?
@@ -39,10 +44,41 @@ nonisolated struct LocalDialog: Identifiable, Equatable, Sendable {
     let lastLocalState: String?
     let lastServerTs: String?
     let unreadCount: Int
+    let mentionCount: Int
     let peerAccountId: String?
     let peerBio: String?
     let peerBirthday: String?
     let peerColorIndex: Int?
+    let revision: Int64
+    let memberCount: Int
+    let selfRole: String?
+    let notificationMode: String
+    let accessState: String
+}
+
+nonisolated struct PendingGroupCreation: Identifiable, Equatable, Sendable {
+    let groupId: String
+    var id: String { groupId }
+    let title: String
+    let memberIds: [String]
+    let localPhotoReference: String?
+    let state: String
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+    let terminal: Bool
+}
+
+nonisolated struct PendingGroupMutation: Identifiable, Equatable, Sendable {
+    let clientMutationId: String
+    var id: String { clientMutationId }
+    let dialogId: String
+    let operation: String
+    let payloadJSON: String
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+    let terminal: Bool
 }
 
 nonisolated struct LocalLaunchSnapshot: Equatable, Sendable {
@@ -58,6 +94,7 @@ nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let replyToMsgId: Int64?
     let forwardedFromDialogId: String?
     let forwardedFromMsgId: Int64?
+    var mentions: [CloudMention] = []
     let retryCount: Int
     let nextRetryAt: String?
 }
@@ -92,6 +129,7 @@ nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
     let clientMsgId: String
     let caption: String
     let replyToMsgId: Int64?
+    var purpose: String = "message"
     let kind: String
     let contentType: String
     let fileName: String?
@@ -243,6 +281,7 @@ nonisolated enum ReplicaBootstrapMode: String, Equatable, Sendable {
 nonisolated enum CloudLocalStoreBootstrapError: LocalizedError, Equatable, Sendable {
     case notInProgress
     case invalidStagedMessage
+    case invalidGroupState
 
     var errorDescription: String? {
         switch self {
@@ -250,6 +289,8 @@ nonisolated enum CloudLocalStoreBootstrapError: LocalizedError, Equatable, Senda
             return "No local replica bootstrap is in progress"
         case .invalidStagedMessage:
             return "The staged local replica contains an invalid message"
+        case .invalidGroupState:
+            return "The local group state is invalid"
         }
     }
 }
@@ -641,11 +682,19 @@ actor CloudLocalStore {
 
     func applyHistoryPage(_ page: HistoryPageResponse) throws {
         try dbQueue.write { db in
+            for profile in page.profiles ?? [] {
+                try upsertProfile(db, profile: profile)
+            }
+            let durableType = try String.fetchOne(
+                db,
+                sql: "SELECT type FROM dialogs WHERE dialog_id = ?",
+                arguments: [page.dialogId]
+            ) ?? "direct"
             for message in page.messages {
                 try upsertDialog(
                     db,
                     dialogId: message.dialogId,
-                    type: "direct",
+                    type: durableType,
                     title: nil,
                     lastMsgId: message.msgId,
                     updatedAt: message.serverTs
@@ -678,11 +727,19 @@ actor CloudLocalStore {
     /// continues from its previously persisted position.
     func applyTargetedHistoryPage(_ page: HistoryPageResponse) throws {
         try dbQueue.write { db in
+            for profile in page.profiles ?? [] {
+                try upsertProfile(db, profile: profile)
+            }
+            let durableType = try String.fetchOne(
+                db,
+                sql: "SELECT type FROM dialogs WHERE dialog_id = ?",
+                arguments: [page.dialogId]
+            ) ?? "direct"
             for message in page.messages {
                 try upsertDialog(
                     db,
                     dialogId: message.dialogId,
-                    type: "direct",
+                    type: durableType,
                     title: nil,
                     lastMsgId: message.msgId,
                     updatedAt: message.serverTs
@@ -875,17 +932,412 @@ actor CloudLocalStore {
         }
     }
 
+    @discardableResult
+    func createPendingGroup(
+        groupId: String,
+        title: String,
+        memberIds: [String],
+        creatorAccountId: String,
+        localPhotoReference: String? = nil
+    ) throws -> Bool {
+        let normalizedMembers = Array(Set(memberIds.filter { $0 != creatorAccountId })).sorted()
+        let memberData = try JSONEncoder().encode(normalizedMembers)
+        guard let memberJSON = String(data: memberData, encoding: .utf8) else {
+            throw CloudLocalStoreBootstrapError.invalidGroupState
+        }
+        return try dbQueue.write { db in
+            let exists = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM pending_group_creations WHERE group_id = ?)",
+                arguments: [groupId]
+            ) ?? false
+            if exists { return false }
+            try db.execute(
+                sql: """
+                INSERT INTO dialogs (
+                  dialog_id, type, title, last_msg_id, updated_at, revision, member_count,
+                  self_role, notification_mode, access_state
+                ) VALUES (?, 'group', ?, 0, datetime('now'), 0, ?, 'owner', 'all', 'pending')
+                ON CONFLICT(dialog_id) DO NOTHING
+                """,
+                arguments: [groupId, title, normalizedMembers.count + 1]
+            )
+            try ensureDialogSummary(db, dialogId: groupId)
+            try db.execute(
+                sql: """
+                INSERT INTO dialog_members (
+                  dialog_id, account_id, role, last_read_msg_id, joined_at, is_active, revision
+                ) VALUES (?, ?, 'owner', 0, datetime('now'), 1, 0)
+                ON CONFLICT(dialog_id, account_id) DO UPDATE SET
+                  role = 'owner', is_active = 1, left_at = NULL
+                """,
+                arguments: [groupId, creatorAccountId]
+            )
+            for memberId in normalizedMembers {
+                try db.execute(
+                    sql: """
+                    INSERT INTO dialog_members (
+                      dialog_id, account_id, role, last_read_msg_id, joined_at, is_active, revision
+                    ) VALUES (?, ?, 'member', 0, datetime('now'), 1, 0)
+                    ON CONFLICT(dialog_id, account_id) DO UPDATE SET
+                      role = 'member', is_active = 1, left_at = NULL
+                    """,
+                    arguments: [groupId, memberId]
+                )
+            }
+            try db.execute(
+                sql: """
+                INSERT INTO pending_group_creations (
+                  group_id, title, member_ids_json, local_photo_reference, state,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', datetime('now'), datetime('now'))
+                """,
+                arguments: [groupId, title, memberJSON, localPhotoReference]
+            )
+            return true
+        }
+    }
+
+    func pendingGroupCreationsReady(limit: Int = 10) throws -> [PendingGroupCreation] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM pending_group_creations
+                WHERE terminal = 0 AND state IN ('queued','creating')
+                  AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+                ORDER BY created_at
+                LIMIT ?
+                """,
+                arguments: [max(1, min(50, limit))]
+            ).compactMap(Self.pendingGroupCreation(from:))
+        }
+    }
+
+    func nextPendingGroupCreationDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM pending_group_creations
+                WHERE terminal = 0 AND state IN ('queued','creating')
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                """,
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: """
+                SELECT MIN(next_retry_at) FROM pending_group_creations
+                WHERE terminal = 0 AND state IN ('queued','creating') AND next_retry_at > ?
+                """,
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
+        }
+    }
+
+    func markGroupCreating(groupId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_creations
+                SET state = 'creating', last_error = NULL, updated_at = datetime('now')
+                WHERE group_id = ? AND terminal = 0
+                """,
+                arguments: [groupId]
+            )
+        }
+    }
+
+    func retryGroupCreation(
+        groupId: String,
+        after delay: TimeInterval,
+        error: String
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_creations
+                SET state = 'queued', retry_count = retry_count + 1,
+                    next_retry_at = ?, last_error = ?, updated_at = datetime('now')
+                WHERE group_id = ? AND terminal = 0
+                """,
+                arguments: [
+                    Self.sqliteTimestamp(Date().addingTimeInterval(max(1, delay))),
+                    error,
+                    groupId,
+                ]
+            )
+        }
+    }
+
+    func failGroupCreation(groupId: String, error: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_creations
+                SET state = 'failed', terminal = 1, last_error = ?, updated_at = datetime('now')
+                WHERE group_id = ?
+                """,
+                arguments: [error, groupId]
+            )
+        }
+    }
+
+    func retryFailedGroupCreation(groupId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_creations
+                SET state = 'queued', terminal = 0, next_retry_at = NULL,
+                    last_error = NULL, updated_at = datetime('now')
+                WHERE group_id = ?
+                """,
+                arguments: [groupId]
+            )
+        }
+    }
+
+    func enqueueGroupMutation(
+        dialogId: String,
+        operation: String,
+        payloadJSON: String,
+        clientMutationId: String
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                INSERT INTO pending_group_mutations (
+                  client_mutation_id, dialog_id, operation, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(client_mutation_id) DO NOTHING
+                """,
+                arguments: [clientMutationId, dialogId, operation, payloadJSON]
+            )
+        }
+    }
+
+    func pendingGroupMutationsReady(
+        now: Date = Date(),
+        limit: Int = 20
+    ) throws -> [PendingGroupMutation] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT pending_group_mutations.* FROM pending_group_mutations
+                LEFT JOIN dialogs
+                  ON dialogs.dialog_id = pending_group_mutations.dialog_id
+                WHERE pending_group_mutations.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (
+                    pending_group_mutations.next_retry_at IS NULL
+                    OR pending_group_mutations.next_retry_at <= ?
+                  )
+                ORDER BY pending_group_mutations.created_at,
+                         pending_group_mutations.client_mutation_id
+                LIMIT ?
+                """,
+                arguments: [Self.sqliteTimestamp(now), max(1, min(100, limit))]
+            ).map(Self.pendingGroupMutation(from:))
+        }
+    }
+
+    func completeGroupMutation(clientMutationId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: "DELETE FROM pending_group_mutations WHERE client_mutation_id = ?",
+                arguments: [clientMutationId]
+            )
+        }
+    }
+
+    func failGroupMutation(
+        clientMutationId: String,
+        retryAfter: TimeInterval?,
+        error: String,
+        terminal: Bool
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_mutations
+                SET retry_count = retry_count + 1,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    terminal = ?
+                WHERE client_mutation_id = ?
+                """,
+                arguments: [
+                    retryAfter.map {
+                        Self.sqliteTimestamp(Date().addingTimeInterval(max(1, $0)))
+                    },
+                    error,
+                    terminal,
+                    clientMutationId,
+                ]
+            )
+        }
+    }
+
+    func nextPendingGroupMutationDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM pending_group_mutations
+                LEFT JOIN dialogs
+                  ON dialogs.dialog_id = pending_group_mutations.dialog_id
+                WHERE pending_group_mutations.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (
+                    pending_group_mutations.next_retry_at IS NULL
+                    OR pending_group_mutations.next_retry_at <= ?
+                  )
+                """,
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: """
+                SELECT MIN(pending_group_mutations.next_retry_at)
+                FROM pending_group_mutations
+                LEFT JOIN dialogs
+                  ON dialogs.dialog_id = pending_group_mutations.dialog_id
+                WHERE pending_group_mutations.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND pending_group_mutations.next_retry_at > ?
+                """,
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
+        }
+    }
+
+    func applyGroupEnvelope(_ envelope: CloudGroupEnvelope) throws {
+        try dbQueue.write { db in
+            for profile in envelope.profiles {
+                try upsertProfile(db, profile: profile)
+            }
+            try applyGroup(db, group: envelope.group)
+            for member in envelope.members ?? [] {
+                try upsertGroupMember(
+                    db,
+                    dialogId: envelope.group.id,
+                    member: member,
+                    revision: envelope.group.revision
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM pending_group_creations WHERE group_id = ?",
+                arguments: [envelope.group.id]
+            )
+        }
+    }
+
+    func applyGroupMembersPage(_ page: CloudGroupMembersPage, generation: String) throws {
+        try dbQueue.write { db in
+            for profile in page.profiles {
+                try upsertProfile(db, profile: profile)
+            }
+            try applyGroup(db, group: page.group)
+            for member in page.members {
+                try upsertGroupMember(
+                    db,
+                    dialogId: page.group.id,
+                    member: member,
+                    revision: page.group.revision,
+                    generation: generation
+                )
+            }
+            if !page.hasMore {
+                try db.execute(
+                    sql: """
+                    DELETE FROM dialog_members
+                    WHERE dialog_id = ? AND COALESCE(seen_generation, '') <> ?
+                    """,
+                    arguments: [page.group.id, generation]
+                )
+                try db.execute(
+                    sql: "DELETE FROM group_member_hydration WHERE dialog_id = ?",
+                    arguments: [page.group.id]
+                )
+            }
+        }
+    }
+
+    func revokeGroupAccess(
+        dialogId: String,
+        accessState: String = "removed",
+        reason: String
+    ) throws {
+        try dbQueue.write { db in
+            try revokeGroupAccess(
+                db,
+                dialogId: dialogId,
+                accessState: accessState,
+                reason: reason
+            )
+        }
+    }
+
+    func drainPendingPurges(limit: Int = 20) throws -> Int {
+        try dbQueue.write { db in
+            let purges = try Row.fetchAll(
+                db,
+                sql: "SELECT * FROM pending_purges ORDER BY created_at LIMIT ?",
+                arguments: [max(1, min(100, limit))]
+            )
+            for purge in purges {
+                let id: String = purge["id"]
+                let dialogId: String = purge["dialog_id"]
+                let kind: String = purge["kind"]
+                if kind == "messages" {
+                    try db.execute(sql: "DELETE FROM messages WHERE dialog_id = ?", arguments: [dialogId])
+                    try db.execute(sql: "DELETE FROM message_media WHERE dialog_id = ?", arguments: [dialogId])
+                } else {
+                    let payload: String? = purge["payload"]
+                    let mediaIds = payload?
+                        .data(using: .utf8)
+                        .flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+                    for mediaId in mediaIds {
+                        try db.execute(
+                            sql: "DELETE FROM media_cache_entries WHERE media_id = ?",
+                            arguments: [mediaId]
+                        )
+                        try db.execute(
+                            sql: "DELETE FROM media_download_jobs WHERE media_id = ?",
+                            arguments: [mediaId]
+                        )
+                    }
+                }
+                try db.execute(sql: "DELETE FROM pending_purges WHERE id = ?", arguments: [id])
+            }
+            return purges.count
+        }
+    }
+
     func insertSending(
         dialogId: String,
         clientMsgId: String,
         text: String,
         senderAccountId: String,
         replyToMsgId: Int64? = nil,
+        mentions: [CloudMention] = [],
         forwardedFromAccountId: String? = nil,
         forwardedFromDialogId: String? = nil,
         forwardedFromMsgId: Int64? = nil
     ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
+        let mentionsJSON = try String(
+            data: JSONEncoder().encode(mentions),
+            encoding: .utf8
+        ) ?? "[]"
         try dbQueue.write { db in
             try upsertDialog(db, dialogId: dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
             try db.execute(
@@ -893,9 +1345,10 @@ actor CloudLocalStore {
                 INSERT INTO messages (
                   local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
                   reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
-                  forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state
+                  forwarded_from_msg_id, is_forwarded, mentions_json,
+                  edit_version, state, server_ts, local_state
                 )
-                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
+                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   text = excluded.text,
                   reply_to_msg_id = excluded.reply_to_msg_id,
@@ -903,31 +1356,33 @@ actor CloudLocalStore {
                   forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   is_forwarded = excluded.is_forwarded,
+                  mentions_json = excluded.mentions_json,
                   local_state = 'sending'
                 """,
                 arguments: [
                     localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId,
                     forwardedFromAccountId, forwardedFromDialogId, forwardedFromMsgId,
-                    forwardedFromMsgId != nil
+                    forwardedFromMsgId != nil, mentionsJSON
                 ]
             )
             try db.execute(
                 sql: """
                 INSERT INTO pending_outbox (
                   client_msg_id, dialog_id, body, reply_to_msg_id,
-                  forwarded_from_dialog_id, forwarded_from_msg_id, created_at
+                  forwarded_from_dialog_id, forwarded_from_msg_id, mentions_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   body = excluded.body,
                   reply_to_msg_id = excluded.reply_to_msg_id,
                   forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
+                  mentions_json = excluded.mentions_json,
                   next_retry_at = NULL
                 """,
                 arguments: [
                     clientMsgId, dialogId, text, replyToMsgId,
-                    forwardedFromDialogId, forwardedFromMsgId
+                    forwardedFromDialogId, forwardedFromMsgId, mentionsJSON
                 ]
             )
             try refreshDialogSummary(db, dialogId: dialogId)
@@ -939,6 +1394,7 @@ actor CloudLocalStore {
             msgId: nil,
             clientMsgId: clientMsgId,
             senderAccountId: senderAccountId,
+            senderDisplayName: nil,
             kind: "text",
             text: text,
             replyToMsgId: replyToMsgId,
@@ -947,7 +1403,10 @@ actor CloudLocalStore {
             forwardedFromMsgId: forwardedFromMsgId,
             isForwarded: forwardedFromMsgId != nil,
             reactions: [],
+            mentions: mentions,
             media: nil,
+            serviceType: nil,
+            serviceData: nil,
             editVersion: 0,
             state: "visible",
             serverTs: nil,
@@ -1048,20 +1507,20 @@ actor CloudLocalStore {
 
     func insertMediaTransfer(
         prepared: PreparedMediaUpload, dialogId: String, clientMsgId: String,
-        caption: String, replyToMsgId: Int64?
+        caption: String, replyToMsgId: Int64?, purpose: String = "message"
     ) throws {
         try dbQueue.write { db in
             try db.execute(
                 sql: """
                 INSERT INTO media_transfers (
                   transfer_id, dialog_id, client_msg_id, caption, reply_to_msg_id,
-                  kind, content_type, file_name, byte_size, sha256, duration_ms, width, height,
+                  purpose, kind, content_type, file_name, byte_size, sha256, duration_ms, width, height,
                   encrypted_source_path, encrypted_thumbnail_path, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))
                 ON CONFLICT(transfer_id) DO NOTHING
                 """,
                 arguments: [
-                    prepared.transferId, dialogId, clientMsgId, caption, replyToMsgId,
+                    prepared.transferId, dialogId, clientMsgId, caption, replyToMsgId, purpose,
                     prepared.kind, prepared.contentType, prepared.fileName, prepared.byteSize,
                     prepared.sha256, prepared.durationMs, prepared.width, prepared.height,
                     prepared.encryptedSourcePath, prepared.encryptedThumbnailPath
@@ -1125,9 +1584,12 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT * FROM media_transfers
-                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                ORDER BY created_at, transfer_id LIMIT ?
+                SELECT media_transfers.* FROM media_transfers
+                LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
+                WHERE media_transfers.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
+                ORDER BY media_transfers.created_at, media_transfers.transfer_id LIMIT ?
                 """,
                 arguments: [Self.sqliteTimestamp(now), limit]
             )
@@ -1140,13 +1602,25 @@ actor CloudLocalStore {
         return try dbQueue.read { db in
             let due = try Int.fetchOne(
                 db,
-                sql: "SELECT COUNT(*) FROM media_transfers WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+                sql: """
+                SELECT COUNT(*) FROM media_transfers
+                LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
+                WHERE media_transfers.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
+                """,
                 arguments: [nowText]
             ) ?? 0
             if due > 0 { return 0 }
             guard let next = try String.fetchOne(
                 db,
-                sql: "SELECT MIN(next_retry_at) FROM media_transfers WHERE terminal = 0 AND next_retry_at > ?",
+                sql: """
+                SELECT MIN(media_transfers.next_retry_at) FROM media_transfers
+                LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
+                WHERE media_transfers.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND media_transfers.next_retry_at > ?
+                """,
                 arguments: [nowText]
             ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
             return max(0, date.timeIntervalSince(now))
@@ -1422,6 +1896,9 @@ actor CloudLocalStore {
                 return
             } else {
                 var messageDialogsToRefresh: Set<String> = []
+                for profile in difference.profiles ?? [] {
+                    try upsertProfile(db, profile: profile)
+                }
                 for update in difference.updates ?? [] {
                     switch update.type {
                     case "message.new", "message.edited", "message.deleted", "reaction.updated":
@@ -1449,10 +1926,16 @@ actor CloudLocalStore {
                             let state: String = previousMessage["state"]
                             return state == "visible" && sender != accountId && (msgId ?? 0) > currentRead
                         }()
+                        let storedType = try String.fetchOne(
+                            db,
+                            sql: "SELECT type FROM dialogs WHERE dialog_id = ?",
+                            arguments: [message.dialogId]
+                        )
+                        let durableType = update.dialogType ?? storedType ?? "direct"
                         try upsertDialog(
                             db,
                             dialogId: message.dialogId,
-                            type: "direct",
+                            type: durableType,
                             title: update.dialogTitle,
                             lastMsgId: message.msgId,
                             updatedAt: message.serverTs
@@ -1487,14 +1970,19 @@ actor CloudLocalStore {
                         }
                     case "dialog.created":
                         guard let dialogId = update.dialogId else { continue }
+                        let durableType = update.dialogType
+                            ?? (update.group == nil ? "direct" : "group")
                         try upsertDialog(
                             db,
                             dialogId: dialogId,
-                            type: "direct",
-                            title: update.dialogTitle,
+                            type: durableType,
+                            title: update.group?.title ?? update.dialogTitle,
                             lastMsgId: 0,
                             updatedAt: nil
                         )
+                        if let group = update.group {
+                            try applyGroupMetadata(db, group: group)
+                        }
                         if let peerAccountId = update.peerAccountId {
                             try upsertMember(
                                 db, dialogId: dialogId,
@@ -1505,6 +1993,27 @@ actor CloudLocalStore {
                                 member: BootstrapDialogMember(accountId: peerAccountId, role: "member", lastReadMsgId: 0)
                             )
                         }
+                    case "member.added", "member.removed", "member.role_changed", "member.left",
+                         "dialog.profile_updated", "dialog.closed":
+                        if let group = update.group {
+                            try applyGroupMetadata(db, group: group)
+                        }
+                        if let member = update.member, let dialogId = update.dialogId {
+                            try upsertGroupMember(
+                                db,
+                                dialogId: dialogId,
+                                member: member,
+                                revision: update.group?.revision ?? 0
+                            )
+                        }
+                    case "dialog.access_revoked":
+                        guard let dialogId = update.dialogId else { continue }
+                        try revokeGroupAccess(
+                            db,
+                            dialogId: dialogId,
+                            accessState: "removed",
+                            reason: "You no longer have access to this group."
+                        )
                     case "read.updated":
                         guard
                             let dialogId = update.dialogId,
@@ -2316,11 +2825,17 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT client_msg_id, dialog_id, body, reply_to_msg_id,
-                       forwarded_from_dialog_id, forwarded_from_msg_id, retry_count, next_retry_at
+                SELECT pending_outbox.client_msg_id, pending_outbox.dialog_id, pending_outbox.body,
+                       pending_outbox.reply_to_msg_id, pending_outbox.forwarded_from_dialog_id,
+                       pending_outbox.forwarded_from_msg_id, pending_outbox.mentions_json,
+                       pending_outbox.retry_count,
+                       pending_outbox.next_retry_at
                 FROM pending_outbox
-                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                ORDER BY created_at ASC, client_msg_id ASC
+                LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
+                WHERE pending_outbox.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (pending_outbox.next_retry_at IS NULL OR pending_outbox.next_retry_at <= ?)
+                ORDER BY pending_outbox.created_at ASC, pending_outbox.client_msg_id ASC
                 LIMIT ?
                 """,
                 arguments: [nowText, limit]
@@ -2343,7 +2858,15 @@ actor CloudLocalStore {
                 db,
                 sql: "SELECT COUNT(*) FROM media_transfers"
             ) ?? 0
-            return pendingText + pendingMutations + pendingMedia
+            let pendingGroups = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT
+                  (SELECT COUNT(*) FROM pending_group_creations)
+                  + (SELECT COUNT(*) FROM pending_group_mutations)
+                """
+            ) ?? 0
+            return pendingText + pendingMutations + pendingMedia + pendingGroups
         }
     }
 
@@ -2355,7 +2878,10 @@ actor CloudLocalStore {
                 sql: """
                 SELECT COUNT(*)
                 FROM pending_outbox
-                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
+                WHERE pending_outbox.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (pending_outbox.next_retry_at IS NULL OR pending_outbox.next_retry_at <= ?)
                 """,
                 arguments: [nowText]
             ) ?? 0
@@ -2366,9 +2892,12 @@ actor CloudLocalStore {
             guard let next = try String.fetchOne(
                 db,
                 sql: """
-                SELECT MIN(next_retry_at)
+                SELECT MIN(pending_outbox.next_retry_at)
                 FROM pending_outbox
-                WHERE terminal = 0 AND next_retry_at > ?
+                LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
+                WHERE pending_outbox.terminal = 0
+                  AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND pending_outbox.next_retry_at > ?
                 """,
                 arguments: [nowText]
             ), let nextDate = Self.makeSQLiteDateFormatter().date(from: next) else {
@@ -2930,6 +3459,31 @@ actor CloudLocalStore {
                     sql: "ALTER TABLE dialog_unread_summaries ADD COLUMN is_exact INTEGER NOT NULL DEFAULT 0"
                 )
             }
+
+            let stagedDialogColumns = try db.columns(in: "bootstrap_staged_dialogs").map(\.name)
+            if !stagedDialogColumns.contains("revision") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN revision INTEGER")
+            }
+            if !stagedDialogColumns.contains("member_count") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN member_count INTEGER")
+            }
+            if !stagedDialogColumns.contains("self_role") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN self_role TEXT")
+            }
+            if !stagedDialogColumns.contains("notification_mode") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN notification_mode TEXT")
+            }
+            if !stagedDialogColumns.contains("photo_media_json") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN photo_media_json TEXT")
+            }
+
+            let stagedMemberColumns = try db.columns(in: "bootstrap_staged_members").map(\.name)
+            if !stagedMemberColumns.contains("joined_at") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_members ADD COLUMN joined_at TEXT")
+            }
+            if !stagedMemberColumns.contains("is_active") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_members ADD COLUMN is_active INTEGER")
+            }
         }
 
         migrator.registerMigration("v8-media-presentation-representations") { db in
@@ -2965,14 +3519,159 @@ actor CloudLocalStore {
             """)
         }
 
+        migrator.registerMigration("v9-groups") { db in
+            let dialogColumns = try db.columns(in: "dialogs").map(\.name)
+            if !dialogColumns.contains("revision") {
+                try db.execute(sql: "ALTER TABLE dialogs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            }
+            if !dialogColumns.contains("photo_media_json") {
+                try db.execute(sql: "ALTER TABLE dialogs ADD COLUMN photo_media_json TEXT")
+            }
+            if !dialogColumns.contains("member_count") {
+                try db.execute(sql: "ALTER TABLE dialogs ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0")
+            }
+            if !dialogColumns.contains("self_role") {
+                try db.execute(sql: "ALTER TABLE dialogs ADD COLUMN self_role TEXT")
+            }
+            if !dialogColumns.contains("notification_mode") {
+                try db.execute(sql: "ALTER TABLE dialogs ADD COLUMN notification_mode TEXT NOT NULL DEFAULT 'all'")
+            }
+            if !dialogColumns.contains("access_state") {
+                try db.execute(
+                    sql: """
+                    ALTER TABLE dialogs ADD COLUMN access_state TEXT NOT NULL DEFAULT 'active'
+                      CHECK (access_state IN ('pending','active','removed','left','closed'))
+                    """
+                )
+            }
+
+            let memberColumns = try db.columns(in: "dialog_members").map(\.name)
+            if !memberColumns.contains("joined_at") {
+                try db.execute(sql: "ALTER TABLE dialog_members ADD COLUMN joined_at TEXT")
+            }
+            if !memberColumns.contains("left_at") {
+                try db.execute(sql: "ALTER TABLE dialog_members ADD COLUMN left_at TEXT")
+            }
+            if !memberColumns.contains("is_active") {
+                try db.execute(sql: "ALTER TABLE dialog_members ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+            }
+            if !memberColumns.contains("revision") {
+                try db.execute(sql: "ALTER TABLE dialog_members ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+            }
+            if !memberColumns.contains("seen_generation") {
+                try db.execute(sql: "ALTER TABLE dialog_members ADD COLUMN seen_generation TEXT")
+            }
+
+            let messageColumns = try db.columns(in: "messages").map(\.name)
+            if !messageColumns.contains("service_type") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN service_type TEXT")
+            }
+            if !messageColumns.contains("service_data_json") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN service_data_json TEXT")
+            }
+            if !messageColumns.contains("mentions_json") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'")
+            }
+
+            let groupOutboxColumns = try db.columns(in: "pending_outbox").map(\.name)
+            if !groupOutboxColumns.contains("mentions_json") {
+                try db.execute(
+                    sql: "ALTER TABLE pending_outbox ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            }
+
+            let mediaTransferColumns = try db.columns(in: "media_transfers").map(\.name)
+            if !mediaTransferColumns.contains("purpose") {
+                try db.execute(
+                    sql: "ALTER TABLE media_transfers ADD COLUMN purpose TEXT NOT NULL DEFAULT 'message'"
+                )
+            }
+
+            let unreadColumns = try db.columns(in: "dialog_unread_summaries").map(\.name)
+            if !unreadColumns.contains("mention_count") {
+                try db.execute(
+                    sql: "ALTER TABLE dialog_unread_summaries ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS pending_group_creations (
+              group_id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              member_ids_json TEXT NOT NULL,
+              local_photo_reference TEXT,
+              state TEXT NOT NULL CHECK (state IN ('queued','creating','failed','active')),
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_group_creations_ready_idx
+              ON pending_group_creations(terminal, next_retry_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS pending_group_mutations (
+              client_mutation_id TEXT PRIMARY KEY,
+              dialog_id TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_group_mutations_ready_idx
+              ON pending_group_mutations(terminal, next_retry_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS message_mentions (
+              dialog_id TEXT NOT NULL,
+              msg_id INTEGER NOT NULL,
+              account_id TEXT NOT NULL,
+              entity_offset INTEGER NOT NULL,
+              length INTEGER NOT NULL,
+              PRIMARY KEY (dialog_id, msg_id, account_id)
+            );
+            CREATE INDEX IF NOT EXISTS message_mentions_account_idx
+              ON message_mentions(account_id, dialog_id, msg_id);
+
+            CREATE TABLE IF NOT EXISTS group_member_hydration (
+              dialog_id TEXT PRIMARY KEY,
+              scan_generation TEXT NOT NULL,
+              scan_revision INTEGER NOT NULL,
+              cursor TEXT,
+              completed INTEGER NOT NULL DEFAULT 0,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_purges (
+              id TEXT PRIMARY KEY,
+              dialog_id TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK (kind IN ('messages','media')),
+              payload TEXT,
+              created_at TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS pending_purges_dialog_idx
+              ON pending_purges(dialog_id, created_at);
+            """)
+        }
+
         try migrator.migrate(dbPool)
     }
 
     nonisolated private static let messageSelectionSQL = """
     SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
            reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
-           forwarded_from_msg_id, is_forwarded, media_json, edit_version, state,
-           server_ts, local_state, rowid AS storage_rowid
+           forwarded_from_msg_id, is_forwarded, mentions_json,
+           media_json, service_type, service_data_json,
+           edit_version, state,
+           server_ts, local_state,
+           (SELECT display_name FROM profiles WHERE account_id = messages.sender_account_id)
+             AS sender_display_name,
+           rowid AS storage_rowid
     FROM messages
     """
 
@@ -3306,8 +4005,14 @@ actor CloudLocalStore {
               d.dialog_id,
               d.type,
               d.title,
+              d.photo_media_json,
               d.last_msg_id,
               d.updated_at,
+              d.revision,
+              d.member_count,
+              d.self_role,
+              d.notification_mode,
+              d.access_state,
               peer.account_id AS peer_account_id,
               profile.bio AS peer_bio,
               profile.birthday AS peer_birthday,
@@ -3318,7 +4023,8 @@ actor CloudLocalStore {
               summary.last_sender_account_id,
               summary.last_local_state,
               summary.last_server_ts,
-              COALESCE(unread.unread_count, 0) AS unread_count
+              COALESCE(unread.unread_count, 0) AS unread_count,
+              COALESCE(unread.mention_count, 0) AS mention_count
             FROM dialogs d
             LEFT JOIN dialog_members peer ON peer.dialog_id = d.dialog_id
               AND peer.account_id != ? AND d.type = 'direct'
@@ -3326,6 +4032,7 @@ actor CloudLocalStore {
             LEFT JOIN dialog_summaries summary ON summary.dialog_id = d.dialog_id
             LEFT JOIN dialog_unread_summaries unread
               ON unread.dialog_id = d.dialog_id AND unread.account_id = ?
+            WHERE d.access_state IN ('pending','active')
             ORDER BY d.updated_at DESC, d.dialog_id DESC
             """,
             arguments: [accountId, accountId]
@@ -3384,21 +4091,32 @@ actor CloudLocalStore {
     ) throws {
         let encoder = JSONEncoder()
         for dialog in page.dialogs {
+            let photoJSON = dialog.photo
+                .flatMap { try? encoder.encode($0) }
+                .flatMap { String(data: $0, encoding: .utf8) }
             try db.execute(
                 sql: """
                 INSERT INTO bootstrap_staged_dialogs (
-                  account_id, dialog_id, type, title, last_msg_id, updated_at, unread_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                  account_id, dialog_id, type, title, last_msg_id, updated_at, unread_count,
+                  revision, member_count, self_role, notification_mode, photo_media_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, dialog_id) DO UPDATE SET
                   type = excluded.type,
                   title = excluded.title,
                   last_msg_id = excluded.last_msg_id,
                   updated_at = excluded.updated_at,
-                  unread_count = excluded.unread_count
+                  unread_count = excluded.unread_count,
+                  revision = excluded.revision,
+                  member_count = excluded.member_count,
+                  self_role = excluded.self_role,
+                  notification_mode = excluded.notification_mode,
+                  photo_media_json = excluded.photo_media_json
                 """,
                 arguments: [
                     accountId, dialog.dialogId, dialog.type, dialog.title,
-                    dialog.lastMsgId, dialog.updatedAt, dialog.unreadCount
+                    dialog.lastMsgId, dialog.updatedAt, dialog.unreadCount,
+                    dialog.revision, dialog.memberCount, dialog.selfRole,
+                    dialog.notificationMode, photoJSON,
                 ]
             )
             try db.execute(
@@ -3413,12 +4131,13 @@ actor CloudLocalStore {
                 try db.execute(
                     sql: """
                     INSERT INTO bootstrap_staged_members (
-                      account_id, dialog_id, member_account_id, role, last_read_msg_id
-                    ) VALUES (?, ?, ?, ?, ?)
+                      account_id, dialog_id, member_account_id, role, last_read_msg_id,
+                      joined_at, is_active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     arguments: [
                         accountId, dialog.dialogId, member.accountId,
-                        member.role, member.lastReadMsgId
+                        member.role, member.lastReadMsgId, member.joinedAt, member.isActive
                     ]
                 )
             }
@@ -3477,7 +4196,7 @@ actor CloudLocalStore {
         let memberRows = try Row.fetchAll(
             db,
             sql: """
-            SELECT dialog_id, member_account_id, role, last_read_msg_id
+            SELECT dialog_id, member_account_id, role, last_read_msg_id, joined_at, is_active
             FROM bootstrap_staged_members
             WHERE account_id = ?
             ORDER BY dialog_id, member_account_id
@@ -3491,7 +4210,9 @@ actor CloudLocalStore {
                 BootstrapDialogMember(
                     accountId: row["member_account_id"],
                     role: row["role"],
-                    lastReadMsgId: row["last_read_msg_id"]
+                    lastReadMsgId: row["last_read_msg_id"],
+                    joinedAt: row["joined_at"],
+                    isActive: row["is_active"]
                 )
             )
         }
@@ -3538,7 +4259,8 @@ actor CloudLocalStore {
         let dialogRows = try Row.fetchAll(
             db,
             sql: """
-            SELECT dialog_id, type, title, last_msg_id, updated_at, unread_count
+            SELECT dialog_id, type, title, last_msg_id, updated_at, unread_count,
+                   revision, member_count, self_role, notification_mode, photo_media_json
             FROM bootstrap_staged_dialogs
             WHERE account_id = ?
             ORDER BY updated_at DESC, dialog_id DESC
@@ -3547,6 +4269,9 @@ actor CloudLocalStore {
         )
         let dialogs = dialogRows.map { row in
             let dialogId: String = row["dialog_id"]
+            let photo = (row["photo_media_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode(CloudMedia.self, from: $0) }
             return BootstrapDialog(
                 dialogId: dialogId,
                 type: row["type"],
@@ -3554,6 +4279,11 @@ actor CloudLocalStore {
                 lastMsgId: row["last_msg_id"],
                 updatedAt: row["updated_at"],
                 unreadCount: row["unread_count"],
+                revision: row["revision"],
+                memberCount: row["member_count"],
+                selfRole: row["self_role"],
+                notificationMode: row["notification_mode"],
+                photo: photo,
                 members: membersByDialog[dialogId] ?? [],
                 messages: messagesByDialog[dialogId] ?? []
             )
@@ -3578,11 +4308,29 @@ actor CloudLocalStore {
 
         try db.execute(
             sql: """
-            INSERT INTO dialogs (dialog_id, type, title, last_msg_id, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO dialogs (
+              dialog_id, type, title, last_msg_id, updated_at, revision, photo_media_json,
+              member_count, self_role, notification_mode, access_state
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'all'), 'active')
             ON CONFLICT(dialog_id) DO UPDATE SET
               type = excluded.type,
               title = excluded.title,
+              revision = CASE
+                WHEN excluded.revision >= dialogs.revision THEN excluded.revision
+                ELSE dialogs.revision
+              END,
+              photo_media_json = CASE
+                WHEN excluded.revision >= dialogs.revision THEN excluded.photo_media_json
+                ELSE dialogs.photo_media_json
+              END,
+              member_count = CASE
+                WHEN excluded.revision >= dialogs.revision THEN excluded.member_count
+                ELSE dialogs.member_count
+              END,
+              self_role = COALESCE(excluded.self_role, dialogs.self_role),
+              notification_mode = COALESCE(excluded.notification_mode, dialogs.notification_mode),
+              access_state = 'active',
               last_msg_id = MAX(
                 excluded.last_msg_id,
                 COALESCE((SELECT MAX(msg_id) FROM messages WHERE dialog_id = ?), 0)
@@ -3591,7 +4339,13 @@ actor CloudLocalStore {
             """,
             arguments: [
                 dialog.dialogId, dialog.type, dialog.title,
-                dialog.lastMsgId, dialog.updatedAt, dialog.dialogId
+                dialog.lastMsgId, dialog.updatedAt, dialog.revision ?? 0,
+                dialog.photo.flatMap { try? JSONEncoder().encode($0) }
+                    .flatMap { String(data: $0, encoding: .utf8) },
+                dialog.memberCount ?? dialog.members.count,
+                dialog.selfRole,
+                dialog.notificationMode,
+                dialog.dialogId,
             ]
         )
         try ensureDialogSummary(db, dialogId: dialog.dialogId)
@@ -3611,12 +4365,17 @@ actor CloudLocalStore {
         for member in dialog.members {
             try db.execute(
                 sql: """
-                INSERT INTO dialog_members (dialog_id, account_id, role, last_read_msg_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO dialog_members (
+                  dialog_id, account_id, role, last_read_msg_id, joined_at, is_active, revision
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 arguments: [
                     dialog.dialogId, member.accountId, member.role,
-                    max(member.lastReadMsgId, existingReads[member.accountId] ?? 0)
+                    max(member.lastReadMsgId, existingReads[member.accountId] ?? 0),
+                    member.joinedAt,
+                    member.isActive ?? true,
+                    dialog.revision ?? 0,
                 ]
             )
         }
@@ -3940,13 +4699,33 @@ actor CloudLocalStore {
     ) throws {
         try db.execute(
             sql: """
-            INSERT INTO dialog_unread_summaries (dialog_id, account_id, unread_count, is_exact)
-            VALUES (?, ?, MAX(0, ?), ?)
+            INSERT INTO dialog_unread_summaries (
+              dialog_id, account_id, unread_count, is_exact, mention_count
+            )
+            VALUES (
+              ?, ?, MAX(0, ?), ?,
+              COALESCE((
+                SELECT COUNT(*)
+                FROM message_mentions mention
+                JOIN messages message
+                  ON message.dialog_id = mention.dialog_id AND message.msg_id = mention.msg_id
+                WHERE mention.dialog_id = ? AND mention.account_id = ?
+                  AND message.state = 'visible'
+                  AND mention.msg_id > COALESCE((
+                    SELECT last_read_msg_id FROM dialog_members
+                    WHERE dialog_id = ? AND account_id = ?
+                  ), 0)
+              ), 0)
+            )
             ON CONFLICT(dialog_id, account_id) DO UPDATE SET
               unread_count = excluded.unread_count,
-              is_exact = excluded.is_exact
+              is_exact = excluded.is_exact,
+              mention_count = excluded.mention_count
             """,
-            arguments: [dialogId, accountId, unreadCount, isExact]
+            arguments: [
+                dialogId, accountId, unreadCount, isExact,
+                dialogId, accountId, dialogId, accountId
+            ]
         )
     }
 
@@ -3959,13 +4738,34 @@ actor CloudLocalStore {
         guard delta != 0 else { return }
         try db.execute(
             sql: """
-            INSERT INTO dialog_unread_summaries (dialog_id, account_id, unread_count, is_exact)
-            VALUES (?, ?, MAX(0, ?), 0)
+            INSERT INTO dialog_unread_summaries (
+              dialog_id, account_id, unread_count, is_exact, mention_count
+            )
+            VALUES (
+              ?, ?, MAX(0, ?), 0,
+              COALESCE((
+                SELECT COUNT(*)
+                FROM message_mentions mention
+                JOIN messages message
+                  ON message.dialog_id = mention.dialog_id AND message.msg_id = mention.msg_id
+                WHERE mention.dialog_id = ? AND mention.account_id = ?
+                  AND message.state = 'visible'
+                  AND mention.msg_id > COALESCE((
+                    SELECT last_read_msg_id FROM dialog_members
+                    WHERE dialog_id = ? AND account_id = ?
+                  ), 0)
+              ), 0)
+            )
             ON CONFLICT(dialog_id, account_id) DO UPDATE SET
               unread_count = MAX(0, dialog_unread_summaries.unread_count + ?),
-              is_exact = dialog_unread_summaries.is_exact
+              is_exact = dialog_unread_summaries.is_exact,
+              mention_count = excluded.mention_count
             """,
-            arguments: [dialogId, accountId, delta, delta]
+            arguments: [
+                dialogId, accountId, delta,
+                dialogId, accountId, dialogId, accountId,
+                delta
+            ]
         )
     }
 
@@ -4075,6 +4875,159 @@ actor CloudLocalStore {
             userInitiated: row["user_initiated"], retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"], lastError: row["last_error"],
             updatedAt: row["updated_at"]
+        )
+    }
+
+    private func applyGroup(_ db: Database, group: CloudGroup) throws {
+        let photoJSON = group.photo
+            .flatMap { try? JSONEncoder().encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
+        try db.execute(
+            sql: """
+            INSERT INTO dialogs (
+              dialog_id, type, title, last_msg_id, updated_at, revision, photo_media_json,
+              member_count, self_role, notification_mode, access_state
+            ) VALUES (?, 'group', ?, 0, datetime('now'), ?, ?, ?, ?, ?, 'active')
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              type = 'group',
+              title = CASE WHEN excluded.revision >= dialogs.revision
+                THEN excluded.title ELSE dialogs.title END,
+              photo_media_json = CASE WHEN excluded.revision >= dialogs.revision
+                THEN excluded.photo_media_json ELSE dialogs.photo_media_json END,
+              member_count = CASE WHEN excluded.revision >= dialogs.revision
+                THEN excluded.member_count ELSE dialogs.member_count END,
+              self_role = excluded.self_role,
+              notification_mode = excluded.notification_mode,
+              access_state = 'active',
+              revision = MAX(dialogs.revision, excluded.revision),
+              updated_at = MAX(dialogs.updated_at, excluded.updated_at)
+            """,
+            arguments: [
+                group.id, group.title, group.revision, photoJSON, group.memberCount,
+                group.selfRole, group.notificationMode,
+            ]
+        )
+        try ensureDialogSummary(db, dialogId: group.id)
+    }
+
+    private func applyGroupMetadata(_ db: Database, group: CloudUpdateGroup) throws {
+        let existingRevision = try Int64.fetchOne(
+            db,
+            sql: "SELECT revision FROM dialogs WHERE dialog_id = ?",
+            arguments: [group.id]
+        ) ?? -1
+        guard group.revision > existingRevision else { return }
+        try db.execute(
+            sql: """
+            INSERT INTO dialogs (
+              dialog_id, type, title, last_msg_id, updated_at, revision, member_count,
+              notification_mode, access_state
+            ) VALUES (?, 'group', ?, 0, datetime('now'), ?, ?, 'all', 'active')
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              type = 'group',
+              title = COALESCE(excluded.title, dialogs.title),
+              revision = excluded.revision,
+              member_count = excluded.member_count,
+              updated_at = excluded.updated_at
+            """,
+            arguments: [group.id, group.title, group.revision, group.memberCount]
+        )
+        try ensureDialogSummary(db, dialogId: group.id)
+    }
+
+    private func upsertGroupMember(
+        _ db: Database,
+        dialogId: String,
+        member: CloudGroupMember,
+        revision: Int64,
+        generation: String? = nil
+    ) throws {
+        let localRevision = try Int64.fetchOne(
+            db,
+            sql: """
+            SELECT revision FROM dialog_members
+            WHERE dialog_id = ? AND account_id = ?
+            """,
+            arguments: [dialogId, member.accountId]
+        ) ?? -1
+        guard revision >= localRevision else { return }
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_members (
+              dialog_id, account_id, role, last_read_msg_id, joined_at, left_at,
+              is_active, revision, seen_generation
+            ) VALUES (?, ?, ?, 0, ?, NULL, ?, ?, ?)
+            ON CONFLICT(dialog_id, account_id) DO UPDATE SET
+              role = excluded.role,
+              joined_at = excluded.joined_at,
+              left_at = excluded.left_at,
+              is_active = excluded.is_active,
+              revision = excluded.revision,
+              seen_generation = COALESCE(excluded.seen_generation, dialog_members.seen_generation)
+            """,
+            arguments: [
+                dialogId, member.accountId, member.role, member.joinedAt,
+                member.isActive, revision, generation,
+            ]
+        )
+    }
+
+    private func revokeGroupAccess(
+        _ db: Database,
+        dialogId: String,
+        accessState: String,
+        reason: String
+    ) throws {
+        let mediaIds = try String.fetchAll(
+            db,
+            sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
+        let mediaPayload = try JSONEncoder().encode(mediaIds)
+        let mediaJSON = String(data: mediaPayload, encoding: .utf8) ?? "[]"
+        // Access state is the first write in this transaction so every observation hides the
+        // conversation even if the process exits before the durable purge is drained.
+        try db.execute(
+            sql: "UPDATE dialogs SET access_state = ?, updated_at = datetime('now') WHERE dialog_id = ?",
+            arguments: [accessState, dialogId]
+        )
+        try db.execute(
+            sql: "UPDATE pending_outbox SET terminal = 1 WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
+        try db.execute(
+            sql: "UPDATE media_transfers SET terminal = 1, last_error = ? WHERE dialog_id = ?",
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE pending_message_mutations
+            SET terminal = 1, last_error = ?
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE pending_group_mutations
+            SET terminal = 1, last_error = ?
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(sql: "DELETE FROM media_download_jobs WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM dialog_unread_summaries WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM group_member_hydration WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(
+            sql: """
+            INSERT INTO pending_purges (id, dialog_id, kind, payload, created_at)
+            VALUES (?, ?, 'media', ?, datetime('now')),
+                   (?, ?, 'messages', NULL, datetime('now'))
+            """,
+            arguments: [
+                UUID().uuidString.lowercased(), dialogId, mediaJSON,
+                UUID().uuidString.lowercased(), dialogId,
+            ]
         )
     }
 
@@ -4220,9 +5173,9 @@ actor CloudLocalStore {
               local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
               reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
               forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state,
-              media_json
+              mentions_json, media_json, service_type, service_data_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -4235,7 +5188,10 @@ actor CloudLocalStore {
               forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
               forwarded_from_msg_id = excluded.forwarded_from_msg_id,
               is_forwarded = excluded.is_forwarded,
+              mentions_json = excluded.mentions_json,
               media_json = excluded.media_json,
+              service_type = excluded.service_type,
+              service_data_json = excluded.service_data_json,
               edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
@@ -4258,7 +5214,12 @@ actor CloudLocalStore {
                 message.state,
                 message.serverTs,
                 localState,
-                message.media.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
+                message.mentions.isEmpty
+                    ? "[]"
+                    : String(data: try JSONEncoder().encode(message.mentions), encoding: .utf8) ?? "[]",
+                message.media.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) },
+                message.serviceType,
+                message.serviceData.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
             ]
         )
         if let previousLocalId, previousLocalId != message.id {
@@ -4288,6 +5249,21 @@ actor CloudLocalStore {
                 arguments: [message.dialogId, message.msgId, reaction.accountId, reaction.emoji]
             )
         }
+        try db.execute(
+            sql: "DELETE FROM message_mentions WHERE dialog_id = ? AND msg_id = ?",
+            arguments: [message.dialogId, message.msgId]
+        )
+        for mention in message.mentions {
+            try db.execute(
+                sql: """
+                INSERT INTO message_mentions (dialog_id, msg_id, account_id, entity_offset, length)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: [
+                    message.dialogId, message.msgId, mention.accountId, mention.offset, mention.length
+                ]
+            )
+        }
         if refreshSummaries {
             try refreshDialogSummary(db, dialogId: message.dialogId)
             try refreshAllUnreadSummaries(db, dialogId: message.dialogId)
@@ -4301,6 +5277,7 @@ actor CloudLocalStore {
             msgId: row["msg_id"],
             clientMsgId: row["client_msg_id"],
             senderAccountId: row["sender_account_id"],
+            senderDisplayName: row["sender_display_name"],
             kind: row["kind"],
             text: row["text"],
             replyToMsgId: row["reply_to_msg_id"],
@@ -4309,7 +5286,14 @@ actor CloudLocalStore {
             forwardedFromMsgId: row["forwarded_from_msg_id"],
             isForwarded: row["is_forwarded"],
             reactions: reactions,
+            mentions: (row["mentions_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
             media: (row["media_json"] as String?).flatMap { $0.data(using: .utf8) }.flatMap { try? JSONDecoder().decode(CloudMedia.self, from: $0) },
+            serviceType: row["service_type"],
+            serviceData: (row["service_data_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode(CloudServiceData.self, from: $0) },
             editVersion: row["edit_version"],
             state: row["state"],
             serverTs: row["server_ts"],
@@ -4321,7 +5305,8 @@ actor CloudLocalStore {
         MediaTransferRecord(
             transferId: row["transfer_id"], dialogId: row["dialog_id"],
             clientMsgId: row["client_msg_id"], caption: row["caption"],
-            replyToMsgId: row["reply_to_msg_id"], kind: row["kind"],
+            replyToMsgId: row["reply_to_msg_id"], purpose: row["purpose"],
+            kind: row["kind"],
             contentType: row["content_type"], fileName: row["file_name"],
             byteSize: row["byte_size"], sha256: row["sha256"], durationMs: row["duration_ms"],
             width: row["width"], height: row["height"],
@@ -4343,11 +5328,46 @@ actor CloudLocalStore {
         )
     }
 
+    private static func pendingGroupCreation(from row: Row) -> PendingGroupCreation? {
+        guard
+            let json: String = row["member_ids_json"],
+            let data = json.data(using: .utf8),
+            let memberIds = try? JSONDecoder().decode([String].self, from: data)
+        else { return nil }
+        return PendingGroupCreation(
+            groupId: row["group_id"],
+            title: row["title"],
+            memberIds: memberIds,
+            localPhotoReference: row["local_photo_reference"],
+            state: row["state"],
+            retryCount: row["retry_count"],
+            nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"],
+            terminal: (row["terminal"] as Int) != 0
+        )
+    }
+
+    private static func pendingGroupMutation(from row: Row) -> PendingGroupMutation {
+        PendingGroupMutation(
+            clientMutationId: row["client_mutation_id"],
+            dialogId: row["dialog_id"],
+            operation: row["operation"],
+            payloadJSON: row["payload_json"],
+            retryCount: row["retry_count"],
+            nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"],
+            terminal: (row["terminal"] as Int) != 0
+        )
+    }
+
     private static func dialog(from row: Row) -> LocalDialog {
         LocalDialog(
             dialogId: row["dialog_id"],
             type: row["type"],
             title: row["title"],
+            photo: (row["photo_media_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode(CloudMedia.self, from: $0) },
             lastMsgId: row["last_msg_id"],
             updatedAt: row["updated_at"],
             lastText: row["last_text"],
@@ -4357,10 +5377,16 @@ actor CloudLocalStore {
             lastLocalState: row["last_local_state"],
             lastServerTs: row["last_server_ts"],
             unreadCount: row["unread_count"],
+            mentionCount: row["mention_count"],
             peerAccountId: row["peer_account_id"],
             peerBio: row["peer_bio"],
             peerBirthday: row["peer_birthday"],
-            peerColorIndex: row["peer_color_index"]
+            peerColorIndex: row["peer_color_index"],
+            revision: row["revision"],
+            memberCount: row["member_count"],
+            selfRole: row["self_role"],
+            notificationMode: row["notification_mode"],
+            accessState: row["access_state"]
         )
     }
 
@@ -4372,6 +5398,9 @@ actor CloudLocalStore {
             replyToMsgId: row["reply_to_msg_id"],
             forwardedFromDialogId: row["forwarded_from_dialog_id"],
             forwardedFromMsgId: row["forwarded_from_msg_id"],
+            mentions: (row["mentions_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"]
         )
@@ -4453,6 +5482,10 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM pending_read_receipts")
         try db.execute(sql: "DELETE FROM chat_viewport_state")
         try db.execute(sql: "DELETE FROM dialog_history_state")
+        try db.execute(sql: "DELETE FROM message_mentions")
+        try db.execute(sql: "DELETE FROM group_member_hydration")
+        try db.execute(sql: "DELETE FROM pending_group_creations")
+        try db.execute(sql: "DELETE FROM pending_purges")
         try db.execute(sql: "DELETE FROM bootstrap_baseline_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_staged_messages")
         try db.execute(sql: "DELETE FROM bootstrap_staged_members")

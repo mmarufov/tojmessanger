@@ -89,6 +89,20 @@ import {
   voiceCallsConfigured,
   type CallHint,
 } from "./calls";
+import {
+  addGroupMembers,
+  changeGroupMemberRole,
+  createGroup,
+  getGroup,
+  getGroupMembers,
+  GroupError,
+  leaveGroup,
+  removeGroupMember,
+  transferGroupOwner,
+  updateGroupNotifications,
+  updateGroupProfile,
+} from "./groups";
+import { DialogAccessError } from "./dialog-access";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -111,10 +125,11 @@ export const CLOUD_CAPABILITIES = {
   ],
 } as const;
 
-function cloudCapabilities(voiceCalls: boolean, videoCalls: boolean) {
+function cloudCapabilities(voiceCalls: boolean, videoCalls: boolean, groups: boolean) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
+  if (groups) capabilities.push("groups_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -236,6 +251,7 @@ export function startCloudServer(
   const metrics = new OperationalMetrics();
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
+  const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -276,7 +292,7 @@ export function startCloudServer(
           const accountVideoAvailable = capabilityToken
             ? videoCallsEnabledForAccount((await resolveDevice(db, capabilityToken)).accountId, videoAvailable)
             : false;
-          response = json(cloudCapabilities(callsAvailable, accountVideoAvailable));
+          response = json(cloudCapabilities(callsAvailable, accountVideoAvailable, groupsAvailable));
         }
 
         else if (url.pathname === "/metrics") {
@@ -311,6 +327,15 @@ export function startCloudServer(
           const body = await readJson(req);
           if (!body.phone || !body.code) throw new AuthError("phone and code required", 400);
           response = json(await checkVerification(db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName));
+        }
+
+        else if (
+          (url.pathname === "/v1/groups" || url.pathname.startsWith("/v1/groups/"))
+          && !groupsAvailable
+        ) {
+          // Hard-close the complete route family during dark deploys. Advertisement alone is not
+          // sufficient because stale or modified clients could otherwise create live group events.
+          response = new Response("not found", { status: 404 });
         }
 
         else {
@@ -372,6 +397,127 @@ export function startCloudServer(
           );
           const callMatch = url.pathname.match(/^\/v1\/calls\/([0-9a-f-]+)$/i);
           const blockMatch = url.pathname.match(/^\/v1\/blocks\/([0-9a-f-]+)$/i);
+          const groupMemberMatch = url.pathname.match(
+            /^\/v1\/groups\/([0-9a-f-]+)\/members\/([0-9a-f-]+)$/i,
+          );
+          const groupMembersMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/members$/i);
+          const groupTransferMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/transfer-owner$/i);
+          const groupLeaveMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/leave$/i);
+          const groupNotificationsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/notifications$/i);
+          const groupMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)$/i);
+
+        if (url.pathname === "/v1/groups" && req.method === "POST") {
+          const result = await createGroup(db, {
+            creatorAccountId: session.accountId,
+            creatorDeviceId: session.deviceId,
+            groupId: body.groupId,
+            title: body.title,
+            memberIds: body.memberIds,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json({
+            group: result.group,
+            members: result.members,
+            profiles: result.profiles,
+            duplicate: result.duplicate,
+          }, result.duplicate ? 200 : 201);
+        }
+
+        if (groupMatch && req.method === "GET") {
+          response = json(await getGroup(db, session.accountId, groupMatch[1]));
+        }
+
+        if (groupMembersMatch && req.method === "GET") {
+          response = json(await getGroupMembers(db, session.accountId, groupMembersMatch[1], {
+            cursor: url.searchParams.get("cursor"),
+            limit: url.searchParams.get("limit"),
+          }));
+        }
+
+        if (groupMembersMatch && req.method === "POST") {
+          const result = await addGroupMembers(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupMembersMatch[1],
+            memberIds: body.memberIds,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupMemberMatch && req.method === "DELETE") {
+          const result = await removeGroupMember(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupMemberMatch[1],
+            targetAccountId: groupMemberMatch[2],
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupMemberMatch && req.method === "PATCH") {
+          const result = await changeGroupMemberRole(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupMemberMatch[1],
+            targetAccountId: groupMemberMatch[2],
+            role: body.role,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupMatch && req.method === "PATCH") {
+          const result = await updateGroupProfile(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupMatch[1],
+            title: body.title,
+            photoMediaId: body.photoMediaId,
+            clearPhoto: body.clearPhoto,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupTransferMatch && req.method === "POST") {
+          const result = await transferGroupOwner(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupTransferMatch[1],
+            targetAccountId: body.accountId,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupLeaveMatch && req.method === "POST") {
+          const result = await leaveGroup(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupLeaveMatch[1],
+            successorAccountId: body.successorAccountId,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({ left: result.left, closed: result.closed });
+        }
+
+        if (groupNotificationsMatch && req.method === "PUT") {
+          const result = await updateGroupNotifications(db, {
+            actorAccountId: session.accountId,
+            dialogId: groupNotificationsMatch[1],
+            mode: body.mode,
+            clientMutationId: body.clientMutationId,
+          });
+          response = json(result);
+        }
 
         if (url.pathname === "/v1/devices/push" && req.method === "POST") {
           if (!body.token || !body.environment) throw new PushError("token and environment required");
@@ -622,6 +768,7 @@ export function startCloudServer(
             mediaId: body.mediaId,
             replyToMsgId: body.replyToMsgId,
             forwardedFrom: body.forwardedFrom,
+            mentions: body.mentions,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -714,6 +861,8 @@ export function startCloudServer(
           ? err.status
           : err instanceof MediaError ? err.status
           : err instanceof CallError ? err.status
+          : err instanceof GroupError ? err.status
+          : err instanceof DialogAccessError ? err.status
           : err instanceof SyncError || err instanceof PushError ? 400 : 500;
         if (status === 500) {
           console.error(JSON.stringify({
@@ -728,11 +877,14 @@ export function startCloudServer(
         if (err instanceof AuthError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof GroupError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof DialogAccessError ? { code: err.code } : {}),
         }, status, headers);
       }
       const status = response?.status ?? 101;

@@ -10,6 +10,17 @@ nonisolated struct CloudReaction: Codable, Equatable, Sendable {
     }
 }
 
+nonisolated struct CloudMention: Codable, Equatable, Sendable {
+    let accountId: String
+    let offset: Int
+    let length: Int
+
+    enum CodingKeys: String, CodingKey {
+        case accountId = "account_id"
+        case offset, length
+    }
+}
+
 nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     nonisolated var id: String { "\(dialogId):\(msgId)" }
     let dialogId: String
@@ -24,7 +35,10 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     let isForwarded: Bool
     let reactions: [CloudReaction]
+    let mentions: [CloudMention]
     let media: CloudMedia?
+    let serviceType: String?
+    let serviceData: CloudServiceData?
     let editVersion: Int
     let state: String
     let serverTs: String
@@ -42,7 +56,10 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         forwardedFromMsgId: Int64? = nil,
         isForwarded: Bool = false,
         reactions: [CloudReaction] = [],
+        mentions: [CloudMention] = [],
         media: CloudMedia? = nil,
+        serviceType: String? = nil,
+        serviceData: CloudServiceData? = nil,
         editVersion: Int,
         state: String,
         serverTs: String
@@ -59,7 +76,10 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         self.forwardedFromMsgId = forwardedFromMsgId
         self.isForwarded = isForwarded
         self.reactions = reactions
+        self.mentions = mentions
         self.media = media
+        self.serviceType = serviceType
+        self.serviceData = serviceData
         self.editVersion = editVersion
         self.state = state
         self.serverTs = serverTs
@@ -78,7 +98,10 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case forwardedFromMsgId = "forwarded_from_msg_id"
         case isForwarded = "forwarded"
         case reactions
+        case mentions
         case media
+        case serviceType = "service_type"
+        case serviceData = "service_data"
         case editVersion = "edit_version"
         case state
         case serverTs = "server_ts"
@@ -98,7 +121,10 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         forwardedFromMsgId = try values.decodeIfPresent(Int64.self, forKey: .forwardedFromMsgId)
         isForwarded = try values.decodeIfPresent(Bool.self, forKey: .isForwarded) ?? false
         reactions = try values.decodeIfPresent([CloudReaction].self, forKey: .reactions) ?? []
+        mentions = try values.decodeIfPresent([CloudMention].self, forKey: .mentions) ?? []
         media = try values.decodeIfPresent(CloudMedia.self, forKey: .media)
+        serviceType = try values.decodeIfPresent(String.self, forKey: .serviceType)
+        serviceData = try values.decodeIfPresent(CloudServiceData.self, forKey: .serviceData)
         editVersion = try values.decode(Int.self, forKey: .editVersion)
         state = try values.decode(String.self, forKey: .state)
         serverTs = try values.decode(String.self, forKey: .serverTs)
@@ -111,7 +137,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let type: String
     let dialogId: String?
     let dialogTitle: String?
+    let dialogType: String?
     let message: CloudMessage?
+    let group: CloudUpdateGroup?
+    let member: CloudGroupMember?
     let readerAccountId: String?
     let maxReadMsgId: Int64?
     let unreadCount: Int?
@@ -132,7 +161,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         type: String,
         dialogId: String?,
         dialogTitle: String?,
+        dialogType: String? = nil,
         message: CloudMessage?,
+        group: CloudUpdateGroup? = nil,
+        member: CloudGroupMember? = nil,
         readerAccountId: String?,
         maxReadMsgId: Int64?,
         unreadCount: Int? = nil,
@@ -152,7 +184,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.type = type
         self.dialogId = dialogId
         self.dialogTitle = dialogTitle
+        self.dialogType = dialogType
         self.message = message
+        self.group = group
+        self.member = member
         self.readerAccountId = readerAccountId
         self.maxReadMsgId = maxReadMsgId
         self.unreadCount = unreadCount
@@ -174,7 +209,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case type
         case dialogId = "dialog_id"
         case dialogTitle = "dialog_title"
+        case dialogType = "dialog_type"
         case message
+        case group
+        case member
         case readerAccountId = "reader_account_id"
         case maxReadMsgId = "max_read_msg_id"
         case unreadCount = "unread_count"
@@ -237,6 +275,71 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
     let updatedAt: String
 }
 
+nonisolated struct CloudServiceData: Codable, Equatable, Sendable {
+    let actorAccountId: String?
+    let subjectAccountId: String?
+    let memberAccountIds: [String]?
+    let successorAccountId: String?
+    let role: String?
+    let title: String?
+
+    enum CodingKeys: String, CodingKey {
+        case actorAccountId = "actor_account_id"
+        case subjectAccountId = "subject_account_id"
+        case memberAccountIds = "member_account_ids"
+        case successorAccountId = "successor_account_id"
+        case role
+        case title
+    }
+}
+
+nonisolated struct CloudUpdateGroup: Codable, Equatable, Sendable {
+    let id: String
+    let title: String?
+    let revision: Int64
+    let memberCount: Int
+}
+
+nonisolated struct CloudGroup: Codable, Equatable, Sendable {
+    let id: String
+    let title: String
+    let photo: CloudMedia?
+    let revision: Int64
+    let memberCount: Int
+    let selfRole: String
+    let notificationMode: String
+    let createdBy: String
+    let createdAt: String
+    let closedAt: String?
+}
+
+nonisolated struct CloudGroupMember: Codable, Equatable, Sendable {
+    let accountId: String
+    let role: String
+    let joinedAt: String
+    let isActive: Bool
+}
+
+nonisolated struct CloudGroupEnvelope: Codable, Sendable {
+    let group: CloudGroup
+    let members: [CloudGroupMember]?
+    let profiles: [CloudProfile]
+    let duplicate: Bool?
+}
+
+nonisolated struct CloudGroupMembersPage: Codable, Sendable {
+    let group: CloudGroup
+    let members: [CloudGroupMember]
+    let profiles: [CloudProfile]
+    let nextCursor: String?
+    let hasMore: Bool
+}
+
+nonisolated struct CloudGroupLeaveResponse: Codable, Sendable {
+    let left: Bool
+    let closed: Bool
+}
+
 private struct ProfileUpdateRequest: Codable, Sendable {
     let firstName: String
     let lastName: String
@@ -280,7 +383,22 @@ nonisolated struct DifferenceResponse: Codable, Sendable {
     let kind: String
     let state: State
     let updates: [CloudUpdate]?
+    let profiles: [CloudProfile]?
     let hasMore: Bool?
+
+    init(
+        kind: String,
+        state: State,
+        updates: [CloudUpdate]?,
+        profiles: [CloudProfile]? = nil,
+        hasMore: Bool?
+    ) {
+        self.kind = kind
+        self.state = state
+        self.updates = updates
+        self.profiles = profiles
+        self.hasMore = hasMore
+    }
 }
 
 nonisolated struct BootstrapStartResponse: Codable, Sendable {
@@ -305,11 +423,29 @@ nonisolated struct BootstrapDialogMember: Codable, Equatable, Sendable {
     let accountId: String
     let role: String
     let lastReadMsgId: Int64
+    let joinedAt: String?
+    let isActive: Bool?
+
+    init(
+        accountId: String,
+        role: String,
+        lastReadMsgId: Int64,
+        joinedAt: String? = nil,
+        isActive: Bool? = nil
+    ) {
+        self.accountId = accountId
+        self.role = role
+        self.lastReadMsgId = lastReadMsgId
+        self.joinedAt = joinedAt
+        self.isActive = isActive
+    }
 
     enum CodingKeys: String, CodingKey {
         case accountId = "account_id"
         case role
         case lastReadMsgId = "last_read_msg_id"
+        case joinedAt = "joined_at"
+        case isActive = "is_active"
     }
 }
 
@@ -320,6 +456,11 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
     let lastMsgId: Int64
     let updatedAt: String
     let unreadCount: Int?
+    let revision: Int64?
+    let memberCount: Int?
+    let selfRole: String?
+    let notificationMode: String?
+    let photo: CloudMedia?
     let members: [BootstrapDialogMember]
     let profiles: [CloudProfile]?
     let messages: [CloudMessage]
@@ -331,6 +472,11 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         lastMsgId: Int64,
         updatedAt: String,
         unreadCount: Int? = nil,
+        revision: Int64? = nil,
+        memberCount: Int? = nil,
+        selfRole: String? = nil,
+        notificationMode: String? = nil,
+        photo: CloudMedia? = nil,
         members: [BootstrapDialogMember],
         profiles: [CloudProfile]? = nil,
         messages: [CloudMessage]
@@ -341,6 +487,11 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         self.lastMsgId = lastMsgId
         self.updatedAt = updatedAt
         self.unreadCount = unreadCount
+        self.revision = revision
+        self.memberCount = memberCount
+        self.selfRole = selfRole
+        self.notificationMode = notificationMode
+        self.photo = photo
         self.members = members
         self.profiles = profiles
         self.messages = messages
@@ -353,6 +504,11 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         case lastMsgId = "last_msg_id"
         case updatedAt = "updated_at"
         case unreadCount = "unread_count"
+        case revision
+        case memberCount = "member_count"
+        case selfRole = "self_role"
+        case notificationMode = "notification_mode"
+        case photo
         case members
         case profiles
         case messages
@@ -374,6 +530,7 @@ nonisolated struct BootstrapDialogsPage: Codable, Sendable {
 nonisolated struct HistoryPageResponse: Codable, Sendable {
     let dialogId: String
     let messages: [CloudMessage]
+    let profiles: [CloudProfile]?
     let nextBeforeMsgId: Int64?
     let nextAfterMsgId: Int64?
     let hasMore: Bool
@@ -381,12 +538,14 @@ nonisolated struct HistoryPageResponse: Codable, Sendable {
     init(
         dialogId: String,
         messages: [CloudMessage],
+        profiles: [CloudProfile]? = nil,
         nextBeforeMsgId: Int64?,
         nextAfterMsgId: Int64? = nil,
         hasMore: Bool
     ) {
         self.dialogId = dialogId
         self.messages = messages
+        self.profiles = profiles
         self.nextBeforeMsgId = nextBeforeMsgId
         self.nextAfterMsgId = nextAfterMsgId
         self.hasMore = hasMore
@@ -395,6 +554,7 @@ nonisolated struct HistoryPageResponse: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case dialogId
         case messages
+        case profiles
         case nextBeforeMsgId
         case nextAfterMsgId
         case hasMore
@@ -567,6 +727,140 @@ struct CloudAPI: Sendable {
         try await post("v1/dialogs/direct", body: ["peerAccountId": peerAccountId], token: token)
     }
 
+    func createGroup(
+        id: String,
+        title: String,
+        memberIds: [String],
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await post(
+            "v1/groups",
+            body: CreateGroupRequest(groupId: id, title: title, memberIds: memberIds),
+            token: token,
+            timeoutInterval: 12
+        )
+    }
+
+    func group(id: String, token: String) async throws -> CloudGroupEnvelope {
+        try await get("v1/groups/\(id)", token: token)
+    }
+
+    func groupMembers(
+        id: String,
+        cursor: String?,
+        limit: Int = 50,
+        token: String
+    ) async throws -> CloudGroupMembersPage {
+        var query = [URLQueryItem(name: "limit", value: String(max(1, min(100, limit))))]
+        if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        return try await get("v1/groups/\(id)/members", queryItems: query, token: token)
+    }
+
+    func addGroupMembers(
+        id: String,
+        memberIds: [String],
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await post(
+            "v1/groups/\(id)/members",
+            body: AddGroupMembersRequest(memberIds: memberIds, clientMutationId: clientMutationId),
+            token: token
+        )
+    }
+
+    func removeGroupMember(
+        groupId: String,
+        accountId: String,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await delete(
+            "v1/groups/\(groupId)/members/\(accountId)",
+            body: GroupMutationRequest(clientMutationId: clientMutationId),
+            token: token
+        )
+    }
+
+    func changeGroupMemberRole(
+        groupId: String,
+        accountId: String,
+        role: String,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await patch(
+            "v1/groups/\(groupId)/members/\(accountId)",
+            body: ChangeGroupRoleRequest(role: role, clientMutationId: clientMutationId),
+            token: token
+        )
+    }
+
+    func updateGroup(
+        id: String,
+        title: String? = nil,
+        photoMediaId: String? = nil,
+        clearPhoto: Bool = false,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await patch(
+            "v1/groups/\(id)",
+            body: UpdateGroupRequest(
+                title: title,
+                photoMediaId: photoMediaId,
+                clearPhoto: clearPhoto,
+                clientMutationId: clientMutationId
+            ),
+            token: token
+        )
+    }
+
+    func transferGroupOwner(
+        id: String,
+        accountId: String,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await post(
+            "v1/groups/\(id)/transfer-owner",
+            body: TransferGroupOwnerRequest(
+                accountId: accountId,
+                clientMutationId: clientMutationId
+            ),
+            token: token
+        )
+    }
+
+    func leaveGroup(
+        id: String,
+        successorAccountId: String? = nil,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupLeaveResponse {
+        try await post(
+            "v1/groups/\(id)/leave",
+            body: LeaveGroupRequest(
+                successorAccountId: successorAccountId,
+                clientMutationId: clientMutationId
+            ),
+            token: token
+        )
+    }
+
+    func updateGroupNotifications(
+        id: String,
+        mode: String,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await put(
+            "v1/groups/\(id)/notifications",
+            body: GroupNotificationsRequest(mode: mode, clientMutationId: clientMutationId),
+            token: token
+        )
+    }
+
     func getState(token: String) async throws -> SyncStateResponse {
         try await get("v1/sync/state", token: token)
     }
@@ -617,6 +911,7 @@ struct CloudAPI: Sendable {
         clientMsgId: String,
         body: String,
         replyToMsgId: Int64? = nil,
+        mentions: [CloudMention] = [],
         token: String
     ) async throws -> SendMessageResponse {
         try await post(
@@ -628,7 +923,8 @@ struct CloudAPI: Sendable {
                 body: body,
                 replyToMsgId: replyToMsgId,
                 mediaId: nil,
-                forwardedFrom: nil
+                forwardedFrom: nil,
+                mentions: mentions
             ),
             token: token
         )
@@ -647,7 +943,7 @@ struct CloudAPI: Sendable {
             body: SendMessageRequest(
                 dialogId: dialogId, clientMsgId: clientMsgId, kind: nil,
                 body: body, replyToMsgId: replyToMsgId, mediaId: mediaId,
-                forwardedFrom: nil
+                forwardedFrom: nil, mentions: []
             ),
             token: token
         )
@@ -669,7 +965,8 @@ struct CloudAPI: Sendable {
                 body: nil,
                 replyToMsgId: nil,
                 mediaId: nil,
-                forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId)
+                forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId),
+                mentions: []
             ),
             token: token
         )
@@ -966,6 +1263,21 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
+    private func patch<Body: Encodable, Response: Decodable>(
+        _ path: String,
+        body: Body,
+        token: String?
+    ) async throws -> Response {
+        var request = URLRequest(url: config.httpURL(path: path))
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encoder.encode(body)
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return try await run(request)
+    }
+
     private func delete<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "DELETE"
@@ -1027,6 +1339,48 @@ private struct ServerError: Codable {
 
 private struct EmptyBody: Encodable {}
 
+private struct CreateGroupRequest: Encodable {
+    let groupId: String
+    let title: String
+    let memberIds: [String]
+}
+
+private struct GroupMutationRequest: Encodable {
+    let clientMutationId: String
+}
+
+private struct AddGroupMembersRequest: Encodable {
+    let memberIds: [String]
+    let clientMutationId: String
+}
+
+private struct ChangeGroupRoleRequest: Encodable {
+    let role: String
+    let clientMutationId: String
+}
+
+private struct UpdateGroupRequest: Encodable {
+    let title: String?
+    let photoMediaId: String?
+    let clearPhoto: Bool
+    let clientMutationId: String
+}
+
+private struct TransferGroupOwnerRequest: Encodable {
+    let accountId: String
+    let clientMutationId: String
+}
+
+private struct LeaveGroupRequest: Encodable {
+    let successorAccountId: String?
+    let clientMutationId: String
+}
+
+private struct GroupNotificationsRequest: Encodable {
+    let mode: String
+    let clientMutationId: String
+}
+
 private struct BootstrapDialogsRequest: Encodable {
     let token: String
     let cursor: String?
@@ -1050,6 +1404,7 @@ private struct SendMessageRequest: Encodable {
     let replyToMsgId: Int64?
     let mediaId: String?
     let forwardedFrom: ForwardedFromRequest?
+    let mentions: [CloudMention]
 }
 
 private struct ForwardedFromRequest: Encodable {

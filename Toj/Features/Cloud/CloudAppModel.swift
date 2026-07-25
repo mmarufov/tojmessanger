@@ -130,6 +130,28 @@ final class CloudAppModel {
         }
     }
 
+    struct GroupMember: Identifiable, Equatable, Sendable {
+        let accountId: String
+        let displayName: String
+        let role: String
+        let isActive: Bool
+        var id: String { accountId }
+    }
+
+    private struct DraftMention: Equatable, Sendable {
+        let accountId: String
+        let token: String
+    }
+
+    private struct GroupMutationPayload: Codable, Sendable {
+        var title: String? = nil
+        var memberIds: [String]? = nil
+        var accountId: String? = nil
+        var role: String? = nil
+        var mode: String? = nil
+        var successorAccountId: String? = nil
+    }
+
     struct Notice: Identifiable, Equatable {
         let id = UUID()
         let title: String
@@ -144,6 +166,8 @@ final class CloudAppModel {
     struct Dialog: Identifiable, Equatable {
         let id: String
         let title: String
+        var photo: CloudMedia? = nil
+        var type = "direct"
         var subtitle: String
         var updatedAt: String
         var isPending: Bool
@@ -160,6 +184,10 @@ final class CloudAppModel {
         var peerBio: String? = nil
         var peerBirthday: String? = nil
         var profileColorIndex: Int? = nil
+        var memberCount = 0
+        var selfRole: String? = nil
+        var notificationMode = "all"
+        var accessState = "active"
     }
 
     struct Line: Identifiable, Equatable, Sendable {
@@ -182,8 +210,11 @@ final class CloudAppModel {
         var msgId: Int64?
         var clientMsgId: String
         var senderAccountId: String? = nil
+        var senderDisplayName: String? = nil
         var text: String
         var kind: String = "text"
+        var serviceType: String? = nil
+        var serviceData: CloudServiceData? = nil
         var mine: Bool
         var delivery: Delivery
         var timestamp: String?
@@ -227,6 +258,7 @@ final class CloudAppModel {
     private(set) var activeDialogId: String?
     private(set) var conversationOpenState: ConversationOpenState = .loadingLocal
     private(set) var dialogs: [Dialog] = []
+    private(set) var groupMembersByDialog: [String: [GroupMember]] = [:]
     private(set) var lines: [Line] = []
     private(set) var openingTimelineAnchor: TimelineAnchor = .bottom
     private(set) var canLoadEarlier = false
@@ -263,6 +295,24 @@ final class CloudAppModel {
         }
     }
     var accountDeletionCode = ""
+
+    private var draftMentionsByDialog: [String: [DraftMention]] = [:]
+
+    var mentionSuggestions: [GroupMember] {
+        guard
+            let dialogId = activeDialogId,
+            dialogs.first(where: { $0.id == dialogId })?.type == "group",
+            let query = activeMentionQuery(in: draft)
+        else { return [] }
+        let accountId = storedSession?.session.accountId
+        return (groupMembersByDialog[dialogId] ?? [])
+            .filter {
+                $0.isActive && $0.accountId != accountId
+                    && (query.isEmpty || $0.displayName.localizedCaseInsensitiveContains(query))
+            }
+            .prefix(6)
+            .map { $0 }
+    }
 
     private let api: CloudAPI
     private let tokenStore: TokenStore
@@ -1325,6 +1375,239 @@ final class CloudAppModel {
         return await openPeer()
     }
 
+    func createGroup(title: String, memberIds: [String], photoData: Data? = nil) async -> String? {
+        guard capabilities.contains(.groups),
+              let accountId = storedSession?.session.accountId,
+              let localStore
+        else { return nil }
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedMembers = Array(Set(memberIds.filter { $0 != accountId })).sorted()
+        guard !normalizedTitle.isEmpty, normalizedTitle.count <= 128,
+              normalizedTitle.lengthOfBytes(using: .utf8) <= 256,
+              !normalizedMembers.isEmpty, normalizedMembers.count <= 199 else {
+            presentNotice(
+                "Group could not be created",
+                message: "Choose at least one member and a group name up to 128 characters."
+            )
+            return nil
+        }
+
+        let groupId = UUID().uuidString.lowercased()
+        do {
+            let preparedPhoto: PreparedMediaUpload?
+            if let photoData {
+                guard let photo = SafeMediaImageDecoder.preparePhotoUpload(photoData) else {
+                    presentNotice(
+                        "Group photo could not be used",
+                        message: "Choose a valid photo and try again."
+                    )
+                    return nil
+                }
+                preparedPhoto = try await mediaEngine.prepare(
+                    data: photo.data,
+                    kind: "photo",
+                    contentType: photo.contentType,
+                    fileName: "group-photo.\(photo.filenameExtension)",
+                    width: photo.pixelWidth,
+                    height: photo.pixelHeight,
+                    thumbnail: photo.thumbnail
+                )
+            } else {
+                preparedPhoto = nil
+            }
+            _ = try await localStore.createPendingGroup(
+                groupId: groupId,
+                title: normalizedTitle,
+                memberIds: normalizedMembers,
+                creatorAccountId: accountId,
+                localPhotoReference: preparedPhoto?.encryptedSourcePath
+            )
+            if let preparedPhoto {
+                try await localStore.insertMediaTransfer(
+                    prepared: preparedPhoto,
+                    dialogId: groupId,
+                    clientMsgId: "group-photo:\(preparedPhoto.transferId)",
+                    caption: "",
+                    replyToMsgId: nil,
+                    purpose: "group_photo"
+                )
+            }
+            await refreshDialogs()
+            scheduleOutboxRetry()
+            return groupId
+        } catch {
+            presentNotice("Group could not be saved", message: error.localizedDescription)
+            return nil
+        }
+    }
+
+    func updateGroupPhoto(dialogId: String, data: Data) async -> Bool {
+        guard let localStore else { return false }
+        do {
+            guard let photo = SafeMediaImageDecoder.preparePhotoUpload(data) else {
+                throw CloudAppModelError.invalidMedia
+            }
+            let prepared = try await mediaEngine.prepare(
+                data: photo.data,
+                kind: "photo",
+                contentType: photo.contentType,
+                fileName: "group-photo.\(photo.filenameExtension)",
+                width: photo.pixelWidth,
+                height: photo.pixelHeight,
+                thumbnail: photo.thumbnail
+            )
+            try await localStore.insertMediaTransfer(
+                prepared: prepared,
+                dialogId: dialogId,
+                clientMsgId: "group-photo:\(prepared.transferId)",
+                caption: "",
+                replyToMsgId: nil,
+                purpose: "group_photo"
+            )
+            scheduleOutboxRetry()
+            return true
+        } catch {
+            presentNotice("Group photo was not changed", message: error.localizedDescription)
+            return false
+        }
+    }
+
+    func retryGroupCreation(dialogId: String) async {
+        guard let localStore else { return }
+        try? await localStore.retryFailedGroupCreation(groupId: dialogId)
+        await refreshDialogs()
+        scheduleOutboxRetry()
+    }
+
+    func loadGroupProfile(dialogId: String) async {
+        guard capabilities.contains(.groups),
+              let token = storedSession?.session.token,
+              let localStore else { return }
+        do {
+            let envelope = try await api.group(id: dialogId, token: token)
+            try await localStore.applyGroupEnvelope(envelope)
+            var cursor: String?
+            var collected: [CloudGroupMember] = []
+            var profiles: [String: CloudProfile] = Dictionary(
+                uniqueKeysWithValues: envelope.profiles.map { ($0.accountId, $0) }
+            )
+            repeat {
+                let page = try await api.groupMembers(
+                    id: dialogId,
+                    cursor: cursor,
+                    token: token
+                )
+                try await localStore.applyGroupMembersPage(page, generation: envelope.group.revision.description)
+                collected.append(contentsOf: page.members)
+                for profile in page.profiles { profiles[profile.accountId] = profile }
+                cursor = page.hasMore ? page.nextCursor : nil
+            } while cursor != nil
+            groupMembersByDialog[dialogId] = collected.map { member in
+                GroupMember(
+                    accountId: member.accountId,
+                    displayName: profiles[member.accountId]?.displayName ?? shortDialogId(member.accountId),
+                    role: member.role,
+                    isActive: member.isActive
+                )
+            }
+            await refreshDialogs()
+        } catch {
+            presentNotice("Group details unavailable", message: error.localizedDescription)
+        }
+    }
+
+    func updateGroupTitle(dialogId: String, title: String) async -> Bool {
+        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty, normalized.count <= 128,
+              normalized.lengthOfBytes(using: .utf8) <= 256 else { return false }
+        return await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "update_title",
+            payload: GroupMutationPayload(title: normalized)
+        )
+    }
+
+    func setGroupMuted(dialogId: String, muted: Bool) async -> Bool {
+        await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "notifications",
+            payload: GroupMutationPayload(mode: muted ? "muted" : "all")
+        )
+    }
+
+    func addGroupMembers(dialogId: String, accountIds: [String]) async -> Bool {
+        let normalized = Array(Set(accountIds)).sorted()
+        guard !normalized.isEmpty else { return false }
+        return await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "add_members",
+            payload: GroupMutationPayload(memberIds: normalized)
+        )
+    }
+
+    func removeGroupMember(dialogId: String, accountId: String) async -> Bool {
+        await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "remove_member",
+            payload: GroupMutationPayload(accountId: accountId)
+        )
+    }
+
+    func changeGroupMemberRole(
+        dialogId: String,
+        accountId: String,
+        role: String
+    ) async -> Bool {
+        return await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "change_role",
+            payload: GroupMutationPayload(accountId: accountId, role: role)
+        )
+    }
+
+    func transferGroupOwnership(dialogId: String, accountId: String) async -> Bool {
+        await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "transfer_owner",
+            payload: GroupMutationPayload(accountId: accountId)
+        )
+    }
+
+    func leaveGroup(dialogId: String) async -> Bool {
+        await submitGroupMutation(
+            dialogId: dialogId,
+            operation: "leave",
+            payload: GroupMutationPayload()
+        )
+    }
+
+    private func submitGroupMutation(
+        dialogId: String,
+        operation: String,
+        payload: GroupMutationPayload
+    ) async -> Bool {
+        guard capabilities.contains(.groups), let localStore else { return false }
+        do {
+            let mutationId = UUID().uuidString.lowercased()
+            let payloadJSON = String(
+                data: try JSONEncoder().encode(payload),
+                encoding: .utf8
+            ) ?? "{}"
+            try await localStore.enqueueGroupMutation(
+                dialogId: dialogId,
+                operation: operation,
+                payloadJSON: payloadJSON,
+                clientMutationId: mutationId
+            )
+            await retryPendingGroupMutations()
+            scheduleOutboxRetry()
+            return true
+        } catch {
+            presentNotice("Group change could not be saved", message: error.localizedDescription)
+            return false
+        }
+    }
+
     func selectDialog(_ dialogId: String) async {
         if activeDialogId != dialogId || timelineObservationTask == nil {
             beginConversationSelection(dialogId)
@@ -1400,6 +1683,12 @@ final class CloudAppModel {
         }
         #endif
         startTimelineObservation(dialogId: dialogId)
+        if dialogs.first(where: { $0.id == dialogId })?.type == "group",
+           groupMembersByDialog[dialogId] == nil {
+            Task { [weak self] in
+                await self?.loadGroupProfile(dialogId: dialogId)
+            }
+        }
     }
 
     func retryConversationLocalLoad() {
@@ -1917,6 +2206,10 @@ final class CloudAppModel {
             replyPreview = nil
             replyToMsgId = nil
         }
+        let mentions = activeDialogId.map { resolvedMentions(in: text, dialogId: $0) } ?? []
+        if let activeDialogId {
+            draftMentionsByDialog.removeValue(forKey: activeDialogId)
+        }
         draft = ""
         composerMode = .text
         #if DEBUG
@@ -1925,7 +2218,50 @@ final class CloudAppModel {
             return
         }
         #endif
-        await send(text, replyToMsgId: replyToMsgId)
+        await send(text, replyToMsgId: replyToMsgId, mentions: mentions)
+    }
+
+    func insertMention(_ member: GroupMember) {
+        guard let dialogId = activeDialogId,
+              let range = activeMentionRange(in: draft) else { return }
+        let token = "@\(member.displayName)"
+        draft.replaceSubrange(range, with: "\(token) ")
+        var mentions = draftMentionsByDialog[dialogId] ?? []
+        mentions.removeAll { $0.accountId == member.accountId }
+        mentions.append(DraftMention(accountId: member.accountId, token: token))
+        draftMentionsByDialog[dialogId] = mentions
+    }
+
+    private func activeMentionRange(in text: String) -> Range<String.Index>? {
+        guard let at = text.lastIndex(of: "@") else { return nil }
+        let suffix = text[at...]
+        guard !suffix.dropFirst().contains(where: \.isWhitespace) else { return nil }
+        if at > text.startIndex {
+            let previous = text[text.index(before: at)]
+            guard previous.isWhitespace else { return nil }
+        }
+        return at..<text.endIndex
+    }
+
+    private func activeMentionQuery(in text: String) -> String? {
+        guard let range = activeMentionRange(in: text) else { return nil }
+        return String(text[range].dropFirst())
+    }
+
+    private func resolvedMentions(in text: String, dialogId: String) -> [CloudMention] {
+        let nsText = text as NSString
+        var seen = Set<String>()
+        return (draftMentionsByDialog[dialogId] ?? []).compactMap { mention in
+            guard seen.insert(mention.accountId).inserted else { return nil }
+            let range = nsText.range(of: mention.token)
+            guard range.location != NSNotFound, range.length > 1 else { return nil }
+            return CloudMention(
+                accountId: mention.accountId,
+                offset: range.location,
+                length: range.length
+            )
+        }
+        .sorted { $0.offset < $1.offset }
     }
 
     func beginReply(to line: Line) {
@@ -2038,7 +2374,11 @@ final class CloudAppModel {
         }
     }
 
-    private func send(_ text: String, replyToMsgId: Int64? = nil) async {
+    private func send(
+        _ text: String,
+        replyToMsgId: Int64? = nil,
+        mentions: [CloudMention] = []
+    ) async {
         guard let token = storedSession?.session.token, let dialogId = activeDialogId else { return }
         openingTimelineAnchor = .bottom
         timelineTopVisibleMsgId = nil
@@ -2051,7 +2391,8 @@ final class CloudAppModel {
                     clientMsgId: clientMsgId,
                     text: text,
                     senderAccountId: accountId,
-                    replyToMsgId: replyToMsgId
+                    replyToMsgId: replyToMsgId,
+                    mentions: mentions
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -2491,7 +2832,9 @@ final class CloudAppModel {
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
+            try? await localStore.drainPendingPurges()
         }
+        scheduleOutboxRetry()
     }
 
     private func startReplicaIntegrityVerification(store: CloudLocalStore, accountId: String) {
@@ -2742,12 +3085,21 @@ final class CloudAppModel {
                 resolved.isPinned = existing.isPinned
                 resolved.isMuted = existing.isMuted
                 resolved.isArchived = existing.isArchived
-                resolved.mentionCount = existing.mentionCount
                 resolved.isTyping = existing.isTyping
             }
             return resolved
         }
         sortDialogsForPresentation()
+        if let activeDialogId,
+           previous[activeDialogId]?.type == "group",
+           !dialogs.contains(where: { $0.id == activeDialogId }) {
+            self.activeDialogId = nil
+            lines = []
+            presentNotice(
+                "Group access ended",
+                message: "You are no longer a member of this group. Its saved messages were removed."
+            )
+        }
     }
 
     func updateTimelineViewport(
@@ -2921,6 +3273,7 @@ final class CloudAppModel {
                 resolved.insert(.voiceNotes)
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
+            if advertised.contains("groups_v1") { resolved.insert(.groups) }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -3331,6 +3684,7 @@ final class CloudAppModel {
             await self.refreshMediaCacheUsage()
             await self.loadMediaPolicies()
             await self.retryPendingMessageMutations()
+            await self.retryPendingGroupMutations()
             await self.retryPendingReadReceipts()
             await self.retryMediaTransfers()
             self.scheduleMediaDownloadProcessing()
@@ -3705,7 +4059,12 @@ final class CloudAppModel {
                 )
             }
             let presentationInputs = preparedLines.map {
-                TimelinePresentationInput(id: $0.id, mine: $0.mine, timestamp: $0.timestamp)
+                TimelinePresentationInput(
+                    id: $0.id,
+                    mine: $0.mine,
+                    senderId: $0.senderAccountId,
+                    timestamp: $0.timestamp
+                )
             }
             let presentation = await Task.detached(priority: .userInitiated) {
                 TimelinePresentationBuilder.build(presentationInputs)
@@ -3835,8 +4194,11 @@ final class CloudAppModel {
             msgId: message.msgId,
             clientMsgId: message.clientMsgId,
             senderAccountId: message.senderAccountId,
+            senderDisplayName: message.senderDisplayName,
             text: presentedText,
             kind: message.kind,
+            serviceType: message.serviceType,
+            serviceData: message.serviceData,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
@@ -3887,16 +4249,23 @@ final class CloudAppModel {
         return Dialog(
             id: local.dialogId,
             title: title,
+            photo: local.photo,
+            type: local.type,
             subtitle: subtitle,
             updatedAt: local.lastServerTs ?? local.updatedAt,
-            isPending: local.lastLocalState == "sending",
+            isPending: local.lastLocalState == "sending" || local.accessState == "pending",
             unreadCount: local.unreadCount,
+            mentionCount: local.mentionCount,
             previewKind: previewKind,
             lastMessageMine: local.lastSenderAccountId == storedSession?.session.accountId,
             peerAccountId: local.peerAccountId,
             peerBio: local.peerBio,
             peerBirthday: local.peerBirthday,
-            profileColorIndex: local.peerColorIndex
+            profileColorIndex: local.peerColorIndex,
+            memberCount: local.memberCount,
+            selfRole: local.selfRole,
+            notificationMode: local.notificationMode,
+            accessState: local.accessState
         )
     }
 
@@ -4116,6 +4485,8 @@ final class CloudAppModel {
         defer { retryInFlight = false }
 
         do {
+            await retryPendingGroupCreations(token: token, localStore: localStore)
+            await retryPendingGroupMutations()
             let items = try await localStore.pendingOutboxReady()
             for item in items {
                 try Task.checkCancellation()
@@ -4149,6 +4520,213 @@ final class CloudAppModel {
             status = "Outbox retry failed: \(error.localizedDescription)"
         }
         await retryMediaTransfers()
+    }
+
+    private func retryPendingGroupCreations(token: String, localStore: CloudLocalStore) async {
+        guard capabilities.contains(.groups) else { return }
+        let creations: [PendingGroupCreation]
+        do {
+            creations = try await localStore.pendingGroupCreationsReady()
+        } catch {
+            status = "Group retry paused: \(error.localizedDescription)"
+            return
+        }
+
+        for creation in creations {
+            if Task.isCancelled || storedSession?.session.token != token { return }
+            do {
+                try await localStore.markGroupCreating(groupId: creation.groupId)
+                let envelope = try await api.createGroup(
+                    id: creation.groupId,
+                    title: creation.title,
+                    memberIds: creation.memberIds,
+                    token: token
+                )
+                try await localStore.applyGroupEnvelope(envelope)
+                if activeDialogId == creation.groupId {
+                    await loadLocalLines(dialogId: creation.groupId)
+                }
+                await refreshDialogs()
+                scheduleSync()
+            } catch is CancellationError {
+                return
+            } catch {
+                let disposition = cloudOperationFailureDisposition(
+                    error,
+                    serverAdvertisesFeature: capabilities.contains(.groups)
+                )
+                switch disposition {
+                case let .transient(retryAfter):
+                    let delay = retryAfter ?? retryDelay(forRetryCount: creation.retryCount + 1)
+                    try? await localStore.retryGroupCreation(
+                        groupId: creation.groupId,
+                        after: delay,
+                        error: error.localizedDescription
+                    )
+                    publishTransportFailure(error)
+                case .authenticationRequired:
+                    try? await localStore.retryGroupCreation(
+                        groupId: creation.groupId,
+                        after: 30,
+                        error: "Sign in required"
+                    )
+                case .unsupportedServer, .permanent:
+                    try? await localStore.failGroupCreation(
+                        groupId: creation.groupId,
+                        error: error.localizedDescription
+                    )
+                    presentNotice(
+                        "Group was not created",
+                        message: "Your draft is saved. Open it and choose Retry when you are ready."
+                    )
+                }
+                await refreshDialogs()
+            }
+        }
+    }
+
+    private func retryPendingGroupMutations() async {
+        guard capabilities.contains(.groups),
+              let token = storedSession?.session.token,
+              let localStore else { return }
+        let mutations: [PendingGroupMutation]
+        do {
+            mutations = try await localStore.pendingGroupMutationsReady()
+        } catch {
+            status = "Group changes paused: \(error.localizedDescription)"
+            return
+        }
+        for mutation in mutations {
+            if Task.isCancelled || storedSession?.session.token != token { return }
+            do {
+                guard
+                    let data = mutation.payloadJSON.data(using: .utf8),
+                    let payload = try? JSONDecoder().decode(GroupMutationPayload.self, from: data)
+                else { throw CloudAppModelError.invalidGroupMutation }
+                let envelope: CloudGroupEnvelope?
+                switch mutation.operation {
+                case "update_title":
+                    guard let title = payload.title else { throw CloudAppModelError.invalidGroupMutation }
+                    envelope = try await api.updateGroup(
+                        id: mutation.dialogId,
+                        title: title,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "notifications":
+                    guard let mode = payload.mode else { throw CloudAppModelError.invalidGroupMutation }
+                    envelope = try await api.updateGroupNotifications(
+                        id: mutation.dialogId,
+                        mode: mode,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "add_members":
+                    guard let memberIds = payload.memberIds else {
+                        throw CloudAppModelError.invalidGroupMutation
+                    }
+                    envelope = try await api.addGroupMembers(
+                        id: mutation.dialogId,
+                        memberIds: memberIds,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "remove_member":
+                    guard let accountId = payload.accountId else {
+                        throw CloudAppModelError.invalidGroupMutation
+                    }
+                    envelope = try await api.removeGroupMember(
+                        groupId: mutation.dialogId,
+                        accountId: accountId,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "change_role":
+                    guard let accountId = payload.accountId, let role = payload.role else {
+                        throw CloudAppModelError.invalidGroupMutation
+                    }
+                    envelope = try await api.changeGroupMemberRole(
+                        groupId: mutation.dialogId,
+                        accountId: accountId,
+                        role: role,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "transfer_owner":
+                    guard let accountId = payload.accountId else {
+                        throw CloudAppModelError.invalidGroupMutation
+                    }
+                    envelope = try await api.transferGroupOwner(
+                        id: mutation.dialogId,
+                        accountId: accountId,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                case "leave":
+                    _ = try await api.leaveGroup(
+                        id: mutation.dialogId,
+                        successorAccountId: payload.successorAccountId,
+                        clientMutationId: mutation.clientMutationId,
+                        token: token
+                    )
+                    envelope = nil
+                default:
+                    throw CloudAppModelError.invalidGroupMutation
+                }
+                if let envelope {
+                    try await localStore.applyGroupEnvelope(envelope)
+                }
+                try await localStore.completeGroupMutation(
+                    clientMutationId: mutation.clientMutationId
+                )
+                if mutation.operation == "leave", activeDialogId == mutation.dialogId {
+                    activeDialogId = nil
+                    lines = []
+                }
+                await refreshDialogs()
+                scheduleSync()
+            } catch is CancellationError {
+                return
+            } catch {
+                if let apiError = error as? CloudAPIError, apiError.status == 410 {
+                    try? await localStore.revokeGroupAccess(
+                        dialogId: mutation.dialogId,
+                        reason: "You no longer have access to this group."
+                    )
+                }
+                let disposition = cloudOperationFailureDisposition(
+                    error,
+                    serverAdvertisesFeature: capabilities.contains(.groups)
+                )
+                switch disposition {
+                case let .transient(retryAfter):
+                    let delay = retryAfter ?? retryDelay(forRetryCount: mutation.retryCount + 1)
+                    try? await localStore.failGroupMutation(
+                        clientMutationId: mutation.clientMutationId,
+                        retryAfter: delay,
+                        error: error.localizedDescription,
+                        terminal: false
+                    )
+                    publishTransportFailure(error)
+                case .authenticationRequired:
+                    try? await localStore.failGroupMutation(
+                        clientMutationId: mutation.clientMutationId,
+                        retryAfter: 30,
+                        error: "Sign in required",
+                        terminal: false
+                    )
+                case .unsupportedServer, .permanent:
+                    try? await localStore.failGroupMutation(
+                        clientMutationId: mutation.clientMutationId,
+                        retryAfter: nil,
+                        error: error.localizedDescription,
+                        terminal: true
+                    )
+                    presentNotice("Group change failed", message: error.localizedDescription)
+                }
+                await refreshDialogs()
+            }
+        }
     }
 
     private func retryMediaTransfers() async {
@@ -4226,6 +4804,27 @@ final class CloudAppModel {
             }
             guard let ready = try await localStore.mediaTransfer(id: initial.transferId) else {
                 throw CloudAppModelError.localStoreUnavailable
+            }
+            if ready.purpose == "group_photo" {
+                let envelope = try await api.updateGroup(
+                    id: ready.dialogId,
+                    photoMediaId: mediaId,
+                    clientMutationId: ready.transferId,
+                    token: token
+                )
+                try await localStore.applyGroupEnvelope(envelope)
+                let promotedToCache = await mediaEngine.finishUpload(ready, localStore: localStore)
+                try await localStore.completeMediaTransfer(transferId: ready.transferId)
+                if !promotedToCache {
+                    await mediaEngine.discardTransfer(ready)
+                }
+                await refreshDialogs()
+                if activeDialogId == ready.dialogId {
+                    await loadGroupProfile(dialogId: ready.dialogId)
+                }
+                scheduleSync()
+                status = "Group photo updated"
+                return
             }
             try await localStore.insertSendingMedia(ready, senderAccountId: accountId)
             if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
@@ -4343,6 +4942,7 @@ final class CloudAppModel {
                 clientMsgId: item.clientMsgId,
                 body: item.body,
                 replyToMsgId: item.replyToMsgId,
+                mentions: item.mentions,
                 token: token
             )
         }
@@ -4365,10 +4965,14 @@ final class CloudAppModel {
 
     private func nextOutboxRetryDelay() async -> TimeInterval? {
         guard let localStore else { return nil }
+        let groupDelay = try? await localStore.nextPendingGroupCreationDelay()
         let textDelay = try? await localStore.nextPendingOutboxDelay()
         let mediaDelay = try? await localStore.nextMediaTransferDelay()
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
-        return [textDelay, mediaDelay, mutationDelay].compactMap { $0 }.min()
+        let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
+        return [
+            groupDelay, groupMutationDelay, textDelay, mediaDelay, mutationDelay,
+        ].compactMap { $0 }.min()
     }
 
     private func retryDelay(forRetryCount retryCount: Int) -> TimeInterval {
@@ -4388,7 +4992,10 @@ final class CloudAppModel {
             lines[index].dialogId = message.dialogId
             lines[index].msgId = message.msgId
             lines[index].senderAccountId = message.senderAccountId
+            lines[index].senderDisplayName = nil
             lines[index].kind = message.kind
+            lines[index].serviceType = message.serviceType
+            lines[index].serviceData = message.serviceData
             lines[index].text = message.text
             lines[index].replyToMsgId = message.replyToMsgId
             lines[index].reactions = Self.reactionBadges(message.reactions)
@@ -4414,6 +5021,8 @@ final class CloudAppModel {
             senderAccountId: message.senderAccountId,
             text: message.text,
             kind: message.kind,
+            serviceType: message.serviceType,
+            serviceData: message.serviceData,
             mine: mine,
             delivery: .sent,
             timestamp: message.serverTs,
@@ -4901,7 +5510,12 @@ final class CloudAppModel {
     private static func applyingPresentation(_ source: [Line]) -> [Line] {
         var result = source
         let inputs = source.map {
-            TimelinePresentationInput(id: $0.id, mine: $0.mine, timestamp: $0.timestamp)
+            TimelinePresentationInput(
+                id: $0.id,
+                mine: $0.mine,
+                senderId: $0.senderAccountId,
+                timestamp: $0.timestamp
+            )
         }
         let metadata = Dictionary(uniqueKeysWithValues: TimelinePresentationBuilder.build(inputs).map {
             ($0.id, $0)
@@ -5014,6 +5628,8 @@ private enum CloudAppModelError: LocalizedError {
     case bootstrapRequired
     case localStoreUnavailable
     case invalidBootstrapCursor
+    case invalidMedia
+    case invalidGroupMutation
 
     var errorDescription: String? {
         switch self {
@@ -5023,6 +5639,10 @@ private enum CloudAppModelError: LocalizedError {
             return "Encrypted local database is unavailable"
         case .invalidBootstrapCursor:
             return "Server returned an incomplete bootstrap page"
+        case .invalidMedia:
+            return "The selected media could not be prepared"
+        case .invalidGroupMutation:
+            return "The saved group change is invalid"
         }
     }
 }
