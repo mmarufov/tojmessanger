@@ -446,6 +446,7 @@ export async function sendMessage(sql: SQL, p: {
       actorAccountId: p.senderAccountId,
       sourceDeviceId: p.senderDeviceId,
       unarchiveOnIncomingMessage: true,
+      useDialogPreferences: process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED !== "0",
     });
     const senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
 

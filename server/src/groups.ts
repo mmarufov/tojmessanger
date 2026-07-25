@@ -942,10 +942,47 @@ export async function updateGroupNotifications(sql: SQL, input: {
   dialogId: string;
   mode: unknown;
   clientMutationId: unknown;
+  usePreferenceService?: boolean;
 }): Promise<{ envelope: GroupEnvelope; pushes: FanoutPush[] }> {
   const mode = String(input.mode ?? "");
   if (mode !== "all" && mode !== "muted") {
     throw new GroupError("notification mode must be all or muted", "invalid_request");
+  }
+  if (input.usePreferenceService === false) {
+    return sql.begin(async (tx) => {
+      const claim = await claimMutation(
+        tx,
+        input.actorAccountId,
+        input.clientMutationId,
+        input.dialogId,
+        "notifications",
+        mode,
+      );
+      if (claim.duplicate) {
+        return {
+          envelope: await envelope(tx, input.actorAccountId, input.dialogId, {
+            duplicate: true,
+          }),
+          pushes: [],
+        };
+      }
+      const access = await mutationAccess(
+        tx,
+        input.actorAccountId,
+        input.dialogId,
+        ["owner", "admin", "member"],
+      );
+      await tx`
+        UPDATE dialog_members
+        SET notification_mode = ${mode}
+        WHERE dialog_id = ${input.dialogId}
+          AND account_id = ${input.actorAccountId}`;
+      await completeMutation(tx, input.actorAccountId, claim.mutationId, access.revision);
+      return {
+        envelope: await envelope(tx, input.actorAccountId, input.dialogId),
+        pushes: [],
+      };
+    });
   }
   const result = await updateDialogPreferences(sql, {
     accountId: input.actorAccountId,

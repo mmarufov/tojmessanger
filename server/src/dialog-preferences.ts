@@ -18,10 +18,23 @@ export class DialogPreferenceError extends Error {
     message: string,
     readonly code: string,
     readonly status = 400,
+    readonly retryAfter?: number,
   ) {
     super(message);
     this.name = "DialogPreferenceError";
   }
+}
+
+export function dialogPreferencesEntrypointEnabled(): boolean {
+  return process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED === "1";
+}
+
+export function dialogPreferencesServerBehaviorEnabled(): boolean {
+  return process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED !== "0";
+}
+
+export function dialogPreferencesCapabilityEnabled(): boolean {
+  return dialogPreferencesEntrypointEnabled() && dialogPreferencesServerBehaviorEnabled();
 }
 
 export type DialogPreferencesDTO = {
@@ -169,6 +182,26 @@ export async function updateDialogPreferences(
     await requireActiveDevice(tx, input.accountId, input.deviceId);
     const access = await lockDialogForMutation(tx, input.accountId, dialogId);
 
+    const budget = await tx`
+      INSERT INTO dialog_preference_action_budgets (
+        account_id, bucket_started, mutation_count
+      )
+      VALUES (
+        ${input.accountId}, date_trunc('hour', now()), 1
+      )
+      ON CONFLICT (account_id, bucket_started) DO UPDATE SET
+        mutation_count = dialog_preference_action_budgets.mutation_count + 1,
+        updated_at = now()
+      WHERE dialog_preference_action_budgets.mutation_count < 240
+      RETURNING mutation_count`;
+    if (budget.length === 0) {
+      throw new DialogPreferenceError(
+        "dialog preference rate limit reached",
+        "rate_limited",
+        429,
+        3600,
+      );
+    }
     await tx`
       INSERT INTO dialog_preferences (
         dialog_id, account_id, is_muted
@@ -178,7 +211,7 @@ export async function updateDialogPreferences(
       ON CONFLICT (dialog_id, account_id) DO NOTHING`;
 
     const before = (await tx`
-      SELECT is_pinned, is_muted, is_archived
+      SELECT dialog_id, account_id, is_pinned, pinned_at, is_muted, is_archived, updated_at
       FROM dialog_preferences
       WHERE dialog_id = ${dialogId} AND account_id = ${input.accountId}
       FOR UPDATE`)[0];
@@ -191,6 +224,27 @@ export async function updateDialogPreferences(
     const hasPinned = patch.pinned !== undefined;
     const hasMuted = patch.muted !== undefined;
     const hasArchived = patch.archived !== undefined;
+    if (changedFields.length === 0) {
+      const preferences = dto(before);
+      const currentPts = n((await tx`
+        SELECT pts
+        FROM account_sync_states
+        WHERE account_id = ${input.accountId}`)[0]?.pts);
+      await tx`
+        UPDATE dialog_preference_requests
+        SET status = 'completed',
+            result_pts = ${currentPts},
+            result_json = ${JSON.stringify(preferences)}::text::jsonb
+        WHERE account_id = ${input.accountId} AND client_mutation_id = ${mutationId}`;
+      return {
+        preferences,
+        changedFields: [],
+        pts: currentPts,
+        duplicate: false,
+        pushes: [],
+      };
+    }
+
     const preferenceRow = (await tx`
       UPDATE dialog_preferences
       SET

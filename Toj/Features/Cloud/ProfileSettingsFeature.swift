@@ -184,7 +184,7 @@ struct ProfileEditView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             if pendingLogoutItemCount > 0 {
-                Text("Pending messages, edits, or uploads have not reached the cloud and will be permanently removed from this device.")
+                Text("Pending messages, edits, chat settings, or uploads have not reached the cloud and will be permanently removed from this device.")
             } else {
                 Text("Your encrypted local replica and downloaded media will be removed. You can sign back in with your phone number at any time.")
             }

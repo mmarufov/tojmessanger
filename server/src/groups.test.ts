@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { checkVerification, startVerification } from "./auth";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
+import { updateDialogPreferences } from "./dialog-preferences";
 import {
   addGroupMembers,
   changeGroupMemberRole,
@@ -328,20 +329,27 @@ describe("Groups v1", () => {
       SELECT pts FROM account_sync_states WHERE account_id = ${owner.accountId}`)[0].pts);
     const aliceBefore = Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts);
+    expect((await db`
+      SELECT is_muted
+      FROM dialog_preferences
+      WHERE dialog_id = ${groupId} AND account_id = ${owner.accountId}`)[0].is_muted)
+      .toBe(false);
     const mutationId = crypto.randomUUID();
     const first = await updateGroupNotifications(db, {
-      actorAccountId: alice.accountId,
-      actorDeviceId: alice.deviceId,
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
       dialogId: groupId,
       mode: "muted",
       clientMutationId: mutationId,
+      usePreferenceService: false,
     });
     const retry = await updateGroupNotifications(db, {
-      actorAccountId: alice.accountId,
-      actorDeviceId: alice.deviceId,
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
       dialogId: groupId,
       mode: "muted",
       clientMutationId: mutationId,
+      usePreferenceService: false,
     });
     expect(first.envelope.group.notificationMode).toBe("muted");
     expect(retry.envelope.duplicate).toBe(true);
@@ -352,11 +360,11 @@ describe("Groups v1", () => {
         ON member.dialog_id = preference.dialog_id
        AND member.account_id = preference.account_id
       WHERE preference.dialog_id = ${groupId}
-        AND preference.account_id = ${alice.accountId}`)[0]).toMatchObject({
+        AND preference.account_id = ${owner.accountId}`)[0]).toMatchObject({
       is_muted: true,
       notification_mode: "muted",
     });
-    const difference = await getDifference(db, alice.accountId, aliceBefore);
+    const difference = await getDifference(db, owner.accountId, ownerBefore);
     if (difference.kind === "difference_too_long") throw new Error("unexpected rebuild");
     expect(difference.updates).toHaveLength(1);
     expect(difference.updates[0]).toMatchObject({
@@ -364,20 +372,76 @@ describe("Groups v1", () => {
       preferences: { dialogId: groupId, muted: true },
     });
     expect(Number((await db`
-      SELECT pts FROM account_sync_states WHERE account_id = ${owner.accountId}`)[0].pts))
-      .toBe(ownerBefore);
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts))
+      .toBe(aliceBefore);
 
     // A still-running legacy server may write only dialog_members during a rolling deployment.
     // The database mirror keeps the new preference source authoritative in both directions.
     await db`
       UPDATE dialog_members
       SET notification_mode = 'all'
-      WHERE dialog_id = ${groupId} AND account_id = ${alice.accountId}`;
+      WHERE dialog_id = ${groupId} AND account_id = ${owner.accountId}`;
     expect((await db`
       SELECT is_muted
       FROM dialog_preferences
-      WHERE dialog_id = ${groupId} AND account_id = ${alice.accountId}`)[0].is_muted)
+      WHERE dialog_id = ${groupId} AND account_id = ${owner.accountId}`)[0].is_muted)
       .toBe(false);
+    const reconciled = await getDifference(db, owner.accountId, ownerBefore + 1);
+    if (reconciled.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(reconciled.updates).toHaveLength(1);
+    expect(reconciled.updates[0]).toMatchObject({
+      type: "dialog.preferences_updated",
+      preferences: { dialogId: groupId, muted: false },
+    });
+  });
+
+  test("an incoming message cannot unarchive a removed member's retained preference", async () => {
+    const { owner, alice } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      creatorDeviceId: owner.deviceId,
+      groupId,
+      title: "Retained archive",
+      memberIds: [alice.accountId],
+    });
+    await updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId: groupId,
+      clientMutationId: crypto.randomUUID(),
+      patch: { archived: true },
+    });
+    await removeGroupMember(db, {
+      actorAccountId: owner.accountId,
+      dialogId: groupId,
+      targetAccountId: alice.accountId,
+      clientMutationId: crypto.randomUUID(),
+    });
+    await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: groupId,
+      clientMsgId: crypto.randomUUID(),
+      body: "while removed",
+    });
+    expect((await db`
+      SELECT is_archived
+      FROM dialog_preferences
+      WHERE dialog_id = ${groupId} AND account_id = ${alice.accountId}`)[0].is_archived)
+      .toBe(true);
+
+    await addGroupMembers(db, {
+      actorAccountId: owner.accountId,
+      dialogId: groupId,
+      memberIds: [alice.accountId],
+      clientMutationId: crypto.randomUUID(),
+    });
+    expect((await db`
+      SELECT is_archived
+      FROM dialog_preferences
+      WHERE dialog_id = ${groupId} AND account_id = ${alice.accountId}`)[0].is_archived)
+      .toBe(true);
   });
 
   test("the route family hard-404s and stays unadvertised while the flag is off", async () => {

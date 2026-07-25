@@ -461,6 +461,111 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertTrue(pending.isEmpty)
     }
 
+    func testBootstrapCursorCoversDelayedPreferenceAcknowledgementBeforeRemoteUpdate() async throws {
+        let store = try makeStore()
+        let accountId = "account-bootstrap-before-ack"
+        let dialogId = "dialog-bootstrap-before-ack"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Bootstrap ordering",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
+        let mutation = try XCTUnwrap(queuedMutation)
+        let accepted = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: false,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:01.000Z"
+        )
+
+        try await store.beginBootstrap(
+            accountId: accountId,
+            token: "bootstrap-before-ack",
+            snapshotPts: 20,
+            mode: .replacement
+        )
+        try await store.applyBootstrapPage(BootstrapDialogsPage(
+            token: "bootstrap-before-ack",
+            state: .init(pts: 20),
+            dialogs: [
+                BootstrapDialog(
+                    dialogId: dialogId,
+                    type: "direct",
+                    title: "Bootstrap ordering",
+                    lastMsgId: 0,
+                    updatedAt: accepted.updatedAt,
+                    preferences: accepted,
+                    members: [],
+                    messages: []
+                ),
+            ],
+            nextCursor: nil,
+            hasMore: false
+        ))
+        try await store.finishBootstrap(accountId: accountId, pts: 20)
+
+        try await store.acknowledgeDialogPreference(
+            clientMutationId: mutation.clientMutationId,
+            pts: 20,
+            preferences: accepted,
+            accountId: accountId
+        )
+        let pendingAfterAcknowledgement = try await store.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(
+            pendingAfterAcknowledgement.isEmpty,
+            "A delayed response covered by the current cursor must be removed immediately"
+        )
+
+        let remote = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: true,
+            pinnedAt: "2026-07-25T10:00:02.000Z",
+            muted: true,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 21),
+                updates: [
+                    CloudUpdate(
+                        pts: 21,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: remote,
+                        clientMutationId: UUID().uuidString.lowercased(),
+                        changedFields: ["pinned", "muted"]
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let storedDialog = try await store.dialogs(accountId: accountId).first
+        let dialog = try XCTUnwrap(storedDialog)
+        XCTAssertTrue(dialog.isPinned)
+        XCTAssertTrue(dialog.isMuted)
+        XCTAssertTrue(dialog.isArchived)
+        let currentPts = try await store.loadPts(accountId: accountId)
+        XCTAssertEqual(currentPts, 21)
+    }
+
     func testIncomingMessagePreferencePayloadAppliesAutoUnarchiveWithTheMessageCursor() async throws {
         let store = try makeStore()
         let accountId = "account-auto-unarchive"
@@ -642,6 +747,217 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertNotNil(authenticationRetry)
         let retainedMute = try await store.dialogs(accountId: accountId).first
         XCTAssertTrue(try XCTUnwrap(retainedMute).isMuted)
+    }
+
+    func testDialogPreferenceDrainStopsAfterFirstOfflineRateLimitOrAuthenticationFailure() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        for status in [0, 429, 401] {
+            let store = try makeStore()
+            let accountId = "account-stop-\(status)"
+            for index in 0..<200 {
+                let dialogId = "dialog-stop-\(status)-\(index)"
+                try await store.upsertDialog(
+                    dialogId: dialogId,
+                    title: "Queued \(index)",
+                    updatedAt: "2026-07-25T10:00:00.000Z"
+                )
+                _ = try await store.queueDialogPreference(
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    field: .pinned,
+                    desiredValue: true
+                )
+            }
+            let requests = LockedCounter()
+            CloudAPIMockURLProtocol.handler = { request in
+                requests.increment()
+                if status == 0 { throw URLError(.notConnectedToInternet) }
+                let headers = status == 429
+                    ? ["content-type": "application/json", "retry-after": "11"]
+                    : ["content-type": "application/json"]
+                return (
+                    try XCTUnwrap(HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: status,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: headers
+                    )),
+                    Data(#"{"error":"paused"}"#.utf8)
+                )
+            }
+
+            let result = try await DialogPreferencesCoordinator(api: api).drain(
+                store: store,
+                accountId: accountId,
+                token: "token-\(status)",
+                serverAdvertisesFeature: true,
+                sessionGeneration: 7
+            )
+            XCTAssertEqual(requests.value, 1, "status \(status) must stop the whole drain")
+            let pendingCount = try await store.pendingDestructiveLogoutItemCount()
+            XCTAssertEqual(pendingCount, 200)
+            if status == 401 {
+                XCTAssertTrue(result.authenticationRequired)
+            } else {
+                XCTAssertNotNil(result.retryAfter)
+            }
+        }
+    }
+
+    func testWithdrawnDialogPreferenceCapabilityPreservesAndConvertsQueuedGroupMute() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = DialogPreferencesCoordinator(api: api)
+        let store = try makeStore()
+        let accountId = "account-capability-withdrawn"
+        let dialogId = "dialog-capability-withdrawn"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Capability withdrawn",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let queued = try XCTUnwrap(queuedMutation)
+        let requests = LockedCounter()
+        CloudAPIMockURLProtocol.handler = { request in
+            requests.increment()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"error":"not found"}"#.utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let result = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true,
+            sessionGeneration: 12
+        )
+        XCTAssertEqual(requests.value, 1)
+        XCTAssertTrue(result.capabilityRefreshRequired)
+        let pendingCount = try await store.pendingDestructiveLogoutItemCount()
+        XCTAssertEqual(pendingCount, 1)
+
+        let moved = try await store.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 1)
+        let remainingPreferences = try await store.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(remainingPreferences.isEmpty)
+        let fallback = try await store.pendingGroupMutationsReady()
+        XCTAssertEqual(fallback.map(\.clientMutationId), [queued.clientMutationId])
+        XCTAssertEqual(fallback.first?.payloadJSON, #"{"mode":"muted"}"#)
+    }
+
+    func testPreferenceDrainCancellationWaitsForSuspendedRequestAndPreservesAccountIntent() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = DialogPreferencesCoordinator(api: api)
+        let store = try makeStore()
+        let accountId = "account-logout-suspended"
+        let dialogId = "dialog-logout-suspended"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Suspended logout",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        let mutation = try XCTUnwrap(queuedMutation)
+        let gate = LockedGate()
+        CloudAPIMockURLProtocol.deferHandlerExecution = true
+        CloudAPIMockURLProtocol.handler = { request in
+            gate.signalStarted()
+            gate.waitForRelease()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"preferences":{"dialogId":"\(dialogId)","pinned":true,
+                "pinnedAt":"2026-07-25T10:00:00.000Z","muted":false,"archived":false,
+                "updatedAt":"2026-07-25T10:00:00.000Z"},"pts":5,"duplicate":false}
+                """.utf8)
+            )
+        }
+        defer {
+            gate.release()
+            CloudAPIMockURLProtocol.deferHandlerExecution = false
+            CloudAPIMockURLProtocol.handler = nil
+        }
+
+        let drain = Task {
+            try await coordinator.drain(
+                store: store,
+                accountId: accountId,
+                token: "old-session-token",
+                serverAdvertisesFeature: true,
+                sessionGeneration: 40
+            )
+        }
+        XCTAssertTrue(gate.waitUntilStarted())
+        drain.cancel()
+        let delayedRelease = Task {
+            try? await Task.sleep(for: .milliseconds(20))
+            gate.release()
+        }
+        await coordinator.cancelAndWait()
+        await delayedRelease.value
+        _ = try? await drain.value
+
+        let hasActiveDrain = await coordinator.hasActiveDrain
+        XCTAssertFalse(hasActiveDrain)
+        let retained = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        XCTAssertEqual(retained?.clientMutationId, mutation.clientMutationId)
+        XCTAssertNil(retained?.acknowledgedPts)
     }
 
     func testCloudFailureClassificationRetriesOnlyRecoverableFailures() {
@@ -1864,6 +2180,24 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(converted.first?.desiredValue, true)
         let legacyGroupMutations = try await upgraded.pendingGroupMutationsReady()
         XCTAssertTrue(legacyGroupMutations.isEmpty)
+        let destructiveLogoutCount = try await upgraded.pendingDestructiveLogoutItemCount()
+        XCTAssertEqual(destructiveLogoutCount, 1)
+
+        let moved = try await upgraded.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 1)
+        let pendingPreferences = try await upgraded.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(
+            pendingPreferences.isEmpty,
+            "With the capability off, the preference lane must not remain immediately due"
+        )
+        let legacyFallback = try await upgraded.pendingGroupMutationsReady()
+        XCTAssertEqual(legacyFallback.map(\.clientMutationId), [mutationId])
+        XCTAssertEqual(legacyFallback.first?.operation, "notifications")
+        XCTAssertEqual(legacyFallback.first?.payloadJSON, #"{"mode":"muted"}"#)
+        let fallbackDialog = try await upgraded.dialogs(accountId: accountId).first
+        XCTAssertTrue(try XCTUnwrap(fallbackDialog).isMuted)
 
         try await upgraded.clearAccount(accountId: accountId)
         let dialogsAfterClear = try await upgraded.dialogs(accountId: accountId)
@@ -3251,9 +3585,15 @@ final class CloudLocalStoreTests: XCTestCase {
         )
     }
 
-    func testDestructiveLogoutCountIncludesTextMutationsAndMediaUploads() async throws {
+    func testDestructiveLogoutCountIncludesOfflineDialogPreferences() async throws {
         let store = try makeStore()
         let dialogId = "dialog-pending-logout"
+        let accountId = "account-me"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Pending logout",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
         _ = try await store.insertSending(
             dialogId: dialogId,
             clientMsgId: "pending-text",
@@ -3287,9 +3627,15 @@ final class CloudLocalStoreTests: XCTestCase {
             caption: "",
             replyToMsgId: nil
         )
+        _ = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
 
         let destructiveLogoutCount = try await store.pendingDestructiveLogoutItemCount()
-        XCTAssertEqual(destructiveLogoutCount, 3)
+        XCTAssertEqual(destructiveLogoutCount, 4)
     }
 
     func testBootstrapAndDifferenceTooLongPreserveReplicaAndEveryDurableOutbox() async throws {
@@ -3973,6 +4319,9 @@ final class CloudLocalStoreTests: XCTestCase {
 
 private final class CloudAPIMockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    nonisolated(unsafe) static var deferHandlerExecution = false
+    private let stateLock = NSLock()
+    private var stopped = false
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -3994,9 +4343,24 @@ private final class CloudAPIMockURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
+        if Self.deferHandlerExecution {
+            let work = DispatchWorkItem { [weak self] in
+                self?.runHandler()
+            }
+            DispatchQueue.global(qos: .userInitiated).async(execute: work)
+            return
+        }
+        runHandler()
+    }
+
+    private func runHandler() {
         do {
             let handler = try XCTUnwrap(Self.handler)
             let (response, data) = try handler(request)
+            stateLock.lock()
+            let shouldDeliver = !stopped
+            stateLock.unlock()
+            guard shouldDeliver else { return }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
@@ -4005,7 +4369,58 @@ private final class CloudAPIMockURLProtocol: URLProtocol {
         }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        stateLock.lock()
+        stopped = true
+        stateLock.unlock()
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+private final class LockedGate: @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didRelease = false
+
+    func signalStarted() {
+        started.signal()
+    }
+
+    func waitUntilStarted() -> Bool {
+        started.wait(timeout: .now() + 2) == .success
+    }
+
+    func waitForRelease() {
+        released.wait()
+    }
+
+    func release() {
+        lock.lock()
+        guard !didRelease else {
+            lock.unlock()
+            return
+        }
+        didRelease = true
+        lock.unlock()
+        released.signal()
+    }
 }
 
 private final class LockedMediaRequests: @unchecked Sendable {

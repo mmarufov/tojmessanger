@@ -41,6 +41,7 @@ import {
   type Push,
 } from "./sync";
 import {
+  dialogPreferenceBacklogMetrics,
   OperationalMetrics,
   logRequest,
   readiness,
@@ -104,6 +105,7 @@ import {
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
 import {
+  dialogPreferencesCapabilityEnabled,
   DialogPreferenceError,
   updateDialogPreferences,
 } from "./dialog-preferences";
@@ -262,7 +264,7 @@ export function startCloudServer(
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
-  const dialogPreferencesAvailable = process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED === "1";
+  const dialogPreferencesAvailable = dialogPreferencesCapabilityEnabled();
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -315,7 +317,10 @@ export function startCloudServer(
           const metricsToken = process.env.TOJ_METRICS_TOKEN;
           if (!metricsToken) response = new Response("not found", { status: 404 });
           else if (bearer(req) !== metricsToken) response = new Response("unauthorized", { status: 401 });
-          else response = new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } });
+          else response = new Response(
+            metrics.render() + await dialogPreferenceBacklogMetrics(db),
+            { headers: { "content-type": "text/plain; version=0.0.4" } },
+          );
         }
 
         else if (url.pathname === "/v1/ws") {
@@ -542,6 +547,7 @@ export function startCloudServer(
             dialogId: groupNotificationsMatch[1],
             mode: body.mode,
             clientMutationId: body.clientMutationId,
+            usePreferenceService: dialogPreferencesAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result.envelope);
@@ -923,6 +929,9 @@ export function startCloudServer(
         if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof GroupError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof DialogPreferenceError && err.retryAfter) {
+          headers["retry-after"] = String(err.retryAfter);
+        }
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,

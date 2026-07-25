@@ -558,9 +558,14 @@ private struct CloudChatsView: View {
                                         Button(dialog.isPinned ? "Unpin" : "Pin", systemImage: dialog.isPinned ? "pin.slash" : "pin") {
                                             model.togglePinned(dialog.id)
                                         }
+                                    }
+                                    if model.capabilities.contains(.chatOrganization)
+                                        || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
                                             model.toggleMuted(dialog.id)
                                         }
+                                    }
+                                    if model.capabilities.contains(.chatOrganization) {
                                         Button(
                                             dialog.isArchived ? "Unarchive" : "Archive",
                                             systemImage: dialog.isArchived ? "tray.and.arrow.up" : "archivebox"
@@ -584,6 +589,9 @@ private struct CloudChatsView: View {
                                             )
                                         }
                                         .tint(TojTheme.strong)
+                                    }
+                                    if model.capabilities.contains(.chatOrganization)
+                                        || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button { model.toggleMuted(dialog.id) } label: {
                                             Label(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash")
                                         }
@@ -713,7 +721,7 @@ private struct CloudChatsView: View {
                     Text("Archived Chats")
                         .font(TojTheme.heading(.headline, weight: .semibold))
                         .foregroundStyle(TojTheme.text)
-                    Text("\(archivedDialogs.count) \(archivedDialogs.count == 1 ? "chat" : "chats")")
+                    Text("\(archivedDialogs.count) archived chats")
                         .font(.subheadline)
                         .foregroundStyle(TojTheme.secondaryText)
                 }
@@ -1513,7 +1521,7 @@ private struct CloudSettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 if pendingLogoutItemCount > 0 {
-                    Text("Pending messages, edits, or uploads have not reached the cloud and will be permanently removed from this device.")
+                    Text("Pending messages, edits, chat settings, or uploads have not reached the cloud and will be permanently removed from this device.")
                 } else {
                     Text("Your encrypted local replica and downloaded media will be removed from this device.")
                 }

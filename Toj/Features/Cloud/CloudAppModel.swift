@@ -365,6 +365,8 @@ final class CloudAppModel {
     private var composerMediaOperationId: UUID?
     private var activeComposerTransferId: String?
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
+    private var preferenceMutationTasks: [UUID: Task<Void, Never>] = [:]
+    private var accountSessionGeneration: UInt64 = 1
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
@@ -640,6 +642,7 @@ final class CloudAppModel {
             )
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
+            accountSessionGeneration &+= 1
             storedSession = stored
             profileDetails = Self.profileDetails(from: name)
             try? await tokenStore.saveProfile(profileDetails, accountId: session.accountId)
@@ -930,6 +933,7 @@ final class CloudAppModel {
 
     private func clearLocalSession(finalStatus: String) async {
         let accountId = storedSession?.session.accountId
+        accountSessionGeneration &+= 1
         var cleanupFailures: [String] = []
         do {
             try await tokenStore.savePendingLocalErasure(accountId: accountId)
@@ -939,6 +943,7 @@ final class CloudAppModel {
 
         let composerTask = composerMediaTask
         let transferTasks = Array(mediaTransferTasks.values)
+        let preferenceTasks = Array(preferenceMutationTasks.values)
         let pendingRetryTask = retryTask
         let backgroundTasks: [Task<Void, Never>] = [
             hintTask, networkObservationTask, memoryPressureTask,
@@ -952,6 +957,8 @@ final class CloudAppModel {
         ].compactMap { $0 }
         backgroundTasks.forEach { $0.cancel() }
         transferTasks.forEach { $0.cancel() }
+        preferenceTasks.forEach { $0.cancel() }
+        await dialogPreferencesCoordinator.cancelAndWait()
         voiceRecorder.cancel()
         await hintSocket?.stop()
         hintSocket = nil
@@ -961,6 +968,7 @@ final class CloudAppModel {
         await BackgroundRuntimeCoordinator.shared.removeWorkHandlersAndWait()
         for task in backgroundTasks { await task.value }
         for task in transferTasks { await task.value }
+        for task in preferenceTasks { await task.value }
         hintTask = nil
         networkObservationTask = nil
         memoryPressureTask = nil
@@ -983,6 +991,7 @@ final class CloudAppModel {
         composerMediaOperationId = nil
         activeComposerTransferId = nil
         mediaTransferTasks.removeAll()
+        preferenceMutationTasks.removeAll()
         mediaTransfersInFlight.removeAll()
         messageMutationsInFlight.removeAll()
         mutationTargetsBeingQueued.removeAll()
@@ -1530,12 +1539,16 @@ final class CloudAppModel {
         )
     }
 
-    func setGroupMuted(dialogId: String, muted: Bool) async -> Bool {
-        await setDialogPreference(
-            dialogId: dialogId,
-            field: .muted,
-            desiredValue: muted
-        )
+    func setGroupMuted(dialogId: String, muted: Bool) {
+        if capabilities.contains(.chatOrganization) {
+            launchDialogPreferenceMutation(
+                dialogId: dialogId,
+                field: .muted,
+                desiredValue: muted
+            )
+        } else if capabilities.contains(.groups) {
+            launchLegacyGroupMute(dialogId: dialogId, muted: muted)
+        }
     }
 
     func addGroupMembers(dialogId: String, accountIds: [String]) async -> Bool {
@@ -1589,7 +1602,12 @@ final class CloudAppModel {
         operation: String,
         payload: GroupMutationPayload
     ) async -> Bool {
-        guard capabilities.contains(.groups), let localStore else { return false }
+        guard
+            capabilities.contains(.groups),
+            let localStore,
+            let accountId = storedSession?.session.accountId
+        else { return false }
+        let generation = accountSessionGeneration
         do {
             let mutationId = UUID().uuidString.lowercased()
             let payloadJSON = String(
@@ -1600,9 +1618,20 @@ final class CloudAppModel {
                 dialogId: dialogId,
                 operation: operation,
                 payloadJSON: payloadJSON,
-                clientMutationId: mutationId
+                clientMutationId: mutationId,
+                accountId: accountId
             )
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId
+            else { return false }
             await retryPendingGroupMutations()
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId
+            else { return false }
             scheduleOutboxRetry()
             return true
         } catch {
@@ -2362,13 +2391,13 @@ final class CloudAppModel {
             return
         }
         #endif
-        Task { [weak self] in
-            _ = await self?.setDialogPreference(dialogId: dialogId, field: .pinned)
-        }
+        launchDialogPreferenceMutation(dialogId: dialogId, field: .pinned)
     }
 
     func toggleMuted(_ dialogId: String) {
-        guard capabilities.contains(.chatOrganization) else { return }
+        guard let dialog = dialogs.first(where: { $0.id == dialogId }) else { return }
+        let supportsLegacyGroupMute = dialog.type == "group" && capabilities.contains(.groups)
+        guard capabilities.contains(.chatOrganization) || supportsLegacyGroupMute else { return }
         #if DEBUG
         if isDemoMode {
             updateDialog(dialogId) {
@@ -2378,9 +2407,11 @@ final class CloudAppModel {
             return
         }
         #endif
-        Task { [weak self] in
-            _ = await self?.setDialogPreference(dialogId: dialogId, field: .muted)
+        if !capabilities.contains(.chatOrganization), supportsLegacyGroupMute {
+            launchLegacyGroupMute(dialogId: dialogId, muted: !dialog.isMuted)
+            return
         }
+        launchDialogPreferenceMutation(dialogId: dialogId, field: .muted)
     }
 
     func archive(_ dialogId: String) {
@@ -2391,13 +2422,11 @@ final class CloudAppModel {
             return
         }
         #endif
-        Task { [weak self] in
-            _ = await self?.setDialogPreference(
-                dialogId: dialogId,
-                field: .archived,
-                desiredValue: true
-            )
-        }
+        launchDialogPreferenceMutation(
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
     }
 
     func unarchive(_ dialogId: String) {
@@ -2408,13 +2437,60 @@ final class CloudAppModel {
             return
         }
         #endif
-        Task { [weak self] in
-            _ = await self?.setDialogPreference(
+        launchDialogPreferenceMutation(
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: false
+        )
+    }
+
+    private func launchDialogPreferenceMutation(
+        dialogId: String,
+        field: DialogPreferenceField,
+        desiredValue: Bool? = nil
+    ) {
+        guard let accountId = storedSession?.session.accountId else { return }
+        let generation = accountSessionGeneration
+        let taskId = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.preferenceMutationTasks.removeValue(forKey: taskId) }
+            _ = await self.setDialogPreference(
                 dialogId: dialogId,
-                field: .archived,
-                desiredValue: false
+                field: field,
+                desiredValue: desiredValue,
+                expectedAccountId: accountId,
+                sessionGeneration: generation
             )
         }
+        preferenceMutationTasks[taskId] = task
+    }
+
+    private func launchLegacyGroupMute(dialogId: String, muted: Bool) {
+        guard let accountId = storedSession?.session.accountId else { return }
+        let generation = accountSessionGeneration
+        let taskId = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { self.preferenceMutationTasks.removeValue(forKey: taskId) }
+            guard
+                !Task.isCancelled,
+                self.accountSessionGeneration == generation,
+                self.storedSession?.session.accountId == accountId
+            else { return }
+            _ = await self.submitGroupMutation(
+                dialogId: dialogId,
+                operation: "notifications",
+                payload: GroupMutationPayload(mode: muted ? "muted" : "all")
+            )
+            guard
+                !Task.isCancelled,
+                self.accountSessionGeneration == generation,
+                self.storedSession?.session.accountId == accountId
+            else { return }
+            await self.refreshDialogs()
+        }
+        preferenceMutationTasks[taskId] = task
     }
 
     private func updateDialog(_ dialogId: String, mutation: (inout Dialog) -> Void) {
@@ -2437,7 +2513,9 @@ final class CloudAppModel {
     private func setDialogPreference(
         dialogId: String,
         field: DialogPreferenceField,
-        desiredValue: Bool? = nil
+        desiredValue: Bool? = nil,
+        expectedAccountId: String? = nil,
+        sessionGeneration: UInt64? = nil
     ) async -> Bool {
         guard capabilities.contains(.chatOrganization) else { return false }
         #if DEBUG
@@ -2469,6 +2547,11 @@ final class CloudAppModel {
             let localStore,
             let accountId = storedSession?.session.accountId
         else { return false }
+        let generation = sessionGeneration ?? accountSessionGeneration
+        guard
+            expectedAccountId == nil || expectedAccountId == accountId,
+            generation == accountSessionGeneration
+        else { return false }
         do {
             _ = try await dialogPreferencesCoordinator.queue(
                 store: localStore,
@@ -2477,6 +2560,11 @@ final class CloudAppModel {
                 field: field,
                 desiredValue: desiredValue
             )
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId
+            else { return false }
             // Observation publishes the SQLCipher overlay immediately; networking happens only
             // after the optimistic write has committed.
             await retryPendingDialogPreferences()
@@ -2484,7 +2572,7 @@ final class CloudAppModel {
             return true
         } catch {
             presentNotice(
-                "Chat preference could not be saved",
+                String(localized: "Chat preference could not be saved"),
                 message: error.localizedDescription
             )
             return false
@@ -2498,13 +2586,21 @@ final class CloudAppModel {
             let accountId = storedSession?.session.accountId,
             let token = storedSession?.session.token
         else { return }
+        let generation = accountSessionGeneration
         do {
             let result = try await dialogPreferencesCoordinator.drain(
                 store: localStore,
                 accountId: accountId,
                 token: token,
-                serverAdvertisesFeature: true
+                serverAdvertisesFeature: true,
+                sessionGeneration: generation
             )
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId,
+                storedSession?.session.token == token
+            else { return }
             if result.acceptedCount > 0 {
                 scheduleSync()
             }
@@ -2515,19 +2611,29 @@ final class CloudAppModel {
                 )
             }
             if result.authenticationRequired {
-                status = "Chat preferences are saved and will sync after sign-in"
+                status = String(localized: "Chat preferences are saved and will sync after sign-in")
+            }
+            if result.capabilityRefreshRequired {
+                await refreshServerCapabilities()
+                guard
+                    generation == accountSessionGeneration,
+                    storedSession?.session.accountId == accountId
+                else { return }
             }
             if let error = result.permanentErrors.first {
                 await refreshDialogs()
                 presentNotice(
-                    "Chat preference was not changed",
+                    String(localized: "Chat preference was not changed"),
                     message: error
                 )
             }
         } catch is CancellationError {
             return
         } catch {
-            status = "Chat preference sync paused: \(error.localizedDescription)"
+            status = String(
+                format: String(localized: "Chat preference sync paused: %@"),
+                error.localizedDescription
+            )
         }
     }
 
@@ -3411,8 +3517,15 @@ final class CloudAppModel {
     }
 
     private func refreshServerCapabilities() async {
+        let generation = accountSessionGeneration
+        let expectedAccountId = storedSession?.session.accountId
         do {
             let response = try await api.capabilities(token: storedSession?.session.token)
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                expectedAccountId == storedSession?.session.accountId
+            else { return }
             var resolved: MessagingCapabilities = []
             let advertised = Set(response.capabilities)
             if advertised.contains("core_text") || advertised.contains("replies") {
@@ -3448,7 +3561,28 @@ final class CloudAppModel {
                 Int(resolved.subtracting(.videoCalls).rawValue),
                 forKey: capabilityCacheKey
             )
+            if !resolved.contains(.chatOrganization),
+               resolved.contains(.groups),
+               let localStore,
+               let accountId = storedSession?.session.accountId {
+                let moved = (try? await localStore.movePendingGroupMutesToLegacy(
+                    accountId: accountId
+                )) ?? 0
+                guard
+                    !Task.isCancelled,
+                    generation == accountSessionGeneration,
+                    expectedAccountId == storedSession?.session.accountId
+                else { return }
+                if moved > 0 {
+                    await retryPendingGroupMutations()
+                }
+            }
         } catch let error as CloudAPIError where error.status == 404 {
+            guard
+                !Task.isCancelled,
+                generation == accountSessionGeneration,
+                expectedAccountId == storedSession?.session.accountId
+            else { return }
             negotiatedCapabilities = [.replies]
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
@@ -5138,7 +5272,8 @@ final class CloudAppModel {
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
         let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
         var preferenceDelay: TimeInterval?
-        if let accountId = storedSession?.session.accountId {
+        if capabilities.contains(.chatOrganization),
+           let accountId = storedSession?.session.accountId {
             preferenceDelay = try? await localStore.nextDialogPreferenceRetryDelay(
                 accountId: accountId
             )
@@ -5511,6 +5646,7 @@ final class CloudAppModel {
     #if DEBUG
     func enterDemoMode() {
         isDemoMode = true
+        accountSessionGeneration &+= 1
         storedSession = StoredCloudSession(
             session: CloudSession(accountId: "debug-demo-account", deviceId: "debug-demo-device", token: "debug-demo-token"),
             phone: "+992 00 000 00 00",
@@ -5563,6 +5699,7 @@ final class CloudAppModel {
 
     private func leaveDemoMode() {
         isDemoMode = false
+        accountSessionGeneration &+= 1
         storedSession = nil
         activeDialogId = nil
         dialogs = []

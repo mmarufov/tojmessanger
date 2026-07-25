@@ -91,6 +91,29 @@ export class OperationalMetrics {
   }
 }
 
+export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> {
+  const row = (await sql`
+    SELECT
+      (SELECT count(*) FROM dialog_preference_requests WHERE status = 'pending')
+        AS pending_requests,
+      (SELECT count(*) FROM dialog_preference_requests
+       WHERE status = 'completed' AND created_at < now() - interval '24 hours')
+        AS expired_completed_requests,
+      (SELECT count(*) FROM dialog_preference_action_budgets
+       WHERE updated_at < now() - interval '24 hours')
+        AS expired_budget_rows`)[0];
+  return [
+    "# HELP toj_dialog_preference_pending_requests Pending idempotency claims.",
+    "# TYPE toj_dialog_preference_pending_requests gauge",
+    `toj_dialog_preference_pending_requests ${Number(row.pending_requests)}`,
+    "# HELP toj_dialog_preference_cleanup_backlog_rows Expired rows awaiting bounded cleanup.",
+    "# TYPE toj_dialog_preference_cleanup_backlog_rows gauge",
+    `toj_dialog_preference_cleanup_backlog_rows{table="requests"} ${Number(row.expired_completed_requests)}`,
+    `toj_dialog_preference_cleanup_backlog_rows{table="budgets"} ${Number(row.expired_budget_rows)}`,
+    "",
+  ].join("\n");
+}
+
 export function providerState(value: unknown): ProviderState {
   return value ? "configured" : "disabled";
 }
@@ -216,6 +239,16 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.account_id = doomed.account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
+  const dialogPreferenceBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, bucket_started FROM dialog_preference_action_budgets
+      WHERE updated_at < now() - interval '24 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+    )
+    DELETE FROM dialog_preference_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
   const events = await sql.begin(async (tx) => {
     const doomed = await tx`
       SELECT account_id, pts
@@ -268,6 +301,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
+    dialogPreferenceBudgets: dialogPreferenceBudgets.length,
     accountEvents: events.length,
     callData,
   };
@@ -287,7 +321,8 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
           deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
           deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
-          deleted.groupMutations || deleted.dialogPreferenceRequests || deleted.accountEvents
+          deleted.groupMutations || deleted.dialogPreferenceRequests ||
+          deleted.dialogPreferenceBudgets || deleted.accountEvents
           || Object.values(deleted.callData).some((value) => value > 0)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }

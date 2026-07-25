@@ -110,16 +110,38 @@ foreign-key integrity is preserved. A later registration with the same phone cre
 ## Dialog preference rollout
 
 `dialog_preferences_v1` and `PUT /v1/dialogs/:id/preferences` are advertised only when
-`TOJ_DIALOG_PREFERENCES_V1_ENABLED=1` was present at process startup. With the switch unset, the route
-family hard-404s. The legacy group-notification route stays available and mirrors the same canonical
-mute row so old and new clients can overlap safely.
+both switches permit them at process startup:
 
-Roll out in this order: apply the PostgreSQL schema/backfill with the switch off, deploy the compatible
-server, distribute the iOS build, then enable the switch and restart. Confirm API version 5 advertises
-`dialog_preferences_v1`, preference-route errors remain flat, account `pts` gaps do not increase, the
-client retry backlog drains, and muted deliveries are silent while unmuted deliveries alert. A rollback
-is the reverse final step: clear the switch and restart. Stored pin/archive/mute values and the mirrored
-legacy group mute remain intact for a later re-enable.
+- `TOJ_DIALOG_PREFERENCES_V1_ENABLED=1` enables the client entrypoint (capability and route).
+- `TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED=0` is the behavior kill switch. It suppresses the
+  capability/route, disables preference-driven auto-unarchive, and makes message push fanout read
+  the legacy notification mode. Its secure rollout default is enabled when unset so existing
+  deployments need only gate the client entrypoint.
+
+With either gate closed, the preference route family hard-404s. The legacy group-notification route
+stays available and writes `dialog_members.notification_mode`. The database compatibility trigger
+mirrors that value and emits the account PTS update needed by new clients, including while old and
+new server nodes overlap. The trigger deliberately remains active when behavior is killed so a
+rollback cannot strand a durable legacy mute or create a sync gap.
+
+Run `bun run migrate` before enabling either client entrypoint. It applies a short-lock expand,
+resumable bounded backfill, concurrent indexes, separately validates the replacement event
+constraint, then swaps constraints in a short contract transaction. Its final JSON log includes
+runtime, rows, batches, legacy reconciliation count, and WAL bytes. Production automation should set
+`TOJ_DIALOG_PREFERENCES_MIGRATION_MAX_RUNTIME_MS` and
+`TOJ_DIALOG_PREFERENCES_MIGRATION_MAX_WAL_BYTES` to measured deployment limits.
+
+Roll out in this order: migrate/backfill with the entrypoint off, deploy compatible server nodes,
+distribute the iOS build, then enable the entrypoint and restart nodes. Confirm API version 5
+advertises `dialog_preferences_v1`, preference-route errors remain flat, account `pts` gaps do not
+increase, the client retry backlog drains, and muted deliveries are silent while unmuted deliveries
+alert. Roll back client entry by clearing `TOJ_DIALOG_PREFERENCES_V1_ENABLED`; kill preference-driven
+server behavior by additionally setting `TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED=0`. Stored
+pin/archive/mute values and mirrored legacy group mute remain intact for a later re-enable.
+
+Account deletion purges preference rows, idempotency payloads, budget rows, preference events, and
+bootstrap snapshots because they are private presentation state. Delivered message history remains
+under the separate message-retention contract.
 
 ## Voice calls and TURN readiness
 

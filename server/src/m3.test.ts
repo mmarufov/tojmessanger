@@ -312,6 +312,7 @@ describe("M3 cloud sync", () => {
       clientMsgId: crypto.randomUUID(),
       body: "history remains for the other participant",
     });
+    await startBootstrap(db, alice.accountId);
 
     const original = (await db`
       SELECT phone_lookup_hash, phone_e164_ciphertext FROM accounts WHERE id = ${alice.accountId}`)[0];
@@ -342,6 +343,16 @@ describe("M3 cloud sync", () => {
       SELECT dialog_id FROM dialog_preferences WHERE account_id = ${alice.accountId}`).toHaveLength(0);
     expect(await db`
       SELECT client_mutation_id FROM dialog_preference_requests
+      WHERE account_id = ${alice.accountId}`).toHaveLength(0);
+    expect(await db`
+      SELECT account_id FROM dialog_preference_action_budgets
+      WHERE account_id = ${alice.accountId}`).toHaveLength(0);
+    expect(await db`
+      SELECT pts FROM account_events
+      WHERE account_id = ${alice.accountId}
+        AND type = 'dialog.preferences_updated'`).toHaveLength(0);
+    expect(await db`
+      SELECT id FROM bootstrap_snapshots
       WHERE account_id = ${alice.accountId}`).toHaveLength(0);
     const erasedDevice = (await db`
       SELECT push_token_hash, device_name FROM devices WHERE id = ${secondDevice.deviceId}`)[0];
@@ -549,6 +560,13 @@ describe("M3 cloud sync", () => {
           ${account.accountId}, ${pendingPreferenceRequest}, ${crypto.randomUUID()},
           ${Buffer.alloc(32)}, 'pending', now() - interval '25 hours'
         )`;
+    await db`
+      INSERT INTO dialog_preference_action_budgets (
+        account_id, bucket_started, mutation_count, updated_at
+      ) VALUES (
+        ${account.accountId}, date_trunc('hour', now() - interval '25 hours'),
+        7, now() - interval '25 hours'
+      )`;
 
     const deleted = await cleanupExpiredData(db, 1);
     expect(deleted).toMatchObject({
@@ -557,6 +575,7 @@ describe("M3 cloud sync", () => {
       pushDeliveries: 0,
       mediaUploads: 1,
       dialogPreferenceRequests: 1,
+      dialogPreferenceBudgets: 1,
     });
     expect(await db`SELECT id FROM bootstrap_snapshots`).toHaveLength(0);
     expect(await db`SELECT id FROM media_objects WHERE status = 'uploading'`).toHaveLength(0);
@@ -1353,6 +1372,13 @@ describe("M3 cloud sync", () => {
     })).rejects.toMatchObject({ code: "invalid_request", status: 400 });
 
     const firstPinnedAt = canonical.pinned_at.toISOString();
+    const beforeRedundant = (await db`
+      SELECT
+        (SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}) AS pts,
+        (SELECT count(*) FROM account_events
+         WHERE account_id = ${alice.accountId}) AS event_count,
+        (SELECT count(*) FROM push_deliveries
+         WHERE account_id = ${alice.accountId}) AS push_count`)[0];
     const redundantPin = await updateDialogPreferences(db, {
       accountId: alice.accountId,
       deviceId: alice.deviceId,
@@ -1361,15 +1387,16 @@ describe("M3 cloud sync", () => {
       patch: { pinned: true },
     });
     expect(redundantPin.preferences.pinnedAt).toBe(firstPinnedAt);
-    const redundantDifference = await getDifference(
-      db,
-      alice.accountId,
-      redundantPin.pts - 1,
-    );
-    if (redundantDifference.kind === "difference_too_long") {
-      throw new Error("unexpected rebuild");
-    }
-    expect(redundantDifference.updates[0].changed_fields).toEqual([]);
+    expect(redundantPin.changedFields).toEqual([]);
+    expect(redundantPin.pushes).toEqual([]);
+    const afterRedundant = (await db`
+      SELECT
+        (SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}) AS pts,
+        (SELECT count(*) FROM account_events
+         WHERE account_id = ${alice.accountId}) AS event_count,
+        (SELECT count(*) FROM push_deliveries
+         WHERE account_id = ${alice.accountId}) AS push_count`)[0];
+    expect(afterRedundant).toEqual(beforeRedundant);
     const unpinned = await updateDialogPreferences(db, {
       accountId: alice.accountId,
       deviceId: alice.deviceId,
@@ -1419,6 +1446,35 @@ describe("M3 cloud sync", () => {
     const pinsByCommitOrder = concurrentPins.sort((left, right) => left.pts - right.pts);
     expect(pinsByCommitOrder[1].preferences.pinnedAt! >
       pinsByCommitOrder[0].preferences.pinnedAt!).toBe(true);
+  });
+
+  test("dialog preference mutation budgets are persisted and return Retry-After", async () => {
+    const { alice, dialogId } = await makePair();
+    await db`
+      INSERT INTO dialog_preference_action_budgets (
+        account_id, bucket_started, mutation_count
+      ) VALUES (
+        ${alice.accountId}, date_trunc('hour', now()), 240
+      )
+      ON CONFLICT (account_id, bucket_started) DO UPDATE
+      SET mutation_count = 240, updated_at = now()`;
+    const before = (await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts;
+
+    await expect(updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      clientMutationId: crypto.randomUUID(),
+      patch: { pinned: true },
+    })).rejects.toMatchObject({
+      code: "rate_limited",
+      status: 429,
+      retryAfter: 3600,
+    });
+    expect((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts)
+      .toBe(before);
   });
 
   test("muted messages stay silent and only unmuted incoming messages auto-unarchive", async () => {
@@ -2199,6 +2255,7 @@ describe("M3 cloud sync", () => {
     await resetDb();
     const { alice, dialogId } = await makePair();
     const previous = process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;
+    const previousBehavior = process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
     let server: ReturnType<typeof startCloudServer> | undefined;
     try {
       delete process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;
@@ -2218,6 +2275,22 @@ describe("M3 cloud sync", () => {
       server = undefined;
 
       process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED = "1";
+      process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = "0";
+      server = startCloudServer(0, db, null, null);
+      base = `http://127.0.0.1:${server.port}`;
+      capabilities = await (await fetch(`${base}/v1/capabilities`)).json() as {
+        api_version: number;
+        capabilities: string[];
+      };
+      expect(capabilities.capabilities).not.toContain("dialog_preferences_v1");
+      expect((await fetch(
+        `${base}/v1/dialogs/${crypto.randomUUID()}/preferences`,
+        { method: "PUT" },
+      )).status).toBe(404);
+      await server.stop(true);
+      server = undefined;
+
+      delete process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
       server = startCloudServer(0, db, null, null);
       base = `http://127.0.0.1:${server.port}`;
       capabilities = await (await fetch(`${base}/v1/capabilities`)).json() as {
@@ -2262,5 +2335,10 @@ describe("M3 cloud sync", () => {
       if (server) await server.stop(true);
       if (previous === undefined) delete process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;
       else process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED = previous;
+      if (previousBehavior === undefined) {
+        delete process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
+      } else {
+        process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = previousBehavior;
+      }
     }
   });

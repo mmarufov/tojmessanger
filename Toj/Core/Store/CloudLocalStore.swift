@@ -963,14 +963,29 @@ actor CloudLocalStore {
             // A delayed HTTP response may predate a difference event already applied locally.
             // The response therefore records only its acknowledgement cursor; canonical values
             // remain exclusively authored by the ordered event/bootstrap stream.
-            try db.execute(
-                sql: """
-                UPDATE pending_dialog_preference_mutations
-                SET acknowledged_pts = ?, next_retry_at = NULL, last_error = NULL
-                WHERE account_id = ? AND client_mutation_id = ? AND terminal = 0
-                """,
-                arguments: [pts, accountId, clientMutationId]
-            )
+            let currentPts = try Int64.fetchOne(
+                db,
+                sql: "SELECT pts FROM sync_state WHERE account_id = ?",
+                arguments: [accountId]
+            ) ?? 0
+            if currentPts >= pts {
+                try db.execute(
+                    sql: """
+                    DELETE FROM pending_dialog_preference_mutations
+                    WHERE account_id = ? AND client_mutation_id = ? AND terminal = 0
+                    """,
+                    arguments: [accountId, clientMutationId]
+                )
+            } else {
+                try db.execute(
+                    sql: """
+                    UPDATE pending_dialog_preference_mutations
+                    SET acknowledged_pts = ?, next_retry_at = NULL, last_error = NULL
+                    WHERE account_id = ? AND client_mutation_id = ? AND terminal = 0
+                    """,
+                    arguments: [pts, accountId, clientMutationId]
+                )
+            }
         }
     }
 
@@ -1341,7 +1356,8 @@ actor CloudLocalStore {
         dialogId: String,
         operation: String,
         payloadJSON: String,
-        clientMutationId: String
+        clientMutationId: String,
+        accountId: String? = nil
     ) throws {
         try dbQueue.write { db in
             try db.execute(
@@ -1353,6 +1369,117 @@ actor CloudLocalStore {
                 """,
                 arguments: [clientMutationId, dialogId, operation, payloadJSON]
             )
+            if operation == "notifications" {
+                let muted = try Bool.fetchOne(
+                    db,
+                    sql: "SELECT json_extract(?, '$.mode') = 'muted'",
+                    arguments: [payloadJSON]
+                ) ?? false
+                try db.execute(
+                    sql: """
+                    UPDATE dialogs
+                    SET notification_mode = ?
+                    WHERE dialog_id = ?
+                    """,
+                    arguments: [muted ? "muted" : "all", dialogId]
+                )
+                if let accountId {
+                    try db.execute(
+                        sql: """
+                        UPDATE dialog_preferences
+                        SET is_muted = ?, server_updated_at = datetime('now')
+                        WHERE dialog_id = ? AND account_id = ?
+                        """,
+                        arguments: [muted, dialogId, accountId]
+                    )
+                } else {
+                    try db.execute(
+                        sql: """
+                        UPDATE dialog_preferences
+                        SET is_muted = ?, server_updated_at = datetime('now')
+                        WHERE dialog_id = ?
+                          AND account_id = (
+                            SELECT account_id FROM sync_state
+                            ORDER BY updated_at DESC LIMIT 1
+                          )
+                        """,
+                        arguments: [muted, dialogId]
+                    )
+                }
+            }
+        }
+    }
+
+    func movePendingGroupMutesToLegacy(accountId: String) throws -> Int {
+        try dbQueue.write { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT pending.dialog_id, pending.desired_value,
+                       pending.desired_at, pending.client_mutation_id,
+                       pending.retry_count, pending.next_retry_at,
+                       pending.last_error, pending.terminal
+                FROM pending_dialog_preference_mutations pending
+                JOIN dialogs dialog ON dialog.dialog_id = pending.dialog_id
+                WHERE pending.account_id = ?
+                  AND pending.field = 'muted'
+                  AND pending.terminal = 0
+                  AND pending.acknowledged_pts IS NULL
+                  AND dialog.type = 'group'
+                ORDER BY pending.desired_at, pending.dialog_id
+                """,
+                arguments: [accountId]
+            )
+            for row in rows {
+                let desired = (row["desired_value"] as Int) != 0
+                let payload = desired ? #"{"mode":"muted"}"# : #"{"mode":"all"}"#
+                try db.execute(
+                    sql: """
+                    INSERT INTO pending_group_mutations (
+                      client_mutation_id, dialog_id, operation, payload_json, created_at,
+                      retry_count, next_retry_at, last_error, terminal
+                    ) VALUES (?, ?, 'notifications', ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(client_mutation_id) DO UPDATE SET
+                      payload_json = excluded.payload_json,
+                      retry_count = excluded.retry_count,
+                      next_retry_at = excluded.next_retry_at,
+                      last_error = excluded.last_error,
+                      terminal = excluded.terminal
+                    """,
+                    arguments: [
+                        row["client_mutation_id"], row["dialog_id"], payload,
+                        row["desired_at"], row["retry_count"], nil,
+                        nil, row["terminal"],
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                    UPDATE dialog_preferences
+                    SET is_muted = ?, server_updated_at = datetime('now')
+                    WHERE account_id = ? AND dialog_id = ?
+                    """,
+                    arguments: [desired, accountId, row["dialog_id"]]
+                )
+                try db.execute(
+                    sql: "UPDATE dialogs SET notification_mode = ? WHERE dialog_id = ?",
+                    arguments: [desired ? "muted" : "all", row["dialog_id"]]
+                )
+            }
+            if !rows.isEmpty {
+                try db.execute(
+                    sql: """
+                    DELETE FROM pending_dialog_preference_mutations
+                    WHERE account_id = ? AND field = 'muted'
+                      AND client_mutation_id IN (
+                        SELECT group_mutation.client_mutation_id
+                        FROM pending_group_mutations group_mutation
+                        WHERE group_mutation.operation = 'notifications'
+                      )
+                    """,
+                    arguments: [accountId]
+                )
+            }
+            return rows.count
         }
     }
 
@@ -3121,7 +3248,16 @@ actor CloudLocalStore {
                   + (SELECT COUNT(*) FROM pending_group_mutations)
                 """
             ) ?? 0
+            let pendingDialogPreferences = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*)
+                FROM pending_dialog_preference_mutations
+                WHERE terminal = 0 AND acknowledged_pts IS NULL
+                """
+            ) ?? 0
             return pendingText + pendingMutations + pendingMedia + pendingGroups
+                + pendingDialogPreferences
         }
     }
 
@@ -5338,6 +5474,17 @@ actor CloudLocalStore {
                 group.id, group.title, group.revision, photoJSON, group.memberCount,
                 group.selfRole, group.notificationMode,
             ]
+        )
+        try db.execute(
+            sql: """
+            UPDATE dialog_preferences
+            SET is_muted = ?, server_updated_at = datetime('now')
+            WHERE dialog_id = ?
+              AND account_id = (
+                SELECT account_id FROM sync_state ORDER BY updated_at DESC LIMIT 1
+              )
+            """,
+            arguments: [group.notificationMode == "muted", group.id]
         )
         try ensureDialogSummary(db, dialogId: group.id)
     }

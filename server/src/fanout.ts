@@ -12,6 +12,7 @@ type FanoutOptions = {
   alertRecipients?: boolean;
   recipientAccountIds?: string[];
   unarchiveOnIncomingMessage?: boolean;
+  useDialogPreferences?: boolean;
 };
 
 const n = (value: unknown) => Number(value as any);
@@ -21,7 +22,8 @@ const n = (value: unknown) => Number(value as any);
  * account_sync_states are acquired in account UUID order before the set-based update.
  */
 export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promise<FanoutPush[]> {
-  const unarchived = options.unarchiveOnIncomingMessage
+  const useDialogPreferences = options.useDialogPreferences !== false;
+  const unarchived = options.unarchiveOnIncomingMessage && useDialogPreferences
     ? await sql`
         UPDATE dialog_preferences
         SET is_archived = FALSE, updated_at = statement_timestamp()
@@ -29,13 +31,23 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
           AND account_id <> ${options.actorAccountId}
           AND is_archived = TRUE
           AND is_muted = FALSE
+          AND EXISTS (
+            SELECT 1
+            FROM dialog_members active_member
+            WHERE active_member.dialog_id = dialog_preferences.dialog_id
+              AND active_member.account_id = dialog_preferences.account_id
+              AND active_member.left_at IS NULL
+          )
         RETURNING account_id`
     : [];
   const unarchivedAccountIds = unarchived.map((row: any) => String(row.account_id));
   const selected = options.recipientAccountIds
     ? await sql`
         SELECT dm.account_id,
-               COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted') AS alert
+               CASE WHEN ${useDialogPreferences}
+                 THEN COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted')
+                 ELSE dm.notification_mode <> 'muted'
+               END AS alert
         FROM dialog_members dm
         LEFT JOIN dialog_preferences preference
           ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
@@ -45,7 +57,10 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
         ORDER BY dm.account_id`
     : await sql`
         SELECT dm.account_id,
-               COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted') AS alert
+               CASE WHEN ${useDialogPreferences}
+                 THEN COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted')
+                 ELSE dm.notification_mode <> 'muted'
+               END AS alert
         FROM dialog_members dm
         LEFT JOIN dialog_preferences preference
           ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id

@@ -250,11 +250,14 @@ struct GroupProfileView: View {
                     isOn: Binding(
                         get: { dialog?.isMuted == true },
                         set: { muted in
-                            Task { _ = await model.setGroupMuted(dialogId: dialogId, muted: muted) }
+                            model.setGroupMuted(dialogId: dialogId, muted: muted)
                         }
                     )
                 )
-                .disabled(!model.capabilities.contains(.chatOrganization))
+                .disabled(
+                    !model.capabilities.contains(.chatOrganization)
+                        && !model.capabilities.contains(.groups)
+                )
                 if dialog?.selfRole == "owner" || dialog?.selfRole == "admin" {
                     PhotosPicker(selection: $photoItem, matching: .images) {
                         Label("Change group photo", systemImage: "photo")
