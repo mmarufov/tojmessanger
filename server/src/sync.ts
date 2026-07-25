@@ -1,23 +1,33 @@
 import type { SQL } from "bun";
 import { Client } from "pg";
 import { seal, open, bodyAAD } from "./crypto";
-import { enqueuePushDeliveries } from "./push";
-import { mediaDTOFromRow, type MediaDTO } from "./media";
+import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
 import { lockAccountMutations } from "./locks";
+import { fanoutDialogEvent } from "./fanout";
+import {
+  DialogAccessError,
+  lockDialogForMutation,
+  requireDialogReadAccess,
+} from "./dialog-access";
 
 export class SyncError extends Error {}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
-//   1 send_requests/message_mutation_requests row → 2 accounts (ascending, FOR SHARE) → 3 acting device
-//   → 4 direct_dialog_pairs → 5 dialogs row → 6 dialog_members → 7 messages
-//   → 8 account_sync_states (ascending account_id) → 9 account_events insert → 10 push_deliveries insert
+//   1 idempotency row (send_requests / message_mutation_requests / group_*_requests)
+//   → 2 accounts (ascending account_id, FOR SHARE) → 3 acting device
+//   → 4 media_objects (FOR UPDATE) → 5 direct_dialog_pairs → 6 dialogs (FOR UPDATE)
+//   → 7 dialog_members (ascending account_id, FOR UPDATE) → 8 messages
+//   → 9 account_sync_states (ascending account_id, FOR NO KEY UPDATE)
+//   → 10 account_events insert → 11 push_deliveries insert
 
 export type MessageDTO = {
   dialog_id: string; msg_id: number; sender_account_id: string; client_msg_id: string;
   kind: string; text: string; reply_to_msg_id: number | null; edit_version: number;
   forwarded: boolean; reactions: { account_id: string; emoji: string }[];
+  mentions: { account_id: string; offset: number; length: number }[];
   media: MediaDTO | null;
+  service_type: string | null; service_data: Record<string, unknown> | null;
   state: string; server_ts: string;
 };
 export type Push = { accountId: string; pts: number; ptsCount: number };
@@ -61,13 +71,6 @@ function decodeCursor<T>(cursor?: string): T | null {
   }
 }
 
-async function requireActiveMember(sql: SQL, accountId: string, dialogId: string): Promise<void> {
-  const rows = await sql`
-    SELECT 1 FROM dialog_members
-    WHERE dialog_id = ${dialogId} AND account_id = ${accountId} AND left_at IS NULL`;
-  if (rows.length === 0) throw new SyncError("not a member of this dialog");
-}
-
 async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> {
   const rows = await sql`
     SELECT id FROM accounts
@@ -99,7 +102,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
     SELECT m.dialog_id, m.msg_id, m.sender_account_id, m.client_msg_id, m.kind,
            m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
            m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
-           m.media_id, m.edit_version, m.state, m.server_ts,
+           m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
            media.id AS media_object_id, media.kind AS media_object_kind,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
            media.file_name_key_id AS media_file_name_key_id,
@@ -112,23 +115,47 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
     JOIN messages m ON m.dialog_id = key.dialog_id AND m.msg_id = key.msg_id
     LEFT JOIN media_objects media ON media.id = m.media_id AND media.status = 'ready'`;
 
-  const reactionRows = await sql`
+  const metadataRows = await sql`
     WITH wanted AS (
       SELECT * FROM unnest(${dialogIds}::uuid[], ${messageIds}::bigint[])
         AS key(dialog_id, msg_id)
     )
-    SELECT reaction.dialog_id, reaction.msg_id, reaction.account_id, reaction.emoji
-    FROM wanted key
-    JOIN message_reactions reaction
-      ON reaction.dialog_id = key.dialog_id AND reaction.msg_id = key.msg_id
-    ORDER BY reaction.dialog_id, reaction.msg_id, reaction.created_at, reaction.account_id`;
+    SELECT key.dialog_id, key.msg_id,
+           COALESCE((
+             SELECT jsonb_agg(
+               jsonb_build_object('account_id', reaction.account_id, 'emoji', reaction.emoji)
+               ORDER BY reaction.created_at, reaction.account_id
+             )
+             FROM message_reactions reaction
+             WHERE reaction.dialog_id = key.dialog_id AND reaction.msg_id = key.msg_id
+           ), '[]'::jsonb) AS reactions,
+           COALESCE((
+             SELECT jsonb_agg(
+               jsonb_build_object(
+                 'account_id', mention.account_id,
+                 'offset', mention.entity_offset,
+                 'length', mention.length
+               )
+               ORDER BY mention.entity_offset, mention.account_id
+             )
+             FROM message_mentions mention
+             WHERE mention.dialog_id = key.dialog_id AND mention.msg_id = key.msg_id
+           ), '[]'::jsonb) AS mentions
+    FROM wanted key`;
 
   const reactions = new Map<string, { account_id: string; emoji: string }[]>();
-  for (const reaction of reactionRows) {
-    const key = `${reaction.dialog_id}:${n(reaction.msg_id)}`;
-    const values = reactions.get(key) ?? [];
-    values.push({ account_id: reaction.account_id, emoji: reaction.emoji });
-    reactions.set(key, values);
+  const mentions = new Map<string, { account_id: string; offset: number; length: number }[]>();
+  for (const metadata of metadataRows) {
+    const key = `${metadata.dialog_id}:${n(metadata.msg_id)}`;
+    reactions.set(key, (metadata.reactions ?? []).map((reaction: any) => ({
+      account_id: reaction.account_id,
+      emoji: reaction.emoji,
+    })));
+    mentions.set(key, (metadata.mentions ?? []).map((mention: any) => ({
+      account_id: mention.account_id,
+      offset: n(mention.offset),
+      length: n(mention.length),
+    })));
   }
 
   const result = new Map<string, MessageDTO>();
@@ -164,7 +191,10 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       // Source identifiers stay server-side. Recipients only need the marker.
       forwarded: row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null,
       reactions: reactions.get(key) ?? [],
+      mentions: mentions.get(key) ?? [],
       media: row.state === "deleted_for_all" ? null : media,
+      service_type: row.service_type ?? null,
+      service_data: row.service_data == null ? null : eventData(row.service_data),
       state: row.state, server_ts: iso(row.server_ts),
     });
   }
@@ -228,12 +258,41 @@ export type SendResult = {
   duplicate: boolean; serverTs?: string; text?: string; senderAccountId?: string; pushes: Push[];
 };
 
+type MessageMention = { accountId: string; offset: number; length: number };
+
+function normalizeMentions(value: unknown, body: string): MessageMention[] {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new SyncError("mentions must be an array");
+  if (value.length > 100) throw new SyncError("too many mentions");
+  const seen = new Set<string>();
+  const mentions = value.map((raw: any) => {
+    const accountId = String(raw?.accountId ?? raw?.account_id ?? "").toLowerCase();
+    const offset = Number(raw?.offset);
+    const length = Number(raw?.length);
+    if (
+      !UUID_PATTERN.test(accountId)
+      || !Number.isSafeInteger(offset) || offset < 0
+      || !Number.isSafeInteger(length) || length <= 0
+      || offset + length > body.length
+    ) {
+      throw new SyncError("invalid mention");
+    }
+    if (seen.has(accountId)) throw new SyncError("duplicate mention target");
+    seen.add(accountId);
+    return { accountId, offset, length };
+  });
+  return mentions.sort((left, right) =>
+    left.offset - right.offset || left.accountId.localeCompare(right.accountId)
+  );
+}
+
 /** review B2: claim the idempotency row BEFORE allocating a msg_id; a retry echoes the original result. */
 export async function sendMessage(sql: SQL, p: {
   senderAccountId: string; senderDeviceId?: string | null; dialogId: string;
   clientMsgId: string; kind?: string; body?: string; replyToMsgId?: number | null;
   mediaId?: string | null;
   forwardedFrom?: { dialogId: string; msgId: number } | null;
+  mentions?: unknown;
   /** Server-only escape hatch for generated lifecycle rows such as call history. */
   internalService?: boolean;
 }): Promise<SendResult> {
@@ -244,6 +303,7 @@ export async function sendMessage(sql: SQL, p: {
     let forwardedFromAccountId: string | null = null;
     let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
+    let mentions = normalizeMentions(p.mentions, body);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
       INSERT INTO send_requests (sender_account_id, client_msg_id, dialog_id, status)
@@ -288,20 +348,10 @@ export async function sendMessage(sql: SQL, p: {
     if (directPair) {
       await lockAccountMutations(tx, [directPair.account_low, directPair.account_high]);
     }
-    await requireActiveMember(tx, p.senderAccountId, p.dialogId);
-    const blocked = await tx`
-      SELECT 1
-      FROM direct_dialog_pairs pair
-      JOIN account_blocks b ON
-        (b.blocker_account_id = pair.account_low AND b.blocked_account_id = pair.account_high)
-        OR (b.blocker_account_id = pair.account_high AND b.blocked_account_id = pair.account_low)
-      WHERE pair.dialog_id = ${p.dialogId}
-      LIMIT 1`;
-    if (blocked.length && p.internalService !== true) throw new SyncError("conversation is blocked");
-
     if (p.forwardedFrom) {
+      if (mentions.length) throw new SyncError("forwarded messages cannot add mentions");
       const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
-      await requireActiveMember(tx, p.senderAccountId, p.forwardedFrom.dialogId);
+      await requireDialogReadAccess(tx, p.senderAccountId, p.forwardedFrom.dialogId);
       const source = (await tx`
         SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext, media_id
         FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}
@@ -318,15 +368,27 @@ export async function sendMessage(sql: SQL, p: {
 
     if (mediaId && !p.forwardedFrom) {
       const media = (await tx`
-        SELECT owner_account_id, kind, status FROM media_objects
+        SELECT owner_account_id, kind, status, purpose FROM media_objects
         WHERE id = ${mediaId} FOR UPDATE`)[0];
       if (!media || media.owner_account_id !== p.senderAccountId) throw new SyncError("media upload not found");
       if (media.status !== "ready") throw new SyncError("media upload is incomplete");
+      if (media.purpose !== "message") throw new SyncError("media purpose does not allow messages");
       kind = media.kind;
     } else if (!mediaId && !p.forwardedFrom && kind !== "text"
       && !(kind === "service" && p.internalService === true)) {
       throw new SyncError("media upload required");
     }
+
+    await lockDialogForMutation(tx, p.senderAccountId, p.dialogId);
+    const blocked = await tx`
+      SELECT 1
+      FROM direct_dialog_pairs pair
+      JOIN account_blocks b ON
+        (b.blocker_account_id = pair.account_low AND b.blocked_account_id = pair.account_high)
+        OR (b.blocker_account_id = pair.account_high AND b.blocked_account_id = pair.account_low)
+      WHERE pair.dialog_id = ${p.dialogId}
+      LIMIT 1`;
+    if (blocked.length && p.internalService !== true) throw new SyncError("conversation is blocked");
 
     if (replyToMsgId != null) {
       const target = await tx`
@@ -334,6 +396,19 @@ export async function sendMessage(sql: SQL, p: {
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${replyToMsgId}`;
       if (target.length === 0) throw new SyncError("reply target not found");
       if (target[0].state !== "visible") throw new SyncError("cannot reply to a deleted message");
+    }
+    if (mentions.length) {
+      const activeTargets = await tx`
+        SELECT account_id
+        FROM dialog_members
+        WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
+          AND account_id = ANY(${tx.array(mentions.map((mention) => mention.accountId), "uuid")}::uuid[])
+        ORDER BY account_id`;
+      const activeIds = new Set(activeTargets.map((row: any) => String(row.account_id)));
+      const unavailable = mentions
+        .map((mention) => mention.accountId)
+        .filter((accountId) => !activeIds.has(accountId));
+      if (unavailable.length) throw new SyncError("mention target is not an active member");
     }
 
     // 3) allocate per-dialog msg_id
@@ -352,24 +427,26 @@ export async function sendMessage(sql: SQL, p: {
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
               ${mediaId})
       RETURNING server_ts`;
+    if (mentions.length) {
+      await tx`
+        INSERT INTO message_mentions (dialog_id, msg_id, account_id, entity_offset, length)
+        SELECT ${p.dialogId}, ${msgId}, account_id, entity_offset, entity_length
+        FROM unnest(
+          ${tx.array(mentions.map((mention) => mention.accountId), "uuid")}::uuid[],
+          ${tx.array(mentions.map((mention) => mention.offset), "int4")}::int[],
+          ${tx.array(mentions.map((mention) => mention.length), "int4")}::int[]
+        ) AS mention(account_id, entity_offset, entity_length)`;
+    }
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
-    const members = await tx`SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL ORDER BY account_id`;
-    let senderPts = 0;
-    const pushes: Push[] = [];
-    for (const m of members) {
-      const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${m.account_id} RETURNING pts`;
-      const pts = n(upd[0].pts);
-      await tx`INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id) VALUES (${m.account_id}, ${pts}, 'message.new', ${p.dialogId}, ${msgId}, ${p.senderAccountId})`;
-      await enqueuePushDeliveries(tx, {
-        accountId: m.account_id,
-        pts,
-        senderAccountId: p.senderAccountId,
-        sourceDeviceId: p.senderDeviceId,
-      });
-      if (m.account_id === p.senderAccountId) senderPts = pts;
-      pushes.push({ accountId: m.account_id, pts, ptsCount: 1 });
-    }
+    const pushes = await fanoutDialogEvent(tx, {
+      dialogId: p.dialogId,
+      type: "message.new",
+      msgId,
+      actorAccountId: p.senderAccountId,
+      sourceDeviceId: p.senderDeviceId,
+    });
+    const senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
 
     // complete the idempotency row so retries return this exact result
     await tx`UPDATE send_requests SET status = 'completed', msg_id = ${msgId}, sender_pts = ${senderPts} WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}`;
@@ -487,7 +564,7 @@ async function mutateMessage(sql: SQL, p: {
 
     await requireActiveAccount(tx, p.actorAccountId);
     await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
-    await requireActiveMember(tx, p.actorAccountId, p.dialogId);
+    await lockDialogForMutation(tx, p.actorAccountId, p.dialogId);
     const members = await tx`
       SELECT account_id FROM dialog_members
       WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
@@ -532,24 +609,17 @@ async function mutateMessage(sql: SQL, p: {
       }
     }
 
-    let actorPts = 0;
-    const pushes: Push[] = [];
     const eventType = p.operation === "edit" ? "message.edited" : "message.deleted";
-    for (const member of members) {
-      const upd = await tx`
-        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
-        WHERE account_id = ${member.account_id} RETURNING pts`;
-      const pts = n(upd[0].pts);
-      await tx`
-        INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id)
-        VALUES (${member.account_id}, ${pts}, ${eventType}, ${p.dialogId}, ${msgId}, ${p.actorAccountId})`;
-      await enqueuePushDeliveries(tx, {
-        accountId: member.account_id, pts, senderAccountId: p.actorAccountId,
-        sourceDeviceId: p.actorDeviceId, alertRecipients: false,
-      });
-      if (member.account_id === p.actorAccountId) actorPts = pts;
-      pushes.push({ accountId: member.account_id, pts, ptsCount: 1 });
-    }
+    const pushes = await fanoutDialogEvent(tx, {
+      dialogId: p.dialogId,
+      type: eventType,
+      msgId,
+      actorAccountId: p.actorAccountId,
+      sourceDeviceId: p.actorDeviceId,
+      alertRecipients: false,
+      recipientAccountIds: members.map((member: any) => member.account_id),
+    });
+    const actorPts = pushes.find((push) => push.accountId === p.actorAccountId)?.pts ?? 0;
     await tx`
       UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}`;
@@ -604,7 +674,7 @@ export async function setReaction(sql: SQL, p: {
 
     await requireActiveAccount(tx, p.actorAccountId);
     await requireActiveDevice(tx, p.actorAccountId, p.actorDeviceId);
-    await requireActiveMember(tx, p.actorAccountId, p.dialogId);
+    await lockDialogForMutation(tx, p.actorAccountId, p.dialogId);
     const members = await tx`
       SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
       ORDER BY account_id FOR UPDATE`;
@@ -620,24 +690,17 @@ export async function setReaction(sql: SQL, p: {
         ON CONFLICT (dialog_id, msg_id, account_id) DO UPDATE SET emoji = excluded.emoji, created_at = now()`;
     }
 
-    let actorPts = 0;
-    const pushes: Push[] = [];
-    for (const member of members) {
-      const upd = await tx`
-        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
-        WHERE account_id = ${member.account_id} RETURNING pts`;
-      const pts = n(upd[0].pts);
-      await tx`
-        INSERT INTO account_events (account_id, pts, type, dialog_id, msg_id, actor_account_id, data)
-        VALUES (${member.account_id}, ${pts}, 'reaction.updated', ${p.dialogId}, ${msgId}, ${p.actorAccountId},
-                ${JSON.stringify({ reactor_account_id: p.actorAccountId, emoji })}::jsonb)`;
-      await enqueuePushDeliveries(tx, {
-        accountId: member.account_id, pts, senderAccountId: p.actorAccountId,
-        sourceDeviceId: p.actorDeviceId, alertRecipients: false,
-      });
-      if (member.account_id === p.actorAccountId) actorPts = pts;
-      pushes.push({ accountId: member.account_id, pts, ptsCount: 1 });
-    }
+    const pushes = await fanoutDialogEvent(tx, {
+      dialogId: p.dialogId,
+      type: "reaction.updated",
+      msgId,
+      actorAccountId: p.actorAccountId,
+      sourceDeviceId: p.actorDeviceId,
+      alertRecipients: false,
+      recipientAccountIds: members.map((member: any) => member.account_id),
+      data: { reactor_account_id: p.actorAccountId, emoji },
+    });
+    const actorPts = pushes.find((push) => push.accountId === p.actorAccountId)?.pts ?? 0;
     await tx`
       UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}`;
@@ -655,7 +718,64 @@ export async function getState(sql: SQL, accountId: string): Promise<{ pts: numb
 
 export type Difference =
   | { kind: "difference_too_long"; state: { pts: number } }
-  | { kind: "difference" | "difference_slice"; state: { pts: number }; updates: any[]; hasMore: boolean };
+  | {
+      kind: "difference" | "difference_slice";
+      state: { pts: number };
+      updates: any[];
+      profiles: ProfileDTO[];
+      hasMore: boolean;
+    };
+
+export type ProfileDTO = {
+  accountId: string;
+  firstName: string;
+  lastName: string;
+  displayName: string;
+  bio: string;
+  birthday: string | null;
+  colorIndex: number;
+  updatedAt: string;
+};
+
+function collectAccountIds(value: unknown, into: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectAccountIds(item, into);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if ((key.endsWith("account_id") || key.endsWith("AccountId"))
+      && typeof child === "string" && ACCOUNT_UUID_PATTERN.test(child)) {
+      into.add(child);
+    } else {
+      collectAccountIds(child, into);
+    }
+  }
+}
+
+export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Promise<ProfileDTO[]> {
+  const ids = [...new Set(accountIds)].filter((id) => ACCOUNT_UUID_PATTERN.test(id)).sort();
+  if (ids.length === 0) return [];
+  const rows = await sql`
+    SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+    FROM accounts
+    WHERE id = ANY(${sql.array(ids, "uuid")}::uuid[])
+    ORDER BY id`;
+  return rows.map((profile: any) => ({
+    accountId: profile.id,
+    firstName: profile.first_name,
+    lastName: profile.last_name,
+    displayName: profile.display_name,
+    bio: profile.bio,
+    birthday: profile.birthday == null ? null : (
+      profile.birthday instanceof Date
+        ? profile.birthday.toISOString().slice(0, 10)
+        : String(profile.birthday).slice(0, 10)
+    ),
+    colorIndex: n(profile.profile_color),
+    updatedAt: iso(profile.updated_at),
+  }));
+}
 
 /** review B3 (pruned floor → too_long) + I3 (byte + count budget, slicing). */
 export async function getDifference(
@@ -670,24 +790,85 @@ export async function getDifference(
   if (sincePts < n(st.pruned_through_pts)) return { kind: "difference_too_long", state: { pts: statePts } };
 
   const rows = await sql`
+    WITH page AS MATERIALIZED (
+      SELECT *
+      FROM account_events
+      WHERE account_id = ${accountId} AND pts > ${sincePts}
+      ORDER BY pts ASC
+      LIMIT ${maxEvents}
+    ), referenced_accounts AS (
+      SELECT actor_account_id AS account_id FROM page WHERE actor_account_id IS NOT NULL
+      UNION
+      SELECT peer_account.id
+      FROM page
+      JOIN dialogs peer_dialog ON peer_dialog.id = page.dialog_id
+      JOIN direct_dialog_pairs peer_pair ON peer_pair.dialog_id = peer_dialog.id
+      JOIN accounts peer_account ON peer_account.id = CASE
+        WHEN peer_pair.account_low = ${accountId} THEN peer_pair.account_high
+        ELSE peer_pair.account_low
+      END
+      UNION
+      SELECT message.sender_account_id
+      FROM page JOIN messages message
+        ON message.dialog_id = page.dialog_id AND message.msg_id = page.msg_id
+      UNION
+      SELECT message.forwarded_from_account_id
+      FROM page JOIN messages message
+        ON message.dialog_id = page.dialog_id AND message.msg_id = page.msg_id
+      WHERE message.forwarded_from_account_id IS NOT NULL
+      UNION
+      SELECT (page.data->>'subject_account_id')::uuid
+      FROM page
+      WHERE page.data ? 'subject_account_id'
+      UNION
+      SELECT member_id::uuid
+      FROM page
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+        COALESCE(page.data->'member_account_ids', '[]'::jsonb)
+      ) AS member(member_id)
+    ), profile_payload AS (
+      SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'accountId', profile.id,
+        'firstName', profile.first_name,
+        'lastName', profile.last_name,
+        'displayName', profile.display_name,
+        'bio', profile.bio,
+        'birthday', profile.birthday,
+        'colorIndex', profile.profile_color,
+        'updatedAt', profile.updated_at
+      ) ORDER BY profile.id), '[]'::jsonb) AS profiles
+      FROM accounts profile
+      WHERE profile.id IN (SELECT account_id FROM referenced_accounts)
+    )
     SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
+           d.type AS dialog_type, d.revision AS group_revision,
+           self.role AS self_role, self.left_at AS self_left_at, d.closed_at,
            peer.id AS peer_account_id,
-           CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title
-    FROM account_events ae
+           CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title,
+           profile_payload.profiles
+    FROM page ae
+    CROSS JOIN profile_payload
     LEFT JOIN dialogs d ON d.id = ae.dialog_id
     LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
+    LEFT JOIN dialog_members self
+      ON self.dialog_id = d.id AND self.account_id = ${accountId}
     LEFT JOIN accounts peer ON peer.id = CASE
       WHEN pair.account_low = ${accountId} THEN pair.account_high
       WHEN pair.account_high = ${accountId} THEN pair.account_low
       ELSE NULL
     END
-    WHERE ae.account_id = ${accountId} AND ae.pts > ${sincePts}
-    ORDER BY ae.pts ASC LIMIT ${maxEvents}`;
+    ORDER BY ae.pts ASC`;
 
+  const revokedDialogs = new Set(rows
+    .filter((event: any) =>
+      event.dialog_type === "group"
+      && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
+    )
+    .map((event: any) => String(event.dialog_id)));
   const messageKeys: MessageKey[] = rows.flatMap((event) =>
     event.msg_id != null && [
       "message.new", "message.edited", "message.deleted", "reaction.updated",
-    ].includes(event.type)
+    ].includes(event.type) && !revokedDialogs.has(event.dialog_id)
       ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
       : []
   );
@@ -698,17 +879,27 @@ export async function getDifference(
   for (const ev of rows) {
     const pts = n(ev.pts);
     let update: any;
-    if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
+    if (revokedDialogs.has(ev.dialog_id)) {
+      update = {
+        pts,
+        ptsCount: 1,
+        type: "dialog.access_revoked",
+        dialog_id: ev.dialog_id,
+        dialog_type: "group",
+      };
+    } else if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
       const message = messages.get(`${ev.dialog_id}:${n(ev.msg_id)}`) ?? null;
       if (!message) {
         update = {
           pts, ptsCount: 1, type: "message.missing", dialog_id: ev.dialog_id,
+          dialog_type: ev.dialog_type,
           dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
           msg_id: n(ev.msg_id),
         };
       } else {
         update = {
           pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
+          dialog_type: ev.dialog_type,
           dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
           message,
         };
@@ -716,6 +907,7 @@ export async function getDifference(
     } else {
       update = {
         pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
+        dialog_type: ev.dialog_type,
         dialog_title: ev.dialog_title ?? undefined,
         peer_account_id: ev.peer_account_id ?? undefined,
         msg_id: ev.msg_id ? n(ev.msg_id) : undefined,
@@ -729,7 +921,16 @@ export async function getDifference(
     lastPts = pts;
   }
   const hasMore = truncated || (rows.length === maxEvents && lastPts < statePts);
-  return { kind: hasMore ? "difference_slice" : "difference", state: { pts: hasMore ? lastPts : statePts }, updates, hasMore };
+  const profiles: ProfileDTO[] = rows.length
+    ? (typeof rows[0].profiles === "string" ? JSON.parse(rows[0].profiles) : rows[0].profiles)
+    : [];
+  return {
+    kind: hasMore ? "difference_slice" : "difference",
+    state: { pts: hasMore ? lastPts : statePts },
+    updates,
+    profiles,
+    hasMore,
+  };
 }
 
 export type BootstrapStart = { token: string; state: { pts: number }; expiresAt: string; dialogCount: number };
@@ -765,8 +966,12 @@ export async function startBootstrap(sql: SQL, accountId: string): Promise<Boots
 
 export type BootstrapDialog = {
   dialog_id: string; type: string; title: string | null; last_msg_id: number;
-  updated_at: string; unread_count: number;
-  members: { account_id: string; role: string; last_read_msg_id: number }[];
+  updated_at: string; unread_count: number; revision: number; member_count: number;
+  self_role: string; notification_mode: string; photo: MediaDTO | null;
+  members: {
+    account_id: string; role: string; last_read_msg_id: number;
+    joined_at: string; is_active: boolean;
+  }[];
   profiles: { accountId: string; firstName: string; lastName: string; displayName: string; bio: string;
     birthday: string | null; colorIndex: number; updatedAt: string }[];
   messages: MessageDTO[];
@@ -798,9 +1003,14 @@ export async function getBootstrapDialogsPage(
     ? await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
                CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
-               d.updated_at
+               d.updated_at, d.revision, d.photo_media_id,
+               self.role AS self_role, self.notification_mode,
+               (SELECT count(*)::int FROM dialog_members active
+                WHERE active.dialog_id = d.id AND active.left_at IS NULL) AS member_count
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
+        JOIN dialog_members self
+          ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high
@@ -814,9 +1024,14 @@ export async function getBootstrapDialogsPage(
     : await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
                CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
-               d.updated_at
+               d.updated_at, d.revision, d.photo_media_id,
+               self.role AS self_role, self.notification_mode,
+               (SELECT count(*)::int FROM dialog_members active
+                WHERE active.dialog_id = d.id AND active.left_at IS NULL) AS member_count
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
+        JOIN dialog_members self
+          ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high
@@ -831,16 +1046,29 @@ export async function getBootstrapDialogsPage(
   const dialogs: BootstrapDialog[] = [];
   for (const row of pageRows) {
     const members = await sql`
-      SELECT account_id, role, last_read_msg_id
+      SELECT account_id, role, last_read_msg_id, joined_at
       FROM dialog_members
-      WHERE dialog_id = ${row.dialog_id}
+      WHERE dialog_id = ${row.dialog_id} AND left_at IS NULL
       ORDER BY account_id`;
     const profiles = await sql`
       SELECT a.id, a.first_name, a.last_name, a.display_name, a.bio, a.birthday,
              a.profile_color, a.updated_at
       FROM accounts a
-      JOIN dialog_members dm ON dm.account_id = a.id
-      WHERE dm.dialog_id = ${row.dialog_id} AND dm.left_at IS NULL
+      WHERE a.id IN (
+        SELECT dm.account_id FROM dialog_members dm
+        WHERE dm.dialog_id = ${row.dialog_id} AND dm.left_at IS NULL
+        UNION
+        SELECT message.sender_account_id FROM messages message
+        WHERE message.dialog_id = ${row.dialog_id}
+        UNION
+        SELECT message.forwarded_from_account_id FROM messages message
+        WHERE message.dialog_id = ${row.dialog_id}
+          AND message.forwarded_from_account_id IS NOT NULL
+        UNION
+        SELECT (message.service_data->>'subject_account_id')::uuid FROM messages message
+        WHERE message.dialog_id = ${row.dialog_id}
+          AND message.service_data ? 'subject_account_id'
+      )
       ORDER BY a.id`;
     // The five-message preview is intentionally sparse. Carry the authoritative unread count
     // separately so a new device can prioritize unread dialogs without first downloading history.
@@ -868,7 +1096,18 @@ export async function getBootstrapDialogsPage(
       dialog_id: row.dialog_id, type: row.type, title: row.title, last_msg_id: n(row.ceiling_msg_id),
       updated_at: iso(row.updated_at),
       unread_count: n(unread?.count),
-      members: members.map((m) => ({ account_id: m.account_id, role: m.role, last_read_msg_id: n(m.last_read_msg_id) })),
+      revision: n(row.revision),
+      member_count: n(row.member_count),
+      self_role: row.self_role,
+      notification_mode: row.notification_mode,
+      photo: await loadMediaDTO(sql, row.photo_media_id),
+      members: members.map((m) => ({
+        account_id: m.account_id,
+        role: m.role,
+        last_read_msg_id: n(m.last_read_msg_id),
+        joined_at: iso(m.joined_at),
+        is_active: true,
+      })),
       profiles: profiles.map((p) => ({
         accountId: p.id, firstName: p.first_name, lastName: p.last_name,
         displayName: p.display_name, bio: p.bio,
@@ -891,6 +1130,7 @@ export async function getBootstrapDialogsPage(
 export type HistoryPage = {
   dialogId: string;
   messages: MessageDTO[];
+  profiles: ProfileDTO[];
   nextBeforeMsgId?: number;
   nextAfterMsgId?: number;
   hasMore: boolean;
@@ -902,7 +1142,7 @@ export async function getHistory(
   dialogId: string,
   opts: { beforeMsgId?: number; afterMsgId?: number; limit?: number; maxBytes?: number } = {},
 ): Promise<HistoryPage> {
-  await requireActiveMember(sql, accountId, dialogId);
+  await requireDialogReadAccess(sql, accountId, dialogId);
   if (opts.beforeMsgId !== undefined && opts.afterMsgId !== undefined) {
     throw new SyncError("history cursors are mutually exclusive");
   }
@@ -929,8 +1169,12 @@ export async function getHistory(
   const messages: MessageDTO[] = [];
   let bytes = 0;
   let hasMore = rows.length > limit;
+  const loaded = await loadMessages(sql, rows.slice(0, limit).map((row: any) => ({
+    dialogId,
+    msgId: n(row.msg_id),
+  })));
   for (const row of rows.slice(0, limit)) {
-    const msg = await loadMessage(sql, dialogId, n(row.msg_id));
+    const msg = loaded.get(`${dialogId}:${n(row.msg_id)}`);
     if (!msg) continue;
     const size = Buffer.byteLength(JSON.stringify(msg));
     if (messages.length > 0 && bytes + size > maxBytes) { hasMore = true; break; }
@@ -938,8 +1182,10 @@ export async function getHistory(
     bytes += size;
   }
   if (opts.afterMsgId === undefined) messages.reverse();
+  const profileIds = new Set<string>();
+  collectAccountIds(messages, profileIds);
   return {
-    dialogId, messages, hasMore,
+    dialogId, messages, profiles: await loadProfiles(sql, profileIds), hasMore,
     nextBeforeMsgId: opts.afterMsgId === undefined && hasMore && messages.length
       ? messages[0].msg_id
       : undefined,
@@ -955,7 +1201,7 @@ export async function readHistory(sql: SQL, p: {
   return await sql.begin(async (tx) => {
     await requireActiveAccount(tx, p.accountId);
     if (p.deviceId) await requireActiveDevice(tx, p.accountId, p.deviceId);
-    await requireActiveMember(tx, p.accountId, p.dialogId);
+    const access = await lockDialogForMutation(tx, p.accountId, p.dialogId);
     const member = (await tx`
       UPDATE dialog_members SET last_read_msg_id = ${p.maxReadMsgId}
       WHERE dialog_id = ${p.dialogId} AND account_id = ${p.accountId} AND left_at IS NULL
@@ -979,7 +1225,6 @@ export async function readHistory(sql: SQL, p: {
       };
     }
 
-    const members = await tx`SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL ORDER BY account_id`;
     const pushes: Push[] = [];
     const unread = (await tx`
       SELECT count(*)::int AS count FROM messages
@@ -993,14 +1238,15 @@ export async function readHistory(sql: SQL, p: {
       max_read_msg_id: n(member.last_read_msg_id),
       unread_count: unreadCount,
     });
-    for (const m of members) {
-      const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${m.account_id} RETURNING pts`;
-      const pts = n(upd[0].pts);
-      await tx`
-        INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id, data)
-        VALUES (${m.account_id}, ${pts}, 'read.updated', ${p.dialogId}, ${p.accountId}, ${data}::jsonb)`;
-      pushes.push({ accountId: m.account_id, pts, ptsCount: 1 });
-    }
+    pushes.push(...await fanoutDialogEvent(tx, {
+      dialogId: p.dialogId,
+      type: "read.updated",
+      actorAccountId: p.accountId,
+      sourceDeviceId: p.deviceId,
+      alertRecipients: false,
+      recipientAccountIds: access.type === "group" ? [p.accountId] : undefined,
+      data: JSON.parse(data),
+    }));
     return { dialogId: p.dialogId, maxReadMsgId: n(member.last_read_msg_id), unreadCount, pushes };
   });
 }

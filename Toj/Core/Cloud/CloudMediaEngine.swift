@@ -229,6 +229,7 @@ nonisolated struct MediaUploadRequest: Codable, Sendable {
     let width: Int?
     let height: Int?
     let uploadProtocol: String?
+    var purpose: String? = nil
 }
 
 nonisolated struct PreparedMediaUpload: Sendable {
@@ -2347,7 +2348,8 @@ actor CloudMediaTransferEngine {
                     fileName: transfer.fileName, byteSize: transfer.byteSize,
                     sha256: transfer.sha256, durationMs: transfer.durationMs,
                     width: transfer.width, height: transfer.height,
-                    uploadProtocol: useMultipartV2 ? "parts_v2" : nil
+                    uploadProtocol: useMultipartV2 ? "parts_v2" : nil,
+                    purpose: transfer.purpose
                 ), token: token
             )
             guard

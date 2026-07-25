@@ -20,6 +20,48 @@ nonisolated enum VoiceGestureIntent: Equatable {
     }
 }
 
+private struct GroupLifecycleServiceRow: View {
+    let line: CloudAppModel.Line
+
+    private var title: String {
+        switch line.serviceType {
+        case "group.created":
+            return String(localized: "Group created")
+        case "member.added":
+            return String(localized: "Members added")
+        case "member.removed":
+            return String(localized: "A member was removed")
+        case "member.left":
+            return String(localized: "A member left")
+        case "member.role_changed":
+            return String(localized: "Member permissions changed")
+        case "dialog.title_changed":
+            if let title = line.serviceData?.title, !title.isEmpty {
+                return String(localized: "Group name changed to \(title)")
+            }
+            return String(localized: "Group name changed")
+        case "dialog.photo_changed":
+            return String(localized: "Group photo changed")
+        case "dialog.owner_transferred":
+            return String(localized: "Group ownership transferred")
+        default:
+            return line.text.isEmpty ? String(localized: "Group updated") : line.text
+        }
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(TojTheme.secondaryText)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(TojTheme.raised.opacity(0.92), in: Capsule())
+            .frame(maxWidth: .infinity)
+            .accessibilityLabel(title)
+    }
+}
+
 struct TojConversationExperience: View {
     @Bindable var model: CloudAppModel
     @Environment(\.dismiss) private var dismiss
@@ -47,6 +89,12 @@ struct TojConversationExperience: View {
     @State private var networkMonitor = MediaNetworkMonitor()
 
     let dialogId: String
+
+    private var dialog: CloudAppModel.Dialog? {
+        model.dialogs.first { $0.id == dialogId }
+    }
+
+    private var isGroup: Bool { dialog?.type == "group" }
 
     private var canSend: Bool {
         model.activeDialogId == dialogId
@@ -82,13 +130,24 @@ struct TojConversationExperience: View {
             publishTimelineViewport()
             Task { await model.flushAndDeselectDialog(dialogId) }
         }
+        .onChange(of: model.activeDialogId) { previous, current in
+            if previous == dialogId, current == nil { dismiss() }
+        }
         .sheet(isPresented: $showingProfile) {
-            TojPeerProfileView(model: model, dialogId: dialogId) {
-                showingProfile = false
-                Task { await model.startVoiceCall(dialogId: dialogId) }
+            if isGroup {
+                NavigationStack {
+                    GroupProfileView(model: model, dialogId: dialogId)
+                }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            } else {
+                TojPeerProfileView(model: model, dialogId: dialogId) {
+                    showingProfile = false
+                    Task { await model.startVoiceCall(dialogId: dialogId) }
+                }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
             }
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showingAttachments) {
             Group {
@@ -216,7 +275,9 @@ struct TojConversationExperience: View {
                     if model.replicaSyncState.showsRetry {
                         model.retryReplicaSync()
                     } else {
-                        showingProfile = model.capabilities.contains(.profiles) || model.capabilities.contains(.calls)
+                        showingProfile = isGroup
+                            || model.capabilities.contains(.profiles)
+                            || model.capabilities.contains(.calls)
                     }
                 } label: {
                     HStack(spacing: 7) {
@@ -246,6 +307,7 @@ struct TojConversationExperience: View {
                     in: Capsule(),
                     interactive: model.capabilities.contains(.profiles)
                         || model.capabilities.contains(.calls)
+                        || isGroup
                         || model.replicaSyncState.showsRetry
                 )
                 .accessibilityHint(
@@ -256,7 +318,7 @@ struct TojConversationExperience: View {
                             : "Connection status")
                 )
 
-                if model.capabilities.contains(.calls) {
+                if !isGroup && model.capabilities.contains(.calls) {
                     Button {
                         Task { await model.startVoiceCall(dialogId: dialogId) }
                     } label: {
@@ -268,7 +330,7 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Call \(model.dialogTitle(dialogId))")
                 }
 
-                if model.capabilities.contains(.videoCalls) {
+                if !isGroup && model.capabilities.contains(.videoCalls) {
                     Button {
                         Task { await model.startVideoCall(dialogId: dialogId) }
                     } label: {
@@ -280,7 +342,11 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Video call \(model.dialogTitle(dialogId))")
                 }
 
-                Button { showingProfile = model.capabilities.contains(.profiles) || model.capabilities.contains(.calls) } label: {
+                Button {
+                    showingProfile = isGroup
+                        || model.capabilities.contains(.profiles)
+                        || model.capabilities.contains(.calls)
+                } label: {
                     TojAvatar(
                         title: model.dialogTitle(dialogId),
                         size: 46,
@@ -288,7 +354,11 @@ struct TojConversationExperience: View {
                     )
                 }
                 .buttonStyle(.tojPressable)
-                .disabled(!model.capabilities.contains(.profiles) && !model.capabilities.contains(.calls))
+                .disabled(
+                    !isGroup
+                        && !model.capabilities.contains(.profiles)
+                        && !model.capabilities.contains(.calls)
+                )
                 .accessibilityLabel("Open \(model.dialogTitle(dialogId)) profile")
             }
         }
@@ -315,7 +385,11 @@ struct TojConversationExperience: View {
     private var headerSubtitle: String {
         switch model.replicaSyncState {
         case .ready:
-            isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
+            if isGroup {
+                "\(dialog?.memberCount ?? 0) members"
+            } else {
+                isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
+            }
         case .checking, .updating, .offline, .connectionSlow, .serverUnavailable,
              .sessionExpired, .protocolFailure, .localFailure, .configurationError:
             model.replicaSyncState.title
@@ -331,12 +405,23 @@ struct TojConversationExperience: View {
         }
     }
 
+    @ViewBuilder
+    private func serviceRow(for line: CloudAppModel.Line) -> some View {
+        if isGroup {
+            GroupLifecycleServiceRow(line: line)
+        } else {
+            VoiceCallServiceRow(line: line)
+        }
+    }
+
     private var messageTimeline: some View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView {
                 LazyVStack(spacing: 3) {
-                    timelinePill(Text("Private conversation"), icon: "lock.fill")
-                        .padding(.vertical, 8)
+                    if !isGroup {
+                        timelinePill(Text("Private conversation"), icon: "lock.fill")
+                            .padding(.vertical, 8)
+                    }
 
                     if model.lines.isEmpty {
                         conversationLocalPlaceholder
@@ -366,7 +451,7 @@ struct TojConversationExperience: View {
                                 unreadDivider
                             }
                             if item.line.kind == "service" {
-                                VoiceCallServiceRow(line: item.line)
+                                serviceRow(for: item.line)
                                     .padding(.vertical, 5)
                             } else {
                                 TojMessageBubble(
@@ -610,6 +695,32 @@ struct TojConversationExperience: View {
             if model.composerMode != .text {
                 composerContext
                     .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+            }
+
+            if !model.mentionSuggestions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(model.mentionSuggestions) { member in
+                            Button {
+                                model.insertMention(member)
+                                composerFocused = true
+                            } label: {
+                                HStack(spacing: 6) {
+                                    TojAvatar(title: member.displayName, size: 24)
+                                    Text(member.displayName)
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(TojTheme.raised, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Mention \(member.displayName)")
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                }
             }
 
             TextField("Message", text: $model.draft, axis: .vertical)
@@ -1026,8 +1137,26 @@ private struct TojMessageBubble: View {
     var body: some View {
         HStack {
             if line.mine { Spacer(minLength: 76) }
+            if isIncomingGroupMessage {
+                Group {
+                    if isLastInGroup {
+                        TojAvatar(title: senderLabel, size: 28)
+                            .accessibilityHidden(true)
+                    } else {
+                        Color.clear
+                            .frame(width: 28, height: 28)
+                    }
+                }
+                .frame(width: 28, alignment: .bottom)
+            }
 
             VStack(alignment: .leading, spacing: 4) {
+                if showsSenderName {
+                    Text(senderLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(TojTheme.gold)
+                        .lineLimit(1)
+                }
                 if line.isForwarded {
                     Label("Forwarded message", systemImage: "arrowshape.turn.up.right.fill")
                         .font(.caption.weight(.semibold))
@@ -1178,6 +1307,18 @@ private struct TojMessageBubble: View {
         line.media.map { $0.kind == "photo" || $0.kind == "video" } ?? false
     }
 
+    private var showsSenderName: Bool {
+        isIncomingGroupMessage && line.presentationIsFirstInGroup
+    }
+
+    private var isIncomingGroupMessage: Bool {
+        !line.mine && model.dialogs.first(where: { $0.id == line.dialogId })?.type == "group"
+    }
+
+    private var senderLabel: String {
+        line.senderDisplayName ?? String(localized: "Group member")
+    }
+
     private var hasCaptionText: Bool {
         !line.text.isEmpty && (line.attachment == nil || line.text != line.attachment?.title)
     }
@@ -1272,7 +1413,13 @@ private struct TojMessageBubble: View {
     private var replyAuthor: String {
         if let replyId = line.replyToMsgId,
            let original = model.lines.first(where: { $0.msgId == replyId }) {
-            return original.mine ? String(localized: "You") : model.dialogTitle(line.dialogId ?? "")
+            if original.mine {
+                return String(localized: "You")
+            }
+            if isIncomingGroupMessage {
+                return original.senderDisplayName ?? String(localized: "Group member")
+            }
+            return model.dialogTitle(line.dialogId ?? "")
         }
         return model.dialogTitle(line.dialogId ?? "")
     }
@@ -1318,7 +1465,9 @@ private struct TojMessageBubble: View {
     }
 
     private var accessibilityDescription: String {
-        let sender = line.mine ? String(localized: "You") : String(localized: "Contact")
+        let sender = line.mine
+            ? String(localized: "You")
+            : (isIncomingGroupMessage ? senderLabel : String(localized: "Contact"))
         let state: String
         switch line.delivery {
         case .sending: state = String(localized: "sending")

@@ -158,10 +158,90 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT mo.id FROM media_objects mo
       WHERE mo.status = 'ready' AND mo.completed_at < now() - interval '24 hours'
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+        AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
       ORDER BY mo.completed_at LIMIT ${batchSize}
     )
     DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
+  const sendRequests = await sql`
+    WITH doomed AS (
+      SELECT sender_account_id, client_msg_id FROM send_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM send_requests request USING doomed
+    WHERE request.sender_account_id = doomed.sender_account_id
+      AND request.client_msg_id = doomed.client_msg_id
+    RETURNING request.client_msg_id`;
+  const messageMutations = await sql`
+    WITH doomed AS (
+      SELECT actor_account_id, client_mutation_id FROM message_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM message_mutation_requests request USING doomed
+    WHERE request.actor_account_id = doomed.actor_account_id
+      AND request.client_mutation_id = doomed.client_mutation_id
+    RETURNING request.client_mutation_id`;
+  const groupCreates = await sql`
+    WITH doomed AS (
+      SELECT creator_account_id, client_group_id FROM group_create_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM group_create_requests request USING doomed
+    WHERE request.creator_account_id = doomed.creator_account_id
+      AND request.client_group_id = doomed.client_group_id
+    RETURNING request.client_group_id`;
+  const groupMutations = await sql`
+    WITH doomed AS (
+      SELECT actor_account_id, client_mutation_id FROM group_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM group_mutation_requests request USING doomed
+    WHERE request.actor_account_id = doomed.actor_account_id
+      AND request.client_mutation_id = doomed.client_mutation_id
+    RETURNING request.client_mutation_id`;
+  const events = await sql.begin(async (tx) => {
+    const doomed = await tx`
+      SELECT account_id, pts
+      FROM account_events
+      WHERE created_at < now() - interval '30 days'
+      ORDER BY created_at, account_id, pts
+      LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED`;
+    if (doomed.length === 0) return [];
+    const accountIds = [...new Set(doomed.map((row: any) => String(row.account_id)))];
+    await tx`
+      WITH floors AS (
+        SELECT account_id, max(pts) AS pts
+        FROM account_events
+        WHERE (account_id, pts) IN (
+          SELECT * FROM unnest(
+            ${tx.array(doomed.map((row: any) => row.account_id), "uuid")}::uuid[],
+            ${tx.array(doomed.map((row: any) => Number(row.pts)), "int8")}::bigint[]
+          )
+        )
+        GROUP BY account_id
+      )
+      UPDATE account_sync_states state
+      SET pruned_through_pts = GREATEST(state.pruned_through_pts, floors.pts),
+          updated_at = now()
+      FROM floors
+      WHERE state.account_id = floors.account_id`;
+    const deleted = await tx`
+      DELETE FROM account_events event
+      WHERE (event.account_id, event.pts) IN (
+        SELECT * FROM unnest(
+          ${tx.array(doomed.map((row: any) => row.account_id), "uuid")}::uuid[],
+          ${tx.array(doomed.map((row: any) => Number(row.pts)), "int8")}::bigint[]
+        )
+      )
+      RETURNING event.account_id`;
+    void accountIds;
+    return deleted;
+  });
   return {
     otp: otp.length,
     snapshots: snapshots.length,
@@ -170,6 +250,11 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     mediaUploads: media.length,
     mediaAttempts: mediaAttempts.length,
     mediaOrphans: mediaOrphans.length,
+    sendRequests: sendRequests.length,
+    messageMutations: messageMutations.length,
+    groupCreates: groupCreates.length,
+    groupMutations: groupMutations.length,
+    accountEvents: events.length,
     callData,
   };
 }
@@ -186,7 +271,9 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
     try {
       const deleted = await cleanupExpiredData(sql);
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
-          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans
+          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
+          deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
+          deleted.groupMutations || deleted.accountEvents
           || Object.values(deleted.callData).some((value) => value > 0)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }

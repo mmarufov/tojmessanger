@@ -3,7 +3,15 @@ import Foundation
 nonisolated struct TimelinePresentationInput: Sendable {
     let id: String
     let mine: Bool
+    let senderId: String?
     let timestamp: String?
+
+    init(id: String, mine: Bool, senderId: String? = nil, timestamp: String?) {
+        self.id = id
+        self.mine = mine
+        self.senderId = senderId
+        self.timestamp = timestamp
+    }
 }
 
 nonisolated struct TimelinePresentationMetadata: Sendable {
@@ -63,6 +71,7 @@ nonisolated enum TimelinePresentationBuilder {
         calendar: Calendar
     ) -> Bool {
         earlier.mine == later.mine
+            && (earlier.mine || earlier.senderId == later.senderId)
             && abs(laterDate.timeIntervalSince(earlierDate)) < 360
             && calendar.isDate(earlierDate, inSameDayAs: laterDate)
     }

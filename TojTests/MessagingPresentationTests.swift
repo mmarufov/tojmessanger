@@ -739,6 +739,37 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(result[3].isFirstInGroup)
         XCTAssertNotNil(result[3].timestampLabel)
     }
+
+    func testIncomingGroupMessagesClusterOnlyWhenTheSenderMatches() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-25T12:00:00Z"))
+        let result = TimelinePresentationBuilder.build(
+            [
+                TimelinePresentationInput(
+                    id: "1", mine: false, senderId: "member-a",
+                    timestamp: "2026-07-25T10:00:00Z"
+                ),
+                TimelinePresentationInput(
+                    id: "2", mine: false, senderId: "member-b",
+                    timestamp: "2026-07-25T10:01:00Z"
+                ),
+                TimelinePresentationInput(
+                    id: "3", mine: false, senderId: "member-b",
+                    timestamp: "2026-07-25T10:02:00Z"
+                ),
+            ],
+            now: now,
+            calendar: calendar
+        )
+
+        XCTAssertTrue(result[0].isFirstInGroup)
+        XCTAssertTrue(result[0].isLastInGroup)
+        XCTAssertTrue(result[1].isFirstInGroup)
+        XCTAssertFalse(result[1].isLastInGroup)
+        XCTAssertFalse(result[2].isFirstInGroup)
+        XCTAssertTrue(result[2].isLastInGroup)
+    }
 }
 
 private actor MediaSchedulerProbe {

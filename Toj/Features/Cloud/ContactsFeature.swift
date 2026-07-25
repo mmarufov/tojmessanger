@@ -263,9 +263,9 @@ final class TojContactsStore {
 
 struct CloudContactsView: View {
     @Bindable var model: CloudAppModel
+    @Bindable var store: TojContactsStore
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var store = TojContactsStore()
     @State private var query = ""
     @State private var path: [String] = []
     @State private var showingNewContact = false

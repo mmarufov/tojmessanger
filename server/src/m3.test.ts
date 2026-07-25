@@ -1790,10 +1790,9 @@ describe("M3 cloud sync", () => {
   });
 });
   test("capability contract is public, cache-safe, and advertises shipped messaging features", async () => {
-    const port = 53_000 + Math.floor(Math.random() * 1_000);
-    const server = startCloudServer(port, db, null, null);
+    const server = startCloudServer(0, db, null, null);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/v1/capabilities`);
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`);
       expect(response.status).toBe(200);
       expect(response.headers.get("cache-control")).toBe("no-store");
       expect(await response.json()).toEqual(CLOUD_CAPABILITIES);

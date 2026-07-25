@@ -13,6 +13,7 @@ import {
   CallVersionCapabilityError,
   normalizeCallVersionCapabilities as normalizeVersionCapabilities,
 } from "./call-versions";
+import { handoffOwnedGroupsForDeletedAccount } from "./groups";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
@@ -1439,6 +1440,7 @@ export async function deleteAccountAndTerminateCalls(sql: SQL, accountId: string
   const deleted = await deleteAuthAccount(sql, accountId, code, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "account", accountId);
+      await handoffOwnedGroupsForDeletedAccount(tx, accountId);
     },
   });
   const syncPushes = await flushCallHistory(sql, ended);

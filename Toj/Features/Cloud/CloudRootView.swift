@@ -345,6 +345,7 @@ private struct CloudMainView: View {
     @State private var searchScope: SearchScope = .chats
     @State private var showingCompose = false
     @State private var splitDialogId: String?
+    @State private var contactsStore = TojContactsStore()
 
     private var unreadCount: Int {
         model.dialogs.reduce(0) { $0 + ($1.isArchived ? 0 : $1.unreadCount) }
@@ -353,7 +354,7 @@ private struct CloudMainView: View {
     var body: some View {
         TabView(selection: $selection) {
             Tab("Contacts", systemImage: "person.crop.circle.fill", value: .contacts) {
-                CloudContactsView(model: model)
+                CloudContactsView(model: model, store: contactsStore)
             }
 
             Tab("Calls", systemImage: "phone.fill", value: .calls) {
@@ -406,7 +407,7 @@ private struct CloudMainView: View {
         }
         #endif
         .sheet(isPresented: $showingCompose) {
-            NewChatSheet(model: model) { dialogId in
+            NewChatSheet(model: model, contactsStore: contactsStore) { dialogId in
                 showingCompose = false
                 selection = .chats
                 model.prepareConversationOpen(dialogId: dialogId)
@@ -930,6 +931,7 @@ private struct CloudDialogRow: View {
 
 private struct NewChatSheet: View {
     @Bindable var model: CloudAppModel
+    let contactsStore: TojContactsStore
     @Environment(\.dismiss) private var dismiss
     @FocusState private var focused: Bool
     @State private var showingGroupCreation = false
@@ -989,7 +991,7 @@ private struct NewChatSheet: View {
                             .frame(maxWidth: .infinity, minHeight: 50)
                     }
                     .buttonStyle(.glass)
-                    .accessibilityHint("Opens the demo group creation flow")
+                    .accessibilityHint("Choose contacts and create a group")
                 }
 
                 Spacer()
@@ -1000,7 +1002,11 @@ private struct NewChatSheet: View {
         }
         .onAppear { focused = true }
         .sheet(isPresented: $showingGroupCreation) {
-            DemoGroupCreationView(dialogs: model.dialogs)
+            GroupCreationView(model: model, store: contactsStore) { dialogId in
+                showingGroupCreation = false
+                dismiss()
+                onOpened(dialogId)
+            }
         }
     }
 }
