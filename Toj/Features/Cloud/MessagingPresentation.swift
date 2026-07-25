@@ -8,7 +8,7 @@ nonisolated enum LaunchPhase: Equatable, Sendable {
 }
 
 nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
-    let rawValue: UInt16
+    let rawValue: UInt64
 
     static let chatOrganization = Self(rawValue: 1 << 0)
     static let replies = Self(rawValue: 1 << 1)
@@ -24,6 +24,10 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let richSearch = Self(rawValue: 1 << 11)
     static let multipartMedia = Self(rawValue: 1 << 12)
     static let videoCalls = Self(rawValue: 1 << 13)
+    static let savedMessages = Self(rawValue: 1 << 14)
+    static let cloudDrafts = Self(rawValue: 1 << 15)
+    static let dialogPreferences = Self(rawValue: 1 << 16)
+    static let localSearch = Self(rawValue: 1 << 17)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
@@ -38,6 +42,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     case react
     case copy
     case edit
+    case save
     case forward
     case delete
     case retry
@@ -51,6 +56,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .react: String(localized: "React")
         case .copy: String(localized: "Copy")
         case .edit: String(localized: "Edit")
+        case .save: String(localized: "Save")
         case .forward: String(localized: "Forward")
         case .delete: String(localized: "Delete")
         case .retry: String(localized: "Retry")
@@ -64,6 +70,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .react: "face.smiling"
         case .copy: "doc.on.doc"
         case .edit: "pencil"
+        case .save: "bookmark"
         case .forward: "arrowshape.turn.up.right"
         case .delete: "trash"
         case .retry: "arrow.clockwise"

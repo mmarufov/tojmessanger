@@ -30,7 +30,7 @@ export function safeRoute(pathname: string): string {
     "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
-    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/messages/react",
+    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/dialogs/saved", "/v1/messages/send", "/v1/messages/react",
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
   ]);
@@ -49,6 +49,10 @@ export class OperationalMetrics {
   private readonly startedAt = Date.now();
   private readonly requests = new Map<string, number>();
   private readonly durations = new Map<string, { count: number; sumSeconds: number }>();
+  private readonly savedMessageEnsures = new Map<string, number>();
+  private savedMessageEnsureCount = 0;
+  private savedMessageEnsureSumSeconds = 0;
+  private savedMessageInvariantViolations = 0;
 
   record(method: string, route: string, status: number, durationMs: number): void {
     const key = `${method}\u0000${route}\u0000${statusClass(status)}`;
@@ -58,6 +62,16 @@ export class OperationalMetrics {
     duration.count += 1;
     duration.sumSeconds += durationMs / 1_000;
     this.durations.set(durationKey, duration);
+  }
+
+  recordSavedMessagesEnsure(
+    result: "created" | "existing" | "repaired" | "error",
+    durationMs: number,
+  ): void {
+    this.savedMessageEnsures.set(result, (this.savedMessageEnsures.get(result) ?? 0) + 1);
+    this.savedMessageEnsureCount += 1;
+    this.savedMessageEnsureSumSeconds += durationMs / 1_000;
+    if (result === "repaired") this.savedMessageInvariantViolations += 1;
   }
 
   render(): string {
@@ -84,6 +98,24 @@ export class OperationalMetrics {
       lines.push(`toj_http_request_duration_seconds_sum{${labels}} ${value.sumSeconds.toFixed(6)}`);
       lines.push(`toj_http_request_duration_seconds_count{${labels}} ${value.count}`);
     }
+    lines.push(
+      "# HELP toj_saved_messages_ensure_total Saved Messages ensures by bounded result.",
+      "# TYPE toj_saved_messages_ensure_total counter",
+    );
+    for (const result of ["created", "existing", "repaired", "error"]) {
+      lines.push(`toj_saved_messages_ensure_total{result="${result}"} ${this.savedMessageEnsures.get(result) ?? 0}`);
+    }
+    lines.push(
+      "# HELP toj_saved_messages_ensure_duration_seconds_sum Cumulative Saved Messages ensure duration.",
+      "# TYPE toj_saved_messages_ensure_duration_seconds_sum counter",
+      `toj_saved_messages_ensure_duration_seconds_sum ${this.savedMessageEnsureSumSeconds.toFixed(6)}`,
+      "# HELP toj_saved_messages_ensure_duration_seconds_count Count of timed Saved Messages ensures.",
+      "# TYPE toj_saved_messages_ensure_duration_seconds_count counter",
+      `toj_saved_messages_ensure_duration_seconds_count ${this.savedMessageEnsureCount}`,
+      "# HELP toj_saved_messages_invariant_violation_total Saved Messages rows repaired during ensure.",
+      "# TYPE toj_saved_messages_invariant_violation_total counter",
+      `toj_saved_messages_invariant_violation_total ${this.savedMessageInvariantViolations}`,
+    );
     return `${lines.join("\n")}\n`;
   }
 }

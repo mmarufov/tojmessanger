@@ -844,7 +844,11 @@ export async function getDifference(
            d.type AS dialog_type, d.revision AS group_revision,
            self.role AS self_role, self.left_at AS self_left_at, d.closed_at,
            peer.id AS peer_account_id,
-           CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title,
+           CASE
+             WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+             WHEN d.type = 'saved' THEN 'Saved Messages'
+             ELSE d.title
+           END AS dialog_title,
            profile_payload.profiles
     FROM page ae
     CROSS JOIN profile_payload
@@ -1002,7 +1006,11 @@ export async function getBootstrapDialogsPage(
   const rows = cursor
     ? await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
-               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               CASE
+                 WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+                 WHEN d.type = 'saved' THEN 'Saved Messages'
+                 ELSE d.title
+               END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
                (SELECT count(*)::int FROM dialog_members active
@@ -1023,7 +1031,11 @@ export async function getBootstrapDialogsPage(
         LIMIT ${limit + 1}`
     : await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
-               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               CASE
+                 WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+                 WHEN d.type = 'saved' THEN 'Saved Messages'
+                 ELSE d.title
+               END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
                (SELECT count(*)::int FROM dialog_members active

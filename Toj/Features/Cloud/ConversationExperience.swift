@@ -95,6 +95,7 @@ struct TojConversationExperience: View {
     }
 
     private var isGroup: Bool { dialog?.type == "group" }
+    private var isSavedMessages: Bool { dialog?.type == "saved" }
 
     private var canSend: Bool {
         model.activeDialogId == dialogId
@@ -200,7 +201,11 @@ struct TojConversationExperience: View {
             }
             Button("Cancel", role: .cancel) { deleteLine = nil }
         } message: {
-            Text("This removes the message for everyone in this conversation.")
+            Text(
+                isSavedMessages
+                    ? "This removes the message from Saved Messages on all your devices."
+                    : "This removes the message for everyone in this conversation."
+            )
         }
         .alert(item: Binding(
             get: { model.operationNotice },
@@ -274,7 +279,7 @@ struct TojConversationExperience: View {
                 Button {
                     if model.replicaSyncState.showsRetry {
                         model.retryReplicaSync()
-                    } else {
+                    } else if !isSavedMessages {
                         showingProfile = isGroup
                             || model.capabilities.contains(.profiles)
                             || model.capabilities.contains(.calls)
@@ -305,20 +310,22 @@ struct TojConversationExperience: View {
                 .buttonStyle(.plain)
                 .tojGlass(
                     in: Capsule(),
-                    interactive: model.capabilities.contains(.profiles)
-                        || model.capabilities.contains(.calls)
-                        || isGroup
-                        || model.replicaSyncState.showsRetry
+                    interactive: model.replicaSyncState.showsRetry
+                        || (!isSavedMessages && (
+                            model.capabilities.contains(.profiles)
+                                || model.capabilities.contains(.calls)
+                                || isGroup
+                        ))
                 )
                 .accessibilityHint(
                     model.replicaSyncState.showsRetry
                         ? "Checks for new messages again"
-                        : (model.capabilities.contains(.profiles) || model.capabilities.contains(.calls)
+                        : (!isSavedMessages && (model.capabilities.contains(.profiles) || model.capabilities.contains(.calls))
                             ? "Opens contact and privacy details"
                             : "Connection status")
                 )
 
-                if !isGroup && model.capabilities.contains(.calls) {
+                if !isGroup && !isSavedMessages && model.capabilities.contains(.calls) {
                     Button {
                         Task { await model.startVoiceCall(dialogId: dialogId) }
                     } label: {
@@ -330,7 +337,7 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Call \(model.dialogTitle(dialogId))")
                 }
 
-                if !isGroup && model.capabilities.contains(.videoCalls) {
+                if !isGroup && !isSavedMessages && model.capabilities.contains(.videoCalls) {
                     Button {
                         Task { await model.startVideoCall(dialogId: dialogId) }
                     } label: {
@@ -343,6 +350,7 @@ struct TojConversationExperience: View {
                 }
 
                 Button {
+                    guard !isSavedMessages else { return }
                     showingProfile = isGroup
                         || model.capabilities.contains(.profiles)
                         || model.capabilities.contains(.calls)
@@ -350,16 +358,21 @@ struct TojConversationExperience: View {
                     TojAvatar(
                         title: model.dialogTitle(dialogId),
                         size: 46,
-                        colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex
+                        colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex,
+                        systemImage: isSavedMessages ? "bookmark.fill" : nil
                     )
                 }
                 .buttonStyle(.tojPressable)
                 .disabled(
-                    !isGroup
+                    isSavedMessages
+                        || (!isGroup
                         && !model.capabilities.contains(.profiles)
-                        && !model.capabilities.contains(.calls)
+                        && !model.capabilities.contains(.calls))
                 )
-                .accessibilityLabel("Open \(model.dialogTitle(dialogId)) profile")
+                .accessibilityLabel(
+                    isSavedMessages ? "Saved Messages" : "Open \(model.dialogTitle(dialogId)) profile"
+                )
+                .accessibilityIdentifier(isSavedMessages ? "saved-messages-avatar" : "")
             }
         }
     }
@@ -385,7 +398,9 @@ struct TojConversationExperience: View {
     private var headerSubtitle: String {
         switch model.replicaSyncState {
         case .ready:
-            if isGroup {
+            if isSavedMessages {
+                String(localized: "Synced across your devices")
+            } else if isGroup {
                 "\(dialog?.memberCount ?? 0) members"
             } else {
                 isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
@@ -407,7 +422,12 @@ struct TojConversationExperience: View {
 
     @ViewBuilder
     private func serviceRow(for line: CloudAppModel.Line) -> some View {
-        if isGroup {
+        if isSavedMessages {
+            timelinePill(
+                Text(line.text.isEmpty ? "Saved item" : line.text),
+                icon: "bookmark.fill"
+            )
+        } else if isGroup {
             GroupLifecycleServiceRow(line: line)
         } else {
             VoiceCallServiceRow(line: line)
@@ -418,7 +438,13 @@ struct TojConversationExperience: View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView {
                 LazyVStack(spacing: 3) {
-                    if !isGroup {
+                    if isSavedMessages {
+                        timelinePill(
+                            Text("Notes and files for your Toj account"),
+                            icon: "bookmark.fill"
+                        )
+                        .padding(.vertical, 8)
+                    } else if !isGroup {
                         timelinePill(Text("Private conversation"), icon: "lock.fill")
                             .padding(.vertical, 8)
                     }
@@ -553,25 +579,30 @@ struct TojConversationExperience: View {
         switch model.conversationOpenState {
         case .loadingLocal, .cached:
             savedMessageSkeleton
-                .accessibilityLabel("Loading saved messages")
+                .accessibilityLabel("Loading offline conversation")
         case .empty, .ready:
             VStack(spacing: 7) {
-                Image(systemName: "bubble.left.and.bubble.right")
+                Image(systemName: isSavedMessages ? "bookmark.fill" : "bubble.left.and.bubble.right")
                     .font(.system(size: 22, weight: .medium))
-                Text("No messages yet")
+                Text(isSavedMessages ? "Save something for yourself" : "No messages yet")
                     .font(.subheadline.weight(.semibold))
-                Text("Messages you send will appear here and stay available offline.")
+                Text(
+                    isSavedMessages
+                        ? "Keep notes, media, links and files here. Downloaded items stay available offline."
+                        : "Messages you send will appear here and stay available offline."
+                )
                     .font(.caption)
                     .multilineTextAlignment(.center)
             }
+            .accessibilityIdentifier(isSavedMessages ? "saved-messages-empty-state" : "")
             .foregroundStyle(TojTheme.secondaryText)
             .padding(.top, 36)
             .padding(.horizontal, 32)
         case .failedLocal:
             VStack(spacing: 10) {
-                Label("Saved messages could not be opened", systemImage: "externaldrive.badge.exclamationmark")
+                Label("Offline conversation could not be opened", systemImage: "externaldrive.badge.exclamationmark")
                     .font(.subheadline.weight(.semibold))
-                Button("Try saved copy again") { model.retryConversationLocalLoad() }
+                Button("Try offline copy again") { model.retryConversationLocalLoad() }
                     .buttonStyle(.glass)
             }
             .foregroundStyle(TojTheme.secondaryText)
@@ -915,6 +946,8 @@ struct TojConversationExperience: View {
         case .edit:
             model.beginEditing(line)
             composerFocused = true
+        case .save:
+            Task { await model.saveMessage(line) }
         case .forward:
             forwardLine = line
             showingForwarding = true
@@ -1244,6 +1277,7 @@ private struct TojMessageBubble: View {
                 } label: {
                     Label(action.title, systemImage: action.systemImage)
                 }
+                .accessibilityIdentifier(action == .save ? "message-action-save" : "")
             }
         }
         .accessibilityElement(children: .combine)
@@ -3731,13 +3765,23 @@ private struct DemoForwardingView: View {
 
     var body: some View {
         NavigationStack {
-            List(dialogs.filter { !$0.isArchived }) { dialog in
+            List(dialogs.filter { !$0.isArchived }.sorted {
+                if ($0.type == "saved") != ($1.type == "saved") {
+                    return $0.type == "saved"
+                }
+                return $0.updatedAt > $1.updatedAt
+            }) { dialog in
                 Button {
                     TojFeedback.sent()
                     onDone(dialog.id)
                 } label: {
                     HStack(spacing: 12) {
-                        TojAvatar(title: dialog.title, size: 42, colorIndex: dialog.profileColorIndex)
+                        TojAvatar(
+                            title: dialog.title,
+                            size: 42,
+                            colorIndex: dialog.profileColorIndex,
+                            systemImage: dialog.type == "saved" ? "bookmark.fill" : nil
+                        )
                         Text(dialog.title).foregroundStyle(TojTheme.text)
                         Spacer()
                     }

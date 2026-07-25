@@ -258,6 +258,9 @@ final class CloudAppModel {
     private(set) var activeDialogId: String?
     private(set) var conversationOpenState: ConversationOpenState = .loadingLocal
     private(set) var dialogs: [Dialog] = []
+    private(set) var savedMessagesDialogId: String?
+    private(set) var savedMessagesSetupInFlight = false
+    private(set) var savedMessagesSetupFailure: String?
     private(set) var groupMembersByDialog: [String: [GroupMember]] = [:]
     private(set) var lines: [Line] = []
     private(set) var openingTimelineAnchor: TimelineAnchor = .bottom
@@ -315,6 +318,7 @@ final class CloudAppModel {
     }
 
     private let api: CloudAPI
+    private let savedMessagesService = SavedMessagesService()
     private let tokenStore: TokenStore
     private var localStore: CloudLocalStore?
     private let localStoreBootstrapper = CloudLocalStoreBootstrapper()
@@ -460,7 +464,8 @@ final class CloudAppModel {
             forKey: "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
         ) as? NSNumber
         self.negotiatedCapabilities = cached.map {
-            MessagingCapabilities(rawValue: $0.uint16Value).subtracting(.videoCalls)
+            MessagingCapabilities(rawValue: $0.uint64Value)
+                .subtracting([.videoCalls, .savedMessages])
         } ?? [.replies]
         self.localStore = injectedLocalStore
         voiceRecorder.onUnexpectedStop = { [weak self] in
@@ -954,6 +959,7 @@ final class CloudAppModel {
         hintSocket = nil
         await replicaSyncCoordinator.stop()
         await mediaPrefetchScheduler.stop()
+        await savedMessagesService.reset()
         mediaSchedulerForegrounded = false
         await BackgroundRuntimeCoordinator.shared.removeWorkHandlersAndWait()
         for task in backgroundTasks { await task.value }
@@ -1037,6 +1043,9 @@ final class CloudAppModel {
         storedSession = nil
         activeDialogId = nil
         dialogs = []
+        savedMessagesDialogId = nil
+        savedMessagesSetupInFlight = false
+        savedMessagesSetupFailure = nil
         lines = []
         loadedLocalMessages = []
         pendingVisibleReadMessages = []
@@ -2099,6 +2108,76 @@ final class CloudAppModel {
         dialogs.first(where: { $0.id == dialogId })?.title ?? shortDialogId(dialogId)
     }
 
+    @discardableResult
+    func ensureSavedMessages(presentsFailure: Bool = true) async -> String? {
+        guard
+            let accountId = storedSession?.session.accountId,
+            let token = storedSession?.session.token,
+            let localStore
+        else { return nil }
+        if let savedMessagesDialogId { return savedMessagesDialogId }
+        if let local = try? await savedMessagesService.localDialogId(
+            store: localStore,
+            accountId: accountId
+        ) {
+            savedMessagesDialogId = local
+            savedMessagesSetupFailure = nil
+            return local
+        }
+        guard capabilities.contains(.savedMessages) else {
+            savedMessagesSetupFailure = String(localized: "Unavailable on this server")
+            return nil
+        }
+
+        savedMessagesSetupInFlight = true
+        savedMessagesSetupFailure = nil
+        defer { savedMessagesSetupInFlight = false }
+        do {
+            let dialogId = try await savedMessagesService.ensure(
+                api: api,
+                store: localStore,
+                accountId: accountId,
+                token: token
+            )
+            savedMessagesDialogId = dialogId
+            savedMessagesSetupFailure = nil
+            await refreshDialogs()
+            return dialogId
+        } catch is CancellationError {
+            return nil
+        } catch {
+            let message: String
+            switch cloudOperationFailureDisposition(error, serverAdvertisesFeature: true) {
+            case .transient:
+                message = String(localized: "Connect once to set up Saved Messages")
+            case .authenticationRequired:
+                message = String(localized: "Sign in again to set up Saved Messages")
+            case .unsupportedServer:
+                message = String(localized: "Unavailable on this server")
+            case .permanent:
+                message = String(localized: "Saved Messages could not be set up")
+            }
+            savedMessagesSetupFailure = message
+            if presentsFailure {
+                presentNotice("Saved Messages", message: message)
+            }
+            return nil
+        }
+    }
+
+    func saveMessage(_ line: Line) async {
+        guard
+            !line.isDeleted,
+            line.msgId != nil,
+            line.dialogId != savedMessagesDialogId,
+            let targetDialogId = await ensureSavedMessages()
+        else { return }
+        await forwardMessage(line, to: targetDialogId)
+        if status == "Forwarded" {
+            status = "Saved to Saved Messages"
+        }
+    }
+
     func startVoiceCall(dialogId: String) async {
         #if DEBUG
         if isDemoMode {
@@ -2301,6 +2380,14 @@ final class CloudAppModel {
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
         if line.mine, line.media == nil, capabilities.contains(.editing) { actions.append(.edit) }
+        let sourceIsSaved = line.dialogId.flatMap { sourceId in
+            dialogs.first(where: { $0.id == sourceId })?.type
+        } == "saved"
+        if line.msgId != nil,
+           !sourceIsSaved,
+           savedMessagesDialogId != nil || capabilities.contains(.savedMessages) {
+            actions.append(.save)
+        }
         if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
         if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
         if case .failed = line.delivery { actions.append(.retry) }
@@ -3089,6 +3176,7 @@ final class CloudAppModel {
             }
             return resolved
         }
+        savedMessagesDialogId = localDialogs.first(where: { $0.type == "saved" })?.dialogId
         sortDialogsForPresentation()
         if let activeDialogId,
            previous[activeDialogId]?.type == "group",
@@ -3097,7 +3185,7 @@ final class CloudAppModel {
             lines = []
             presentNotice(
                 "Group access ended",
-                message: "You are no longer a member of this group. Its saved messages were removed."
+                message: "You are no longer a member of this group. Its offline copy was removed."
             )
         }
     }
@@ -3274,6 +3362,7 @@ final class CloudAppModel {
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
             if advertised.contains("groups_v1") { resolved.insert(.groups) }
+            if advertised.contains("saved_messages_v1") { resolved.insert(.savedMessages) }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -3281,12 +3370,15 @@ final class CloudAppModel {
                 resolved.insert(.videoCalls)
             }
             negotiatedCapabilities = resolved
-            // Video rollout is account-scoped. Never let one signed-in account's bucket leak into
-            // another account through the server-wide capability cache.
+            // Account-scoped rollout bits must not leak between sign-ins through the server-wide
+            // capability cache. A locally materialized Saved Messages row still opens offline.
             capabilityDefaults.set(
-                Int(resolved.subtracting(.videoCalls).rawValue),
+                Int(resolved.subtracting([.videoCalls, .savedMessages]).rawValue),
                 forKey: capabilityCacheKey
             )
+            if resolved.contains(.savedMessages) {
+                _ = await ensureSavedMessages(presentsFailure: false)
+            }
         } catch let error as CloudAPIError where error.status == 404 {
             negotiatedCapabilities = [.replies]
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
@@ -3354,7 +3446,7 @@ final class CloudAppModel {
                 previous = snapshot.networkClass
                 if snapshot.networkClass == .offline {
                     self.setReplicaSyncState(.offline)
-                    self.status = "Offline. Showing saved messages."
+                    self.status = "Offline. Showing downloaded conversations."
                     continue
                 }
                 guard recovered else { continue }
@@ -3574,7 +3666,7 @@ final class CloudAppModel {
         let initialNetwork = ReplicaNetworkMonitor.shared.snapshot()
         if initialNetwork.networkClass == .offline {
             setReplicaSyncState(.offline)
-            status = "Offline. Showing saved messages."
+            status = "Offline. Showing downloaded conversations."
             return
         }
         let api = api
@@ -3605,7 +3697,7 @@ final class CloudAppModel {
             lastSuccessfulServerContact = Date()
             if remoteState.pts < pts {
                 setReplicaSyncState(.protocolFailure)
-                status = "Server update state moved backwards. Showing saved messages."
+                status = "Server update state moved backwards. Showing the offline copy."
                 return
             }
             let replicaInitialized = if let localStore,
@@ -3645,7 +3737,7 @@ final class CloudAppModel {
             status = failure.title
         case .timedOut:
             setReplicaSyncState(.connectionSlow)
-            status = "Connection is slow. Showing saved messages."
+            status = "Connection is slow. Showing the offline copy."
         case .cancelled:
             return
         }
@@ -4229,7 +4321,10 @@ final class CloudAppModel {
     }
 
     private func dialog(from local: LocalDialog) -> Dialog {
-        let title = displayTitle(local.title, fallback: shortDialogId(local.dialogId))
+        let isSavedMessages = local.type == "saved"
+        let title = isSavedMessages
+            ? String(localized: "Saved Messages")
+            : displayTitle(local.title, fallback: shortDialogId(local.dialogId))
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let previewKind = ChatListPreviewKind(messageKind: local.lastKind)
         let subtitle: String
@@ -4254,8 +4349,8 @@ final class CloudAppModel {
             subtitle: subtitle,
             updatedAt: local.lastServerTs ?? local.updatedAt,
             isPending: local.lastLocalState == "sending" || local.accessState == "pending",
-            unreadCount: local.unreadCount,
-            mentionCount: local.mentionCount,
+            unreadCount: isSavedMessages ? 0 : local.unreadCount,
+            mentionCount: isSavedMessages ? 0 : local.mentionCount,
             previewKind: previewKind,
             lastMessageMine: local.lastSenderAccountId == storedSession?.session.accountId,
             peerAccountId: local.peerAccountId,
@@ -4264,7 +4359,7 @@ final class CloudAppModel {
             profileColorIndex: local.peerColorIndex,
             memberCount: local.memberCount,
             selfRole: local.selfRole,
-            notificationMode: local.notificationMode,
+            notificationMode: isSavedMessages ? "all" : local.notificationMode,
             accessState: local.accessState
         )
     }
@@ -4372,6 +4467,7 @@ final class CloudAppModel {
 
     private func markReadIfNeeded(dialogId: String, messages: [LocalMessage]) async {
         guard let accountId = storedSession?.session.accountId, let localStore else { return }
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         guard let maxMsgId = messages.compactMap(\.msgId).max() else { return }
 
         do {
@@ -5384,6 +5480,8 @@ final class CloudAppModel {
         storedSession = nil
         activeDialogId = nil
         dialogs = []
+        savedMessagesDialogId = nil
+        savedMessagesSetupFailure = nil
         lines = []
         devices = []
         demoLinesByDialog = [:]

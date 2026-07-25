@@ -13,7 +13,7 @@ export class DialogAccessError extends Error {
 
 export type DialogAccess = {
   dialogId: string;
-  type: "direct" | "group";
+  type: "direct" | "group" | "saved";
   revision: number;
   lastMsgId: number;
   closed: boolean;

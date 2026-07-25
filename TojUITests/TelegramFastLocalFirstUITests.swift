@@ -5,6 +5,7 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
     private enum Fixture {
         static let primaryDialog = "00000000-0000-4000-8000-000000000201"
         static let secondDialog = "00000000-0000-4000-8000-000000000202"
+        static let savedDialog = "00000000-0000-4000-8000-000000000203"
         static let photo = "00000000-0000-4000-8000-000000000301"
         static let video = "00000000-0000-4000-8000-000000000302"
     }
@@ -59,6 +60,20 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
             element("media-viewer-\(Fixture.photo)").waitForExistence(timeout: 5),
             "A cached fullscreen photo must reopen from encrypted disk after process death."
         )
+    }
+
+    func testSavedMessagesSettingsRouteOpensEncryptedOfflineConversation() {
+        let settingsTab = app.tabBars.buttons["Settings"]
+        XCTAssertTrue(settingsTab.waitForExistence(timeout: 3))
+        settingsTab.tap()
+
+        let savedMessages = app.buttons["settings-saved-messages"]
+        XCTAssertTrue(savedMessages.waitForExistence(timeout: 3))
+        savedMessages.tap()
+
+        XCTAssertTrue(element("conversation-\(Fixture.savedDialog)").waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["Saved Messages"].waitForExistence(timeout: 3))
+        XCTAssertTrue(element("message-ui-fixture-saved-note").waitForExistence(timeout: 3))
     }
 
     private func launch(reset: Bool) {

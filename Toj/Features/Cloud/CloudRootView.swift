@@ -829,8 +829,10 @@ private struct CloudDialogRow: View {
                 title: dialog.title,
                 size: 56,
                 highlighted: false,
-                colorIndex: dialog.profileColorIndex
+                colorIndex: dialog.profileColorIndex,
+                systemImage: dialog.type == "saved" ? "bookmark.fill" : nil
             )
+            .accessibilityIdentifier(dialog.type == "saved" ? "saved-messages-avatar" : "")
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -843,7 +845,7 @@ private struct CloudDialogRow: View {
                             .font(.caption2)
                             .foregroundStyle(TojTheme.secondaryText)
                     }
-                    if dialog.isMuted {
+                    if dialog.isMuted && dialog.type != "saved" {
                         Image(systemName: "speaker.slash.fill")
                             .font(.caption2)
                             .foregroundStyle(TojTheme.secondaryText)
@@ -1051,6 +1053,7 @@ private struct CloudSettingsView: View {
     @State private var showingClearMedia = false
     @State private var showingProfileEditor = false
     @State private var profilePhotoData: Data?
+    @State private var navigationPath: [String] = []
 
     private var displayName: String {
         let candidate = model.storedSession?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1066,7 +1069,7 @@ private struct CloudSettingsView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             ScrollView {
                 LazyVStack(spacing: 20) {
                     ZStack(alignment: .topTrailing) {
@@ -1096,12 +1099,22 @@ private struct CloudSettingsView: View {
                     .padding(.top, 16)
 
                     TojSectionCard {
-                        settingsLink(
-                            title: "Saved Messages",
-                            icon: "bookmark.fill",
-                            colors: [Color(hex: 0x4EA5FF), Color(hex: 0x2474ED)],
-                            divider: true,
-                            detail: "Keep notes, links and files close at hand."
+                        Button(action: openSavedMessages) {
+                            SettingsRowLabel(
+                                title: "Saved Messages",
+                                icon: "bookmark.fill",
+                                colors: [Color(hex: 0x4B401F), Color(hex: 0x211D13)],
+                                value: savedMessagesRowValue,
+                                showsDivider: true
+                            )
+                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
+                        .disabled(model.savedMessagesSetupInFlight)
+                        .accessibilityIdentifier("settings-saved-messages")
+                        .accessibilityHint(
+                            model.savedMessagesDialogId == nil
+                                ? "Sets up your private notes conversation"
+                                : "Opens your private notes conversation"
                         )
                         settingsLink(
                             title: "Recent Calls",
@@ -1311,6 +1324,9 @@ private struct CloudSettingsView: View {
                 .padding(.bottom, 28)
             }
             .background(TojTheme.canvas)
+            .navigationDestination(for: String.self) { dialogId in
+                TojConversationExperience(model: model, dialogId: dialogId)
+            }
             .toolbar(.hidden, for: .navigationBar)
             .task(id: profilePhotoAccountId) {
                 await model.loadDevices()
@@ -1374,6 +1390,29 @@ private struct CloudSettingsView: View {
                     photoAccountId: profilePhotoAccountId
                 )
                 .presentationBackground(TojTheme.canvas)
+            }
+        }
+    }
+
+    private var savedMessagesRowValue: LocalizedStringKey? {
+        if model.savedMessagesSetupInFlight { return "Setting up…" }
+        if let failure = model.savedMessagesSetupFailure {
+            return LocalizedStringKey(failure)
+        }
+        return nil
+    }
+
+    private func openSavedMessages() {
+        if let dialogId = model.savedMessagesDialogId {
+            model.prepareConversationOpen(dialogId: dialogId)
+            navigationPath.append(dialogId)
+            return
+        }
+        Task {
+            guard let dialogId = await model.ensureSavedMessages() else { return }
+            model.prepareConversationOpen(dialogId: dialogId)
+            if navigationPath.last != dialogId {
+                navigationPath.append(dialogId)
             }
         }
     }

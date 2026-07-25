@@ -105,6 +105,40 @@ credential hash and device name, removes push tokens, kills pending push work, r
 revokes all sessions. Existing message rows remain so other participants do not lose their history and
 foreign-key integrity is preserved. A later registration with the same phone creates a new account ID.
 
+Saved Messages is the exception to retained conversation history: it has only the deleting account as
+an active member, so account deletion removes that dialog and its messages in the same transaction.
+
+## Saved Messages rollout
+
+Saved Messages is dark by default. Migrate PostgreSQL before enabling it; API version 5 adds the
+authenticated `saved_messages_v1` capability and `POST /v1/dialogs/saved`.
+
+- `TOJ_SAVED_MESSAGES_V1_ENABLED=1` enables the route family globally.
+- `TOJ_SAVED_MESSAGES_ALLOWLIST` is a comma-separated list of account UUIDs that bypass percentage
+  rollout.
+- `TOJ_SAVED_MESSAGES_ROLLOUT_PERCENT` accepts 0 through 100 and defaults to zero.
+
+The route returns `404` and performs no mutation when the global switch or the authenticated
+account's rollout bucket is off. Deploy the schema and endpoint at zero percent, ship the compatible
+iOS client, then allowlist internal multi-device accounts before increasing deterministic buckets.
+Rollback by setting the percentage to zero or clearing the global switch; existing server and
+encrypted local data is preserved.
+
+After the compatible client is stable at full rollout, provision existing accounts in bounded,
+restart-safe batches:
+
+```bash
+TOJ_SAVED_MESSAGES_BACKFILL_BATCH_SIZE=100 bun run backfill:saved-messages
+```
+
+The command logs aggregate counts only, handles `SIGINT`/`SIGTERM` between accounts, and stops on a
+failed batch rather than hot-looping. Multiple workers are safe because provisioning is serialized
+per account and guarded by the unique partial index, though one worker is normally sufficient.
+
+Protected `/metrics` output includes `toj_saved_messages_ensure_total` by bounded result,
+ensure duration sum/count, and `toj_saved_messages_invariant_violation_total`. Page immediately on
+invariant repairs or sustained ensure errors; none of these series contains account or dialog data.
+
 ## Voice calls and TURN readiness
 
 `voice_calls_v1` is advertised only when all of the following are configured:

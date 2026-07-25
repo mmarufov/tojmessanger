@@ -140,7 +140,7 @@ CREATE INDEX IF NOT EXISTS contact_lookup_attempts_requester_idx
 -- ============ conversations ============
 CREATE TABLE IF NOT EXISTS dialogs (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  type        TEXT NOT NULL CHECK (type IN ('direct','group')),
+  type        TEXT NOT NULL CHECK (type IN ('direct','group','saved')),
   title       TEXT,
   created_by  UUID REFERENCES accounts(id),
   last_msg_id BIGINT NOT NULL DEFAULT 0,              -- per-dialog message counter
@@ -151,6 +151,16 @@ CREATE TABLE IF NOT EXISTS dialogs (
 );
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+ALTER TABLE dialogs DROP CONSTRAINT IF EXISTS dialogs_type_check;
+ALTER TABLE dialogs ADD CONSTRAINT dialogs_type_check
+  CHECK (type IN ('direct','group','saved')) NOT VALID;
+ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_type_check;
+DO $$ BEGIN
+  ALTER TABLE dialogs ADD CONSTRAINT dialogs_saved_owner_check
+    CHECK (type <> 'saved' OR created_by IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check;
 
 -- One direct dialog per unordered pair (idempotent 1:1 creation).
 CREATE TABLE IF NOT EXISTS direct_dialog_pairs (

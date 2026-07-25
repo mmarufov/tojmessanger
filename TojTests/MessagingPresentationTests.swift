@@ -17,6 +17,13 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.demo.contains(.multipartMedia))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.groups))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.calls))
+        XCTAssertFalse(MessagingCapabilities.demo.contains(.savedMessages))
+        let dailyUseBits: [MessagingCapabilities] = [
+            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch,
+        ]
+        XCTAssertEqual(Set(dailyUseBits.map(\.rawValue)).count, dailyUseBits.count)
+        XCTAssertEqual(MessagingCapabilities.savedMessages.rawValue, 1 << 14)
+        XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
     }
 
     func testMediaBubbleGeometryPreservesNormalRatiosAndBoundsExtremes() {

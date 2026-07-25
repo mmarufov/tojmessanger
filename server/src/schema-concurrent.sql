@@ -12,6 +12,7 @@ WHERE namespace.nspname = 'public'
     'messages_call_eligibility_idx',
     'dialog_members_active_owner_idx',
     'dialog_members_active_page_idx',
+    'dialogs_one_saved_per_account_idx',
     'message_mentions_account_idx',
     'account_events_retention_idx',
     'group_action_budgets_account_idx',
@@ -35,6 +36,10 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS dialog_members_active_owner_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_members_active_page_idx
   ON dialog_members(dialog_id, joined_at, account_id)
   WHERE left_at IS NULL;
+
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS dialogs_one_saved_per_account_idx
+  ON dialogs(created_by)
+  WHERE type = 'saved';
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mentions_account_idx
   ON message_mentions(account_id, dialog_id, msg_id);

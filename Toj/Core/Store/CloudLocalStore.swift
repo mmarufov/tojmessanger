@@ -932,6 +932,41 @@ actor CloudLocalStore {
         }
     }
 
+    func savedMessagesDialogId(accountId: String) throws -> String? {
+        try dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                SELECT dialog.dialog_id
+                FROM dialogs dialog
+                JOIN dialog_members member ON member.dialog_id = dialog.dialog_id
+                WHERE dialog.type = 'saved'
+                  AND dialog.access_state = 'active'
+                  AND member.account_id = ?
+                  AND member.is_active = 1
+                ORDER BY dialog.updated_at DESC, dialog.dialog_id
+                LIMIT 1
+                """,
+                arguments: [accountId]
+            )
+        }
+    }
+
+    func ensureSavedDialog(
+        dialogId: String,
+        accountId: String,
+        updatedAt: String?
+    ) throws {
+        try dbQueue.write { db in
+            try ensureSavedDialog(
+                db,
+                dialogId: dialogId,
+                accountId: accountId,
+                updatedAt: updatedAt
+            )
+        }
+    }
+
     @discardableResult
     func createPendingGroup(
         groupId: String,
@@ -1972,6 +2007,15 @@ actor CloudLocalStore {
                         guard let dialogId = update.dialogId else { continue }
                         let durableType = update.dialogType
                             ?? (update.group == nil ? "direct" : "group")
+                        if durableType == "saved" {
+                            try ensureSavedDialog(
+                                db,
+                                dialogId: dialogId,
+                                accountId: accountId,
+                                updatedAt: nil
+                            )
+                            continue
+                        }
                         try upsertDialog(
                             db,
                             dialogId: dialogId,
@@ -5055,6 +5099,63 @@ actor CloudLocalStore {
             arguments: [dialogId, type, title, lastMsgId, updatedAt]
         )
         try ensureDialogSummary(db, dialogId: dialogId)
+    }
+
+    private func ensureSavedDialog(
+        _ db: Database,
+        dialogId: String,
+        accountId: String,
+        updatedAt: String?
+    ) throws {
+        try db.execute(
+            sql: """
+            INSERT INTO dialogs (
+              dialog_id, type, title, last_msg_id, updated_at, revision,
+              member_count, self_role, notification_mode, access_state
+            ) VALUES (
+              ?, 'saved', NULL, 0, COALESCE(?, datetime('now')), 0,
+              1, 'owner', 'all', 'active'
+            )
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              type = 'saved',
+              member_count = 1,
+              self_role = 'owner',
+              notification_mode = 'all',
+              access_state = 'active',
+              updated_at = CASE
+                WHEN ? IS NULL THEN dialogs.updated_at
+                ELSE MAX(dialogs.updated_at, excluded.updated_at)
+              END
+            """,
+            arguments: [dialogId, updatedAt, updatedAt]
+        )
+        try ensureDialogSummary(db, dialogId: dialogId)
+        try db.execute(
+            sql: "DELETE FROM dialog_members WHERE dialog_id = ? AND account_id != ?",
+            arguments: [dialogId, accountId]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_members (
+              dialog_id, account_id, role, last_read_msg_id, joined_at,
+              left_at, is_active, revision
+            ) VALUES (
+              ?, ?, 'owner', 0, datetime('now'), NULL, 1, 0
+            )
+            ON CONFLICT(dialog_id, account_id) DO UPDATE SET
+              role = 'owner',
+              left_at = NULL,
+              is_active = 1
+            """,
+            arguments: [dialogId, accountId]
+        )
+        try setUnreadSummary(
+            db,
+            dialogId: dialogId,
+            accountId: accountId,
+            unreadCount: 0,
+            isExact: true
+        )
     }
 
     private func upsertMember(_ db: Database, dialogId: String, member: BootstrapDialogMember) throws {

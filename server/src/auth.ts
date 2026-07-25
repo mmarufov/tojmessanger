@@ -567,6 +567,11 @@ export async function deleteAccount(
     if (!account || !["active", "limited"].includes(account.status)) {
       return new AuthError("account unavailable", 403);
     }
+    // Saved Messages is the account owner's private cloud archive. Unlike direct/group history it
+    // has no other participant who can retain the conversation after account deletion.
+    await tx`
+      DELETE FROM dialogs
+      WHERE type = 'saved' AND created_by = ${accountId}`;
     const anonymizedPhone = seal(`deleted:${accountId}`, PHONE_AAD);
     const anonymizedLookup = randomBytes(32);
     await tx`
