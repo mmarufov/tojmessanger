@@ -70,17 +70,23 @@ final class CloudDraftsV1Tests: XCTestCase {
         try await Task.sleep(for: .milliseconds(900))
 
         XCTAssertEqual(requests.snapshot().map(\.text), ["latest"])
-        XCTAssertNil(
-            try await store.pendingDraftMutation(
-                accountId: "account-a",
-                dialogId: "dialog-a"
-            )
+        let remainingMutation = try await store.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-a"
         )
+        XCTAssertNil(remainingMutation)
     }
 
     func testCoordinatorCapsDraftAttachmentUploadsAtTwo() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
         let coordinator = DraftSyncCoordinator(
             api: CloudAPI(config: CloudConfig(baseURL: URL(string: "https://example.test")!))
+        )
+        await coordinator.configure(
+            store: store,
+            session: CloudSession(accountId: "account-a", deviceId: "device-a", token: "token"),
+            cloudEnabled: false
         )
         let probe = UploadConcurrencyProbe()
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -120,14 +126,16 @@ final class CloudDraftsV1Tests: XCTestCase {
                 replyPreview: nil,
                 mentions: []
             )
-            XCTAssertEqual(try await store.pendingDraftMutationsReady().count, 1)
+            let pendingCount = try await store.pendingDraftMutationsReady().count
+            XCTAssertEqual(pendingCount, 1)
         }
 
         let reopened = try CloudLocalStore(path: fixture.path, key: fixture.key)
         let draft = try await reopened.loadDraft(accountId: "account-a", dialogId: "dialog-a")
         XCTAssertEqual(draft?.text, raw + "!")
         XCTAssertEqual(draft?.state, "active")
-        XCTAssertEqual(try await reopened.pendingDraftMutationsReady().count, 1)
+        let reopenedPendingCount = try await reopened.pendingDraftMutationsReady().count
+        XCTAssertEqual(reopenedPendingCount, 1)
     }
 
     func testStaleAcknowledgementPreservesNewerLocalOverlay() async throws {
@@ -173,7 +181,8 @@ final class CloudDraftsV1Tests: XCTestCase {
         let visible = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
         XCTAssertEqual(visible?.text, "newer local generation")
         XCTAssertEqual(visible?.operationId, newer.operationId)
-        XCTAssertEqual(try await store.pendingDraftMutationsReady().first?.operationId, newer.operationId)
+        let pendingOperationId = try await store.pendingDraftMutationsReady().first?.operationId
+        XCTAssertEqual(pendingOperationId, newer.operationId)
     }
 
     func testReadyAttachmentsConvertAtomicallyToGroupAndRestoreAfterInvalidReply() async throws {
@@ -209,9 +218,8 @@ final class CloudDraftsV1Tests: XCTestCase {
                 error: nil
             )
         }
-        let ready = try XCTUnwrap(
-            try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
-        )
+        let loadedReady = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        let ready = try XCTUnwrap(loadedReady)
 
         let group = try await store.consumeDraftAsMediaGroup(
             accountId: "account-a",
@@ -221,7 +229,8 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertEqual(group.payload.items.count, 3)
         XCTAssertEqual(group.payload.caption, "album caption")
         XCTAssertEqual(group.payload.replyToMsgId, 17)
-        XCTAssertEqual(try await store.pendingMediaGroupSendsReady().map(\.clientGroupId), [
+        let pendingGroupIds = try await store.pendingMediaGroupSendsReady().map(\.clientGroupId)
+        XCTAssertEqual(pendingGroupIds, [
             group.clientGroupId,
         ])
         let consumed = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
@@ -238,7 +247,8 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertEqual(restored.text, "album caption")
         XCTAssertNil(restored.replyToMsgId)
         XCTAssertEqual(restored.attachments.count, 3)
-        XCTAssertTrue(try await store.pendingMediaGroupSendsReady().isEmpty)
+        let pendingGroupsAfterRestore = try await store.pendingMediaGroupSendsReady()
+        XCTAssertTrue(pendingGroupsAfterRestore.isEmpty)
     }
 
     func testGroupAcknowledgementKeepsAlbumFieldsAcrossReopen() async throws {
@@ -271,9 +281,11 @@ final class CloudDraftsV1Tests: XCTestCase {
                     error: nil
                 )
             }
-            let draft = try XCTUnwrap(
-                try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+            let loadedDraft = try await store.loadDraft(
+                accountId: "account-a",
+                dialogId: "dialog-a"
             )
+            let draft = try XCTUnwrap(loadedDraft)
             group = try await store.consumeDraftAsMediaGroup(
                 accountId: "account-a",
                 dialogId: "dialog-a",
@@ -314,7 +326,39 @@ final class CloudDraftsV1Tests: XCTestCase {
         let snapshot = try await reopened.conversationSnapshot(dialogId: "dialog-a", window: .initial)
         XCTAssertEqual(snapshot.timeline.messages.compactMap(\.mediaGroupIndex).sorted(), [0, 1])
         XCTAssertEqual(snapshot.timeline.messages.map(\.mediaGroupCount), [2, 2])
-        XCTAssertTrue(try await reopened.pendingMediaGroupSendsReady().isEmpty)
+        let reopenedPendingGroups = try await reopened.pendingMediaGroupSendsReady()
+        XCTAssertTrue(reopenedPendingGroups.isEmpty)
+    }
+
+    func testPartialAlbumUsesStableMediaGroupIndexSlots() {
+        let first = albumLine(id: "album-first", msgId: 101, index: 0, count: 3)
+        let third = albumLine(id: "album-third", msgId: 103, index: 2, count: 3)
+        let slots = AlbumSlotAssignment.linesBySlot([third, first])
+
+        XCTAssertEqual(AlbumSlotAssignment.slotCount(lines: [third, first], expectedCount: 3), 3)
+        XCTAssertEqual(slots[0]?.id, first.id)
+        XCTAssertNil(slots[1])
+        XCTAssertEqual(slots[2]?.id, third.id)
+    }
+
+    @MainActor
+    func testSelectedAlbumItemBecomesReplyTarget() {
+        let defaultsName = "CloudDraftsV1Tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let model = CloudAppModel(
+            useDefaultLocalStore: false,
+            capabilityDefaults: defaults
+        )
+        let selected = albumLine(id: "album-selected", msgId: 202, index: 1, count: 3)
+
+        model.beginReply(to: selected)
+
+        let composerMode = model.composerMode
+        XCTAssertEqual(
+            composerMode,
+            .replying(messageId: selected.id, preview: selected.text)
+        )
     }
 
     func testSingleMediaInvalidReplyRestoresCaptionMentionsAndAttachment() async throws {
@@ -349,9 +393,8 @@ final class CloudDraftsV1Tests: XCTestCase {
             progress: 1,
             error: nil
         )
-        let draft = try XCTUnwrap(
-            try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
-        )
+        let loadedDraft = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        let draft = try XCTUnwrap(loadedDraft)
         let transfer = try await store.consumeDraftAsSingleMedia(
             accountId: "account-a",
             dialogId: "dialog-a",
@@ -367,10 +410,11 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertEqual(restored.mentions, mentions)
         XCTAssertNil(restored.replyToMsgId)
         XCTAssertEqual(restored.attachments.map(\.mediaId), ["media-only"])
-        XCTAssertTrue(
-            try await store.conversationSnapshot(dialogId: "dialog-a", window: .initial)
-                .timeline.messages.isEmpty
+        let snapshotAfterRestore = try await store.conversationSnapshot(
+            dialogId: "dialog-a",
+            window: .initial
         )
+        XCTAssertTrue(snapshotAfterRestore.timeline.messages.isEmpty)
     }
 
     func testTextInvalidReplyRestoresOnlyTheExactConsumedDraft() async throws {
@@ -400,12 +444,11 @@ final class CloudDraftsV1Tests: XCTestCase {
             draftConsumeOperationId: draft.operationId,
             requiresCloudDraftSync: false
         )
-        XCTAssertNil(
-            try await store.pendingDraftMutation(
-                accountId: "account-a",
-                dialogId: "dialog-a"
-            )
+        let pendingMutation = try await store.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-a"
         )
+        XCTAssertNil(pendingMutation)
 
         let outcome = try await store.recoverTextSendAfterInvalidReply(
             clientMsgId: "text-send-a",
@@ -416,10 +459,11 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertEqual(restored?.text, "@friend exact text  ")
         XCTAssertNil(restored?.replyToMsgId)
         XCTAssertEqual(restored?.mentions, mentions)
-        XCTAssertTrue(
-            try await store.conversationSnapshot(dialogId: "dialog-a", window: .initial)
-                .timeline.messages.isEmpty
+        let snapshotAfterRecovery = try await store.conversationSnapshot(
+            dialogId: "dialog-a",
+            window: .initial
         )
+        XCTAssertTrue(snapshotAfterRecovery.timeline.messages.isEmpty)
     }
 
     func testStaleTextInvalidReplyKeepsNewerDraftAndRetryableOldContent() async throws {
@@ -455,19 +499,575 @@ final class CloudDraftsV1Tests: XCTestCase {
             accountId: "account-a"
         )
         XCTAssertEqual(outcome, .keptFailedMessage(dialogId: "dialog-a"))
-        XCTAssertEqual(
-            try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")?.text,
-            "newer draft"
+        let visibleDraft = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-a"
         )
+        XCTAssertEqual(visibleDraft?.text, "newer draft")
         let failed = try await store.conversationSnapshot(dialogId: "dialog-a", window: .initial)
             .timeline.messages
         XCTAssertEqual(failed.first?.localState, "failed")
         XCTAssertNil(failed.first?.replyToMsgId)
 
         try await store.markRetrying(clientMsgId: "text-send-stale")
-        let retry = try XCTUnwrap(try await store.pendingOutboxReady().first)
+        let pendingRetry = try await store.pendingOutboxReady().first
+        let retry = try XCTUnwrap(pendingRetry)
         XCTAssertEqual(retry.body, "old content")
         XCTAssertNil(retry.replyToMsgId)
+    }
+
+    func testDelayedAcknowledgementMaterializesHigherRevisionRemoteShadow() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let attempted = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-a",
+            text: "device A",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        try await store.applyCloudDraft(
+            CloudDraft(
+                dialogId: "dialog-a",
+                revision: 90,
+                state: "active",
+                text: "newer device B",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: [],
+                attachments: [],
+                operationId: "operation-b",
+                updatedAt: "2026-07-25T12:00:02.000Z"
+            ),
+            accountId: "account-a"
+        )
+        try await store.acknowledgeDraftMutation(
+            DraftMutationResponse(
+                draft: CloudDraft(
+                    dialogId: "dialog-a",
+                    revision: 80,
+                    state: "active",
+                    text: "device A",
+                    replyToMsgId: nil,
+                    replyPreview: nil,
+                    mentions: [],
+                    attachments: [],
+                    operationId: attempted.operationId,
+                    updatedAt: "2026-07-25T12:00:01.000Z"
+                ),
+                duplicate: false
+            ),
+            accountId: "account-a",
+            attemptedOperationId: attempted.operationId
+        )
+        let converged = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        XCTAssertEqual(converged?.text, "newer device B")
+        XCTAssertEqual(converged?.serverRevision, 90)
+        let remaining = try await store.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-a"
+        )
+        XCTAssertNil(remaining)
+    }
+
+    func testLogoutAndAccountSwitchRejectStaleGenerationAfterAwait() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let requestStarted = DispatchSemaphore(value: 0)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DraftMockURLProtocol.self]
+        DraftMockURLProtocol.handler = { request in
+            let body = try XCTUnwrap(DraftMockURLProtocol.bodyData(from: request))
+            let json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: Any]
+            )
+            let operationId = try XCTUnwrap(json["operation_id"] as? String)
+            requestStarted.signal()
+            Thread.sleep(forTimeInterval: 0.2)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )!,
+                try JSONSerialization.data(withJSONObject: [
+                    "draft": [
+                        "dialog_id": "dialog-a",
+                        "revision": 42,
+                        "state": "active",
+                        "text": "old account",
+                        "mentions": [],
+                        "attachments": [],
+                        "operation_id": operationId,
+                        "updated_at": "2026-07-25T12:00:00.000Z",
+                    ],
+                    "duplicate": false,
+                ])
+            )
+        }
+        defer { DraftMockURLProtocol.handler = nil }
+        let coordinator = DraftSyncCoordinator(
+            api: CloudAPI(
+                config: CloudConfig(baseURL: URL(string: "https://drafts.example.test")!),
+                session: URLSession(configuration: configuration)
+            )
+        )
+        await coordinator.configure(
+            store: store,
+            session: CloudSession(accountId: "account-a", deviceId: "device-a", token: "token-a"),
+            cloudEnabled: true
+        )
+        _ = try await coordinator.mutate(
+            dialogId: "dialog-a",
+            text: "old account",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let oldFlush = Task {
+            await coordinator.flush(dialogId: "dialog-a", force: true)
+        }
+        XCTAssertEqual(requestStarted.wait(timeout: .now() + 1), .success)
+
+        await coordinator.cancelAndWait()
+        await coordinator.configure(
+            store: store,
+            session: CloudSession(accountId: "account-b", deviceId: "device-b", token: "token-b"),
+            cloudEnabled: false
+        )
+        _ = try await coordinator.mutate(
+            dialogId: "dialog-a",
+            text: "new account",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: [],
+            reason: .navigation
+        )
+        let oldFlushSucceeded = await oldFlush.value
+        XCTAssertFalse(oldFlushSucceeded)
+
+        let oldPending = try await store.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-a"
+        )
+        XCTAssertEqual(oldPending?.text, "old account")
+        let newVisible = try await coordinator.currentDraft(dialogId: "dialog-a")
+        XCTAssertEqual(newVisible?.accountId, "account-b")
+        XCTAssertEqual(newVisible?.text, "new account")
+        await coordinator.cancelAndWait()
+    }
+
+    func testOfflineAlbumKeepsExactDependencyAndOnePendingGroupAcrossReopen() async throws {
+        let fixture = try makeStoreFixture()
+        let operationId: String
+        let clientGroupId: String
+        do {
+            let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+            _ = try await store.saveLocalDraft(
+                accountId: "account-a",
+                dialogId: "dialog-a",
+                text: "offline album",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: []
+            )
+            for position in 0..<2 {
+                let prepared = preparedUpload(position)
+                _ = try await store.stageDraftAttachment(
+                    prepared: prepared,
+                    accountId: "account-a",
+                    dialogId: "dialog-a",
+                    attachmentId: "attachment-\(position)",
+                    position: position
+                )
+                try await store.updateDraftAttachment(
+                    transferId: prepared.transferId,
+                    mediaId: "media-\(position)",
+                    state: "ready",
+                    progress: 1,
+                    error: nil
+                )
+            }
+            let loaded = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+            let draft = try XCTUnwrap(loaded)
+            operationId = draft.operationId
+            let group = try await store.consumeDraftAsMediaGroup(
+                accountId: "account-a",
+                dialogId: "dialog-a",
+                operationId: operationId
+            )
+            clientGroupId = group.clientGroupId
+        }
+        let reopened = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let groups = try await reopened.pendingMediaGroupSendsReady()
+        XCTAssertEqual(groups.map(\.clientGroupId), [clientGroupId])
+        XCTAssertEqual(groups.first?.draftConsumeOperationId, operationId)
+        let dependency = try await reopened.pendingDraftDependency(operationId: operationId)
+        XCTAssertEqual(dependency?.text, "offline album")
+        let snapshot = try await reopened.conversationSnapshot(dialogId: "dialog-a", window: .initial)
+        XCTAssertEqual(snapshot.timeline.messages.count, 2)
+        XCTAssertEqual(Set(snapshot.timeline.messages.compactMap(\.mediaGroupId)), [clientGroupId])
+    }
+
+    func testAlbumAcknowledgementCleanupSurvivesCrashAndReconcilesOnce() async throws {
+        let fixture = try makeStoreFixture()
+        let group: PendingMediaGroupSend
+        do {
+            let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+            _ = try await store.saveLocalDraft(
+                accountId: "account-a",
+                dialogId: "dialog-a",
+                text: "cleanup",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: []
+            )
+            for position in 0..<2 {
+                let prepared = preparedUpload(position)
+                _ = try await store.stageDraftAttachment(
+                    prepared: prepared,
+                    accountId: "account-a",
+                    dialogId: "dialog-a",
+                    attachmentId: "attachment-\(position)",
+                    position: position
+                )
+                try await store.updateDraftAttachment(
+                    transferId: prepared.transferId,
+                    mediaId: "media-\(position)",
+                    state: "ready",
+                    progress: 1,
+                    error: nil
+                )
+            }
+            let loaded = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+            let draft = try XCTUnwrap(loaded)
+            group = try await store.consumeDraftAsMediaGroup(
+                accountId: "account-a",
+                dialogId: "dialog-a",
+                operationId: draft.operationId
+            )
+            let messages = group.payload.items.enumerated().map { index, item in
+                CloudMessage(
+                    dialogId: "dialog-a",
+                    msgId: Int64(200 + index),
+                    senderAccountId: "account-a",
+                    clientMsgId: item.clientMsgId,
+                    kind: item.media.kind,
+                    text: index == 0 ? "cleanup" : "",
+                    media: item.media,
+                    mediaGroupId: group.clientGroupId,
+                    mediaGroupIndex: index,
+                    mediaGroupCount: 2,
+                    editVersion: 0,
+                    state: "visible",
+                    serverTs: "2026-07-25T12:00:00.000Z"
+                )
+            }
+            try await store.completeMediaGroupSend(
+                MediaGroupSendResponse(
+                    dialogId: "dialog-a",
+                    clientGroupId: group.clientGroupId,
+                    messages: messages,
+                    senderPts: 12,
+                    clearedDraftRevision: 12,
+                    duplicate: false
+                ),
+                senderAccountId: "account-a",
+                attemptedOperationId: group.draftConsumeOperationId
+            )
+        }
+        let reopened = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let cleanupRows = try await reopened.pendingMediaGroupCleanups()
+        let cleanup = try XCTUnwrap(cleanupRows.first)
+        XCTAssertEqual(cleanup.clientGroupId, group.clientGroupId)
+        XCTAssertEqual(cleanup.transferIds.count, 2)
+        let sendsAfterAck = try await reopened.pendingMediaGroupSendsReady()
+        XCTAssertTrue(sendsAfterAck.isEmpty)
+        try await reopened.finalizeMediaGroupCleanup(cleanup)
+        let cleanupsAfterFinalize = try await reopened.pendingMediaGroupCleanups()
+        let transfersAfterFinalize = try await reopened.mediaTransfers(ids: cleanup.transferIds)
+        XCTAssertTrue(cleanupsAfterFinalize.isEmpty)
+        XCTAssertTrue(transfersAfterFinalize.isEmpty)
+    }
+
+    func testConcurrentStagingAllocatesUniqueContiguousPositions() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let uploads = (0..<10).map(preparedUpload)
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for position in 0..<10 {
+                let prepared = uploads[position]
+                group.addTask {
+                    _ = try await store.stageDraftAttachment(
+                        prepared: prepared,
+                        accountId: "account-a",
+                        dialogId: "dialog-a",
+                        attachmentId: "attachment-\(position)",
+                        position: 0
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+        let draft = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        XCTAssertEqual(draft?.attachments.map(\.position).sorted(), Array(0..<10))
+        XCTAssertEqual(Set(draft?.attachments.map(\.position) ?? []).count, 10)
+    }
+
+    func testDoubleTapConsumesOneAlbumOperationOnlyOnce() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-a",
+            text: "one tap",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        for position in 0..<2 {
+            let prepared = preparedUpload(position)
+            _ = try await store.stageDraftAttachment(
+                prepared: prepared,
+                accountId: "account-a",
+                dialogId: "dialog-a",
+                attachmentId: "attachment-\(position)",
+                position: position
+            )
+            try await store.updateDraftAttachment(
+                transferId: prepared.transferId,
+                mediaId: "media-\(position)",
+                state: "ready",
+                progress: 1,
+                error: nil
+            )
+        }
+        let loaded = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        let operationId = try XCTUnwrap(loaded?.operationId)
+        let successes = await withTaskGroup(of: Bool.self, returning: Int.self) { group in
+            for _ in 0..<2 {
+                group.addTask {
+                    do {
+                        _ = try await store.consumeDraftAsMediaGroup(
+                            accountId: "account-a",
+                            dialogId: "dialog-a",
+                            operationId: operationId
+                        )
+                        return true
+                    } catch {
+                        return false
+                    }
+                }
+            }
+            var count = 0
+            for await success in group where success { count += 1 }
+            return count
+        }
+        XCTAssertEqual(successes, 1)
+        let pendingGroupCount = try await store.pendingMediaGroupSendsReady().count
+        XCTAssertEqual(pendingGroupCount, 1)
+    }
+
+    func test401SuspendsCoordinatorWithoutTerminalizingDurableMutation() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DraftMockURLProtocol.self]
+        DraftMockURLProtocol.handler = { request in
+            (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 401,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )!,
+                Data(#"{"error":"expired","code":"session_expired"}"#.utf8)
+            )
+        }
+        defer { DraftMockURLProtocol.handler = nil }
+        let coordinator = DraftSyncCoordinator(
+            api: CloudAPI(
+                config: CloudConfig(baseURL: URL(string: "https://drafts.example.test")!),
+                session: URLSession(configuration: configuration)
+            )
+        )
+        await coordinator.configure(
+            store: store,
+            session: CloudSession(accountId: "account-a", deviceId: "device-a", token: "expired"),
+            cloudEnabled: true
+        )
+        _ = try await coordinator.mutate(
+            dialogId: "dialog-a",
+            text: "must survive auth",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: [],
+            reason: .navigation
+        )
+        let flushed = await coordinator.flush(dialogId: "dialog-a", force: true)
+        XCTAssertFalse(flushed)
+        let pending = try await store.pendingDraftMutation(accountId: "account-a", dialogId: "dialog-a")
+        XCTAssertEqual(pending?.text, "must survive auth")
+        XCTAssertFalse(pending?.terminal ?? true)
+        await coordinator.cancelAndWait()
+    }
+
+    func testHundredQueuedDraftsStopAfterFirstNetworkFailure() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        for index in 0..<100 {
+            _ = try await store.saveLocalDraft(
+                accountId: "account-a",
+                dialogId: "dialog-\(index)",
+                text: "queued \(index)",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: []
+            )
+        }
+        let requests = LockedDraftRequests()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DraftMockURLProtocol.self]
+        DraftMockURLProtocol.handler = { request in
+            requests.append(operationId: "failed", text: request.url?.path ?? "")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 503,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )!,
+                Data(#"{"error":"unavailable","code":"temporarily_unavailable"}"#.utf8)
+            )
+        }
+        defer { DraftMockURLProtocol.handler = nil }
+        let coordinator = DraftSyncCoordinator(
+            api: CloudAPI(
+                config: CloudConfig(baseURL: URL(string: "https://drafts.example.test")!),
+                session: URLSession(configuration: configuration)
+            )
+        )
+        await coordinator.configure(
+            store: store,
+            session: CloudSession(accountId: "account-a", deviceId: "device-a", token: "token"),
+            cloudEnabled: true
+        )
+        await coordinator.flushAll(reason: .navigation)
+        XCTAssertEqual(requests.snapshot().count, 1)
+        let stillQueued = try await store.pendingDraftDialogIds(accountId: "account-a")
+        XCTAssertEqual(stillQueued.count, 100)
+        await coordinator.cancelAndWait()
+    }
+
+    func testCapabilityWithdrawalPreservesDraftDependentSendAndExcludesRetryDelay() async throws {
+        XCTAssertEqual(
+            cloudFailureDisposition(
+                CloudAPIError(
+                    status: 404,
+                    message: "feature killed",
+                    retryAfter: nil,
+                    code: "capability_unavailable"
+                )
+            ),
+            .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudFailureDisposition(
+                CloudAPIError(
+                    status: 404,
+                    message: "resource missing",
+                    retryAfter: nil,
+                    code: "media_not_found"
+                )
+            ),
+            .permanent
+        )
+
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-a",
+            text: "preserve me",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let prepared = preparedUpload(0)
+        _ = try await store.stageDraftAttachment(
+            prepared: prepared,
+            accountId: "account-a",
+            dialogId: "dialog-a",
+            attachmentId: "attachment-only",
+            position: 0
+        )
+        try await store.updateDraftAttachment(
+            transferId: prepared.transferId,
+            mediaId: "media-only",
+            state: "ready",
+            progress: 1,
+            error: nil
+        )
+        let loaded = try await store.loadDraft(accountId: "account-a", dialogId: "dialog-a")
+        let draft = try XCTUnwrap(loaded)
+        let transfer = try await store.consumeDraftAsSingleMedia(
+            accountId: "account-a",
+            dialogId: "dialog-a",
+            operationId: draft.operationId
+        )
+        XCTAssertEqual(transfer.draftOperationId, draft.operationId)
+        _ = try await store.insertSending(
+            dialogId: "dialog-a",
+            clientMsgId: "capability-withdrawn-text",
+            text: "queued text",
+            senderAccountId: "account-a",
+            draftConsumeOperationId: draft.operationId
+        )
+        let disabledOutbox = try await store.pendingOutboxReady(
+            includeCloudDraftDependencies: false
+        )
+        XCTAssertTrue(disabledOutbox.isEmpty)
+        let disabledOutboxDelay = try await store.nextPendingOutboxDelay(
+            includeCloudDraftDependencies: false
+        )
+        XCTAssertNil(disabledOutboxDelay)
+        let enabledOutbox = try await store.pendingOutboxReady(
+            includeCloudDraftDependencies: true
+        )
+        XCTAssertEqual(enabledOutbox.count, 1)
+        let disabledDelay = try await store.nextMediaTransferDelay(
+            includeCloudDraftDependencies: false
+        )
+        XCTAssertNil(disabledDelay)
+        let enabledDelay = try await store.nextMediaTransferDelay(
+            includeCloudDraftDependencies: true
+        )
+        XCTAssertEqual(enabledDelay, 0)
+        let dependency = try await store.pendingDraftDependency(operationId: draft.operationId)
+        XCTAssertNotNil(dependency)
+        try await store.markDraftDependencyFailed(
+            operationId: draft.operationId,
+            error: "resource missing",
+            retryAfter: nil,
+            terminal: true
+        )
+        let terminalDependency = try await store.pendingDraftDependency(operationId: draft.operationId)
+        XCTAssertTrue(terminalDependency?.terminal ?? false)
+        let terminalOutbox = try await store.pendingOutboxReady(
+            includeCloudDraftDependencies: true
+        )
+        let terminalMediaDelay = try await store.nextMediaTransferDelay(
+            includeCloudDraftDependencies: true
+        )
+        XCTAssertTrue(terminalOutbox.isEmpty)
+        XCTAssertNil(terminalMediaDelay)
+        let failedSnapshot = try await store.conversationSnapshot(
+            dialogId: "dialog-a",
+            window: .initial
+        )
+        XCTAssertTrue(failedSnapshot.timeline.messages.allSatisfy { $0.localState == "failed" })
     }
 
     private func preparedUpload(_ index: Int) -> PreparedMediaUpload {
@@ -483,6 +1083,26 @@ final class CloudDraftsV1Tests: XCTestCase {
             height: 100,
             encryptedSourcePath: "/tmp/item-\(index).tojmedia",
             encryptedThumbnailPath: "/tmp/item-\(index)-thumb.tojmedia"
+        )
+    }
+
+    private func albumLine(
+        id: String,
+        msgId: Int64,
+        index: Int,
+        count: Int
+    ) -> CloudAppModel.Line {
+        CloudAppModel.Line(
+            id: id,
+            dialogId: "dialog-a",
+            msgId: msgId,
+            clientMsgId: "client-\(id)",
+            text: "album item \(index + 1)",
+            mine: false,
+            delivery: .sent,
+            mediaGroupId: "album-a",
+            mediaGroupIndex: index,
+            mediaGroupCount: count
         )
     }
 

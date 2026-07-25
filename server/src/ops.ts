@@ -2,7 +2,9 @@ import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
-const CLEANUP_BATCH_SIZE = 1_000;
+export const CLEANUP_BATCH_SIZE = 1_000;
+export const MAINTENANCE_INTERVAL_MS = 60 * 1_000;
+export const ALLOWED_MUTATION_INGRESS_PER_MINUTE = 720;
 
 export type ProviderState = "configured" | "development" | "disabled";
 
@@ -49,6 +51,13 @@ export class OperationalMetrics {
   private readonly startedAt = Date.now();
   private readonly requests = new Map<string, number>();
   private readonly durations = new Map<string, { count: number; sumSeconds: number }>();
+  private cleanupDeleted = 0;
+  private cleanupBacklog = 0;
+
+  recordCleanup(deleted: number, backlog: number): void {
+    this.cleanupDeleted += deleted;
+    this.cleanupBacklog = backlog;
+  }
 
   record(method: string, route: string, status: number, durationMs: number): void {
     const key = `${method}\u0000${route}\u0000${statusClass(status)}`;
@@ -84,6 +93,20 @@ export class OperationalMetrics {
       lines.push(`toj_http_request_duration_seconds_sum{${labels}} ${value.sumSeconds.toFixed(6)}`);
       lines.push(`toj_http_request_duration_seconds_count{${labels}} ${value.count}`);
     }
+    lines.push(
+      "# HELP toj_cleanup_deleted_total Rows deleted by maintenance cleanup.",
+      "# TYPE toj_cleanup_deleted_total counter",
+      `toj_cleanup_deleted_total ${this.cleanupDeleted}`,
+      "# HELP toj_cleanup_backlog Expired rows waiting for maintenance cleanup.",
+      "# TYPE toj_cleanup_backlog gauge",
+      `toj_cleanup_backlog ${this.cleanupBacklog}`,
+      "# HELP toj_cleanup_batch_capacity Maximum rows cleaned per category per run.",
+      "# TYPE toj_cleanup_batch_capacity gauge",
+      `toj_cleanup_batch_capacity ${CLEANUP_BATCH_SIZE}`,
+      "# HELP toj_allowed_mutation_ingress_per_minute Maximum draft mutations plus album items.",
+      "# TYPE toj_allowed_mutation_ingress_per_minute gauge",
+      `toj_allowed_mutation_ingress_per_minute ${ALLOWED_MUTATION_INGRESS_PER_MINUTE}`,
+    );
     return `${lines.join("\n")}\n`;
   }
 }
@@ -142,8 +165,12 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM media_objects
       WHERE status IN ('uploading', 'rejected') AND expires_at < now()
       ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
-    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
+    DELETE FROM media_objects object
+    WHERE object.id IN (SELECT id FROM doomed)
+      AND object.status IN ('uploading', 'rejected')
+      AND object.expires_at < now()
     RETURNING id`;
   const mediaAttempts = await sql`
     WITH doomed AS (
@@ -174,9 +201,28 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
           WHERE attachment.media_id = mo.id AND draft.state = 'active'
         )
       ORDER BY mo.completed_at LIMIT ${batchSize}
+      FOR UPDATE OF mo SKIP LOCKED
     )
-    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
-    RETURNING id`;
+    DELETE FROM media_objects mo
+    WHERE mo.id IN (SELECT id FROM doomed)
+      AND mo.status = 'ready'
+      AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
+      AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+      AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM draft_attachments attachment
+        JOIN account_dialog_drafts draft
+          ON draft.account_id = attachment.account_id
+         AND draft.dialog_id = attachment.dialog_id
+        JOIN dialogs dialog ON dialog.id = draft.dialog_id AND dialog.closed_at IS NULL
+        JOIN dialog_members member
+          ON member.dialog_id = draft.dialog_id
+         AND member.account_id = draft.account_id
+         AND member.left_at IS NULL
+        WHERE attachment.media_id = mo.id AND draft.state = 'active'
+      )
+    RETURNING mo.id`;
   const sendRequests = await sql`
     WITH doomed AS (
       SELECT sender_account_id, client_msg_id FROM send_requests
@@ -225,6 +271,16 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.sender_account_id = doomed.sender_account_id
       AND request.client_group_id = doomed.client_group_id
     RETURNING request.client_group_id`;
+  const mediaGroupBudgets = await sql`
+    WITH doomed AS (
+      SELECT id FROM media_group_send_budgets
+      WHERE accepted_at < now() - interval '2 minutes'
+      ORDER BY accepted_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM media_group_send_budgets budget USING doomed
+    WHERE budget.id = doomed.id
+    RETURNING budget.id`;
   const groupCreates = await sql`
     WITH doomed AS (
       SELECT creator_account_id, client_group_id FROM group_create_requests
@@ -297,6 +353,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     draftMutations: draftMutations.length,
     draftBudgets: draftBudgets.length,
     mediaGroupSends: mediaGroupSends.length,
+    mediaGroupBudgets: mediaGroupBudgets.length,
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
     accountEvents: events.length,
@@ -308,20 +365,44 @@ function cleanError(value: unknown): string {
   return (value instanceof Error ? value.message : String(value)).replace(/[\r\n]+/g, " ").slice(0, 300);
 }
 
-export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): () => void {
+export function startMaintenanceWorker(
+  sql: SQL,
+  intervalMs = MAINTENANCE_INTERVAL_MS,
+  metrics?: OperationalMetrics,
+): () => void {
   let running = false;
   const tick = async () => {
     if (running) return;
     running = true;
     try {
       const deleted = await cleanupExpiredData(sql);
+      const backlogRows = await sql`
+        SELECT
+          (SELECT count(*) FROM media_objects
+             WHERE expires_at < now() AND status IN ('uploading','rejected'))
+          + (SELECT count(*) FROM draft_mutation_requests
+             WHERE created_at < now() - interval '24 hours')
+          + (SELECT count(*) FROM media_group_send_requests
+             WHERE created_at < now() - interval '24 hours') AS count`;
+      const deletedCount = Object.entries(deleted)
+        .filter(([key]) => key !== "callData")
+        .reduce((sum, [, value]) => sum + Number(value), 0)
+        + Object.values(deleted.callData).reduce((sum, value) => sum + value, 0);
+      const backlog = Number(backlogRows[0]?.count ?? 0);
+      metrics?.recordCleanup(deletedCount, backlog);
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
           deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
           deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
           deleted.groupMutations || deleted.draftMutations || deleted.draftBudgets ||
-          deleted.mediaGroupSends || deleted.accountEvents
+          deleted.mediaGroupSends || deleted.mediaGroupBudgets || deleted.accountEvents
           || Object.values(deleted.callData).some((value) => value > 0)) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "maintenance.cleanup",
+          deleted,
+          backlog,
+          capacity_per_category: CLEANUP_BATCH_SIZE,
+        }));
       }
     } catch (error) {
       console.error(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.error", error: cleanError(error) }));

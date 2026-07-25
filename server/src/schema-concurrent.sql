@@ -15,6 +15,10 @@ WHERE namespace.nspname = 'public'
     'message_mentions_account_idx',
     'messages_media_group_idx',
     'account_events_retention_idx',
+    'media_objects_expiry_idx',
+    'media_objects_orphan_expiry_idx',
+    'draft_mutation_requests_expiry_idx',
+    'media_group_send_requests_expiry_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx'
   )
@@ -46,6 +50,20 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS messages_media_group_idx
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_retention_idx
   ON account_events(created_at, account_id, pts);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_expiry_idx
+  ON media_objects(expires_at, id)
+  WHERE status IN ('uploading','rejected');
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_orphan_expiry_idx
+  ON media_objects(GREATEST(completed_at, last_accessed_at), id)
+  WHERE status = 'ready';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_mutation_requests_expiry_idx
+  ON draft_mutation_requests(created_at, account_id, operation_id);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_group_send_requests_expiry_idx
+  ON media_group_send_requests(created_at, sender_account_id, client_group_id);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_account_idx
   ON group_action_budgets(account_id, action, created_at DESC);

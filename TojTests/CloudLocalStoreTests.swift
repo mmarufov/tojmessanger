@@ -41,17 +41,46 @@ final class CloudLocalStoreTests: XCTestCase {
             .authenticationRequired
         )
         XCTAssertEqual(
-            cloudFailureDisposition(CloudAPIError(status: 404, message: "missing", retryAfter: nil)),
+            cloudFailureDisposition(
+                CloudAPIError(
+                    status: 404,
+                    message: "feature disabled",
+                    retryAfter: nil,
+                    code: "capability_unavailable"
+                )
+            ),
             .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudFailureDisposition(
+                CloudAPIError(
+                    status: 404,
+                    message: "resource missing",
+                    retryAfter: nil,
+                    code: "message_not_found"
+                )
+            ),
+            .permanent
         )
         XCTAssertEqual(
             cloudFailureDisposition(CloudAPIError(status: 413, message: "too large", retryAfter: nil)),
             .permanent
         )
-        let missing = CloudAPIError(status: 404, message: "message missing", retryAfter: nil)
+        let unavailable = CloudAPIError(
+            status: 404,
+            message: "feature disabled",
+            retryAfter: nil,
+            code: "capability_unavailable"
+        )
         XCTAssertEqual(
-            cloudOperationFailureDisposition(missing, serverAdvertisesFeature: false),
+            cloudOperationFailureDisposition(unavailable, serverAdvertisesFeature: false),
             .unsupportedServer
+        )
+        let missing = CloudAPIError(
+            status: 404,
+            message: "message missing",
+            retryAfter: nil,
+            code: "message_not_found"
         )
         XCTAssertEqual(
             cloudOperationFailureDisposition(missing, serverAdvertisesFeature: true),

@@ -40,7 +40,55 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE 
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE calls ALTER COLUMN selectable_media_profiles SET NOT NULL"`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${concurrentSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE devices VALIDATE CONSTRAINT devices_voip_push_environment_check"`.quiet();
-await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE messages VALIDATE CONSTRAINT messages_media_group_shape_check"`.quiet();
+
+async function completeConstraintMigration(
+  marker: string,
+  table: string,
+  constraints: string[],
+): Promise<void> {
+  const pending = (await $`psql ${url} -v ON_ERROR_STOP=1 -qAt -c ${
+    `SELECT NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = '${marker}')`
+  }`.quiet().text()).trim() === "t";
+  if (!pending) return;
+  for (const constraint of constraints) {
+    await $`psql ${url} -v ON_ERROR_STOP=1 -c ${
+      `SET lock_timeout = '5s'; ALTER TABLE ${table} VALIDATE CONSTRAINT ${constraint}_v2`
+    }`.quiet();
+  }
+  const swaps = constraints.map((constraint) =>
+    `ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${constraint};`
+      + ` ALTER TABLE ${table} RENAME CONSTRAINT ${constraint}_v2 TO ${constraint};`
+  ).join(" ");
+  await $`psql ${url} -v ON_ERROR_STOP=1 -c ${
+    `BEGIN; SET LOCAL lock_timeout = '5s'; ${swaps}`
+      + ` INSERT INTO schema_migrations(name) VALUES ('${marker}'); COMMIT;`
+  }`.quiet();
+}
+
+await completeConstraintMigration("media-constraints-v2", "media_objects", [
+  "media_objects_upload_protocol_check",
+  "media_objects_status_check",
+  "media_objects_purpose_check",
+]);
+await completeConstraintMigration(
+  "messages-media-group-shape-v2",
+  "messages",
+  ["messages_media_group_shape_check"],
+);
+await completeConstraintMigration("messages-domain-constraints-v2", "messages", [
+  "messages_kind_check",
+  "messages_service_type_check",
+]);
+await completeConstraintMigration(
+  "account-events-type-v2",
+  "account_events",
+  ["account_events_type_check"],
+);
+await completeConstraintMigration(
+  "message-mutation-operation-v2",
+  "message_mutation_requests",
+  ["message_mutation_requests_operation_check"],
+);
 
 function redactUrl(value: string): string {
   try {

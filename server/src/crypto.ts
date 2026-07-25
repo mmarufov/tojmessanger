@@ -91,6 +91,17 @@ export function mediaDigestHMAC(digest: Uint8Array): Buffer {
   return createHmac("sha256", HMAC_KEY).update("toj/media-digest/v1|").update(digest).digest();
 }
 
+/** Opaque, domain-separated idempotency fingerprint. Database readers cannot test plaintext. */
+export function requestFingerprintHMAC(
+  domain: "draft-mutation" | "media-group-send",
+  canonicalPayload: Uint8Array | string,
+): Buffer {
+  return createHmac("sha256", HMAC_KEY)
+    .update(`toj/request-fingerprint/${domain}/v1|`)
+    .update(canonicalPayload)
+    .digest();
+}
+
 export function normalizePhone(p: string): string {
   return p.replace(/[^\d+]/g, "");
 }

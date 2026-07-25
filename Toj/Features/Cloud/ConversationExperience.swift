@@ -1454,7 +1454,7 @@ private struct TojMessageBubble: View {
                                     line: albumLine,
                                     title: model.dialogTitle(albumLine.dialogId ?? ""),
                                     subtitle: albumLine.presentationMediaTimestampLabel ?? "",
-                                    onReply: { onAction(.reply) }
+                                    onReply: { model.beginReply(to: albumLine) }
                                 )
                                 .tag(albumLine.id)
                             }
@@ -1923,6 +1923,26 @@ private struct ProductionMediaBubble: View {
     }
 }
 
+enum AlbumSlotAssignment {
+    static func linesBySlot(
+        _ lines: [CloudAppModel.Line]
+    ) -> [Int: CloudAppModel.Line] {
+        Dictionary(
+            lines.compactMap { line in
+                line.mediaGroupIndex.map { ($0, line) }
+            },
+            uniquingKeysWith: { current, _ in current }
+        )
+    }
+
+    static func slotCount(
+        lines: [CloudAppModel.Line],
+        expectedCount: Int
+    ) -> Int {
+        min(10, max(lines.count, expectedCount))
+    }
+}
+
 private struct AlbumMediaBubble: View {
     let model: CloudAppModel
     let lines: [CloudAppModel.Line]
@@ -1935,7 +1955,11 @@ private struct AlbumMediaBubble: View {
     }
 
     private var slotCount: Int {
-        min(10, max(lines.count, expectedCount))
+        AlbumSlotAssignment.slotCount(lines: lines, expectedCount: expectedCount)
+    }
+
+    private var linesBySlot: [Int: CloudAppModel.Line] {
+        AlbumSlotAssignment.linesBySlot(lines)
     }
 
     var body: some View {
@@ -1949,8 +1973,8 @@ private struct AlbumMediaBubble: View {
                     spacing: 3
                 ) {
                     ForEach(0..<slotCount, id: \.self) { index in
-                        if index < lines.count, let media = lines[index].media {
-                            AlbumVisualCell(model: model, line: lines[index], media: media)
+                        if let line = linesBySlot[index], let media = line.media {
+                            AlbumVisualCell(model: model, line: line, media: media)
                         } else {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(TojTheme.raised)
@@ -1965,8 +1989,8 @@ private struct AlbumMediaBubble: View {
                 }
             } else {
                 VStack(spacing: 2) {
-                    ForEach(lines) { item in
-                        if let media = item.media {
+                    ForEach(0..<slotCount, id: \.self) { index in
+                        if let item = linesBySlot[index], let media = item.media {
                             HStack(spacing: 10) {
                                 Image(systemName: "doc.fill")
                                     .font(.system(size: 16, weight: .semibold))
@@ -1985,17 +2009,16 @@ private struct AlbumMediaBubble: View {
                             }
                             .padding(.horizontal, 7)
                             .padding(.vertical, 5)
+                        } else {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Waiting for album item")
+                                    .font(.caption)
+                                    .foregroundStyle(TojTheme.secondaryText)
+                                Spacer()
+                            }
+                            .padding(8)
                         }
-                    }
-                    ForEach(lines.count..<slotCount, id: \.self) { _ in
-                        HStack {
-                            ProgressView().controlSize(.small)
-                            Text("Waiting for album item")
-                                .font(.caption)
-                                .foregroundStyle(TojTheme.secondaryText)
-                            Spacer()
-                        }
-                        .padding(8)
                     }
                 }
                 .frame(width: 252)

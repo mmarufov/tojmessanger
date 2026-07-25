@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { requireActiveDevice } from "./auth";
-import { draftBodyAAD, draftResponseAAD, open, seal } from "./crypto";
+import { draftBodyAAD, draftResponseAAD, open, requestFingerprintHMAC, seal } from "./crypto";
 import { lockDialogForMutation, requireDialogReadAccess } from "./dialog-access";
 import { fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { lockAccountMutations } from "./locks";
@@ -185,7 +185,7 @@ function normalizeDraft(input: {
 }
 
 function draftFingerprint(dialogId: string, draft: NormalizedDraft): Buffer {
-  return createHash("sha256").update(JSON.stringify({
+  return requestFingerprintHMAC("draft-mutation", JSON.stringify({
     dialog_id: dialogId,
     state: draft.state,
     text: draft.text,
@@ -196,7 +196,7 @@ function draftFingerprint(dialogId: string, draft: NormalizedDraft): Buffer {
       media_id: attachment.mediaId,
       position: attachment.position,
     })),
-  })).digest();
+  }));
 }
 
 function draftFromCachedResponse(row: any, accountId: string, operationId: string): DraftDTO {

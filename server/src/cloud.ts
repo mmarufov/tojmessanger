@@ -265,7 +265,7 @@ export function startCloudServer(
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const stopPushWorker = startPushWorker(db, pushSender);
-  const stopMaintenanceWorker = startMaintenanceWorker(db);
+  const stopMaintenanceWorker = startMaintenanceWorker(db, undefined, metrics);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
   const stopSyncNotifications = startSyncNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
@@ -737,6 +737,7 @@ export function startCloudServer(
           response = json(await getDifference(db, session.accountId, Number(body.sincePts ?? 0), {
             maxEvents: body.maxEvents,
             maxBytes: body.maxBytes,
+            cloudDraftsEnabled: cloudDraftsAvailable,
           }));
         }
 
@@ -749,6 +750,7 @@ export function startCloudServer(
             cursor: body.cursor,
             limit: body.limit,
             previewMessages: body.previewMessages,
+            cloudDraftsEnabled: cloudDraftsAvailable,
           }));
         }
 
@@ -789,6 +791,7 @@ export function startCloudServer(
             mentions: body.mentions,
             draftConsumeOperationId:
               body.draftConsumeOperationId ?? body.draft_consume_operation_id,
+            allowDraftConsumption: cloudDraftsAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -839,6 +842,7 @@ export function startCloudServer(
             mentions: body.mentions,
             draftConsumeOperationId:
               body.draft_consume_operation_id ?? body.draftConsumeOperationId,
+            allowDraftConsumption: cloudDraftsAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result);

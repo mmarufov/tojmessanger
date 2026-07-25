@@ -1,10 +1,16 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { checkVerification, startVerification } from "./auth";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
 import { DraftError, getDraft, putDraft } from "./drafts";
 import { cancelMediaUpload, downloadMediaChunk } from "./media";
-import { cleanupExpiredData } from "./ops";
+import {
+  ALLOWED_MUTATION_INGRESS_PER_MINUTE,
+  CLEANUP_BATCH_SIZE,
+  MAINTENANCE_INTERVAL_MS,
+  cleanupExpiredData,
+} from "./ops";
 import {
   getBootstrapDialogsPage,
   getDifference,
@@ -349,5 +355,150 @@ describe("cloud drafts and media groups", () => {
       if (oldGroups == null) delete process.env.TOJ_MEDIA_GROUPS_V1_ENABLED;
       else process.env.TOJ_MEDIA_GROUPS_V1_ENABLED = oldGroups;
     }
+  });
+
+  test("request fingerprints are keyed, versioned, and not plaintext-derived SHA-256", async () => {
+    const { alice, dialogId } = await pair();
+    const operationId = crypto.randomUUID();
+    await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId,
+      state: "active",
+      text: "fingerprint secret",
+      mentions: [],
+      attachments: [],
+    });
+    const stored = (await db`
+      SELECT payload_fingerprint FROM draft_mutation_requests
+      WHERE account_id = ${alice.accountId} AND operation_id = ${operationId}`)[0];
+    const raw = createHash("sha256").update(JSON.stringify({
+      dialog_id: dialogId,
+      state: "active",
+      text: "fingerprint secret",
+      reply_to_msg_id: null,
+      mentions: [],
+      attachments: [],
+    })).digest();
+    expect(Buffer.from(stored.payload_fingerprint).equals(raw)).toBe(false);
+    expect(Buffer.from(stored.payload_fingerprint)).toHaveLength(32);
+  });
+
+  test("group retry reconstructs an exact duplicate after the request row expires", async () => {
+    const { alice, dialogId } = await pair();
+    const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+    const clientGroupId = crypto.randomUUID();
+    const items = mediaIds.map((media_id) => ({
+      media_id,
+      client_msg_id: crypto.randomUUID(),
+    }));
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId,
+      items,
+      body: "durable duplicate",
+    };
+    const first = await sendMediaGroup(db, request);
+    await db`
+      DELETE FROM media_group_send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_group_id = ${clientGroupId}`;
+    const reconstructed = await sendMediaGroup(db, request);
+    expect(reconstructed.duplicate).toBe(true);
+    expect(reconstructed.messages.map((message) => message.msg_id))
+      .toEqual(first.messages.map((message) => message.msg_id));
+    expect(await db`
+      SELECT msg_id FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND media_group_id = ${clientGroupId}`)
+      .toHaveLength(2);
+  });
+
+  test("draft kill switch covers consumption, difference, and bootstrap without pts gaps", async () => {
+    const { alice, dialogId } = await pair();
+    const draft = await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: crypto.randomUUID(),
+      text: "hidden while killed",
+    });
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "queued",
+      draftConsumeOperationId: draft.draft.operation_id,
+      allowDraftConsumption: false,
+    })).rejects.toMatchObject({ status: 404, code: "capability_unavailable" });
+    const difference = await getDifference(db, alice.accountId, draft.draft.revision - 1, {
+      cloudDraftsEnabled: false,
+    });
+    expect(difference.kind).toBe("difference");
+    if (difference.kind === "difference") {
+      expect(difference.updates).toEqual([
+        expect.objectContaining({
+          pts: draft.draft.revision,
+          ptsCount: 1,
+          type: "capability.skipped",
+        }),
+      ]);
+      expect(difference.state.pts).toBeGreaterThanOrEqual(draft.draft.revision);
+    }
+    const bootstrap = await startBootstrap(db, alice.accountId);
+    const page = await getBootstrapDialogsPage(db, alice.accountId, bootstrap.token, {
+      cloudDraftsEnabled: false,
+    });
+    expect(page.dialogs[0].draft).toBeNull();
+    expect((await getDraft(db, alice.accountId, dialogId))?.text).toBe("hidden while killed");
+  });
+
+  test("album item budget is enforced independently of request count", async () => {
+    const { alice, dialogId } = await pair();
+    await db`
+      INSERT INTO media_group_send_budgets(account_id, device_id, item_count)
+      SELECT ${alice.accountId}, ${alice.deviceId}, 10
+      FROM generate_series(1, 60)`;
+    const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+    await expect(sendMediaGroup(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId: crypto.randomUUID(),
+      items: mediaIds.map((media_id) => ({ media_id })),
+    })).rejects.toMatchObject({ status: 429, code: "media_group_rate_limited" });
+  });
+
+  test("cleanup skips locked orphan media and migration constraints complete once", async () => {
+    expect(CLEANUP_BATCH_SIZE * 60_000 / MAINTENANCE_INTERVAL_MS)
+      .toBeGreaterThan(ALLOWED_MUTATION_INGRESS_PER_MINUTE);
+    const { alice } = await pair();
+    const mediaId = await readyMedia(alice.accountId);
+    await db`
+      UPDATE media_objects SET completed_at = now() - interval '2 days',
+        last_accessed_at = now() - interval '2 days'
+      WHERE id = ${mediaId}`;
+    await db.begin(async (tx) => {
+      await tx`SELECT id FROM media_objects WHERE id = ${mediaId} FOR UPDATE`;
+      const cleaned = await cleanupExpiredData(db);
+      expect(cleaned.mediaOrphans).toBe(0);
+    });
+    expect(await db`SELECT id FROM media_objects WHERE id = ${mediaId}`).toHaveLength(1);
+    const markers = await db`
+      SELECT name FROM schema_migrations
+      WHERE name IN (
+        'media-constraints-v2',
+        'messages-media-group-shape-v2',
+        'messages-domain-constraints-v2',
+        'account-events-type-v2',
+        'message-mutation-operation-v2'
+      )`;
+    expect(markers).toHaveLength(5);
+    const invalid = await db`
+      SELECT conname FROM pg_constraint
+      WHERE conname LIKE '%\\_v2' ESCAPE '\\' OR NOT convalidated`;
+    expect(invalid).toHaveLength(0);
   });
 });

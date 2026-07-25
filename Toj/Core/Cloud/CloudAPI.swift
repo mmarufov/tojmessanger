@@ -739,11 +739,12 @@ nonisolated func cloudFailureDisposition(_ error: Error) -> CloudFailureDisposit
         }
     }
     guard let apiError = error as? CloudAPIError else { return .permanent }
+    if apiError.code == "capability_unavailable" {
+        return .unsupportedServer
+    }
     switch apiError.status {
     case 401, 403:
         return .authenticationRequired
-    case 404:
-        return .unsupportedServer
     case 408, 425, 429, 500...599:
         return .transient(retryAfter: apiError.retryAfter.map(TimeInterval.init))
     default:
@@ -755,11 +756,7 @@ nonisolated func cloudOperationFailureDisposition(
     _ error: Error,
     serverAdvertisesFeature: Bool
 ) -> CloudFailureDisposition {
-    if serverAdvertisesFeature, let apiError = error as? CloudAPIError, apiError.status == 404 {
-        // Once the capability contract confirms a route family exists, a 404 is a missing/expired
-        // resource rather than deployment drift. Retrying it forever would hide a permanent error.
-        return .permanent
-    }
+    _ = serverAdvertisesFeature
     return cloudFailureDisposition(error)
 }
 

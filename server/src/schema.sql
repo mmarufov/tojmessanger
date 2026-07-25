@@ -3,6 +3,10 @@
 -- .context/m3-review-and-corrections.md. TEXT+CHECK instead of enums (C5, no ALTER TYPE friction).
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  name TEXT PRIMARY KEY,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ============ identity ============
 CREATE TABLE IF NOT EXISTS accounts (
@@ -229,17 +233,19 @@ ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS upload_protocol TEXT NOT NULL
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS part_size INT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS total_parts INT;
 ALTER TABLE media_objects ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'message';
-ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_upload_protocol_check;
-ALTER TABLE media_objects ADD CONSTRAINT media_objects_upload_protocol_check CHECK (
-  (upload_protocol = 'offset_v1' AND part_size IS NULL AND total_parts IS NULL) OR
-  (upload_protocol = 'parts_v2' AND part_size > 0 AND total_parts > 0)
-);
-ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_status_check;
-ALTER TABLE media_objects ADD CONSTRAINT media_objects_status_check
-  CHECK (status IN ('uploading','ready','rejected','deleted'));
-ALTER TABLE media_objects DROP CONSTRAINT IF EXISTS media_objects_purpose_check;
-ALTER TABLE media_objects ADD CONSTRAINT media_objects_purpose_check
-  CHECK (purpose IN ('message','group_photo'));
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'media-constraints-v2')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'media_objects_upload_protocol_check_v2') THEN
+    ALTER TABLE media_objects ADD CONSTRAINT media_objects_upload_protocol_check_v2 CHECK (
+      (upload_protocol = 'offset_v1' AND part_size IS NULL AND total_parts IS NULL) OR
+      (upload_protocol = 'parts_v2' AND part_size > 0 AND total_parts > 0)
+    ) NOT VALID;
+    ALTER TABLE media_objects ADD CONSTRAINT media_objects_status_check_v2
+      CHECK (status IN ('uploading','ready','rejected','deleted')) NOT VALID;
+    ALTER TABLE media_objects ADD CONSTRAINT media_objects_purpose_check_v2
+      CHECK (purpose IN ('message','group_photo')) NOT VALID;
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS media_objects_owner_quota_idx
   ON media_objects(owner_account_id, status, created_at);
 
@@ -309,32 +315,41 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_obj
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_index SMALLINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_count SMALLINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS draft_consume_operation_id UUID;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS draft_cleared_revision BIGINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_data JSONB;
-ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;
-ALTER TABLE messages ADD CONSTRAINT messages_kind_check
-  CHECK (kind IN ('text','photo','video','file','voice','service'));
-ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_service_type_check;
-ALTER TABLE messages ADD CONSTRAINT messages_service_type_check CHECK (
-  service_type IS NULL OR service_type IN (
-    'group.created','member.added','member.removed','member.role_changed','member.left',
-    'dialog.title_changed','dialog.photo_changed','dialog.owner_transferred','dialog.closed',
-    'call.completed','call.declined','call.missed','call.busy','call.cancelled','call.failed'
-  )
-);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'messages-domain-constraints-v2')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'messages_kind_check_v2') THEN
+    ALTER TABLE messages ADD CONSTRAINT messages_kind_check_v2
+      CHECK (kind IN ('text','photo','video','file','voice','service')) NOT VALID;
+    ALTER TABLE messages ADD CONSTRAINT messages_service_type_check_v2 CHECK (
+      service_type IS NULL OR service_type IN (
+        'group.created','member.added','member.removed','member.role_changed','member.left',
+        'dialog.title_changed','dialog.photo_changed','dialog.owner_transferred','dialog.closed',
+        'call.completed','call.declined','call.missed','call.busy','call.cancelled','call.failed'
+      )
+    ) NOT VALID;
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS messages_media_idx ON messages(media_id) WHERE media_id IS NOT NULL;
-ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_media_group_shape_check;
-ALTER TABLE messages ADD CONSTRAINT messages_media_group_shape_check CHECK (
-  (media_group_id IS NULL AND media_group_index IS NULL AND media_group_count IS NULL)
-  OR (
-    media_group_id IS NOT NULL
-    AND media_group_index IS NOT NULL
-    AND media_group_count BETWEEN 2 AND 10
-    AND media_group_index >= 0
-    AND media_group_index < media_group_count
-    AND media_id IS NOT NULL
-  )
-) NOT VALID;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'messages-media-group-shape-v2')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'messages_media_group_shape_check_v2') THEN
+    ALTER TABLE messages ADD CONSTRAINT messages_media_group_shape_check_v2 CHECK (
+      (media_group_id IS NULL AND media_group_index IS NULL AND media_group_count IS NULL)
+      OR (
+        media_group_id IS NOT NULL
+        AND media_group_index IS NOT NULL
+        AND media_group_count BETWEEN 2 AND 10
+        AND media_group_index >= 0
+        AND media_group_index < media_group_count
+        AND media_id IS NOT NULL
+      )
+    ) NOT VALID;
+  END IF;
+END $$;
 -- The call-eligibility index is built concurrently by schema-concurrent.sql because messages is an
 -- existing, high-write table.
 DO $$ BEGIN
@@ -383,12 +398,16 @@ CREATE TABLE IF NOT EXISTS account_events (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, pts)                            -- serves get_difference: WHERE account_id=? AND pts>? ORDER BY pts
 );
-ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
-ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
-  ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-   'dialog.created','member.added','member.removed','member.role_changed','member.left',
-   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
-   'draft.updated'));
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v2')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v2') THEN
+    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v2 CHECK (type IN
+      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+       'dialog.created','member.added','member.removed','member.role_changed','member.left',
+       'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
+       'draft.updated')) NOT VALID;
+  END IF;
+END $$;
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -464,8 +483,15 @@ CREATE TABLE IF NOT EXISTS draft_mutation_requests (
       AND response_key_id IS NOT NULL AND response_nonce IS NOT NULL AND response_ciphertext IS NOT NULL)
   )
 );
-ALTER TABLE draft_mutation_requests
-  DROP CONSTRAINT IF EXISTS draft_mutation_requests_dialog_id_fkey;
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'draft_mutation_requests_dialog_id_fkey'
+  ) THEN
+    ALTER TABLE draft_mutation_requests
+      DROP CONSTRAINT draft_mutation_requests_dialog_id_fkey;
+  END IF;
+END $$;
 
 -- One immutable row per accepted mutation makes the 120/minute device budget a true rolling window.
 CREATE TABLE IF NOT EXISTS draft_mutation_budgets (
@@ -498,8 +524,26 @@ CREATE TABLE IF NOT EXISTS media_group_send_requests (
     (status = 'completed' AND first_msg_id IS NOT NULL AND last_msg_id IS NOT NULL AND sender_pts IS NOT NULL)
   )
 );
-ALTER TABLE media_group_send_requests
-  DROP CONSTRAINT IF EXISTS media_group_send_requests_dialog_id_fkey;
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'media_group_send_requests_dialog_id_fkey'
+  ) THEN
+    ALTER TABLE media_group_send_requests
+      DROP CONSTRAINT media_group_send_requests_dialog_id_fkey;
+  END IF;
+END $$;
+
+-- Counts album items rather than requests so ten-item groups cannot multiply mutation ingress.
+CREATE TABLE IF NOT EXISTS media_group_send_budgets (
+  id BIGSERIAL PRIMARY KEY,
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  item_count SMALLINT NOT NULL CHECK (item_count BETWEEN 2 AND 10),
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS media_group_send_budgets_account_window_idx
+  ON media_group_send_budgets(account_id, accepted_at DESC);
 
 -- Edit/delete retries use a client-generated mutation id just like sends use client_msg_id.
 -- The claim is taken before locking the message so a timed-out request can safely be repeated.
@@ -516,11 +560,24 @@ CREATE TABLE IF NOT EXISTS message_mutation_requests (
 );
 -- Early development versions briefly added this FK. The idempotency row must be claimable before
 -- the message row is locked (global lock order), so validation happens transactionally in sync.ts.
-ALTER TABLE message_mutation_requests
-  DROP CONSTRAINT IF EXISTS message_mutation_requests_dialog_id_msg_id_fkey;
-ALTER TABLE message_mutation_requests DROP CONSTRAINT IF EXISTS message_mutation_requests_operation_check;
-ALTER TABLE message_mutation_requests ADD CONSTRAINT message_mutation_requests_operation_check
-  CHECK (operation IN ('edit','delete','reaction'));
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'message_mutation_requests_dialog_id_msg_id_fkey'
+  ) THEN
+    ALTER TABLE message_mutation_requests
+      DROP CONSTRAINT message_mutation_requests_dialog_id_msg_id_fkey;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM schema_migrations WHERE name = 'message-mutation-operation-v2'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'message_mutation_requests_operation_check_v2'
+  ) THEN
+    ALTER TABLE message_mutation_requests
+      ADD CONSTRAINT message_mutation_requests_operation_check_v2
+      CHECK (operation IN ('edit','delete','reaction')) NOT VALID;
+  END IF;
+END $$;
 
 -- Group creation uses the final client UUID as both the dialog id and the idempotency key.
 CREATE TABLE IF NOT EXISTS group_create_requests (

@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { Client } from "pg";
-import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { seal, open, bodyAAD } from "./crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { seal, open, bodyAAD, requestFingerprintHMAC } from "./crypto";
 import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
 import { lockAccountMutations } from "./locks";
@@ -222,6 +222,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
 }
 
 const MAX_TEXT_BYTES = 16 * 1024;
+const MAX_MEDIA_GROUP_ITEMS_PER_MINUTE = 600;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function requireTextBody(body: unknown): string {
@@ -315,9 +316,13 @@ export async function sendMessage(sql: SQL, p: {
   forwardedFrom?: { dialogId: string; msgId: number } | null;
   mentions?: unknown;
   draftConsumeOperationId?: string | null;
+  allowDraftConsumption?: boolean;
   /** Server-only escape hatch for generated lifecycle rows such as call history. */
   internalService?: boolean;
 }): Promise<SendResult> {
+  if (p.draftConsumeOperationId != null && p.allowDraftConsumption === false) {
+    throw new SyncError("cloud drafts are unavailable", 404, "capability_unavailable");
+  }
   return await sql.begin(async (tx) => {
     const draftConsumeOperationId = p.draftConsumeOperationId == null
       ? null
@@ -420,6 +425,7 @@ export async function sendMessage(sql: SQL, p: {
       if (media.status !== "ready") throw new SyncError("media upload is incomplete");
       if (media.purpose !== "message") throw new SyncError("media purpose does not allow messages");
       kind = media.kind;
+      await tx`UPDATE media_objects SET last_accessed_at = now() WHERE id = ${mediaId}`;
     } else if (!mediaId && !p.forwardedFrom && kind !== "text"
       && !(kind === "service" && p.internalService === true)) {
       throw new SyncError("media upload required");
@@ -582,7 +588,7 @@ function mediaGroupFingerprint(input: {
   draftConsumeOperationId: string | null;
   items: NormalizedGroupItem[];
 }): Buffer {
-  return createHash("sha256").update(JSON.stringify({
+  return requestFingerprintHMAC("media-group-send", JSON.stringify({
     dialog_id: input.dialogId,
     body: input.body,
     reply_to_msg_id: input.replyToMsgId,
@@ -596,7 +602,7 @@ function mediaGroupFingerprint(input: {
       media_id: item.mediaId,
       client_msg_id: item.fingerprintClientMsgId,
     })),
-  })).digest();
+  }));
 }
 
 /**
@@ -613,6 +619,7 @@ export async function sendMediaGroup(sql: SQL, p: {
   replyToMsgId?: unknown;
   mentions?: unknown;
   draftConsumeOperationId?: string | null;
+  allowDraftConsumption?: boolean;
 }): Promise<MediaGroupSendResult> {
   const dialogId = String(p.dialogId ?? "").toLowerCase();
   const clientGroupId = String(p.clientGroupId ?? "").toLowerCase();
@@ -630,6 +637,9 @@ export async function sendMediaGroup(sql: SQL, p: {
   if (draftConsumeOperationId != null && !UUID_PATTERN.test(draftConsumeOperationId)) {
     throw new SyncError("invalid draft consume operation id");
   }
+  if (draftConsumeOperationId != null && p.allowDraftConsumption === false) {
+    throw new SyncError("cloud drafts are unavailable", 404, "capability_unavailable");
+  }
   const fingerprint = mediaGroupFingerprint({
     dialogId,
     body,
@@ -640,6 +650,84 @@ export async function sendMediaGroup(sql: SQL, p: {
   });
 
   return await sql.begin(async (tx) => {
+    const requestStillPresent = (await tx`
+      SELECT 1 FROM media_group_send_requests
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}`)[0] != null;
+    const durableGroup = requestStillPresent ? [] : await tx`
+      SELECT dialog_id, msg_id, client_msg_id, media_id, media_group_index, media_group_count,
+             draft_consume_operation_id, draft_cleared_revision
+      FROM messages
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND media_group_id = ${clientGroupId}
+      ORDER BY media_group_index`;
+    if (durableGroup.length) {
+      const shapeMatches = durableGroup.length === items.length
+        && durableGroup.every((row: any, index: number) =>
+          row.dialog_id === dialogId
+          && n(row.media_group_index) === index
+          && n(row.media_group_count) === items.length
+          && row.media_id === items[index].mediaId
+          && row.client_msg_id === items[index].clientMsgId
+          && (row.draft_consume_operation_id ?? null) === draftConsumeOperationId
+        );
+      const keys = durableGroup.map((row: any) => ({
+        dialogId: String(row.dialog_id),
+        msgId: n(row.msg_id),
+      }));
+      const loaded = await loadMessages(tx, keys);
+      const messages = keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`))
+        .filter((message): message is MessageDTO => message != null);
+      const first = messages[0];
+      const contentMatches = first?.text === body
+        && first?.reply_to_msg_id === replyToMsgId
+        && JSON.stringify(first?.mentions ?? []) === JSON.stringify(
+          mentions.map((mention) => ({
+            account_id: mention.accountId,
+            offset: mention.offset,
+            length: mention.length,
+          })),
+        );
+      if (!shapeMatches || !contentMatches || messages.length !== items.length) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+      const firstMsgId = n(durableGroup[0].msg_id);
+      const lastMsgId = n(durableGroup[durableGroup.length - 1].msg_id);
+      const clearedRevision = durableGroup[0].draft_cleared_revision == null
+        ? null : n(durableGroup[0].draft_cleared_revision);
+      const messagePts = (await tx`
+        SELECT COALESCE(max(pts), 0)::bigint AS pts
+        FROM account_events
+        WHERE account_id = ${p.senderAccountId}
+          AND dialog_id = ${dialogId}
+          AND type = 'message.new'
+          AND msg_id BETWEEN ${firstMsgId} AND ${lastMsgId}`)[0];
+      const senderPts = Math.max(n(messagePts.pts), clearedRevision ?? 0);
+      await tx`
+        INSERT INTO media_group_send_requests (
+          sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+          first_msg_id, last_msg_id, sender_pts, draft_consume_operation_id,
+          cleared_draft_revision
+        ) VALUES (
+          ${p.senderAccountId}, ${clientGroupId}, ${dialogId}, ${fingerprint}, 'completed',
+          ${firstMsgId}, ${lastMsgId}, ${senderPts}, ${draftConsumeOperationId},
+          ${clearedRevision}
+        )
+        ON CONFLICT (sender_account_id, client_group_id) DO NOTHING`;
+      return {
+        dialogId,
+        clientGroupId,
+        messages,
+        senderPts,
+        clearedDraftRevision: clearedRevision,
+        duplicate: true,
+        pushes: [],
+      };
+    }
     const claim = await tx`
       INSERT INTO media_group_send_requests (
         sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
@@ -699,6 +787,17 @@ export async function sendMediaGroup(sql: SQL, p: {
     await lockAccountMutations(tx, directPair
       ? [directPair.account_low, directPair.account_high]
       : [p.senderAccountId]);
+    const itemBudget = (await tx`
+      SELECT COALESCE(sum(item_count), 0)::int AS count
+      FROM media_group_send_budgets
+      WHERE account_id = ${p.senderAccountId}
+        AND accepted_at > now() - interval '1 minute'`)[0];
+    if (n(itemBudget.count) + items.length > MAX_MEDIA_GROUP_ITEMS_PER_MINUTE) {
+      throw new SyncError("media group item budget exceeded", 429, "media_group_rate_limited");
+    }
+    await tx`
+      INSERT INTO media_group_send_budgets(account_id, device_id, item_count)
+      VALUES (${p.senderAccountId}, ${p.senderDeviceId}, ${items.length})`;
 
     const sortedMediaIds = items.map((item) => item.mediaId).sort();
     const mediaRows = await tx`
@@ -716,6 +815,9 @@ export async function sendMediaGroup(sql: SQL, p: {
       )) {
       throw new SyncError("group media is unavailable", 409, "media_group_item_unavailable");
     }
+    await tx`
+      UPDATE media_objects SET last_accessed_at = now()
+      WHERE id = ANY(${tx.array(sortedMediaIds, "uuid")}::uuid[])`;
     const mediaById = new Map(mediaRows.map((row: any) => [String(row.id), row]));
 
     await lockDialogForMutation(tx, p.senderAccountId, dialogId);
@@ -813,6 +915,11 @@ export async function sendMediaGroup(sql: SQL, p: {
       pushes.push(...consumed.pushes);
       senderPts = consumed.revision;
     }
+    await tx`
+      UPDATE messages SET
+        draft_consume_operation_id = ${draftConsumeOperationId},
+        draft_cleared_revision = ${consumed?.revision ?? null}
+      WHERE dialog_id = ${dialogId} AND msg_id = ${firstMsgId}`;
     await tx`
       UPDATE media_group_send_requests SET
         status = 'completed',
@@ -1155,7 +1262,7 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
 /** review B3 (pruned floor → too_long) + I3 (byte + count budget, slicing). */
 export async function getDifference(
   sql: SQL, accountId: string, sincePts: number,
-  opts: { maxEvents?: number; maxBytes?: number } = {},
+  opts: { maxEvents?: number; maxBytes?: number; cloudDraftsEnabled?: boolean } = {},
 ): Promise<Difference> {
   const maxEvents = boundedInteger(opts.maxEvents, 200, 1, 200);
   const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
@@ -1251,7 +1358,9 @@ export async function getDifference(
   const draftDialogIds = rows
     .filter((event: any) => event.type === "draft.updated" && !revokedDialogs.has(event.dialog_id))
     .map((event: any) => String(event.dialog_id));
-  const drafts = await loadDrafts(sql, accountId, draftDialogIds);
+  const drafts = opts.cloudDraftsEnabled === false
+    ? new Map<string, DraftDTO>()
+    : await loadDrafts(sql, accountId, draftDialogIds);
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
@@ -1283,6 +1392,10 @@ export async function getDifference(
           message,
         };
       }
+    } else if (ev.type === "draft.updated" && opts.cloudDraftsEnabled === false) {
+      // Preserve the contiguous account pts stream while the lane is killed. No draft payload
+      // leaks through the disabled capability; re-enable is recovered by replacement bootstrap.
+      update = { pts, ptsCount: 1, type: "capability.skipped" };
     } else if (ev.type === "draft.updated") {
       update = {
         pts,
@@ -1383,7 +1496,12 @@ export async function getBootstrapDialogsPage(
   sql: SQL,
   accountId: string,
   token: string,
-  opts: { cursor?: string; limit?: number; previewMessages?: number } = {},
+  opts: {
+    cursor?: string;
+    limit?: number;
+    previewMessages?: number;
+    cloudDraftsEnabled?: boolean;
+  } = {},
 ): Promise<BootstrapPage> {
   // Keep worst-case hydration bounded. The client pages dialogs and history separately, so a
   // bootstrap response never needs thousands of per-message lookups in one request.
@@ -1440,11 +1558,13 @@ export async function getBootstrapDialogsPage(
         LIMIT ${limit + 1}`;
 
   const pageRows = rows.slice(0, limit);
-  const pageDrafts = await loadDrafts(
-    sql,
-    accountId,
-    pageRows.map((row: any) => String(row.dialog_id)),
-  );
+  const pageDrafts = opts.cloudDraftsEnabled === false
+    ? new Map<string, DraftDTO>()
+    : await loadDrafts(
+      sql,
+      accountId,
+      pageRows.map((row: any) => String(row.dialog_id)),
+    );
   const dialogs: BootstrapDialog[] = [];
   for (const row of pageRows) {
     const members = await sql`
