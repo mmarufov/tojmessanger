@@ -37,6 +37,9 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let reactions: [CloudReaction]
     let mentions: [CloudMention]
     let media: CloudMedia?
+    let mediaGroupId: String?
+    let mediaGroupIndex: Int?
+    let mediaGroupCount: Int?
     let serviceType: String?
     let serviceData: CloudServiceData?
     let editVersion: Int
@@ -58,6 +61,9 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         reactions: [CloudReaction] = [],
         mentions: [CloudMention] = [],
         media: CloudMedia? = nil,
+        mediaGroupId: String? = nil,
+        mediaGroupIndex: Int? = nil,
+        mediaGroupCount: Int? = nil,
         serviceType: String? = nil,
         serviceData: CloudServiceData? = nil,
         editVersion: Int,
@@ -78,6 +84,9 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         self.reactions = reactions
         self.mentions = mentions
         self.media = media
+        self.mediaGroupId = mediaGroupId
+        self.mediaGroupIndex = mediaGroupIndex
+        self.mediaGroupCount = mediaGroupCount
         self.serviceType = serviceType
         self.serviceData = serviceData
         self.editVersion = editVersion
@@ -100,6 +109,9 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case reactions
         case mentions
         case media
+        case mediaGroupId = "media_group_id"
+        case mediaGroupIndex = "media_group_index"
+        case mediaGroupCount = "media_group_count"
         case serviceType = "service_type"
         case serviceData = "service_data"
         case editVersion = "edit_version"
@@ -123,11 +135,63 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         reactions = try values.decodeIfPresent([CloudReaction].self, forKey: .reactions) ?? []
         mentions = try values.decodeIfPresent([CloudMention].self, forKey: .mentions) ?? []
         media = try values.decodeIfPresent(CloudMedia.self, forKey: .media)
+        mediaGroupId = try values.decodeIfPresent(String.self, forKey: .mediaGroupId)
+        mediaGroupIndex = try values.decodeIfPresent(Int.self, forKey: .mediaGroupIndex)
+        mediaGroupCount = try values.decodeIfPresent(Int.self, forKey: .mediaGroupCount)
         serviceType = try values.decodeIfPresent(String.self, forKey: .serviceType)
         serviceData = try values.decodeIfPresent(CloudServiceData.self, forKey: .serviceData)
         editVersion = try values.decode(Int.self, forKey: .editVersion)
         state = try values.decode(String.self, forKey: .state)
         serverTs = try values.decode(String.self, forKey: .serverTs)
+    }
+}
+
+nonisolated struct CloudDraftReplyPreview: Codable, Equatable, Sendable {
+    let msgId: Int64
+    let senderAccountId: String
+    let text: String
+    let unavailable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case msgId = "msg_id"
+        case senderAccountId = "sender_account_id"
+        case text, unavailable
+    }
+}
+
+nonisolated struct CloudDraftAttachment: Codable, Equatable, Sendable {
+    let attachmentId: String
+    let mediaId: String
+    let position: Int
+    let media: CloudMedia
+
+    enum CodingKeys: String, CodingKey {
+        case attachmentId = "attachment_id"
+        case mediaId = "media_id"
+        case position, media
+    }
+}
+
+nonisolated struct CloudDraft: Codable, Equatable, Sendable {
+    let dialogId: String
+    let revision: Int64
+    let state: String
+    let text: String
+    let replyToMsgId: Int64?
+    let replyPreview: CloudDraftReplyPreview?
+    let mentions: [CloudMention]
+    let attachments: [CloudDraftAttachment]
+    let operationId: String
+    let updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case dialogId = "dialog_id"
+        case revision, state, text
+        case replyToMsgId = "reply_to_msg_id"
+        case replyPreview = "reply_preview"
+        case mentions, attachments
+        case operationId = "operation_id"
+        case updatedAt = "updated_at"
     }
 }
 
@@ -139,6 +203,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let dialogTitle: String?
     let dialogType: String?
     let message: CloudMessage?
+    let draft: CloudDraft?
     let group: CloudUpdateGroup?
     let member: CloudGroupMember?
     let readerAccountId: String?
@@ -163,6 +228,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         dialogTitle: String?,
         dialogType: String? = nil,
         message: CloudMessage?,
+        draft: CloudDraft? = nil,
         group: CloudUpdateGroup? = nil,
         member: CloudGroupMember? = nil,
         readerAccountId: String?,
@@ -186,6 +252,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.dialogTitle = dialogTitle
         self.dialogType = dialogType
         self.message = message
+        self.draft = draft
         self.group = group
         self.member = member
         self.readerAccountId = readerAccountId
@@ -211,6 +278,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case dialogTitle = "dialog_title"
         case dialogType = "dialog_type"
         case message
+        case draft
         case group
         case member
         case readerAccountId = "reader_account_id"
@@ -358,9 +426,44 @@ nonisolated struct SendMessageResponse: Codable, Sendable {
     let clientMsgId: String
     let msgId: Int64
     let senderPts: Int64
+    let clearedDraftRevision: Int64?
     let duplicate: Bool
     let serverTs: String?
     let text: String?
+
+    init(
+        dialogId: String,
+        clientMsgId: String,
+        msgId: Int64,
+        senderPts: Int64,
+        clearedDraftRevision: Int64? = nil,
+        duplicate: Bool,
+        serverTs: String?,
+        text: String?
+    ) {
+        self.dialogId = dialogId
+        self.clientMsgId = clientMsgId
+        self.msgId = msgId
+        self.senderPts = senderPts
+        self.clearedDraftRevision = clearedDraftRevision
+        self.duplicate = duplicate
+        self.serverTs = serverTs
+        self.text = text
+    }
+}
+
+nonisolated struct DraftMutationResponse: Codable, Sendable {
+    let draft: CloudDraft
+    let duplicate: Bool
+}
+
+nonisolated struct MediaGroupSendResponse: Codable, Sendable {
+    let dialogId: String
+    let clientGroupId: String
+    let messages: [CloudMessage]
+    let senderPts: Int64
+    let clearedDraftRevision: Int64?
+    let duplicate: Bool
 }
 
 nonisolated struct MessageMutationResponse: Codable, Sendable {
@@ -461,6 +564,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
     let selfRole: String?
     let notificationMode: String?
     let photo: CloudMedia?
+    let draft: CloudDraft?
     let members: [BootstrapDialogMember]
     let profiles: [CloudProfile]?
     let messages: [CloudMessage]
@@ -477,6 +581,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         selfRole: String? = nil,
         notificationMode: String? = nil,
         photo: CloudMedia? = nil,
+        draft: CloudDraft? = nil,
         members: [BootstrapDialogMember],
         profiles: [CloudProfile]? = nil,
         messages: [CloudMessage]
@@ -492,6 +597,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         self.selfRole = selfRole
         self.notificationMode = notificationMode
         self.photo = photo
+        self.draft = draft
         self.members = members
         self.profiles = profiles
         self.messages = messages
@@ -509,6 +615,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         case selfRole = "self_role"
         case notificationMode = "notification_mode"
         case photo
+        case draft
         case members
         case profiles
         case messages
@@ -912,6 +1019,7 @@ struct CloudAPI: Sendable {
         body: String,
         replyToMsgId: Int64? = nil,
         mentions: [CloudMention] = [],
+        draftConsumeOperationId: String? = nil,
         token: String
     ) async throws -> SendMessageResponse {
         try await post(
@@ -924,7 +1032,8 @@ struct CloudAPI: Sendable {
                 replyToMsgId: replyToMsgId,
                 mediaId: nil,
                 forwardedFrom: nil,
-                mentions: mentions
+                mentions: mentions,
+                draftConsumeOperationId: draftConsumeOperationId
             ),
             token: token
         )
@@ -936,6 +1045,8 @@ struct CloudAPI: Sendable {
         body: String,
         mediaId: String,
         replyToMsgId: Int64? = nil,
+        mentions: [CloudMention] = [],
+        draftConsumeOperationId: String? = nil,
         token: String
     ) async throws -> SendMessageResponse {
         try await post(
@@ -943,7 +1054,8 @@ struct CloudAPI: Sendable {
             body: SendMessageRequest(
                 dialogId: dialogId, clientMsgId: clientMsgId, kind: nil,
                 body: body, replyToMsgId: replyToMsgId, mediaId: mediaId,
-                forwardedFrom: nil, mentions: []
+                forwardedFrom: nil, mentions: mentions,
+                draftConsumeOperationId: draftConsumeOperationId
             ),
             token: token
         )
@@ -966,7 +1078,57 @@ struct CloudAPI: Sendable {
                 replyToMsgId: nil,
                 mediaId: nil,
                 forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId),
-                mentions: []
+                mentions: [],
+                draftConsumeOperationId: nil
+            ),
+            token: token
+        )
+    }
+
+    func updateDraft(
+        dialogId: String,
+        operationId: String,
+        state: String,
+        text: String,
+        replyToMsgId: Int64?,
+        mentions: [CloudMention],
+        attachments: [DraftAttachmentRequest],
+        token: String
+    ) async throws -> DraftMutationResponse {
+        try await put(
+            "v1/drafts/\(dialogId)",
+            body: DraftMutationRequest(
+                operationId: operationId,
+                state: state,
+                text: text,
+                replyToMsgId: replyToMsgId,
+                mentions: mentions,
+                attachments: attachments
+            ),
+            token: token
+        )
+    }
+
+    func sendMediaGroup(
+        dialogId: String,
+        clientGroupId: String,
+        items: [MediaGroupItemRequest],
+        caption: String,
+        replyToMsgId: Int64?,
+        mentions: [CloudMention],
+        draftConsumeOperationId: String?,
+        token: String
+    ) async throws -> MediaGroupSendResponse {
+        try await post(
+            "v1/messages/send-group",
+            body: MediaGroupSendRequest(
+                clientGroupId: clientGroupId,
+                dialogId: dialogId,
+                items: items,
+                body: caption,
+                replyToMsgId: replyToMsgId,
+                mentions: mentions,
+                draftConsumeOperationId: draftConsumeOperationId
             ),
             token: token
         )
@@ -1396,6 +1558,63 @@ private struct HistoryRequest: Encodable {
     let maxBytes: Int
 }
 
+nonisolated struct DraftAttachmentRequest: Codable, Equatable, Sendable {
+    let attachmentId: String
+    let mediaId: String
+    let position: Int
+
+    enum CodingKeys: String, CodingKey {
+        case attachmentId = "attachment_id"
+        case mediaId = "media_id"
+        case position
+    }
+}
+
+private struct DraftMutationRequest: Encodable {
+    let operationId: String
+    let state: String
+    let text: String
+    let replyToMsgId: Int64?
+    let mentions: [CloudMention]
+    let attachments: [DraftAttachmentRequest]
+
+    enum CodingKeys: String, CodingKey {
+        case operationId = "operation_id"
+        case state, text
+        case replyToMsgId = "reply_to_msg_id"
+        case mentions, attachments
+    }
+}
+
+nonisolated struct MediaGroupItemRequest: Codable, Equatable, Sendable {
+    let clientMsgId: String
+    let mediaId: String
+
+    enum CodingKeys: String, CodingKey {
+        case clientMsgId = "client_msg_id"
+        case mediaId = "media_id"
+    }
+}
+
+private struct MediaGroupSendRequest: Encodable {
+    let clientGroupId: String
+    let dialogId: String
+    let items: [MediaGroupItemRequest]
+    let body: String
+    let replyToMsgId: Int64?
+    let mentions: [CloudMention]
+    let draftConsumeOperationId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case clientGroupId = "client_group_id"
+        case dialogId = "dialog_id"
+        case items, body
+        case replyToMsgId = "reply_to_msg_id"
+        case mentions
+        case draftConsumeOperationId = "draft_consume_operation_id"
+    }
+}
+
 private struct SendMessageRequest: Encodable {
     let dialogId: String
     let clientMsgId: String
@@ -1405,6 +1624,7 @@ private struct SendMessageRequest: Encodable {
     let mediaId: String?
     let forwardedFrom: ForwardedFromRequest?
     let mentions: [CloudMention]
+    let draftConsumeOperationId: String?
 }
 
 private struct ForwardedFromRequest: Encodable {

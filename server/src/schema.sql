@@ -289,6 +289,9 @@ CREATE TABLE IF NOT EXISTS messages (
   forwarded_from_dialog_id UUID,
   forwarded_from_msg_id BIGINT,
   media_id          UUID REFERENCES media_objects(id),
+  media_group_id    UUID,
+  media_group_index SMALLINT,
+  media_group_count SMALLINT,
   service_type      TEXT,
   service_data      JSONB,
   edit_version      INT NOT NULL DEFAULT 0,
@@ -303,6 +306,9 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_account_id UUID REF
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_dialog_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_msg_id BIGINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_objects(id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_id UUID;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_index SMALLINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_count SMALLINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_data JSONB;
 ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;
@@ -317,6 +323,18 @@ ALTER TABLE messages ADD CONSTRAINT messages_service_type_check CHECK (
   )
 );
 CREATE INDEX IF NOT EXISTS messages_media_idx ON messages(media_id) WHERE media_id IS NOT NULL;
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_media_group_shape_check;
+ALTER TABLE messages ADD CONSTRAINT messages_media_group_shape_check CHECK (
+  (media_group_id IS NULL AND media_group_index IS NULL AND media_group_count IS NULL)
+  OR (
+    media_group_id IS NOT NULL
+    AND media_group_index IS NOT NULL
+    AND media_group_count BETWEEN 2 AND 10
+    AND media_group_index >= 0
+    AND media_group_index < media_group_count
+    AND media_id IS NOT NULL
+  )
+) NOT VALID;
 -- The call-eligibility index is built concurrently by schema-concurrent.sql because messages is an
 -- existing, high-write table.
 DO $$ BEGIN
@@ -369,7 +387,8 @@ ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
 ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
   ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
    'dialog.created','member.added','member.removed','member.role_changed','member.left',
-   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated'));
+   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
+   'draft.updated'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -379,9 +398,108 @@ CREATE TABLE IF NOT EXISTS send_requests (
   status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
   msg_id            BIGINT,                            -- filled on completion
   sender_pts        BIGINT,                            -- filled on completion (retry must echo this)
+  draft_consume_operation_id UUID,
+  cleared_draft_revision BIGINT,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
+ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS draft_consume_operation_id UUID;
+ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS cleared_draft_revision BIGINT;
+
+-- ============ account-private cloud drafts ============
+-- Draft bodies use the same server-side AEAD model as cloud message bodies. A cleared row remains
+-- as a tombstone, preventing delayed device responses from resurrecting an older generation.
+CREATE TABLE IF NOT EXISTS account_dialog_drafts (
+  account_id        UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  dialog_id         UUID NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+  state             TEXT NOT NULL CHECK (state IN ('active','cleared')),
+  body_key_id       TEXT NOT NULL,
+  body_nonce        BYTEA NOT NULL,
+  body_ciphertext   BYTEA NOT NULL,
+  reply_to_msg_id   BIGINT,
+  mentions          JSONB NOT NULL DEFAULT '[]'::jsonb,
+  revision          BIGINT NOT NULL CHECK (revision > 0),
+  operation_id      UUID NOT NULL,
+  source_device_id  UUID REFERENCES devices(id) ON DELETE SET NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, dialog_id),
+  FOREIGN KEY (dialog_id, reply_to_msg_id) REFERENCES messages(dialog_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS account_dialog_drafts_dialog_idx
+  ON account_dialog_drafts(dialog_id, account_id);
+
+CREATE TABLE IF NOT EXISTS draft_attachments (
+  account_id     UUID NOT NULL,
+  dialog_id      UUID NOT NULL,
+  attachment_id UUID NOT NULL,
+  media_id       UUID NOT NULL REFERENCES media_objects(id) ON DELETE CASCADE,
+  position       SMALLINT NOT NULL CHECK (position BETWEEN 0 AND 9),
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, dialog_id, attachment_id),
+  UNIQUE (account_id, dialog_id, position),
+  UNIQUE (account_id, dialog_id, media_id),
+  FOREIGN KEY (account_id, dialog_id)
+    REFERENCES account_dialog_drafts(account_id, dialog_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS draft_attachments_media_idx ON draft_attachments(media_id);
+
+CREATE TABLE IF NOT EXISTS draft_mutation_requests (
+  account_id          UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  operation_id        UUID NOT NULL,
+  dialog_id           UUID NOT NULL,
+  payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  status              TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+  resulting_revision  BIGINT,
+  response_key_id     TEXT,
+  response_nonce      BYTEA,
+  response_ciphertext BYTEA,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, operation_id),
+  CHECK (
+    (status = 'pending' AND resulting_revision IS NULL
+      AND response_key_id IS NULL AND response_nonce IS NULL AND response_ciphertext IS NULL)
+    OR
+    (status = 'completed' AND resulting_revision IS NOT NULL
+      AND response_key_id IS NOT NULL AND response_nonce IS NOT NULL AND response_ciphertext IS NOT NULL)
+  )
+);
+ALTER TABLE draft_mutation_requests
+  DROP CONSTRAINT IF EXISTS draft_mutation_requests_dialog_id_fkey;
+
+-- One immutable row per accepted mutation makes the 120/minute device budget a true rolling window.
+CREATE TABLE IF NOT EXISTS draft_mutation_budgets (
+  id           BIGSERIAL PRIMARY KEY,
+  account_id   UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device_id    UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  operation_id UUID NOT NULL,
+  accepted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (account_id, operation_id)
+);
+CREATE INDEX IF NOT EXISTS draft_mutation_budgets_device_window_idx
+  ON draft_mutation_budgets(device_id, accepted_at DESC);
+
+CREATE TABLE IF NOT EXISTS media_group_send_requests (
+  sender_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  client_group_id   UUID NOT NULL,
+  dialog_id         UUID NOT NULL,
+  payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  status            TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
+  first_msg_id      BIGINT,
+  last_msg_id       BIGINT,
+  sender_pts        BIGINT,
+  draft_consume_operation_id UUID,
+  cleared_draft_revision BIGINT,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (sender_account_id, client_group_id),
+  CHECK (
+    (status = 'pending' AND first_msg_id IS NULL AND last_msg_id IS NULL AND sender_pts IS NULL)
+    OR
+    (status = 'completed' AND first_msg_id IS NOT NULL AND last_msg_id IS NOT NULL AND sender_pts IS NOT NULL)
+  )
+);
+ALTER TABLE media_group_send_requests
+  DROP CONSTRAINT IF EXISTS media_group_send_requests_dialog_id_fkey;
 
 -- Edit/delete retries use a client-generated mutation id just like sends use client_msg_id.
 -- The claim is taken before locking the message so a timed-out request can safely be repeated.

@@ -642,8 +642,29 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(model.draft, outgoing.text)
 
         model.cancelComposerMode()
-        XCTAssertEqual(model.composerMode, .text)
+        XCTAssertEqual(
+            model.composerMode,
+            .replying(messageId: incoming.id, preview: incoming.text)
+        )
         XCTAssertTrue(model.draft.isEmpty)
+    }
+
+    @MainActor
+    func testReplyTargetWithoutTextRemainsADraftInsteadOfSendingAnEmptyMessage() async throws {
+        let model = CloudAppModel(useDefaultLocalStore: false)
+        model.enterDemoMode()
+        await model.selectDialog("demo-mehrona")
+        let incoming = try XCTUnwrap(model.lines.first(where: { !$0.mine }))
+        let before = model.lines
+
+        model.beginReply(to: incoming)
+        await model.sendDraft()
+
+        XCTAssertEqual(model.lines, before)
+        XCTAssertEqual(
+            model.composerMode,
+            .replying(messageId: incoming.id, preview: incoming.text)
+        )
     }
 
     @MainActor

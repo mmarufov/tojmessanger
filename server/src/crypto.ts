@@ -46,6 +46,16 @@ export function open(sealed: Sealed, aad: Buffer): Buffer {
 export function bodyAAD(dialogId: string, msgId: number | bigint, senderId: string): Buffer {
   return Buffer.from(`toj/msg|${dialogId}|${msgId}|${senderId}`, "utf8");
 }
+
+/** Binds an encrypted cloud draft body to one account/dialog server revision. */
+export function draftBodyAAD(accountId: string, dialogId: string, revision: number | bigint): Buffer {
+  return Buffer.from(`toj/draft|${accountId}|${dialogId}|${revision}`, "utf8");
+}
+
+/** Keeps the cached response for an idempotent draft operation encrypted at rest as well. */
+export function draftResponseAAD(accountId: string, operationId: string): Buffer {
+  return Buffer.from(`toj/draft-response|${accountId}|${operationId}`, "utf8");
+}
 export const PHONE_AAD = Buffer.from("toj/phone", "utf8");
 
 /** Binds an APNs device token to the exact authenticated device row. */

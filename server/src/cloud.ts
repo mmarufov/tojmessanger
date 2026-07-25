@@ -32,6 +32,7 @@ import {
   getState,
   readHistory,
   sendMessage,
+  sendMediaGroup,
   editMessage,
   deleteMessage,
   setReaction,
@@ -40,6 +41,7 @@ import {
   SyncError,
   type Push,
 } from "./sync";
+import { DraftError, getDraft, putDraft } from "./drafts";
 import {
   OperationalMetrics,
   logRequest,
@@ -111,7 +113,7 @@ const jsonHeaders = { "content-type": "application/json", "cache-control": "no-s
 const MAX_JSON_BYTES = 64 * 1024;
 
 export const CLOUD_CAPABILITIES = {
-  api_version: 4,
+  api_version: 5,
   capabilities: [
     "core_text",
     "replies",
@@ -125,11 +127,19 @@ export const CLOUD_CAPABILITIES = {
   ],
 } as const;
 
-function cloudCapabilities(voiceCalls: boolean, videoCalls: boolean, groups: boolean) {
+function cloudCapabilities(
+  voiceCalls: boolean,
+  videoCalls: boolean,
+  groups: boolean,
+  cloudDrafts: boolean,
+  mediaGroups: boolean,
+) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
   if (groups) capabilities.push("groups_v1");
+  if (cloudDrafts) capabilities.push("cloud_drafts_v1");
+  if (mediaGroups) capabilities.push("media_groups_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -252,6 +262,8 @@ export function startCloudServer(
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
+  const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
+  const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -292,7 +304,13 @@ export function startCloudServer(
           const accountVideoAvailable = capabilityToken
             ? videoCallsEnabledForAccount((await resolveDevice(db, capabilityToken)).accountId, videoAvailable)
             : false;
-          response = json(cloudCapabilities(callsAvailable, accountVideoAvailable, groupsAvailable));
+          response = json(cloudCapabilities(
+            callsAvailable,
+            accountVideoAvailable,
+            groupsAvailable,
+            cloudDraftsAvailable,
+            mediaGroupsAvailable,
+          ));
         }
 
         else if (url.pathname === "/metrics") {
@@ -769,6 +787,58 @@ export function startCloudServer(
             replyToMsgId: body.replyToMsgId,
             forwardedFrom: body.forwardedFrom,
             mentions: body.mentions,
+            draftConsumeOperationId:
+              body.draftConsumeOperationId ?? body.draft_consume_operation_id,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+
+        const draftMatch = url.pathname.match(/^\/v1\/drafts\/([0-9a-f-]+)$/i);
+        if (draftMatch && req.method === "GET") {
+          if (!cloudDraftsAvailable) {
+            throw new DraftError("cloud drafts are unavailable", 404, "capability_unavailable");
+          }
+          response = json({ draft: await getDraft(db, session.accountId, draftMatch[1]) });
+        }
+        if (draftMatch && req.method === "PUT") {
+          if (!cloudDraftsAvailable) {
+            throw new DraftError("cloud drafts are unavailable", 404, "capability_unavailable");
+          }
+          const result = await putDraft(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            dialogId: draftMatch[1],
+            operationId: body.operation_id ?? body.operationId,
+            state: body.state,
+            text: body.text,
+            replyToMsgId: body.reply_to_msg_id ?? body.replyToMsgId,
+            mentions: body.mentions,
+            attachments: body.attachments,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({ draft: result.draft, duplicate: result.duplicate });
+        }
+
+        if (url.pathname === "/v1/messages/send-group" && req.method === "POST") {
+          if (!mediaGroupsAvailable) {
+            throw new SyncError(
+              "media groups are unavailable",
+              404,
+              "capability_unavailable",
+            );
+          }
+          const result = await sendMediaGroup(db, {
+            senderAccountId: session.accountId,
+            senderDeviceId: session.deviceId,
+            dialogId: body.dialog_id ?? body.dialogId,
+            clientGroupId: body.client_group_id ?? body.clientGroupId,
+            items: body.items,
+            body: body.body ?? body.caption ?? "",
+            replyToMsgId: body.reply_to_msg_id ?? body.replyToMsgId,
+            mentions: body.mentions,
+            draftConsumeOperationId:
+              body.draft_consume_operation_id ?? body.draftConsumeOperationId,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -863,7 +933,9 @@ export function startCloudServer(
           : err instanceof CallError ? err.status
           : err instanceof GroupError ? err.status
           : err instanceof DialogAccessError ? err.status
-          : err instanceof SyncError || err instanceof PushError ? 400 : 500;
+          : err instanceof DraftError ? err.status
+          : err instanceof SyncError ? err.status
+          : err instanceof PushError ? 400 : 500;
         if (status === 500) {
           console.error(JSON.stringify({
             ts: new Date().toISOString(), event: "http.error", requestId,
@@ -878,6 +950,7 @@ export function startCloudServer(
         if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof GroupError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof DraftError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
@@ -885,6 +958,8 @@ export function startCloudServer(
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
+          ...(err instanceof DraftError ? { code: err.code } : {}),
+          ...(err instanceof SyncError ? { code: err.code, ...err.details } : {}),
         }, status, headers);
       }
       const status = response?.status ?? 101;

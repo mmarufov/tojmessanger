@@ -156,9 +156,23 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const mediaOrphans = await sql`
     WITH doomed AS (
       SELECT mo.id FROM media_objects mo
-      WHERE mo.status = 'ready' AND mo.completed_at < now() - interval '24 hours'
+      WHERE mo.status = 'ready'
+        AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM draft_attachments attachment
+          JOIN account_dialog_drafts draft
+            ON draft.account_id = attachment.account_id
+           AND draft.dialog_id = attachment.dialog_id
+          JOIN dialogs dialog ON dialog.id = draft.dialog_id AND dialog.closed_at IS NULL
+          JOIN dialog_members member
+            ON member.dialog_id = draft.dialog_id
+           AND member.account_id = draft.account_id
+           AND member.left_at IS NULL
+          WHERE attachment.media_id = mo.id AND draft.state = 'active'
+        )
       ORDER BY mo.completed_at LIMIT ${batchSize}
     )
     DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
@@ -183,6 +197,34 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
+  const draftMutations = await sql`
+    WITH doomed AS (
+      SELECT account_id, operation_id FROM draft_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM draft_mutation_requests request USING doomed
+    WHERE request.account_id = doomed.account_id
+      AND request.operation_id = doomed.operation_id
+    RETURNING request.operation_id`;
+  const draftBudgets = await sql`
+    WITH doomed AS (
+      SELECT id FROM draft_mutation_budgets
+      WHERE accepted_at < now() - interval '2 minutes'
+      ORDER BY accepted_at LIMIT ${batchSize}
+    )
+    DELETE FROM draft_mutation_budgets WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const mediaGroupSends = await sql`
+    WITH doomed AS (
+      SELECT sender_account_id, client_group_id FROM media_group_send_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM media_group_send_requests request USING doomed
+    WHERE request.sender_account_id = doomed.sender_account_id
+      AND request.client_group_id = doomed.client_group_id
+    RETURNING request.client_group_id`;
   const groupCreates = await sql`
     WITH doomed AS (
       SELECT creator_account_id, client_group_id FROM group_create_requests
@@ -252,6 +294,9 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     mediaOrphans: mediaOrphans.length,
     sendRequests: sendRequests.length,
     messageMutations: messageMutations.length,
+    draftMutations: draftMutations.length,
+    draftBudgets: draftBudgets.length,
+    mediaGroupSends: mediaGroupSends.length,
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
     accountEvents: events.length,
@@ -273,7 +318,8 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
           deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
           deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
-          deleted.groupMutations || deleted.accountEvents
+          deleted.groupMutations || deleted.draftMutations || deleted.draftBudgets ||
+          deleted.mediaGroupSends || deleted.accountEvents
           || Object.values(deleted.callData).some((value) => value > 0)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }
