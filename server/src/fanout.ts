@@ -11,6 +11,7 @@ type FanoutOptions = {
   data?: Record<string, unknown>;
   alertRecipients?: boolean;
   recipientAccountIds?: string[];
+  unarchiveOnIncomingMessage?: boolean;
 };
 
 const n = (value: unknown) => Number(value as any);
@@ -20,19 +21,34 @@ const n = (value: unknown) => Number(value as any);
  * account_sync_states are acquired in account UUID order before the set-based update.
  */
 export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promise<FanoutPush[]> {
+  const unarchived = options.unarchiveOnIncomingMessage
+    ? await sql`
+        UPDATE dialog_preferences
+        SET is_archived = FALSE, updated_at = statement_timestamp()
+        WHERE dialog_id = ${options.dialogId}
+          AND account_id <> ${options.actorAccountId}
+          AND is_archived = TRUE
+          AND is_muted = FALSE
+        RETURNING account_id`
+    : [];
+  const unarchivedAccountIds = unarchived.map((row: any) => String(row.account_id));
   const selected = options.recipientAccountIds
     ? await sql`
         SELECT dm.account_id,
-               (dm.notification_mode <> 'muted') AS alert
+               COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted') AS alert
         FROM dialog_members dm
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
         WHERE dm.dialog_id = ${options.dialogId}
           AND dm.left_at IS NULL
           AND dm.account_id = ANY(${sql.array(options.recipientAccountIds, "uuid")}::uuid[])
         ORDER BY dm.account_id`
     : await sql`
         SELECT dm.account_id,
-               (dm.notification_mode <> 'muted') AS alert
+               COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted') AS alert
         FROM dialog_members dm
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
         WHERE dm.dialog_id = ${options.dialogId} AND dm.left_at IS NULL
         ORDER BY dm.account_id`;
   if (selected.length === 0) return [];
@@ -55,11 +71,30 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     INSERT INTO account_events (
       account_id, pts, type, dialog_id, msg_id, actor_account_id, data
     )
-    SELECT account_id, pts, ${options.type}, ${options.dialogId},
+    SELECT bumped.account_id, bumped.pts, ${options.type}, ${options.dialogId},
            ${options.msgId ?? null}, ${options.actorAccountId},
-           ${JSON.stringify(options.data ?? {})}::jsonb
+           ${JSON.stringify(options.data ?? {})}::text::jsonb ||
+           CASE
+             WHEN bumped.account_id = ANY(
+               ${sql.array(unarchivedAccountIds, "uuid")}::uuid[]
+             ) THEN jsonb_build_object(
+               'preferences',
+               jsonb_build_object(
+                 'dialogId', preference.dialog_id,
+                 'pinned', preference.is_pinned,
+                 'pinnedAt', preference.pinned_at,
+                 'muted', preference.is_muted,
+                 'archived', preference.is_archived,
+                 'updatedAt', preference.updated_at
+               )
+             )
+             ELSE '{}'::jsonb
+           END
     FROM bumped
-    ORDER BY account_id
+    LEFT JOIN dialog_preferences preference
+      ON preference.dialog_id = ${options.dialogId}
+     AND preference.account_id = bumped.account_id
+    ORDER BY bumped.account_id
     RETURNING account_id, pts`;
 
   const eventByAccount = new Map(events.map((row: any) => [String(row.account_id), n(row.pts)]));

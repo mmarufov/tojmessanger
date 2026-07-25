@@ -103,6 +103,10 @@ import {
   updateGroupProfile,
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
+import {
+  DialogPreferenceError,
+  updateDialogPreferences,
+} from "./dialog-preferences";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -111,7 +115,7 @@ const jsonHeaders = { "content-type": "application/json", "cache-control": "no-s
 const MAX_JSON_BYTES = 64 * 1024;
 
 export const CLOUD_CAPABILITIES = {
-  api_version: 4,
+  api_version: 5,
   capabilities: [
     "core_text",
     "replies",
@@ -125,11 +129,17 @@ export const CLOUD_CAPABILITIES = {
   ],
 } as const;
 
-function cloudCapabilities(voiceCalls: boolean, videoCalls: boolean, groups: boolean) {
+function cloudCapabilities(
+  voiceCalls: boolean,
+  videoCalls: boolean,
+  groups: boolean,
+  dialogPreferences: boolean,
+) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
   if (groups) capabilities.push("groups_v1");
+  if (dialogPreferences) capabilities.push("dialog_preferences_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -252,6 +262,7 @@ export function startCloudServer(
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
+  const dialogPreferencesAvailable = process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED === "1";
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -292,7 +303,12 @@ export function startCloudServer(
           const accountVideoAvailable = capabilityToken
             ? videoCallsEnabledForAccount((await resolveDevice(db, capabilityToken)).accountId, videoAvailable)
             : false;
-          response = json(cloudCapabilities(callsAvailable, accountVideoAvailable, groupsAvailable));
+          response = json(cloudCapabilities(
+            callsAvailable,
+            accountVideoAvailable,
+            groupsAvailable,
+            dialogPreferencesAvailable,
+          ));
         }
 
         else if (url.pathname === "/metrics") {
@@ -335,6 +351,13 @@ export function startCloudServer(
         ) {
           // Hard-close the complete route family during dark deploys. Advertisement alone is not
           // sufficient because stale or modified clients could otherwise create live group events.
+          response = new Response("not found", { status: 404 });
+        }
+
+        else if (
+          /^\/v1\/dialogs\/[0-9a-f-]+\/preferences$/i.test(url.pathname)
+          && !dialogPreferencesAvailable
+        ) {
           response = new Response("not found", { status: 404 });
         }
 
@@ -405,6 +428,9 @@ export function startCloudServer(
           const groupLeaveMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/leave$/i);
           const groupNotificationsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/notifications$/i);
           const groupMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)$/i);
+          const dialogPreferencesMatch = url.pathname.match(
+            /^\/v1\/dialogs\/([0-9a-f-]+)\/preferences$/i,
+          );
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
           const result = await createGroup(db, {
@@ -512,11 +538,29 @@ export function startCloudServer(
         if (groupNotificationsMatch && req.method === "PUT") {
           const result = await updateGroupNotifications(db, {
             actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
             dialogId: groupNotificationsMatch[1],
             mode: body.mode,
             clientMutationId: body.clientMutationId,
           });
-          response = json(result);
+          pushHints(sockets, result.pushes);
+          response = json(result.envelope);
+        }
+
+        if (dialogPreferencesMatch && req.method === "PUT") {
+          const result = await updateDialogPreferences(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            dialogId: dialogPreferencesMatch[1],
+            clientMutationId: body.clientMutationId,
+            patch: body,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({
+            preferences: result.preferences,
+            pts: result.pts,
+            duplicate: result.duplicate,
+          });
         }
 
         if (url.pathname === "/v1/devices/push" && req.method === "POST") {
@@ -862,6 +906,7 @@ export function startCloudServer(
           : err instanceof MediaError ? err.status
           : err instanceof CallError ? err.status
           : err instanceof GroupError ? err.status
+          : err instanceof DialogPreferenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof SyncError || err instanceof PushError ? 400 : 500;
         if (status === 500) {
@@ -884,6 +929,7 @@ export function startCloudServer(
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
         }, status, headers);
       }

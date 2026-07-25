@@ -182,6 +182,57 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS dialog_members_account_active_idx ON dialog_members(account_id) WHERE left_at IS NULL;
 
+-- Private, per-account presentation and notification state shared by all of an account's devices.
+-- `dialog_members.notification_mode` remains mirrored during the compatibility window.
+CREATE TABLE IF NOT EXISTS dialog_preferences (
+  dialog_id   UUID NOT NULL,
+  account_id  UUID NOT NULL,
+  is_pinned   BOOLEAN NOT NULL DEFAULT FALSE,
+  pinned_at   TIMESTAMPTZ,
+  is_muted    BOOLEAN NOT NULL DEFAULT FALSE,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (dialog_id, account_id),
+  FOREIGN KEY (dialog_id, account_id)
+    REFERENCES dialog_members(dialog_id, account_id) ON DELETE CASCADE,
+  CHECK (is_pinned OR pinned_at IS NULL)
+);
+CREATE INDEX IF NOT EXISTS dialog_preferences_account_idx
+  ON dialog_preferences(account_id, dialog_id);
+CREATE INDEX IF NOT EXISTS dialog_preferences_pinned_order_idx
+  ON dialog_preferences(account_id, pinned_at DESC)
+  WHERE is_pinned = TRUE;
+
+INSERT INTO dialog_preferences (dialog_id, account_id, is_muted)
+SELECT dialog_id, account_id, notification_mode = 'muted'
+FROM dialog_members
+ON CONFLICT (dialog_id, account_id) DO UPDATE SET
+  is_muted = EXCLUDED.is_muted
+WHERE dialog_preferences.is_muted IS DISTINCT FROM EXCLUDED.is_muted;
+
+-- Keep direct writes from an older server/client generation authoritative during a rolling
+-- compatibility release. New preference writes update the legacy column in the same transaction;
+-- this trigger supplies the reverse direction without disturbing pin or archive state.
+CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO dialog_preferences (dialog_id, account_id, is_muted)
+  VALUES (NEW.dialog_id, NEW.account_id, NEW.notification_mode = 'muted')
+  ON CONFLICT (dialog_id, account_id) DO UPDATE SET
+    is_muted = EXCLUDED.is_muted,
+    updated_at = statement_timestamp()
+  WHERE dialog_preferences.is_muted IS DISTINCT FROM EXCLUDED.is_muted;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS dialog_members_notification_mode_mirror ON dialog_members;
+CREATE TRIGGER dialog_members_notification_mode_mirror
+AFTER INSERT OR UPDATE OF notification_mode ON dialog_members
+FOR EACH ROW
+EXECUTE FUNCTION mirror_dialog_notification_mode_to_preferences();
+
 -- ============ encrypted resumable media ============
 -- Private-beta storage is provider-free: each independently resumable chunk is AEAD encrypted
 -- before PostgreSQL persists it. The API is deliberately storage-adapter shaped so object storage
@@ -369,7 +420,8 @@ ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
 ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
   ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
    'dialog.created','member.added','member.removed','member.role_changed','member.left',
-   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated'));
+   'dialog.profile_updated','dialog.closed','dialog.access_revoked','dialog.preferences_updated',
+   'profile.updated'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -428,6 +480,21 @@ CREATE TABLE IF NOT EXISTS group_mutation_requests (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (actor_account_id, client_mutation_id)
 );
+
+CREATE TABLE IF NOT EXISTS dialog_preference_requests (
+  account_id         UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  client_mutation_id UUID NOT NULL,
+  dialog_id          UUID NOT NULL,
+  fingerprint        BYTEA NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending','completed')),
+  result_pts         BIGINT,
+  result_json        JSONB,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, client_mutation_id)
+);
+CREATE INDEX IF NOT EXISTS dialog_preference_requests_retention_idx
+  ON dialog_preference_requests(created_at);
 
 CREATE TABLE IF NOT EXISTS group_action_budgets (
   id BIGSERIAL PRIMARY KEY,
@@ -718,6 +785,18 @@ CREATE TABLE IF NOT EXISTS bootstrap_snapshot_dialogs (
 );
 CREATE INDEX IF NOT EXISTS bootstrap_snapshot_dialogs_page_idx
   ON bootstrap_snapshot_dialogs(snapshot_id, sort_updated_at DESC, dialog_id DESC);
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preferences_captured BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preference_is_pinned BOOLEAN;
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preference_pinned_at TIMESTAMPTZ;
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preference_is_muted BOOLEAN;
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preference_is_archived BOOLEAN;
+ALTER TABLE bootstrap_snapshot_dialogs
+  ADD COLUMN IF NOT EXISTS preference_updated_at TIMESTAMPTZ;
 
 -- ============ compliance (append-only audit) ============
 CREATE TABLE IF NOT EXISTS content_access_audit (

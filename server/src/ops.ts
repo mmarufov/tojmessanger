@@ -21,6 +21,9 @@ export function safeRoute(pathname: string): string {
   if (/^\/v1\/media\/[0-9a-f-]+\/chunks$/i.test(pathname)) return "/v1/media/:id/chunks";
   if (/^\/v1\/media\/[0-9a-f-]+\/thumbnail$/i.test(pathname)) return "/v1/media/:id/thumbnail";
   if (/^\/v1\/blocks\/[0-9a-f-]+$/i.test(pathname)) return "/v1/blocks/:id";
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/preferences$/i.test(pathname)) {
+    return "/v1/dialogs/:id/preferences";
+  }
   if (/^\/v1\/calls\/[0-9a-f-]+\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i.test(pathname)) {
     return pathname.replace(/[0-9a-f-]{36}/i, ":id");
   }
@@ -203,6 +206,16 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
+  const dialogPreferenceRequests = await sql`
+    WITH doomed AS (
+      SELECT account_id, client_mutation_id FROM dialog_preference_requests
+      WHERE status = 'completed' AND created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}
+    )
+    DELETE FROM dialog_preference_requests request USING doomed
+    WHERE request.account_id = doomed.account_id
+      AND request.client_mutation_id = doomed.client_mutation_id
+    RETURNING request.client_mutation_id`;
   const events = await sql.begin(async (tx) => {
     const doomed = await tx`
       SELECT account_id, pts
@@ -254,6 +267,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     messageMutations: messageMutations.length,
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
+    dialogPreferenceRequests: dialogPreferenceRequests.length,
     accountEvents: events.length,
     callData,
   };
@@ -273,7 +287,7 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
       if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
           deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
           deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
-          deleted.groupMutations || deleted.accountEvents
+          deleted.groupMutations || deleted.dialogPreferenceRequests || deleted.accountEvents
           || Object.values(deleted.callData).some((value) => value > 0)) {
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
       }

@@ -606,6 +606,10 @@ export async function deleteAccount(
         voip_push_environment = NULL,
         voip_push_updated_at = now()
       WHERE account_id = ${accountId}`;
+    // Accounts are privacy-anonymized rather than physically deleted, so preference rows and their
+    // idempotency payloads need explicit lifecycle cleanup instead of relying on FK cascades.
+    await tx`DELETE FROM dialog_preferences WHERE account_id = ${accountId}`;
+    await tx`DELETE FROM dialog_preference_requests WHERE account_id = ${accountId}`;
     // Device rows are revoked and locked before call rows, matching call-mutation lock order.
     // The injected call cleanup therefore commits atomically with account deletion without letting
     // an in-flight device mutation recreate state after the termination scan.

@@ -21,7 +21,9 @@ The server runs an hourly, bounded cleanup. Each table deletes at most 1,000 eli
 expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal push deliveries
 older than seven days. Incomplete media uploads are resumable for 24 hours and are then removed with
 their encrypted chunks; expired upload-attempt rate records and unattached completed media are also
-removed. Message history, attached media, and the account event log are never deleted by this worker.
+removed. Completed dialog-preference idempotency records are retained for 24 hours; pending records
+are never aged out. Message history, attached media, and the account event log are never deleted by
+this worker.
 
 ## Media storage
 
@@ -104,6 +106,20 @@ with non-identifying values, changes the profile name to `Deleted Account`, dest
 credential hash and device name, removes push tokens, kills pending push work, removes OTP rows, and
 revokes all sessions. Existing message rows remain so other participants do not lose their history and
 foreign-key integrity is preserved. A later registration with the same phone creates a new account ID.
+
+## Dialog preference rollout
+
+`dialog_preferences_v1` and `PUT /v1/dialogs/:id/preferences` are advertised only when
+`TOJ_DIALOG_PREFERENCES_V1_ENABLED=1` was present at process startup. With the switch unset, the route
+family hard-404s. The legacy group-notification route stays available and mirrors the same canonical
+mute row so old and new clients can overlap safely.
+
+Roll out in this order: apply the PostgreSQL schema/backfill with the switch off, deploy the compatible
+server, distribute the iOS build, then enable the switch and restart. Confirm API version 5 advertises
+`dialog_preferences_v1`, preference-route errors remain flat, account `pts` gaps do not increase, the
+client retry backlog drains, and muted deliveries are silent while unmuted deliveries alert. A rollback
+is the reverse final step: clear the switch and restart. Stored pin/archive/mute values and the mirrored
+legacy group mute remain intact for a later re-enable.
 
 ## Voice calls and TURN readiness
 

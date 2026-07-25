@@ -174,6 +174,7 @@ final class CloudAppModel {
         var unreadCount: Int
         var draftPreview: String? = nil
         var isPinned = false
+        var pinnedAt: String? = nil
         var isMuted = false
         var isArchived = false
         var mentionCount = 0
@@ -333,6 +334,8 @@ final class CloudAppModel {
         guard let self else { return }
         await self.runForegroundSyncAttempt(generation: generation)
     }
+    @ObservationIgnored private lazy var dialogPreferencesCoordinator =
+        DialogPreferencesCoordinator(api: api)
     private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
@@ -1528,10 +1531,10 @@ final class CloudAppModel {
     }
 
     func setGroupMuted(dialogId: String, muted: Bool) async -> Bool {
-        await submitGroupMutation(
+        await setDialogPreference(
             dialogId: dialogId,
-            operation: "notifications",
-            payload: GroupMutationPayload(mode: muted ? "muted" : "all")
+            field: .muted,
+            desiredValue: muted
         )
     }
 
@@ -1852,7 +1855,7 @@ final class CloudAppModel {
 
     func dialogs(matching query: String) -> [Dialog] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return dialogs }
+        guard !trimmed.isEmpty else { return dialogs.filter { !$0.isArchived } }
         return dialogs.filter {
             $0.title.localizedStandardContains(trimmed)
                 || $0.subtitle.localizedStandardContains(trimmed)
@@ -1866,10 +1869,11 @@ final class CloudAppModel {
         switch scope {
         case .chats:
             return dialogs.filter {
-                !$0.isArchived && ($0.title.localizedStandardContains(trimmed) || $0.subtitle.localizedStandardContains(trimmed))
+                $0.title.localizedStandardContains(trimmed)
+                    || $0.subtitle.localizedStandardContains(trimmed)
             }
         case .people:
-            return dialogs.filter { !$0.isArchived && $0.title.localizedStandardContains(trimmed) }
+            return dialogs.filter { $0.title.localizedStandardContains(trimmed) }
         case .messages:
             #if DEBUG
             if isDemoMode {
@@ -2348,18 +2352,69 @@ final class CloudAppModel {
 
     func togglePinned(_ dialogId: String) {
         guard capabilities.contains(.chatOrganization) else { return }
-        updateDialog(dialogId) { $0.isPinned.toggle() }
-        sortDialogsForPresentation()
+        #if DEBUG
+        if isDemoMode {
+            updateDialog(dialogId) {
+                $0.isPinned.toggle()
+                $0.pinnedAt = $0.isPinned ? CloudLocalStore.sqliteTimestamp(Date()) : nil
+            }
+            sortDialogsForPresentation()
+            return
+        }
+        #endif
+        Task { [weak self] in
+            _ = await self?.setDialogPreference(dialogId: dialogId, field: .pinned)
+        }
     }
 
     func toggleMuted(_ dialogId: String) {
         guard capabilities.contains(.chatOrganization) else { return }
-        updateDialog(dialogId) { $0.isMuted.toggle() }
+        #if DEBUG
+        if isDemoMode {
+            updateDialog(dialogId) {
+                $0.isMuted.toggle()
+                $0.notificationMode = $0.isMuted ? "muted" : "all"
+            }
+            return
+        }
+        #endif
+        Task { [weak self] in
+            _ = await self?.setDialogPreference(dialogId: dialogId, field: .muted)
+        }
     }
 
     func archive(_ dialogId: String) {
         guard capabilities.contains(.chatOrganization) else { return }
-        updateDialog(dialogId) { $0.isArchived = true }
+        #if DEBUG
+        if isDemoMode {
+            updateDialog(dialogId) { $0.isArchived = true }
+            return
+        }
+        #endif
+        Task { [weak self] in
+            _ = await self?.setDialogPreference(
+                dialogId: dialogId,
+                field: .archived,
+                desiredValue: true
+            )
+        }
+    }
+
+    func unarchive(_ dialogId: String) {
+        guard capabilities.contains(.chatOrganization) else { return }
+        #if DEBUG
+        if isDemoMode {
+            updateDialog(dialogId) { $0.isArchived = false }
+            return
+        }
+        #endif
+        Task { [weak self] in
+            _ = await self?.setDialogPreference(
+                dialogId: dialogId,
+                field: .archived,
+                desiredValue: false
+            )
+        }
     }
 
     private func updateDialog(_ dialogId: String, mutation: (inout Dialog) -> Void) {
@@ -2370,7 +2425,109 @@ final class CloudAppModel {
     private func sortDialogsForPresentation() {
         dialogs.sort {
             if $0.isPinned != $1.isPinned { return $0.isPinned }
-            return $0.updatedAt > $1.updatedAt
+            if $0.isPinned, $0.pinnedAt != $1.pinnedAt {
+                return ($0.pinnedAt ?? "") > ($1.pinnedAt ?? "")
+            }
+            if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
+            return $0.id > $1.id
+        }
+    }
+
+    @discardableResult
+    private func setDialogPreference(
+        dialogId: String,
+        field: DialogPreferenceField,
+        desiredValue: Bool? = nil
+    ) async -> Bool {
+        guard capabilities.contains(.chatOrganization) else { return false }
+        #if DEBUG
+        if isDemoMode {
+            updateDialog(dialogId) { dialog in
+                let current: Bool
+                switch field {
+                case .pinned: current = dialog.isPinned
+                case .muted: current = dialog.isMuted
+                case .archived: current = dialog.isArchived
+                }
+                let value = desiredValue ?? !current
+                switch field {
+                case .pinned:
+                    dialog.isPinned = value
+                    dialog.pinnedAt = value ? CloudLocalStore.sqliteTimestamp(Date()) : nil
+                case .muted:
+                    dialog.isMuted = value
+                    dialog.notificationMode = value ? "muted" : "all"
+                case .archived:
+                    dialog.isArchived = value
+                }
+            }
+            sortDialogsForPresentation()
+            return true
+        }
+        #endif
+        guard
+            let localStore,
+            let accountId = storedSession?.session.accountId
+        else { return false }
+        do {
+            _ = try await dialogPreferencesCoordinator.queue(
+                store: localStore,
+                accountId: accountId,
+                dialogId: dialogId,
+                field: field,
+                desiredValue: desiredValue
+            )
+            // Observation publishes the SQLCipher overlay immediately; networking happens only
+            // after the optimistic write has committed.
+            await retryPendingDialogPreferences()
+            scheduleOutboxRetry()
+            return true
+        } catch {
+            presentNotice(
+                "Chat preference could not be saved",
+                message: error.localizedDescription
+            )
+            return false
+        }
+    }
+
+    private func retryPendingDialogPreferences() async {
+        guard
+            capabilities.contains(.chatOrganization),
+            let localStore,
+            let accountId = storedSession?.session.accountId,
+            let token = storedSession?.session.token
+        else { return }
+        do {
+            let result = try await dialogPreferencesCoordinator.drain(
+                store: localStore,
+                accountId: accountId,
+                token: token,
+                serverAdvertisesFeature: true
+            )
+            if result.acceptedCount > 0 {
+                scheduleSync()
+            }
+            if let retryAfter = result.retryAfter {
+                scheduleOutboxRetry(after: retryAfter)
+                BackgroundRuntimeCoordinator.shared.scheduleAppRefresh(
+                    earliestBeginDate: Date(timeIntervalSinceNow: retryAfter)
+                )
+            }
+            if result.authenticationRequired {
+                status = "Chat preferences are saved and will sync after sign-in"
+            }
+            if let error = result.permanentErrors.first {
+                await refreshDialogs()
+                presentNotice(
+                    "Chat preference was not changed",
+                    message: error
+                )
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            status = "Chat preference sync paused: \(error.localizedDescription)"
         }
     }
 
@@ -2976,6 +3133,8 @@ final class CloudAppModel {
                     try context.checkCancellation()
                     await self.retryPendingOutbox()
                     try context.checkCancellation()
+                    await self.retryPendingDialogPreferences()
+                    try context.checkCancellation()
                     await self.retryPendingMessageMutations()
                     try context.checkCancellation()
                     await self.retryPendingReadReceipts()
@@ -2991,6 +3150,8 @@ final class CloudAppModel {
                     await self.syncNow()
                     try context.checkCancellation()
                     await self.resumeHistoryHydration()
+                    try context.checkCancellation()
+                    await self.retryPendingDialogPreferences()
                     try context.checkCancellation()
                     await self.retryPendingReadReceipts()
                     try context.checkCancellation()
@@ -3082,9 +3243,6 @@ final class CloudAppModel {
                     let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                     return trimmed.isEmpty ? nil : trimmed
                 }
-                resolved.isPinned = existing.isPinned
-                resolved.isMuted = existing.isMuted
-                resolved.isArchived = existing.isArchived
                 resolved.isTyping = existing.isTyping
             }
             return resolved
@@ -3274,6 +3432,9 @@ final class CloudAppModel {
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
             if advertised.contains("groups_v1") { resolved.insert(.groups) }
+            if advertised.contains("dialog_preferences_v1") {
+                resolved.insert(.chatOrganization)
+            }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -3685,6 +3846,7 @@ final class CloudAppModel {
             await self.loadMediaPolicies()
             await self.retryPendingMessageMutations()
             await self.retryPendingGroupMutations()
+            await self.retryPendingDialogPreferences()
             await self.retryPendingReadReceipts()
             await self.retryMediaTransfers()
             self.scheduleMediaDownloadProcessing()
@@ -4255,6 +4417,10 @@ final class CloudAppModel {
             updatedAt: local.lastServerTs ?? local.updatedAt,
             isPending: local.lastLocalState == "sending" || local.accessState == "pending",
             unreadCount: local.unreadCount,
+            isPinned: local.isPinned,
+            pinnedAt: local.pinnedAt,
+            isMuted: local.isMuted,
+            isArchived: local.isArchived,
             mentionCount: local.mentionCount,
             previewKind: previewKind,
             lastMessageMine: local.lastSenderAccountId == storedSession?.session.accountId,
@@ -4264,7 +4430,7 @@ final class CloudAppModel {
             profileColorIndex: local.peerColorIndex,
             memberCount: local.memberCount,
             selfRole: local.selfRole,
-            notificationMode: local.notificationMode,
+            notificationMode: local.isMuted ? "muted" : "all",
             accessState: local.accessState
         )
     }
@@ -4487,6 +4653,7 @@ final class CloudAppModel {
         do {
             await retryPendingGroupCreations(token: token, localStore: localStore)
             await retryPendingGroupMutations()
+            await retryPendingDialogPreferences()
             let items = try await localStore.pendingOutboxReady()
             for item in items {
                 try Task.checkCancellation()
@@ -4970,8 +5137,23 @@ final class CloudAppModel {
         let mediaDelay = try? await localStore.nextMediaTransferDelay()
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
         let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
+        var preferenceDelay: TimeInterval?
+        if let accountId = storedSession?.session.accountId {
+            preferenceDelay = try? await localStore.nextDialogPreferenceRetryDelay(
+                accountId: accountId
+            )
+            if preferenceDelay == 0,
+               await dialogPreferencesCoordinator.hasActiveDrain {
+                // A rapid coalesced toggle can become ready while the prior HTTP request is still
+                // in flight. Avoid a zero-delay retry loop; the active drain will pick it up.
+                preferenceDelay = 1
+            }
+        } else {
+            preferenceDelay = nil
+        }
         return [
-            groupDelay, groupMutationDelay, textDelay, mediaDelay, mutationDelay,
+            groupDelay, groupMutationDelay, preferenceDelay,
+            textDelay, mediaDelay, mutationDelay,
         ].compactMap { $0 }.min()
     }
 

@@ -656,8 +656,15 @@ final class MessagingPresentationTests: XCTestCase {
         model.archive("demo-aziz")
 
         XCTAssertEqual(model.dialogs.first(where: { $0.id == "demo-mehrona" })?.isMuted, true)
-        XCTAssertEqual(model.dialogs.first?.id, "demo-mehrona", "Existing pinned chat remains first")
+        XCTAssertEqual(model.dialogs.first?.id, "demo-firooz", "The most recently pinned chat is first")
         XCTAssertFalse(model.dialogs(matching: "", scope: .chats).contains(where: { $0.id == "demo-aziz" }))
+        XCTAssertEqual(
+            model.dialogs(matching: "Азиз", scope: .chats).first?.isArchived,
+            true,
+            "Main search can discover archived chats"
+        )
+        model.unarchive("demo-aziz")
+        XCTAssertTrue(model.dialogs(matching: "", scope: .chats).contains(where: { $0.id == "demo-aziz" }))
         await Task.yield()
     }
 
