@@ -3,7 +3,7 @@
 Status: implementation plus independent launch-review remediation complete on
 `mmarufov/saved-messages-plan`. Automated backend, production-sized migration, serialized iOS
 unit/UI, exact forwarding/account-deletion, and Release simulator/device compile gates were
-reverified 2026-07-26. Physical-device runtime performance and production rollout/canary gates
+reverified 2026-07-27. Physical-device runtime performance and production rollout/canary gates
 remain open; the production provisioning backfill has not been run.
 
 Baseline: `0df5aa9` (`origin/main`)
@@ -71,6 +71,14 @@ and reminders are useful later layers, not requirements for this walking skeleto
 10. **The feature is reversible.** With `saved_messages_v1` off, the route family is closed and new
     dialogs are not provisioned. Existing saved dialogs remain readable to clients that already have
     them; disabling a flag must never delete user data.
+11. **Saved access is owner-only at every boundary.** Read, mutation, media, fanout, difference, and
+    bootstrap paths require the creator's active `owner` membership. PostgreSQL rejects new active
+    non-owner memberships; cursor-based reconciliation repairs every legacy Saved dialog and stages
+    ordered revocations before member removal.
+12. **Revocation is file-first and crash-resumable.** SQLCipher hides the dialog and removes
+    outbox/transfer payloads immediately. A session-scoped coordinator cancels media activity,
+    deletes exclusive encrypted files through the media engine, and only then finalizes SQL removal.
+    Media still referenced by a forwarded destination is retained.
 
 ---
 
@@ -83,7 +91,7 @@ and reminders are useful later layers, not requirements for this walking skeleto
 | Set-based account-event and silent APNs fanout | `server/src/fanout.ts` | Reuse for the one account member |
 | Difference, bootstrap, history, and read access | `server/src/sync.ts` | Reuse; teach payloads the `saved` type |
 | Message/media authorization by active membership | `server/src/dialog-access.ts`, `server/src/media.ts` | Reuse |
-| SQLCipher/GRDB dialog, message, outbox, media, and observation tables | `Toj/Core/Store/CloudLocalStore.swift` | Reuse without a Saved Messages schema migration |
+| SQLCipher/GRDB dialog, message, outbox, media, and observation tables | `Toj/Core/Store/CloudLocalStore.swift` | Reuse, plus the v10 crash-resumable access-purge state machine |
 | Optimistic text and forwarding outbox | `CloudLocalStore.insertSending`, `CloudAppModel.forwardMessage` | Reuse |
 | Resumable encrypted media and persistent cache | `CloudMediaEngine.swift` | Reuse under the user's existing cache policy |
 | Bounded timeline windows and local history hydration | `CloudLocalStore.swift`, `CloudAppModel.swift` | Reuse |
@@ -755,7 +763,8 @@ Gate:
 - a local saved row opens after process restart with no network;
 - queued text and forward survive restart;
 - event replay creates no duplicate and never downgrades type to `direct`;
-- no GRDB migration is introduced.
+- no parallel Saved-message schema is introduced; the only later GRDB addition is the generic
+  crash-resumable access-purge state machine required for revocation.
 
 ### Slice 3 - Real Settings route and saved-dialog presentation
 
@@ -1010,6 +1019,14 @@ Launch-review Definition of Done:
   message without consuming a new message id.
 - [x] Unauthorized Saved membership repair emits access revocation, silent push, sync wakeup, and
   causes the receiving SQLCipher replica and encrypted media ledger to purge.
+- [x] Owner-only authorization covers history, mutation, media, difference, bootstrap, and fanout,
+  with a database invariant preventing new active rogue memberships.
+- [x] Current and raw old-node account deletion use one database-boundary cleanup that revokes rogue
+  access, detaches provenance, deletes the archive and true orphan chunks, and preserves forwarded
+  media.
+- [x] Access purge is account/token/store/session-generation scoped, drains every bounded batch on
+  launch and after revocation, overrides active playback, deletes encrypted files before SQL, and
+  resumes safely after process death.
 - [x] Saved Messages cannot be muted or newly archived and remains first/available in the forwarding
   picker even if an old in-memory archive flag is present.
 - [x] Russian and Tajik cover all new setup, failure, purge, retry, Remove, and Saved copy.
@@ -1094,6 +1111,10 @@ Saved Messages v1 is done only when all statements are true:
       E2EE copy.
 - [x] Generic "saved local copy" wording is no longer confused with the Saved Messages product name.
 - [x] Account deletion removes the self-only archive and preserves forwarded direct/group text and media.
+- [x] Corrupt memberships are reconciled across every Saved dialog, including provisioning-backfill
+      skips, with deterministic revocation PTS, silent pushes, and sync wakeups.
+- [x] Revoked offline archives purge file-first across launch, process death, active playback,
+      account switches, and queues larger than one 20-job batch.
 - [x] Direct and group message regressions are green.
 - [x] Backend migration, backend tests, Release WebRTC build, serialized iOS tests, and UI tests are
       green on the final review-remediation commit.

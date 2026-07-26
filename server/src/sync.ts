@@ -900,7 +900,8 @@ export async function getDifference(
       WHERE profile.id IN (SELECT account_id FROM referenced_accounts)
     )
     SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
-           d.type AS dialog_type, d.revision AS group_revision,
+           d.type AS dialog_type, d.created_by AS dialog_created_by,
+           d.revision AS group_revision,
            self.role AS self_role, self.left_at AS self_left_at, d.closed_at,
            peer.id AS peer_account_id,
            CASE
@@ -928,6 +929,15 @@ export async function getDifference(
       || (
         event.dialog_type === "group"
         && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
+      )
+      || (
+        event.dialog_type === "saved"
+        && (
+          event.dialog_created_by !== accountId
+          || event.self_role !== "owner"
+          || event.self_left_at != null
+          || event.closed_at != null
+        )
       )
     )
     .map((event: any) => String(event.dialog_id)));
@@ -1022,6 +1032,10 @@ export async function startBootstrap(sql: SQL, accountId: string): Promise<Boots
       FROM dialog_members dm
       JOIN dialogs d ON d.id = dm.dialog_id
       WHERE dm.account_id = ${accountId} AND dm.left_at IS NULL
+        AND (
+          d.type <> 'saved'
+          OR (d.created_by = ${accountId} AND dm.role = 'owner')
+        )
       ORDER BY d.updated_at DESC, d.id DESC`;
 
     const count = (await tx`
@@ -1081,6 +1095,10 @@ export async function getBootstrapDialogsPage(
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND self.role = 'owner')
+          )
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high
@@ -1106,6 +1124,10 @@ export async function getBootstrapDialogsPage(
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND self.role = 'owner')
+          )
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high

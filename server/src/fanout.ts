@@ -25,15 +25,25 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
         SELECT dm.account_id,
                (dm.notification_mode <> 'muted') AS alert
         FROM dialog_members dm
+        JOIN dialogs d ON d.id = dm.dialog_id
         WHERE dm.dialog_id = ${options.dialogId}
           AND dm.left_at IS NULL
           AND dm.account_id = ANY(${sql.array(options.recipientAccountIds, "uuid")}::uuid[])
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = dm.account_id AND dm.role = 'owner')
+          )
         ORDER BY dm.account_id`
     : await sql`
         SELECT dm.account_id,
                (dm.notification_mode <> 'muted') AS alert
         FROM dialog_members dm
+        JOIN dialogs d ON d.id = dm.dialog_id
         WHERE dm.dialog_id = ${options.dialogId} AND dm.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = dm.account_id AND dm.role = 'owner')
+          )
         ORDER BY dm.account_id`;
   if (selected.length === 0) return [];
 

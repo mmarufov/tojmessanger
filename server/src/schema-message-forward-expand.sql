@@ -50,36 +50,4 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Database-boundary cleanup keeps account deletion correct even if an older application binary
--- knows nothing about Saved Messages. It also protects mixed writers whose marker backfill has not
--- reached their row yet.
-CREATE OR REPLACE FUNCTION toj_cleanup_saved_messages_before_account_delete()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  IF OLD.status <> 'deleted' AND NEW.status = 'deleted' THEN
-    UPDATE messages AS copy
-    SET is_forwarded = TRUE,
-        forwarded_from_account_id = NULL,
-        forwarded_from_dialog_id = NULL,
-        forwarded_from_msg_id = NULL
-    FROM dialogs AS source
-    WHERE copy.forwarded_from_dialog_id = source.id
-      AND copy.forwarded_from_msg_id IS NOT NULL
-      AND source.type = 'saved'
-      AND source.created_by = OLD.id;
-
-    DELETE FROM dialogs
-    WHERE type = 'saved' AND created_by = OLD.id;
-  END IF;
-  RETURN NEW;
-END
-$$;
-
-DROP TRIGGER IF EXISTS accounts_cleanup_saved_messages ON accounts;
-CREATE TRIGGER accounts_cleanup_saved_messages
-BEFORE UPDATE OF status ON accounts
-FOR EACH ROW
-WHEN (OLD.status IS DISTINCT FROM NEW.status)
-EXECUTE FUNCTION toj_cleanup_saved_messages_before_account_delete();
+-- Saved access/deletion invariants are installed separately after this forwarding-marker expand.

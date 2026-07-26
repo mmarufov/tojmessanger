@@ -567,35 +567,9 @@ export async function deleteAccount(
     if (!account || !["active", "limited"].includes(account.status)) {
       return new AuthError("account unavailable", 403);
     }
-    // Forwarded copies own immutable ciphertext/media but used to retain an internal FK to their
-    // source row. Detach provenance before deleting the private archive while preserving the
-    // explicit forwarded marker and every destination copy.
-    await tx`
-      UPDATE messages AS copy
-      SET is_forwarded = TRUE,
-          forwarded_from_account_id = NULL,
-          forwarded_from_dialog_id = NULL,
-          forwarded_from_msg_id = NULL
-      FROM dialogs AS source
-      WHERE copy.forwarded_from_dialog_id = source.id
-        AND copy.forwarded_from_msg_id IS NOT NULL
-        AND source.type = 'saved'
-        AND source.created_by = ${accountId}`;
-    // Saved Messages is the account owner's private cloud archive. Unlike direct/group history it
-    // has no other participant who can retain the conversation after account deletion.
-    await tx`
-      DELETE FROM dialogs
-      WHERE type = 'saved' AND created_by = ${accountId}`;
-    // Remove only media that lost its final visible message reference. Forwarded media remains
-    // referenced by the destination row and therefore survives account deletion.
-    await tx`
-      DELETE FROM media_objects AS media
-      WHERE media.owner_account_id = ${accountId}
-        AND media.purpose = 'message'
-        AND NOT EXISTS (
-          SELECT 1 FROM messages message
-          WHERE message.media_id = media.id AND message.state = 'visible'
-        )`;
+    // This database-boundary function is also called by the account-status trigger used by old
+    // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
+    await tx`SELECT toj_cleanup_saved_messages_for_account(${accountId})`;
     const anonymizedPhone = seal(`deleted:${accountId}`, PHONE_AAD);
     const anonymizedLookup = randomBytes(32);
     await tx`

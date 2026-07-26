@@ -319,6 +319,21 @@ nonisolated struct MediaCacheEntry: Equatable, Sendable {
     let protectedUntil: String?
 }
 
+nonisolated enum AccessPurgePhase: String, Equatable, Sendable {
+    case staged
+    case filesDeleted = "files_deleted"
+}
+
+nonisolated struct AccessPurgeJob: Equatable, Sendable, Identifiable {
+    let id: String
+    let dialogId: String
+    let allMediaIds: Set<String>
+    let purgeMediaIds: Set<String>
+    let encryptedPaths: Set<String>
+    let phase: AccessPurgePhase
+    let attempts: Int
+}
+
 nonisolated enum MediaDownloadJobState: String, Equatable, Sendable {
     case queued
     case downloading
@@ -1323,39 +1338,197 @@ actor CloudLocalStore {
         }
     }
 
-    func drainPendingPurges(limit: Int = 20) throws -> Int {
-        try dbQueue.write { db in
-            let purges = try Row.fetchAll(
+    func pendingAccessPurgeJobs(limit: Int = 20) throws -> [AccessPurgeJob] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
                 db,
-                sql: "SELECT * FROM pending_purges ORDER BY created_at LIMIT ?",
+                sql: """
+                SELECT id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                       encrypted_paths_json, phase, attempts
+                FROM pending_access_purges
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
                 arguments: [max(1, min(100, limit))]
-            )
-            for purge in purges {
-                let id: String = purge["id"]
-                let dialogId: String = purge["dialog_id"]
-                let kind: String = purge["kind"]
-                if kind == "messages" {
-                    try db.execute(sql: "DELETE FROM messages WHERE dialog_id = ?", arguments: [dialogId])
-                    try db.execute(sql: "DELETE FROM message_media WHERE dialog_id = ?", arguments: [dialogId])
-                } else {
-                    let payload: String? = purge["payload"]
-                    let mediaIds = payload?
-                        .data(using: .utf8)
-                        .flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
-                    for mediaId in mediaIds {
-                        try db.execute(
-                            sql: "DELETE FROM media_cache_entries WHERE media_id = ?",
-                            arguments: [mediaId]
-                        )
-                        try db.execute(
-                            sql: "DELETE FROM media_download_jobs WHERE media_id = ?",
-                            arguments: [mediaId]
-                        )
-                    }
-                }
-                try db.execute(sql: "DELETE FROM pending_purges WHERE id = ?", arguments: [id])
+            ).compactMap(Self.accessPurgeJob(from:))
+        }
+    }
+
+    func pendingAccessPurgeCount() throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT count(*) FROM pending_access_purges") ?? 0
+        }
+    }
+
+    /// Re-snapshots revocation state after UI/network media tasks have been cancelled and awaited.
+    /// This closes the window where an in-flight upload persisted its encrypted path after the
+    /// original difference transaction staged the purge.
+    func refreshAccessPurgeJob(id: String) throws -> AccessPurgeJob? {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                       encrypted_paths_json, phase, attempts
+                FROM pending_access_purges WHERE id = ?
+                """,
+                arguments: [id]
+            ) else { return nil }
+            guard AccessPurgePhase(rawValue: row["phase"]) == .staged else {
+                return Self.accessPurgeJob(from: row)
             }
-            return purges.count
+            let dialogId: String = row["dialog_id"]
+            let previousMediaIds = Self.decodeStringSet(row["all_media_ids_json"])
+            let currentMediaIds = Set(try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
+                arguments: [dialogId]
+            ))
+            let allMediaIds = previousMediaIds.union(currentMediaIds)
+            let purgeMediaIds = try Set(allMediaIds.filter { mediaId in
+                try !Bool.fetchOne(
+                    db,
+                    sql: """
+                    SELECT EXISTS (
+                      SELECT 1 FROM message_media
+                      WHERE media_id = ? AND dialog_id <> ?
+                    )
+                    """,
+                    arguments: [mediaId, dialogId]
+                )!
+            })
+            let previousPaths = Self.decodeStringSet(row["encrypted_paths_json"])
+            let allCachePaths = Set(try String.fetchAll(
+                db,
+                sql: """
+                SELECT encrypted_path FROM media_cache_entries
+                WHERE media_id IN (SELECT value FROM json_each(?))
+                """,
+                arguments: [Self.encodeStringSet(allMediaIds)]
+            ))
+            let currentPaths = Set(try String.fetchAll(
+                db,
+                sql: """
+                SELECT encrypted_path FROM media_cache_entries
+                WHERE media_id IN (SELECT value FROM json_each(?))
+                UNION
+                SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+                UNION
+                SELECT encrypted_thumbnail_path FROM media_transfers
+                WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+                """,
+                arguments: [
+                    Self.encodeStringSet(purgeMediaIds), dialogId, dialogId,
+                ]
+            ))
+            // Keep prior upload paths after their rows were zeroed, but re-derive cache paths so a
+            // late forwarded reference can turn an originally-exclusive media object into shared.
+            let encryptedPaths = previousPaths.subtracting(allCachePaths).union(currentPaths)
+            try db.execute(
+                sql: """
+                UPDATE pending_access_purges
+                SET all_media_ids_json = ?, purge_media_ids_json = ?,
+                    encrypted_paths_json = ?, updated_at = datetime('now')
+                WHERE id = ? AND phase = 'staged'
+                """,
+                arguments: [
+                    Self.encodeStringSet(allMediaIds), Self.encodeStringSet(purgeMediaIds),
+                    Self.encodeStringSet(encryptedPaths), id,
+                ]
+            )
+
+            let pendingLocalIds = try String.fetchAll(
+                db,
+                sql: "SELECT local_id FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
+                arguments: [dialogId]
+            )
+            for localId in pendingLocalIds {
+                try db.execute(
+                    sql: "DELETE FROM message_media WHERE local_id = ?",
+                    arguments: [localId]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
+                arguments: [dialogId]
+            )
+            for table in [
+                "pending_outbox", "media_transfers", "pending_message_mutations",
+                "pending_group_mutations", "media_download_jobs",
+            ] {
+                try db.execute(
+                    sql: "DELETE FROM \(table) WHERE dialog_id = ?",
+                    arguments: [dialogId]
+                )
+            }
+            return AccessPurgeJob(
+                id: id,
+                dialogId: dialogId,
+                allMediaIds: allMediaIds,
+                purgeMediaIds: purgeMediaIds,
+                encryptedPaths: encryptedPaths,
+                phase: .staged,
+                attempts: row["attempts"]
+            )
+        }
+    }
+
+    func markAccessPurgeFilesDeleted(id: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_access_purges
+                SET phase = 'files_deleted', attempts = attempts + 1, updated_at = datetime('now')
+                WHERE id = ? AND phase = 'staged'
+                """,
+                arguments: [id]
+            )
+        }
+    }
+
+    func finalizeAccessPurge(id: String) throws {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT dialog_id, purge_media_ids_json
+                FROM pending_access_purges
+                WHERE id = ? AND phase = 'files_deleted'
+                """,
+                arguments: [id]
+            ) else { return }
+            let dialogId: String = row["dialog_id"]
+            let purgeMediaIds = Self.decodeStringSet(row["purge_media_ids_json"])
+            for mediaId in purgeMediaIds {
+                try db.execute(
+                    sql: "DELETE FROM media_cache_entries WHERE media_id = ?",
+                    arguments: [mediaId]
+                )
+                try db.execute(
+                    sql: "DELETE FROM media_download_jobs WHERE media_id = ?",
+                    arguments: [mediaId]
+                )
+            }
+            for table in [
+                "message_reactions", "message_mentions", "message_media", "messages",
+                "dialog_members", "dialog_unread_summaries", "dialog_summaries",
+                "pending_outbox", "pending_read_receipts", "chat_viewport_state",
+                "dialog_history_state", "group_member_hydration", "pending_group_mutations",
+                "media_transfers", "media_download_jobs", "bootstrap_baseline_dialogs",
+                "bootstrap_staged_messages", "bootstrap_staged_members",
+                "bootstrap_staged_dialogs", "pending_purges",
+            ] {
+                try db.execute(
+                    sql: "DELETE FROM \(table) WHERE dialog_id = ?",
+                    arguments: [dialogId]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM pending_group_creations WHERE group_id = ?",
+                arguments: [dialogId]
+            )
+            try db.execute(sql: "DELETE FROM dialogs WHERE dialog_id = ?", arguments: [dialogId])
+            try db.execute(sql: "DELETE FROM pending_access_purges WHERE id = ?", arguments: [id])
         }
     }
 
@@ -3769,6 +3942,85 @@ actor CloudLocalStore {
             """)
         }
 
+        migrator.registerMigration("v10-access-purge-state-machine") { db in
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS pending_access_purges (
+              id TEXT PRIMARY KEY,
+              dialog_id TEXT NOT NULL UNIQUE,
+              all_media_ids_json TEXT NOT NULL,
+              purge_media_ids_json TEXT NOT NULL,
+              encrypted_paths_json TEXT NOT NULL,
+              phase TEXT NOT NULL CHECK (phase IN ('staged','files_deleted')),
+              attempts INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_access_purges_ready_idx
+              ON pending_access_purges(phase, created_at, id);
+            """)
+
+            // Upgrade interrupted v9 purges without dropping their durable intent. Media shared by
+            // another dialog is excluded from physical deletion.
+            let legacyDialogs = try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT dialog_id FROM pending_purges ORDER BY dialog_id"
+            )
+            for dialogId in legacyDialogs {
+                let payload = try String.fetchOne(
+                    db,
+                    sql: """
+                    SELECT payload FROM pending_purges
+                    WHERE dialog_id = ? AND kind = 'media'
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    arguments: [dialogId]
+                )
+                let allMediaIds = decodeStringSet(payload)
+                let purgeMediaIds = try Set(allMediaIds.filter { mediaId in
+                    try !Bool.fetchOne(
+                        db,
+                        sql: """
+                        SELECT EXISTS (
+                          SELECT 1 FROM message_media
+                          WHERE media_id = ? AND dialog_id <> ?
+                        )
+                        """,
+                        arguments: [mediaId, dialogId]
+                    )!
+                })
+                let encryptedPaths = try String.fetchAll(
+                    db,
+                    sql: """
+                    SELECT encrypted_path FROM media_cache_entries
+                    WHERE media_id IN (
+                      SELECT value FROM json_each(?)
+                    )
+                    UNION
+                    SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+                    UNION
+                    SELECT encrypted_thumbnail_path FROM media_transfers
+                    WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+                    """,
+                    arguments: [
+                        encodeStringSet(purgeMediaIds), dialogId, dialogId,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                    INSERT OR IGNORE INTO pending_access_purges (
+                      id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                      encrypted_paths_json, phase, attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'staged', 0, datetime('now'), datetime('now'))
+                    """,
+                    arguments: [
+                        UUID().uuidString.lowercased(), dialogId,
+                        encodeStringSet(allMediaIds), encodeStringSet(purgeMediaIds),
+                        encodeStringSet(Set(encryptedPaths)),
+                    ]
+                )
+            }
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -5088,13 +5340,38 @@ actor CloudLocalStore {
         accessState: String,
         reason: String
     ) throws {
-        let mediaIds = try String.fetchAll(
+        let mediaIds = Set(try String.fetchAll(
             db,
             sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
             arguments: [dialogId]
-        )
-        let mediaPayload = try JSONEncoder().encode(mediaIds)
-        let mediaJSON = String(data: mediaPayload, encoding: .utf8) ?? "[]"
+        ))
+        let purgeMediaIds = try Set(mediaIds.filter { mediaId in
+            try !Bool.fetchOne(
+                db,
+                sql: """
+                SELECT EXISTS (
+                  SELECT 1 FROM message_media
+                  WHERE media_id = ? AND dialog_id <> ?
+                )
+                """,
+                arguments: [mediaId, dialogId]
+            )!
+        })
+        let encryptedPaths = Set(try String.fetchAll(
+            db,
+            sql: """
+            SELECT encrypted_path FROM media_cache_entries
+            WHERE media_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+            UNION
+            SELECT encrypted_thumbnail_path FROM media_transfers
+            WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+            """,
+            arguments: [
+                Self.encodeStringSet(purgeMediaIds), dialogId, dialogId,
+            ]
+        ))
         // Access state is the first write in this transaction so every observation hides the
         // conversation even if the process exits before the durable purge is drained.
         try db.execute(
@@ -5102,42 +5379,63 @@ actor CloudLocalStore {
             arguments: [accessState, dialogId]
         )
         try db.execute(
-            sql: "UPDATE pending_outbox SET terminal = 1 WHERE dialog_id = ?",
+            sql: """
+            INSERT INTO pending_access_purges (
+              id, dialog_id, all_media_ids_json, purge_media_ids_json,
+              encrypted_paths_json, phase, attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'staged', 0, datetime('now'), datetime('now'))
+            ON CONFLICT(dialog_id) DO NOTHING
+            """,
+            arguments: [
+                UUID().uuidString.lowercased(), dialogId,
+                Self.encodeStringSet(mediaIds), Self.encodeStringSet(purgeMediaIds),
+                Self.encodeStringSet(encryptedPaths),
+            ]
+        )
+        // Remove plaintext/outbox and encrypted-upload payloads immediately. The canonical message
+        // archive stays hidden until encrypted files are gone, then finalization removes all SQL.
+        let pendingLocalIds = try String.fetchAll(
+            db,
+            sql: "SELECT local_id FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
             arguments: [dialogId]
         )
-        try db.execute(
-            sql: "UPDATE media_transfers SET terminal = 1, last_error = ? WHERE dialog_id = ?",
-            arguments: [reason, dialogId]
-        )
-        try db.execute(
-            sql: """
-            UPDATE pending_message_mutations
-            SET terminal = 1, last_error = ?
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
-        )
-        try db.execute(
-            sql: """
-            UPDATE pending_group_mutations
-            SET terminal = 1, last_error = ?
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
-        )
+        for localId in pendingLocalIds {
+            try db.execute(sql: "DELETE FROM message_media WHERE local_id = ?", arguments: [localId])
+        }
+        try db.execute(sql: "DELETE FROM messages WHERE dialog_id = ? AND msg_id IS NULL", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_outbox WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM media_transfers WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_message_mutations WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_group_mutations WHERE dialog_id = ?", arguments: [dialogId])
         try db.execute(sql: "DELETE FROM media_download_jobs WHERE dialog_id = ?", arguments: [dialogId])
         try db.execute(sql: "DELETE FROM dialog_unread_summaries WHERE dialog_id = ?", arguments: [dialogId])
         try db.execute(sql: "DELETE FROM group_member_hydration WHERE dialog_id = ?", arguments: [dialogId])
-        try db.execute(
-            sql: """
-            INSERT INTO pending_purges (id, dialog_id, kind, payload, created_at)
-            VALUES (?, ?, 'media', ?, datetime('now')),
-                   (?, ?, 'messages', NULL, datetime('now'))
-            """,
-            arguments: [
-                UUID().uuidString.lowercased(), dialogId, mediaJSON,
-                UUID().uuidString.lowercased(), dialogId,
-            ]
+    }
+
+    nonisolated private static func encodeStringSet(_ values: Set<String>) -> String {
+        let data = (try? JSONEncoder().encode(values.sorted())) ?? Data("[]".utf8)
+        return String(data: data, encoding: .utf8) ?? "[]"
+    }
+
+    nonisolated private static func decodeStringSet(_ value: String?) -> Set<String> {
+        guard
+            let value,
+            let data = value.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return Set(decoded)
+    }
+
+    nonisolated private static func accessPurgeJob(from row: Row) -> AccessPurgeJob? {
+        guard let phase = AccessPurgePhase(rawValue: row["phase"]) else { return nil }
+        return AccessPurgeJob(
+            id: row["id"],
+            dialogId: row["dialog_id"],
+            allMediaIds: decodeStringSet(row["all_media_ids_json"]),
+            purgeMediaIds: decodeStringSet(row["purge_media_ids_json"]),
+            encryptedPaths: decodeStringSet(row["encrypted_paths_json"]),
+            phase: phase,
+            attempts: row["attempts"]
         )
     }
 
@@ -5653,6 +5951,7 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM group_member_hydration")
         try db.execute(sql: "DELETE FROM pending_group_creations")
         try db.execute(sql: "DELETE FROM pending_purges")
+        try db.execute(sql: "DELETE FROM pending_access_purges")
         try db.execute(sql: "DELETE FROM bootstrap_baseline_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_staged_messages")
         try db.execute(sql: "DELETE FROM bootstrap_staged_members")

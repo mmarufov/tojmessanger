@@ -343,6 +343,7 @@ final class CloudAppModel {
     private let pushCenter: PushRegistrationCenter
     private let voipPushCenter: VoIPPushRegistrationCenter
     private let mediaEngine: CloudMediaTransferEngine
+    private let accessPurgeCoordinator = AccessPurgeCoordinator()
     private let capabilityDefaults: UserDefaults
     private let capabilityCacheKey: String
     private var negotiatedCapabilities: MessagingCapabilities
@@ -969,6 +970,7 @@ final class CloudAppModel {
         // that exact task before awaiting the user-facing wrapper; otherwise an unstructured
         // network task that ignores parent cancellation could keep teardown waiting forever.
         await savedMessagesService.reset()
+        await accessPurgeCoordinator.reset()
         for operation in savedOperations { await operation.wait() }
         let accountId = storedSession?.session.accountId
         var cleanupFailures: [String] = []
@@ -3048,11 +3050,20 @@ final class CloudAppModel {
     }
 
     private func afterSignIn() async {
-        guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
+        guard
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId
+        else { return }
         do {
             guard let restoredStore = try await ensureLocalStore() else {
                 throw CloudAppModelError.localStoreUnavailable
             }
+            try await drainAccessPurges(
+                store: restoredStore,
+                accountId: accountId,
+                token: token,
+                generation: savedMessagesSessionGeneration
+            )
             let launchSnapshot = try await restoredStore.loadLaunchSnapshot(accountId: accountId)
 
             // Publish the complete cached launch state in one main-actor turn.
@@ -3088,9 +3099,89 @@ final class CloudAppModel {
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
-            _ = try? await localStore.drainPendingPurges()
         }
         scheduleOutboxRetry()
+    }
+
+    private func drainAccessPurges(
+        store: CloudLocalStore,
+        accountId: String,
+        token: String,
+        generation: UInt64
+    ) async throws {
+        let scope = AccessPurgeScope(
+            accountId: accountId,
+            token: token,
+            generation: generation,
+            store: store
+        )
+        _ = try await accessPurgeCoordinator.drain(
+            scope: scope,
+            store: store,
+            mediaEngine: mediaEngine,
+            isCurrent: { [weak self, store] in
+                guard let self else { return false }
+                return !self.sessionTeardownActive
+                    && self.savedMessagesSessionGeneration == generation
+                    && self.storedSession?.session.accountId == accountId
+                    && self.storedSession?.session.token == token
+                    && self.localStore === store
+            },
+            invalidatePresentation: { [weak self] job in
+                guard let self else { return }
+                await self.invalidatePresentationForAccessPurge(job)
+            }
+        )
+        if mediaSchedulerForegrounded {
+            await mediaPrefetchScheduler.update(
+                networkClass: ReplicaNetworkMonitor.shared.snapshot().networkClass,
+                foregrounded: true
+            )
+        }
+    }
+
+    private func invalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
+        let dialogId = job.dialogId
+        MediaPresentationCache.shared.invalidate(mediaIds: job.allMediaIds)
+
+        let cancellableTasks = Array(mediaTransferTasks.values)
+        cancellableTasks.forEach { $0.cancel() }
+        mediaDownloadTask?.cancel()
+        retryTask?.cancel()
+        composerMediaTask?.cancel()
+        historyHydrationTask?.cancel()
+        await mediaPrefetchScheduler.stop()
+        for task in cancellableTasks { await task.value }
+        await mediaDownloadTask?.value
+        await retryTask?.value
+        await composerMediaTask?.value
+        await historyHydrationTask?.value
+        mediaTransferTasks.removeAll()
+        mediaTransfersInFlight.removeAll()
+        mediaDownloadTask = nil
+        retryTask = nil
+        composerMediaTask = nil
+        historyHydrationTask = nil
+        activeComposerTransferId = nil
+        composerMediaOperationId = nil
+
+        cachedLinesByDialog[dialogId] = nil
+        cachedLocalMessagesByDialog[dialogId] = nil
+        cachedConversationCostByDialog[dialogId] = nil
+        cachedLineDialogOrder.removeAll { $0 == dialogId }
+        timelineForwardCursorByDialog[dialogId] = nil
+        conversationOpenWaiters[dialogId]?.forEach { $0.resume() }
+        conversationOpenWaiters[dialogId] = nil
+        conversationOpenStartedAt[dialogId] = nil
+        dialogs.removeAll { $0.id == dialogId }
+        if savedMessagesDialogId == dialogId { savedMessagesDialogId = nil }
+        if activeDialogId == dialogId {
+            activeDialogId = nil
+            lines = []
+            loadedLocalMessages = []
+            pendingVisibleReadMessages = []
+            canLoadEarlier = false
+        }
     }
 
     private func startReplicaIntegrityVerification(store: CloudLocalStore, accountId: String) {
@@ -4101,6 +4192,15 @@ final class CloudAppModel {
 
         if let localStore, let accountId = storedSession?.session.accountId {
             try await localStore.applyDifference(difference, accountId: accountId)
+            if difference.updates?.contains(where: { $0.type == "dialog.access_revoked" }) == true,
+               let token = storedSession?.session.token {
+                try await drainAccessPurges(
+                    store: localStore,
+                    accountId: accountId,
+                    token: token,
+                    generation: savedMessagesSessionGeneration
+                )
+            }
             if !profileDetails.needsServerSync,
                let token = storedSession?.session.token,
                let ownProfile = (difference.updates ?? []).reversed().compactMap({ update in

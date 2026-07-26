@@ -112,6 +112,19 @@ export async function savedMessagesSchemaReadiness(
         WHERE tgrelid = to_regclass('public.accounts')
           AND tgname = 'accounts_cleanup_saved_messages' AND tgenabled <> 'D'
       ) AS deletion_trigger,
+      EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = to_regclass('public.dialog_members')
+          AND tgname = 'dialog_members_enforce_saved_owner' AND tgenabled <> 'D'
+      ) AS member_invariant_trigger,
+      EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = to_regclass('public.dialogs')
+          AND tgname = 'dialogs_enforce_saved_owner' AND tgenabled <> 'D'
+      ) AS dialog_invariant_trigger,
+      to_regprocedure(
+        'public.toj_cleanup_saved_messages_for_account(uuid)'
+      ) IS NOT NULL AS deletion_function,
       to_regclass('public.schema_migration_progress') IS NOT NULL AS progress_schema`)[0];
 
   const checks: Array<[string, boolean]> = [
@@ -125,16 +138,26 @@ export async function savedMessagesSchemaReadiness(
     ["saved_messages_backfill_claims", Boolean(row.claims_schema)],
     ["messages_derive_forward_marker", Boolean(row.writer_trigger)],
     ["accounts_cleanup_saved_messages", Boolean(row.deletion_trigger)],
+    ["dialog_members_enforce_saved_owner", Boolean(row.member_invariant_trigger)],
+    ["dialogs_enforce_saved_owner", Boolean(row.dialog_invariant_trigger)],
+    ["toj_cleanup_saved_messages_for_account", Boolean(row.deletion_function)],
     ["schema_migration_progress", Boolean(row.progress_schema)],
   ];
   if (row.progress_schema) {
     const progress = await sql`
-      SELECT 1
+      SELECT migration_name
       FROM schema_migration_progress
-      WHERE migration_name = ${"messages_is_forwarded_v1"} AND completed_at IS NOT NULL`;
-    checks.push(["messages_is_forwarded_v1", progress.length === 1]);
+      WHERE migration_name = ANY(${sql.array([
+        "messages_is_forwarded_v1",
+        "saved_dialog_membership_v1",
+      ], "text")}::text[])
+        AND completed_at IS NOT NULL`;
+    const completed = new Set(progress.map((item: any) => String(item.migration_name)));
+    checks.push(["messages_is_forwarded_v1", completed.has("messages_is_forwarded_v1")]);
+    checks.push(["saved_dialog_membership_v1", completed.has("saved_dialog_membership_v1")]);
   } else {
     checks.push(["messages_is_forwarded_v1", false]);
+    checks.push(["saved_dialog_membership_v1", false]);
   }
   const missing = checks.filter(([, present]) => !present).map(([name]) => name);
   return { ready: missing.length === 0, missing };
@@ -206,12 +229,15 @@ export async function ensureSavedMessages(
         WHERE id = ${dialogId}`;
     }
 
-    const removed = await tx`
-      DELETE FROM dialog_members
+    const rogueMembers = await tx`
+      SELECT account_id
+      FROM dialog_members
       WHERE dialog_id = ${dialogId} AND account_id <> ${accountId}
-      RETURNING account_id`;
+        AND left_at IS NULL
+      ORDER BY account_id
+      FOR UPDATE`;
     const revokedPushes: FanoutPush[] = [];
-    for (const row of removed) {
+    for (const row of rogueMembers) {
       revokedPushes.push(await appendAccessRevokedEvent(
         tx,
         String(row.account_id),
@@ -219,6 +245,15 @@ export async function ensureSavedMessages(
         accountId,
         "saved",
       ));
+    }
+    // Event rows, silent push outbox entries, and transaction-bound wakeups are staged before the
+    // membership disappears. A crash rolls all of them back together, so a retry cannot duplicate
+    // PTS or silently remove access.
+    await notifySyncWakeups(tx, revokedPushes);
+    if (rogueMembers.length > 0) {
+      await tx`
+        DELETE FROM dialog_members
+        WHERE dialog_id = ${dialogId} AND account_id <> ${accountId}`;
     }
     const previous = (await tx`
       SELECT role, notification_mode, left_at
@@ -244,7 +279,7 @@ export async function ensureSavedMessages(
           left_at = NULL`;
     }
 
-    const repaired = !created && (!dialogMetadataValid || !memberValid || removed.length > 0);
+    const repaired = !created && (!dialogMetadataValid || !memberValid || rogueMembers.length > 0);
     if (!created && !repaired) {
       return { dialogId, type: "saved", created: false, repaired: false, pushes: [] };
     }
@@ -263,7 +298,7 @@ export async function ensureSavedMessages(
       },
     });
     const pushes = [...revokedPushes, ...ownerPushes];
-    await notifySyncWakeups(tx, pushes);
+    await notifySyncWakeups(tx, ownerPushes);
     return {
       dialogId,
       type: "saved",

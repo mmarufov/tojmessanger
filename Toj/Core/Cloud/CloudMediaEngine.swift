@@ -1362,6 +1362,37 @@ actor EncryptedMediaCache {
         )
     }
 
+    /// Access revocation overrides active playback leases. UI and network activity are cancelled
+    /// before this call; physical deletion is verified so SQL finalization cannot race ahead of
+    /// encrypted bytes that survived a filesystem error.
+    func purgeRevokedMedia(
+        mediaIds: Set<String>,
+        additionalEncryptedPaths: Set<String>
+    ) throws {
+        try loadIndexIfNeeded()
+        for mediaId in mediaIds {
+            activeAccessCounts[mediaId] = nil
+            removeCachedMedia(mediaId: mediaId)
+            let paths = [
+                downloadDirectory(mediaId),
+                thumbnailURL(mediaId),
+                representationDirectory(mediaId),
+            ]
+            for path in paths where fileManager.fileExists(atPath: path.path) {
+                try fileManager.removeItem(at: path)
+            }
+        }
+        for rawPath in additionalEncryptedPaths where !rawPath.isEmpty {
+            let url = URL(fileURLWithPath: rawPath)
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+            if let uploadBytes = uploadBytesByPath.removeValue(forKey: url.path) {
+                trackedBytes = max(0, trackedBytes - uploadBytes)
+            }
+        }
+    }
+
     func createTemporaryPreview(_ data: Data, fileExtension: String?) throws -> URL {
         guard !data.isEmpty, data.count <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
         let candidate = (fileExtension ?? "").lowercased()
@@ -2912,6 +2943,32 @@ actor CloudMediaTransferEngine {
         autoDownloadQueue.removeAll {
             result.clearedMediaIds.contains($0.media.id)
         }
+    }
+
+    func purgeRevokedAccess(
+        allMediaIds: Set<String>,
+        purgeMediaIds: Set<String>,
+        encryptedPaths: Set<String>,
+        localStore: CloudLocalStore
+    ) async throws {
+        guard !allMediaIds.isEmpty || !encryptedPaths.isEmpty else { return }
+        for mediaId in allMediaIds {
+            inFlightFullDownloads.removeValue(forKey: mediaId)?.task.cancel()
+            inFlightThumbnailDownloads.removeValue(forKey: mediaId)?.task.cancel()
+            autoDownloadQueue.removeAll { $0.media.id == mediaId }
+        }
+        try await backgroundDownloads?.cancelAndDelete(mediaIds: allMediaIds)
+        let cache = try resolvedCache()
+        try await hydrateDurableLedgerIfNeeded(localStore: localStore)
+        try await cache.purgeRevokedMedia(
+            mediaIds: purgeMediaIds,
+            additionalEncryptedPaths: encryptedPaths
+        )
+        try await synchronizeRemovedLedgerKeys(localStore: localStore)
+        _ = try await localStore.cancelMediaDownloadJobs(
+            mediaIds: allMediaIds,
+            excluding: []
+        )
     }
 
     func cacheUsageBytes() async -> Int64 {

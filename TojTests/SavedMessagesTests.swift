@@ -599,14 +599,375 @@ final class SavedMessagesTests: XCTestCase {
 
         let visibleDialogs = try await store.dialogs(accountId: accountId)
         let outbox = try await store.pendingOutboxReady()
-        let purgeCount = try await store.drainPendingPurges()
+        let purgeJobs = try await store.pendingAccessPurgeJobs()
+        for job in purgeJobs {
+            try await store.markAccessPurgeFilesDeleted(id: job.id)
+            try await store.finalizeAccessPurge(id: job.id)
+        }
         let timeline = try await store.timeline(dialogId: dialogId)
         let cache = try await store.mediaCacheEntry(mediaId: media.id, variant: "full")
         XCTAssertTrue(visibleDialogs.isEmpty)
         XCTAssertTrue(outbox.isEmpty)
-        XCTAssertGreaterThan(purgeCount, 0)
+        XCTAssertFalse(purgeJobs.isEmpty)
         XCTAssertTrue(timeline.messages.isEmpty)
         XCTAssertNil(cache)
+    }
+
+    @MainActor
+    func testAccessPurgeDeletesRealEncryptedFilesDuringPlaybackAndZerosPayloads() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let cacheRoot = URL(fileURLWithPath: fixture.path)
+            .deletingLastPathComponent()
+            .appending(path: "encrypted-media", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot,
+            keyData: Data(repeating: 0x51, count: 32),
+            limitBytes: 2 * 1024 * 1024
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let coordinator = AccessPurgeCoordinator()
+        let accountId = "purge-account"
+        let dialogId = "purge-saved"
+        let mediaId = "revoked-active-media"
+        let media = CloudMedia(
+            id: mediaId, kind: "voice", contentType: "audio/ogg",
+            fileName: nil, byteSize: 64, durationMs: 1_000, width: nil, height: nil,
+            hasThumbnail: false
+        )
+        let payload = Data(repeating: 0x52, count: 64)
+        try await cache.storeDownloadChunk(payload, mediaId: mediaId, offset: 0)
+        let downloadPath = cacheRoot.appending(path: "downloads/\(mediaId)")
+        try await store.upsertMediaCacheEntry(MediaCacheEntry(
+            mediaId: mediaId, variant: "full", encryptedPath: downloadPath.path,
+            byteSize: 64, cachedBytes: 92, contiguousOffset: 64, state: "complete",
+            lastAccessedAt: "2026-07-27 00:00:00", protectedUntil: nil
+        ))
+        try await store.ensureSavedDialog(dialogId: dialogId, accountId: accountId, updatedAt: nil)
+        try await applyCanonicalMedia(
+            store: store, accountId: accountId, dialogId: dialogId,
+            dialogType: "saved", media: media, pts: 1, msgId: 1
+        )
+
+        let prepared = try await cache.prepareUpload(
+            data: Data("revoked upload source".utf8),
+            kind: "file",
+            contentType: "application/octet-stream",
+            fileName: "private.bin"
+        )
+        let latePrepared = try await cache.prepareUpload(
+            data: Data("late revoked upload source".utf8),
+            kind: "file",
+            contentType: "application/octet-stream",
+            fileName: "late-private.bin"
+        )
+        try await store.insertMediaTransfer(
+            prepared: prepared, dialogId: dialogId,
+            clientMsgId: UUID().uuidString.lowercased(), caption: "", replyToMsgId: nil
+        )
+        _ = try await store.insertSending(
+            dialogId: dialogId,
+            clientMsgId: UUID().uuidString.lowercased(),
+            text: "plaintext outbox must disappear",
+            senderAccountId: accountId
+        )
+        await engine.beginMediaAccess(mediaId)
+
+        try await applyRevocation(
+            store: store, accountId: accountId, dialogId: dialogId, pts: 2
+        )
+        let stagedOutbox = try await store.pendingOutboxReady()
+        let stagedTransfers = try await store.mediaTransfers(dialogId: dialogId)
+        XCTAssertTrue(stagedOutbox.isEmpty)
+        XCTAssertTrue(stagedTransfers.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: downloadPath.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.encryptedSourcePath))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: latePrepared.encryptedSourcePath))
+
+        let scope = AccessPurgeScope(
+            accountId: accountId, token: "token-a", generation: 1, store: store
+        )
+        let result = try await coordinator.drain(
+            scope: scope,
+            store: store,
+            mediaEngine: engine,
+            isCurrent: { true },
+            invalidatePresentation: { _ in
+                // Model a transfer task that completed its SQL write after revocation was staged
+                // but just as cancellation was being awaited.
+                try! await store.insertMediaTransfer(
+                    prepared: latePrepared,
+                    dialogId: dialogId,
+                    clientMsgId: UUID().uuidString.lowercased(),
+                    caption: "",
+                    replyToMsgId: nil
+                )
+            }
+        )
+
+        XCTAssertEqual(result, AccessPurgeDrainResult(finalized: 1, batches: 1))
+        let remainingJobs = try await store.pendingAccessPurgeCount()
+        let purgedTimeline = try await store.timeline(dialogId: dialogId)
+        let purgedCache = try await store.mediaCacheEntry(mediaId: mediaId, variant: "full")
+        let cacheUsage = try await cache.usageSnapshot()
+        XCTAssertEqual(remainingJobs, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: downloadPath.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.encryptedSourcePath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: latePrepared.encryptedSourcePath))
+        XCTAssertEqual(cacheUsage.protectedUploadBytes, 0)
+        XCTAssertTrue(purgedTimeline.messages.isEmpty)
+        XCTAssertNil(purgedCache)
+    }
+
+    @MainActor
+    func testAccessPurgePreservesEncryptedMediaReferencedByForwardedCopy() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let cacheRoot = URL(fileURLWithPath: fixture.path)
+            .deletingLastPathComponent()
+            .appending(path: "forwarded-cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot,
+            keyData: Data(repeating: 0x61, count: 32),
+            limitBytes: 2 * 1024 * 1024
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let accountId = "shared-account"
+        let savedId = "shared-saved"
+        let targetId = "shared-target"
+        let mediaId = "forwarded-shared-media"
+        let media = CloudMedia(
+            id: mediaId, kind: "video", contentType: "video/mp4",
+            fileName: "shared.mp4", byteSize: 80, durationMs: 2_000,
+            width: 320, height: 240, hasThumbnail: false
+        )
+        try await cache.storeDownloadChunk(Data(repeating: 0x62, count: 80), mediaId: mediaId, offset: 0)
+        let downloadPath = cacheRoot.appending(path: "downloads/\(mediaId)")
+        try await store.upsertMediaCacheEntry(MediaCacheEntry(
+            mediaId: mediaId, variant: "full", encryptedPath: downloadPath.path,
+            byteSize: 80, cachedBytes: 108, contiguousOffset: 80, state: "complete",
+            lastAccessedAt: "2026-07-27 00:00:00", protectedUntil: nil
+        ))
+        try await store.ensureSavedDialog(dialogId: savedId, accountId: accountId, updatedAt: nil)
+        try await store.upsertDialog(dialogId: targetId, type: "direct", title: "Peer")
+        try await applyCanonicalMedia(
+            store: store, accountId: accountId, dialogId: savedId,
+            dialogType: "saved", media: media, pts: 1, msgId: 1
+        )
+        try await applyCanonicalMedia(
+            store: store, accountId: accountId, dialogId: targetId,
+            dialogType: "direct", media: media, pts: 2, msgId: 1, forwarded: true
+        )
+        try await applyRevocation(
+            store: store, accountId: accountId, dialogId: savedId, pts: 3
+        )
+        let stagedJobs = try await store.pendingAccessPurgeJobs()
+        let job = try XCTUnwrap(stagedJobs.first)
+        XCTAssertEqual(job.allMediaIds, Set([mediaId]))
+        XCTAssertTrue(job.purgeMediaIds.isEmpty)
+
+        let coordinator = AccessPurgeCoordinator()
+        _ = try await coordinator.drain(
+            scope: AccessPurgeScope(
+                accountId: accountId, token: "token-shared", generation: 1, store: store
+            ),
+            store: store,
+            mediaEngine: engine,
+            isCurrent: { true },
+            invalidatePresentation: { _ in }
+        )
+
+        let sharedCache = try await store.mediaCacheEntry(mediaId: mediaId, variant: "full")
+        let targetTimeline = try await store.timeline(dialogId: targetId)
+        let savedTimeline = try await store.timeline(dialogId: savedId)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: downloadPath.path))
+        XCTAssertNotNil(sharedCache)
+        XCTAssertEqual(targetTimeline.messages.first?.media, media)
+        XCTAssertTrue(savedTimeline.messages.isEmpty)
+    }
+
+    @MainActor
+    func testAccessPurgeDrainsMoreThanTwentyJobsInBoundedBatches() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        for index in 0..<41 {
+            let dialogId = "revoked-\(index)"
+            try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Revoked")
+            try await store.revokeGroupAccess(
+                dialogId: dialogId, reason: "dialog.access_revoked"
+            )
+        }
+        let stagedCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(stagedCount, 41)
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path)
+                .deletingLastPathComponent()
+                .appending(path: "batch-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x71, count: 32),
+            limitBytes: 1_000_000
+        )
+        let result = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: "batch-account", token: "batch-token", generation: 1, store: store
+            ),
+            store: store,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            isCurrent: { true },
+            invalidatePresentation: { _ in }
+        )
+        XCTAssertEqual(result.finalized, 41)
+        XCTAssertEqual(result.batches, 3)
+        let remainingCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(remainingCount, 0)
+    }
+
+    @MainActor
+    func testAccessPurgeResumesAfterFilesDeletedCrashBoundary() async throws {
+        let fixture = try makeStoreFixture()
+        do {
+            let firstStore = try CloudLocalStore(path: fixture.path, key: fixture.key)
+            try await firstStore.upsertDialog(
+                dialogId: "crash-dialog", type: "group", title: "Crash"
+            )
+            try await firstStore.revokeGroupAccess(
+                dialogId: "crash-dialog", reason: "dialog.access_revoked"
+            )
+            let jobs = try await firstStore.pendingAccessPurgeJobs()
+            let job = try XCTUnwrap(jobs.first)
+            try await firstStore.markAccessPurgeFilesDeleted(id: job.id)
+            let pendingCount = try await firstStore.pendingAccessPurgeCount()
+            XCTAssertEqual(pendingCount, 1)
+        }
+
+        let relaunched = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path)
+                .deletingLastPathComponent()
+                .appending(path: "crash-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x72, count: 32),
+            limitBytes: 1_000_000
+        )
+        let result = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: "crash-account", token: "crash-token", generation: 2,
+                store: relaunched
+            ),
+            store: relaunched,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            isCurrent: { true },
+            invalidatePresentation: { _ in }
+        )
+        XCTAssertEqual(result.finalized, 1)
+        let remainingCount = try await relaunched.pendingAccessPurgeCount()
+        let timeline = try await relaunched.timeline(dialogId: "crash-dialog")
+        XCTAssertEqual(remainingCount, 0)
+        XCTAssertTrue(timeline.messages.isEmpty)
+    }
+
+    @MainActor
+    func testOfflineLaunchDrainsRevokedArchiveBeforePublishingSnapshot() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "offline-launch-account"
+        let dialogId = "offline-launch-saved"
+        try await store.ensureSavedDialog(dialogId: dialogId, accountId: accountId, updatedAt: nil)
+        _ = try await store.insertSending(
+            dialogId: dialogId, clientMsgId: UUID().uuidString.lowercased(),
+            text: "must never flash on launch", senderAccountId: accountId
+        )
+        try await store.revokeGroupAccess(dialogId: dialogId, reason: "dialog.access_revoked")
+        let stagedJobs = try await store.pendingAccessPurgeJobs()
+        XCTAssertEqual(stagedJobs.count, 1)
+
+        let tokenStore = TokenStore(service: "com.toj.offline-purge.\(UUID().uuidString)")
+        try await tokenStore.save(StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId, deviceId: "offline-device", token: "offline-token"
+            ),
+            phone: "+992900000002",
+            displayName: "Offline Account"
+        ))
+        let config = CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://offline-purge.invalid"))
+        )
+        let model = CloudAppModel(
+            config: config,
+            tokenStore: tokenStore,
+            localStore: store,
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: "offline-purge-\(UUID().uuidString)")!
+        )
+
+        await model.prepareForBackgroundRuntime()
+
+        let remainingJobs = try await store.pendingAccessPurgeCount()
+        let timeline = try await store.timeline(dialogId: dialogId)
+        XCTAssertEqual(model.launchPhase, .localReady)
+        XCTAssertFalse(model.dialogs.contains { $0.id == dialogId })
+        XCTAssertEqual(remainingJobs, 0)
+        XCTAssertTrue(timeline.messages.isEmpty)
+        try await tokenStore.clear()
+    }
+
+    @MainActor
+    func testAccessPurgeAccountSwitchCancelsAndAwaitsExactOldScope() async throws {
+        let oldFixture = try makeStoreFixture()
+        let newFixture = try makeStoreFixture()
+        let oldStore = try CloudLocalStore(path: oldFixture.path, key: oldFixture.key)
+        let newStore = try CloudLocalStore(path: newFixture.path, key: newFixture.key)
+        try await oldStore.upsertDialog(dialogId: "old-revoked", type: "group", title: "Old")
+        try await oldStore.revokeGroupAccess(
+            dialogId: "old-revoked", reason: "dialog.access_revoked"
+        )
+        try await newStore.upsertDialog(dialogId: "new-revoked", type: "group", title: "New")
+        try await newStore.revokeGroupAccess(
+            dialogId: "new-revoked", reason: "dialog.access_revoked"
+        )
+        let oldCache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: oldFixture.path)
+                .deletingLastPathComponent().appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x73, count: 32), limitBytes: 1_000_000
+        )
+        let newCache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: newFixture.path)
+                .deletingLastPathComponent().appending(path: "cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x74, count: 32), limitBytes: 1_000_000
+        )
+        let coordinator = AccessPurgeCoordinator()
+        let oldTask = Task {
+            try await coordinator.drain(
+                scope: AccessPurgeScope(
+                    accountId: "old-account", token: "old-token", generation: 1, store: oldStore
+                ),
+                store: oldStore,
+                mediaEngine: CloudMediaTransferEngine(cache: oldCache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in
+                    try? await Task.sleep(for: .seconds(5))
+                }
+            )
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        let newResult = try await coordinator.drain(
+            scope: AccessPurgeScope(
+                accountId: "new-account", token: "new-token", generation: 2, store: newStore
+            ),
+            store: newStore,
+            mediaEngine: CloudMediaTransferEngine(cache: newCache),
+            isCurrent: { true },
+            invalidatePresentation: { _ in }
+        )
+        do {
+            _ = try await oldTask.value
+            XCTFail("old account purge must be cancelled")
+        } catch is CancellationError {
+            // Expected: the exact old task was cancelled and awaited before the new scope ran.
+        }
+        XCTAssertEqual(newResult.finalized, 1)
+        let oldCount = try await oldStore.pendingAccessPurgeCount()
+        let newCount = try await newStore.pendingAccessPurgeCount()
+        XCTAssertEqual(oldCount, 1)
+        XCTAssertEqual(newCount, 0)
     }
 
     func testSavedMessagesStringsHaveRussianAndTajikTranslations() throws {
@@ -672,6 +1033,60 @@ final class SavedMessagesTests: XCTestCase {
         return (
             directory.appending(path: "cloud.sqlite").path,
             Data("saved-messages-test-key".utf8)
+        )
+    }
+
+    private func applyCanonicalMedia(
+        store: CloudLocalStore,
+        accountId: String,
+        dialogId: String,
+        dialogType: String,
+        media: CloudMedia,
+        pts: Int64,
+        msgId: Int64,
+        forwarded: Bool = false
+    ) async throws {
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: pts),
+                updates: [CloudUpdate(
+                    pts: pts, ptsCount: 1, type: "message.new",
+                    dialogId: dialogId,
+                    dialogTitle: dialogType == "saved" ? "Saved Messages" : "Peer",
+                    dialogType: dialogType,
+                    message: CloudMessage(
+                        dialogId: dialogId, msgId: msgId, senderAccountId: accountId,
+                        clientMsgId: UUID().uuidString.lowercased(), kind: media.kind,
+                        text: "", isForwarded: forwarded, media: media, editVersion: 0,
+                        state: "visible", serverTs: "2026-07-27T00:00:00Z"
+                    ),
+                    readerAccountId: nil, maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+    }
+
+    private func applyRevocation(
+        store: CloudLocalStore,
+        accountId: String,
+        dialogId: String,
+        pts: Int64
+    ) async throws {
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: pts),
+                updates: [CloudUpdate(
+                    pts: pts, ptsCount: 1, type: "dialog.access_revoked",
+                    dialogId: dialogId, dialogTitle: nil, dialogType: "saved",
+                    message: nil, readerAccountId: nil, maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
         )
     }
 }

@@ -1,6 +1,7 @@
 import { $ } from "bun";
 import { DEFAULT_URL, makeSql } from "./db";
 import { backfillMessageForwardMarkers } from "./message-forward-backfill";
+import { reconcileExistingSavedDialogs } from "./saved-dialog-reconciliation";
 
 // Apply contract DDL atomically, build indexes on existing hot tables without blocking writes,
 // then validate the new constraint under a short lock timeout. Every phase is idempotent.
@@ -21,6 +22,10 @@ const messageForwardBackfillIndexSchema = new URL(
   "./schema-message-forward-backfill-index.sql",
   import.meta.url,
 ).pathname;
+const savedAccessExpandSchema = new URL(
+  "./schema-saved-access-expand.sql",
+  import.meta.url,
+).pathname;
 const callMediaBackfillBatchSize = 1_000;
 
 await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -c "SET LOCAL lock_timeout = '5s'" -f ${schema}`.quiet();
@@ -29,6 +34,7 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE 
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check"`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogSwapSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messageForwardExpandSchema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${savedAccessExpandSchema}`.quiet();
 let backfilledCallCount = 0;
 while (true) {
   const query = `
@@ -67,8 +73,10 @@ if (!forwardMigrationComplete) {
 }
 const migrationSql = makeSql(url);
 let messageForwardBackfill;
+let savedDialogReconciliation;
 try {
   messageForwardBackfill = await backfillMessageForwardMarkers(migrationSql);
+  savedDialogReconciliation = await reconcileExistingSavedDialogs(migrationSql);
 } finally {
   await migrationSql.end();
 }
@@ -87,5 +95,6 @@ function redactUrl(value: string): string {
 
 console.log(
   `migrated: ${redactUrl(url)} (${backfilledCallCount} calls backfilled, `
-  + `${messageForwardBackfill.processed} forward markers in ${messageForwardBackfill.batches} batches)`,
+  + `${messageForwardBackfill.processed} forward markers in ${messageForwardBackfill.batches} batches, `
+  + `${savedDialogReconciliation.processed} Saved dialogs reconciled)`,
 );

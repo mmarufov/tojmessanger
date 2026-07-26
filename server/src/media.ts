@@ -489,14 +489,23 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
       EXISTS (
         SELECT 1 FROM messages m
         JOIN dialog_members dm ON dm.dialog_id = m.dialog_id
+        JOIN dialogs d ON d.id = m.dialog_id
         WHERE m.media_id = mo.id AND m.state = 'visible'
           AND dm.account_id = ${accountId} AND dm.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND dm.role = 'owner')
+          )
       )
       OR EXISTS (
         SELECT 1 FROM dialogs d
         JOIN dialog_members dm ON dm.dialog_id = d.id
         WHERE d.photo_media_id = mo.id
           AND dm.account_id = ${accountId} AND dm.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND dm.role = 'owner')
+          )
       )
     )
     FOR KEY SHARE OF mo`)[0];

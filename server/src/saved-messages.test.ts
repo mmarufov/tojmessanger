@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { Client } from "pg";
 import {
   checkVerification,
   deleteAccount,
@@ -29,6 +30,10 @@ import {
   SavedMessagesError,
 } from "./saved-messages";
 import {
+  reconcileExistingSavedDialogs,
+  SAVED_DIALOG_RECONCILIATION,
+} from "./saved-dialog-reconciliation";
+import {
   getBootstrapDialogsPage,
   getDifference,
   getHistory,
@@ -47,6 +52,21 @@ async function resetDb() {
 async function account(phone: string, name: string) {
   const { code } = await startVerification(db, phone);
   return checkVerification(db, phone, code, "ios", `${name} iPhone`, name);
+}
+
+async function insertLegacyRogueSavedMember(
+  dialogId: string,
+  accountId: string,
+  role = "member",
+) {
+  await db`ALTER TABLE dialog_members DISABLE TRIGGER dialog_members_enforce_saved_owner`;
+  try {
+    await db`
+      INSERT INTO dialog_members (dialog_id, account_id, role)
+      VALUES (${dialogId}, ${accountId}, ${role})`;
+  } finally {
+    await db`ALTER TABLE dialog_members ENABLE TRIGGER dialog_members_enforce_saved_owner`;
+  }
 }
 
 describe("Saved Messages v1", () => {
@@ -204,9 +224,7 @@ describe("Saved Messages v1", () => {
     await db`
       UPDATE dialogs SET title = 'damaged', closed_at = now()
       WHERE id = ${saved.dialogId}`;
-    await db`
-      INSERT INTO dialog_members (dialog_id, account_id, role)
-      VALUES (${saved.dialogId}, ${outsider.accountId}, 'member')`;
+    await insertLegacyRogueSavedMember(saved.dialogId, outsider.accountId);
     await registerPushToken(
       db,
       outsider.deviceId,
@@ -251,6 +269,172 @@ describe("Saved Messages v1", () => {
     expect(Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${outsider.accountId}`)[0].pts))
       .toBe(ptsAfterRepair);
+  });
+
+  test("database invariant and both authorization paths reject rogue Saved access", async () => {
+    const owner = await account("+16505554130", "Owner");
+    const rogue = await account("+16505554131", "Rogue");
+    const saved = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
+    await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "owner private note",
+    });
+
+    let invariantError = "";
+    try {
+      await db`
+        INSERT INTO dialog_members (dialog_id, account_id, role)
+        VALUES (${saved.dialogId}, ${rogue.accountId}, 'member')`;
+    } catch (error) {
+      invariantError = String(error);
+    }
+    expect(invariantError).toContain(
+      "active Saved Messages membership must belong to its owner",
+    );
+
+    await insertLegacyRogueSavedMember(saved.dialogId, rogue.accountId);
+    await expect(getHistory(db, rogue.accountId, saved.dialogId))
+      .rejects.toMatchObject({ code: "saved_dialog_forbidden", status: 403 });
+    const legacyPts = Number((await db`
+      UPDATE account_sync_states SET pts = pts + 1
+      WHERE account_id = ${rogue.accountId}
+      RETURNING pts`)[0].pts);
+    await db`
+      INSERT INTO account_events (
+        account_id, pts, type, dialog_id, msg_id, actor_account_id, data
+      ) VALUES (
+        ${rogue.accountId}, ${legacyPts}, 'message.new', ${saved.dialogId}, 1,
+        ${owner.accountId}, '{}'::jsonb
+      )`;
+    const legacyDifference = await getDifference(db, rogue.accountId, legacyPts - 1);
+    if (legacyDifference.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(legacyDifference.updates).toEqual([expect.objectContaining({
+      pts: legacyPts,
+      type: "dialog.access_revoked",
+      dialog_id: saved.dialogId,
+      dialog_type: "saved",
+    })]);
+    expect(JSON.stringify(legacyDifference.updates)).not.toContain("owner private note");
+
+    await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "must only fan out to the owner",
+    });
+    const rogueDifference = await getDifference(db, rogue.accountId, legacyPts);
+    if (rogueDifference.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(rogueDifference.updates).toEqual([]);
+    await expect(sendMessage(db, {
+      senderAccountId: rogue.accountId,
+      senderDeviceId: rogue.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "must never be written",
+    })).rejects.toMatchObject({ code: "saved_dialog_forbidden", status: 403 });
+    expect(Number((await db`
+      SELECT count(*) AS count
+      FROM messages
+      WHERE dialog_id = ${saved.dialogId} AND sender_account_id = ${rogue.accountId}`
+    )[0].count)).toBe(0);
+  });
+
+  test("reconciliation covers skipped dialogs and emits deterministic revocations before removal", async () => {
+    const firstOwner = await account("+16505554132", "First Owner");
+    const secondOwner = await account("+16505554133", "Second Owner");
+    const rogue = await account("+16505554134", "Rogue");
+    const first = await ensureSavedMessages(db, firstOwner.accountId, firstOwner.deviceId);
+    const second = await ensureSavedMessages(db, secondOwner.accountId, secondOwner.deviceId);
+    await registerPushToken(db, rogue.deviceId, "b".repeat(64), "sandbox");
+    await insertLegacyRogueSavedMember(first.dialogId, rogue.accountId);
+    await insertLegacyRogueSavedMember(second.dialogId, rogue.accountId);
+
+    // Provisioning backfill has already skipped/completed these accounts. Reconciliation must
+    // independently scan every existing Saved dialog.
+    await db`
+      INSERT INTO saved_messages_backfill_claims (
+        account_id, worker_id, claimed_at, completed_at
+      ) VALUES
+        (${firstOwner.accountId}, ${crypto.randomUUID()}, now(), now()),
+        (${secondOwner.accountId}, ${crypto.randomUUID()}, now(), now())
+      ON CONFLICT (account_id) DO UPDATE SET completed_at = EXCLUDED.completed_at`;
+    await db`
+      UPDATE schema_migration_progress
+      SET completed_at = NULL, cursor_dialog_id = NULL, cursor_msg_id = NULL,
+          rows_processed = 0, updated_at = now()
+      WHERE migration_name = ${SAVED_DIALOG_RECONCILIATION}`;
+
+    const beforePts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${rogue.accountId}`)[0].pts);
+    const listener = new Client({ connectionString: TEST_URL });
+    await listener.connect();
+    await listener.query("LISTEN toj_sync_events");
+    const wakeups = new Promise<Array<{ accountId: string; pts: number; ptsCount: number }>>(
+      (resolve, reject) => {
+        const received: Array<{ accountId: string; pts: number; ptsCount: number }> = [];
+        const timeout = setTimeout(
+          () => reject(new Error("Saved revocation sync wake-ups timed out")),
+          2_000,
+        );
+        listener.on("notification", (notification) => {
+          if (notification.channel !== "toj_sync_events" || !notification.payload) return;
+          const decoded = JSON.parse(notification.payload);
+          if (decoded.accountId !== rogue.accountId) return;
+          received.push(decoded);
+          if (received.length === 2) {
+            clearTimeout(timeout);
+            resolve(received);
+          }
+        });
+      },
+    );
+    let reconciled;
+    let receivedWakeups;
+    try {
+      reconciled = await reconcileExistingSavedDialogs(db, 1);
+      receivedWakeups = await wakeups;
+    } finally {
+      await listener.end();
+    }
+    expect(reconciled).toMatchObject({
+      processed: 2,
+      repaired: 2,
+      batches: 2,
+      skippedCompleted: false,
+    });
+    const events = await db`
+      SELECT pts, dialog_id
+      FROM account_events
+      WHERE account_id = ${rogue.accountId}
+        AND type = 'dialog.access_revoked'
+        AND pts > ${beforePts}
+      ORDER BY pts`;
+    const expectedDialogOrder = [first.dialogId, second.dialogId].sort();
+    expect(events.map((event) => String(event.dialog_id))).toEqual(expectedDialogOrder);
+    expect(events.map((event) => Number(event.pts))).toEqual([beforePts + 1, beforePts + 2]);
+    expect(receivedWakeups).toEqual([
+      { accountId: rogue.accountId, pts: beforePts + 1, ptsCount: 1 },
+      { accountId: rogue.accountId, pts: beforePts + 2, ptsCount: 1 },
+    ]);
+    expect(Number((await db`
+      SELECT count(*) AS count
+      FROM push_deliveries
+      WHERE account_id = ${rogue.accountId} AND pts > ${beforePts} AND alert = false`
+    )[0].count)).toBe(2);
+    expect(Number((await db`
+      SELECT count(*) AS count
+      FROM dialog_members
+      WHERE account_id = ${rogue.accountId}
+        AND dialog_id IN (${first.dialogId}, ${second.dialogId})`
+    )[0].count)).toBe(0);
+    expect(await reconcileExistingSavedDialogs(db, 1)).toMatchObject({
+      processed: 0,
+      skippedCompleted: true,
+    });
   });
 
   test("reuses ordinary send, difference, history, and bootstrap pipelines", async () => {
@@ -421,6 +605,23 @@ describe("Saved Messages v1", () => {
     await db`
       UPDATE schema_migration_progress SET completed_at = now()
       WHERE migration_name = 'messages_is_forwarded_v1'`;
+
+    await db`ALTER TABLE dialog_members DISABLE TRIGGER dialog_members_enforce_saved_owner`;
+    try {
+      expect((await savedMessagesSchemaReadiness(db)).missing)
+        .toContain("dialog_members_enforce_saved_owner");
+    } finally {
+      await db`ALTER TABLE dialog_members ENABLE TRIGGER dialog_members_enforce_saved_owner`;
+    }
+
+    await db`
+      UPDATE schema_migration_progress SET completed_at = NULL
+      WHERE migration_name = 'saved_dialog_membership_v1'`;
+    expect((await savedMessagesSchemaReadiness(db)).missing)
+      .toContain("saved_dialog_membership_v1");
+    await db`
+      UPDATE schema_migration_progress SET completed_at = now()
+      WHERE migration_name = 'saved_dialog_membership_v1'`;
     expect(await savedMessagesSchemaReadiness(db)).toEqual({ ready: true, missing: [] });
   });
 
@@ -619,6 +820,109 @@ describe("Saved Messages v1", () => {
       forwarded_from_msg_id: null,
       media_id: upload.mediaId,
     });
+  });
+
+  test("raw old-node deletion uses the database boundary and only removes orphaned media", async () => {
+    const owner = await account("+16505554140", "Legacy Owner");
+    const peer = await account("+16505554141", "Peer");
+    const rogue = await account("+16505554142", "Rogue");
+    const saved = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
+    await registerPushToken(db, rogue.deviceId, "c".repeat(64), "sandbox");
+    await insertLegacyRogueSavedMember(saved.dialogId, rogue.accountId);
+
+    const sharedBytes = Buffer.from("shared encrypted object survives");
+    const sharedUpload = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "file",
+      contentType: "application/octet-stream",
+      fileName: "shared.bin",
+      byteSize: sharedBytes.length,
+      sha256: createHash("sha256").update(sharedBytes).digest("hex"),
+    });
+    await uploadMediaChunk(
+      db, owner.accountId, owner.deviceId, sharedUpload.mediaId, 0, sharedBytes,
+    );
+    await completeMediaUpload(db, owner.accountId, owner.deviceId, sharedUpload.mediaId);
+    const source = await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "",
+      mediaId: sharedUpload.mediaId,
+    });
+    const direct = await getOrCreateDirectDialog(db, owner.accountId, peer.accountId);
+    const forwarded = await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: direct.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      forwardedFrom: { dialogId: saved.dialogId, msgId: source.msgId },
+    });
+
+    const orphanBytes = Buffer.from("private orphan must be erased");
+    const orphanUpload = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "file",
+      contentType: "application/octet-stream",
+      fileName: "orphan.bin",
+      byteSize: orphanBytes.length,
+      sha256: createHash("sha256").update(orphanBytes).digest("hex"),
+    });
+    await uploadMediaChunk(
+      db, owner.accountId, owner.deviceId, orphanUpload.mediaId, 0, orphanBytes,
+    );
+    await completeMediaUpload(db, owner.accountId, owner.deviceId, orphanUpload.mediaId);
+    await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "",
+      mediaId: orphanUpload.mediaId,
+    });
+    const roguePts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${rogue.accountId}`)[0].pts);
+
+    // This is the mixed-version/old-node path: it knows only the legacy account status update.
+    await db`UPDATE accounts SET status = 'deleted' WHERE id = ${owner.accountId}`;
+
+    expect(await db`SELECT id FROM dialogs WHERE id = ${saved.dialogId}`).toHaveLength(0);
+    expect((await db`
+      SELECT pts, type, dialog_id
+      FROM account_events
+      WHERE account_id = ${rogue.accountId} AND pts > ${roguePts}
+      ORDER BY pts`
+    ).map((event) => ({
+      pts: Number(event.pts),
+      type: event.type,
+      dialogId: String(event.dialog_id),
+    }))).toEqual([{
+      pts: roguePts + 1,
+      type: "dialog.access_revoked",
+      dialogId: saved.dialogId,
+    }]);
+    expect(Number((await db`
+      SELECT count(*) AS count
+      FROM dialog_members
+      WHERE dialog_id = ${saved.dialogId} AND account_id = ${rogue.accountId}`
+    )[0].count)).toBe(0);
+    expect((await db`
+      SELECT is_forwarded, forwarded_from_account_id, forwarded_from_dialog_id,
+             forwarded_from_msg_id, media_id
+      FROM messages
+      WHERE dialog_id = ${direct.dialogId} AND msg_id = ${forwarded.msgId}`)[0])
+      .toMatchObject({
+        is_forwarded: true,
+        forwarded_from_account_id: null,
+        forwarded_from_dialog_id: null,
+        forwarded_from_msg_id: null,
+        media_id: sharedUpload.mediaId,
+      });
+    expect((await downloadMediaChunk(db, peer.accountId, sharedUpload.mediaId, 0)).bytes)
+      .toEqual(sharedBytes);
+    expect(await db`SELECT id FROM media_objects WHERE id = ${orphanUpload.mediaId}`)
+      .toHaveLength(0);
+    expect(await db`SELECT media_id FROM media_chunks WHERE media_id = ${orphanUpload.mediaId}`)
+      .toHaveLength(0);
   });
 
   test("rollout flag hard-closes the route and authenticated capability", async () => {

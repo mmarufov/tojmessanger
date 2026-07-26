@@ -155,11 +155,15 @@ final class GroupsV1Tests: XCTestCase {
 
         let visibleDialogs = try await store.dialogs(accountId: "account-me")
         let readyOutbox = try await store.pendingOutboxReady()
-        let purgeCount = try await store.drainPendingPurges()
+        let purgeJobs = try await store.pendingAccessPurgeJobs()
+        for job in purgeJobs {
+            try await store.markAccessPurgeFilesDeleted(id: job.id)
+            try await store.finalizeAccessPurge(id: job.id)
+        }
         let timeline = try await store.timeline(dialogId: groupId)
         XCTAssertTrue(visibleDialogs.isEmpty)
         XCTAssertTrue(readyOutbox.isEmpty)
-        XCTAssertGreaterThan(purgeCount, 0)
+        XCTAssertFalse(purgeJobs.isEmpty)
         XCTAssertTrue(timeline.messages.isEmpty)
     }
 
