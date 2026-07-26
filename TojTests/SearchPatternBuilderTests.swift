@@ -113,6 +113,48 @@ final class SearchPatternBuilderTests: XCTestCase {
         XCTAssertEqual(SearchPatternBuilder.pattern(for: "salom")?.folded, "\"салом\"*")
     }
 
+    // MARK: - Budgets
+
+    /// Clamping happens before normalization so a multi-megabyte paste never gets walked three
+    /// times on the debounce path. This asserts the bound, and that it runs fast enough to sit on
+    /// a keystroke path.
+    func testHugePasteIsClampedBeforeNormalization() {
+        let paste = String(repeating: "салом ", count: 200_000)  // ~1.2M scalars
+        XCTAssertLessThanOrEqual(
+            SearchPatternBuilder.clamp(paste).unicodeScalars.count,
+            SearchPatternBuilder.maximumQueryScalars
+        )
+        let started = Date()
+        let pattern = SearchPatternBuilder.pattern(for: paste)
+        XCTAssertNotNil(pattern)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5, "clamping must bound the work")
+    }
+
+    func testClampRespectsTheUTF8BudgetForAstralScalars() {
+        // Four bytes per scalar, so the byte budget binds before the scalar budget.
+        let astral = String(repeating: "\u{1F600}", count: 2_000)
+        let clamped = SearchPatternBuilder.clamp(astral)
+        XCTAssertLessThanOrEqual(clamped.utf8.count, SearchPatternBuilder.maximumQueryBytes)
+        XCTAssertLessThanOrEqual(clamped.unicodeScalars.count, SearchPatternBuilder.maximumQueryScalars)
+    }
+
+    func testClampNeverSplitsAScalar() {
+        for count in [1, 7, 255, 256, 257, 1_000] {
+            let input = String(repeating: "ҷ", count: count)
+            let clamped = SearchPatternBuilder.clamp(input)
+            XCTAssertTrue(clamped.unicodeScalars.allSatisfy { $0 == "ҷ" })
+            XCTAssertEqual(String(clamped.unicodeScalars), clamped)
+        }
+    }
+
+    /// Combining marks are separators, so a decomposed query still yields the base-letter token
+    /// rather than an empty phrase.
+    func testCombiningMarksDoNotProduceEmptyPhrases() {
+        XCTAssertEqual(SearchPatternBuilder.pattern(for: "cafe\u{0301}")?.exact, "\"cafe\"*")
+        XCTAssertNil(SearchPatternBuilder.pattern(for: "\u{0301}\u{0308}\u{0300}"))
+        XCTAssertNil(SearchPatternBuilder.pattern(for: " \u{0301} "))
+    }
+
     // MARK: - Dialog scoping
 
     func testDialogTokenStripsHyphensSoTheUUIDIsOneToken() {

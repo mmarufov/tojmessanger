@@ -1,0 +1,107 @@
+import Foundation
+import GRDB
+
+/// The authoritative definition of the FTS5 index that backs message search.
+///
+/// This type owns the DDL and nothing else. The `v10` migration that creates the ordinary tables
+/// and triggers, and the indexer that drains them, are separate — deliberately, because the
+/// virtual table is **not** created by the migrator.
+///
+/// ## Why the virtual table is created outside the migration
+///
+/// A throwing migration makes `CloudLocalStore.init` throw, which routes the caller into the
+/// quarantine path and can cost a user every chat they have — over an index that is derived and
+/// rebuildable from `messages`. So ``createVirtualTable(_:)`` is called later, by the indexer,
+/// inside its own `do`/`catch`: if it fails, search reports itself unavailable and the app is
+/// otherwise untouched.
+///
+/// ## Tokenizer
+///
+/// ``tokenize`` must stay in step with `scripts/generate-search-unicode-tables.py`, which probes a
+/// table configured exactly this way to produce the tables `SearchTextNormalizer` folds with.
+/// Changing it changes what tokens exist and requires bumping `SearchTextNormalizer.version`.
+nonisolated enum SearchIndexSchema {
+    static let tokenize = "unicode61 remove_diacritics 2"
+
+    /// `contentless_delete=1` needs SQLite 3.43. SQLCipher 4.10.0 ships 3.50.4, so this is
+    /// satisfied — but it is probed at runtime rather than assumed, because the pod is resolved
+    /// from a lockfile that a future bump could move backwards.
+    static let minimumSQLiteVersionNumber = 3_043_000
+
+    /// Contentless because we never call `snippet()` or `highlight()`: displayed text and its
+    /// match ranges are computed in Swift from `messages.text`, so the FTS content shadow table
+    /// would be a duplicate copy of every message for nothing. Halves the index.
+    ///
+    /// Note that `'rebuild'` does not work on contentless tables, which is why repair drops and
+    /// recreates rather than rebuilding in place.
+    ///
+    /// `dialog_token` carries the dialog UUID with hyphens stripped so it tokenizes as one term.
+    /// Without it, in-chat search MATCHes the whole corpus and filters afterwards.
+    static let createVirtualTableSQL = """
+        CREATE VIRTUAL TABLE message_search USING fts5(
+            exact,
+            folded,
+            file_name,
+            link_text,
+            dialog_token,
+            tokenize = '\(tokenize)',
+            prefix = '2 3 4',
+            content = '',
+            contentless_delete = 1
+        )
+        """
+
+    /// Merge tuning. These are *not* valid `CREATE VIRTUAL TABLE` options — FTS5 rejects them
+    /// there with "unrecognized option" — and must be applied as config inserts afterwards.
+    ///
+    /// Edits are delete-plus-insert, so a chatty account accumulates tombstones; `automerge` keeps
+    /// the steady state healthy and `deletemerge` triggers a merge once a segment is 10% deletions.
+    static let configureMergeSQL = [
+        "INSERT INTO message_search(message_search, rank) VALUES('automerge', 8)",
+        "INSERT INTO message_search(message_search, rank) VALUES('deletemerge', 10)",
+    ]
+
+    static let dropVirtualTableSQL = "DROP TABLE IF EXISTS message_search"
+
+    /// `sqlite_version()` as a comparable integer, e.g. 3.50.4 becomes 3_050_004.
+    static func sqliteVersionNumber(_ db: Database) throws -> Int {
+        let version = try String.fetchOne(db, sql: "SELECT sqlite_version()") ?? "0.0.0"
+        let parts = version.split(separator: ".").compactMap { Int($0) }
+        guard parts.count >= 3 else { return 0 }
+        return parts[0] * 1_000_000 + parts[1] * 1_000 + parts[2]
+    }
+
+    /// Whether this build can store the index at all.
+    ///
+    /// Two independent things can be missing: FTS5 itself (a compile-time flag on SQLCipher) and
+    /// `contentless_delete` (a version floor). Probing rather than asserting keeps a pod bump from
+    /// silently producing an index that cannot delete rows — which would leave deleted message
+    /// text searchable, a privacy bug rather than a broken feature.
+    ///
+    /// - Important: Requires a **writable** connection. The probe creates and drops a temporary
+    ///   table, which GRDB's `read` blocks with `query_only`, so calling this inside a read
+    ///   transaction reports `false` no matter what the build supports. Call it from the same write
+    ///   that goes on to create the index.
+    static func supportsContentlessDelete(_ db: Database) throws -> Bool {
+        guard try sqliteVersionNumber(db) >= minimumSQLiteVersionNumber else { return false }
+        do {
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE temp.__toj_fts_probe USING fts5(
+                    x, content = '', contentless_delete = 1
+                )
+                """)
+            try db.execute(sql: "DROP TABLE temp.__toj_fts_probe")
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Creates the index and applies its merge tuning. Callers own the failure policy.
+    static func createVirtualTable(_ db: Database) throws {
+        try db.execute(sql: createVirtualTableSQL)
+        for sql in configureMergeSQL {
+            try db.execute(sql: sql)
+        }
+    }
+}

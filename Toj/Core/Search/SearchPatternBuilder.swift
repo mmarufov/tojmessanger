@@ -34,23 +34,35 @@ nonisolated enum SearchPatternBuilder {
     /// characters is both faster and closer to what the user meant.
     static let minimumPrefixLength = 2
 
+    /// Scalar budget applied to raw input *before* any normalization.
+    ///
+    /// A search field can receive a multi-megabyte paste, and normalization is O(scalars) with an
+    /// allocation per form. Clamping first bounds that work to a constant regardless of input, and
+    /// it runs on the main actor's debounce path, so it must not be O(paste).
+    static let maximumQueryScalars = 512
+
+    /// UTF-8 budget applied alongside ``maximumQueryScalars``. Astral scalars cost four bytes
+    /// each, so a scalar-only cap still admits a 2 KB query; this bounds the byte cost too.
+    static let maximumQueryBytes = 1024
+
     /// Builds the MATCH expressions for `query`, or `nil` when it contains nothing searchable
     /// (whitespace, punctuation, or emoji only).
     ///
     /// - Parameter prefixMatching: Whether the final term matches as a prefix. True while the user
     ///   is typing; false once they submit, where whole-word matching is less surprising.
     static func pattern(for query: String, prefixMatching: Bool = true) -> SearchPattern? {
-        let exactTerms = terms(in: SearchTextNormalizer.exact(query))
+        let clamped = clamp(query)
+        let exactTerms = terms(in: SearchTextNormalizer.exact(clamped))
         guard !exactTerms.isEmpty else { return nil }
 
         let exact = expression(exactTerms, prefixMatching: prefixMatching)
 
         var alternatives: [String] = []
-        let foldedTerms = terms(in: SearchTextNormalizer.foldedForm(query))
+        let foldedTerms = terms(in: SearchTextNormalizer.foldedForm(clamped))
         if foldedTerms != exactTerms {
             alternatives.append(expression(foldedTerms, prefixMatching: prefixMatching))
         }
-        if let candidate = SearchTextNormalizer.cyrillicCandidate(query) {
+        if let candidate = SearchTextNormalizer.cyrillicCandidate(clamped) {
             let candidateTerms = terms(in: candidate)
             if !candidateTerms.isEmpty, candidateTerms != exactTerms, candidateTerms != foldedTerms {
                 alternatives.append(expression(candidateTerms, prefixMatching: prefixMatching))
@@ -97,6 +109,23 @@ nonisolated enum SearchPatternBuilder {
     /// tokens cannot contain `"` anyway — this is belt-and-braces for a token rule that changes.
     private static func quote(_ text: String) -> String {
         "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// Truncates raw input to the scalar and UTF-8 budgets before anything walks it.
+    ///
+    /// Cuts on a scalar boundary, never mid-scalar, so the result is always valid. Because only
+    /// ``maximumTerms`` terms survive anyway, a query long enough to hit either budget has already
+    /// contributed every term it can, and truncating changes no result the user would notice.
+    static func clamp(_ query: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        var bytes = 0
+        for scalar in query.unicodeScalars {
+            let width = UTF8.width(scalar)
+            if scalars.count >= maximumQueryScalars || bytes + width > maximumQueryBytes { break }
+            scalars.append(scalar)
+            bytes += width
+        }
+        return String(scalars)
     }
 
     private struct Term: Equatable {
