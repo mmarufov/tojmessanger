@@ -15,11 +15,12 @@ than a tautology.
 """
 
 import json
+import os
 import subprocess
 import sys
 
 TOKENIZE = "unicode61 remove_diacritics 2"
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 # The six Tajik letters a Russian keyboard cannot produce. unicode61 folds none of them.
 TAJIK_FOLDS = {0x04B7: 0x0447, 0x0493: 0x0433, 0x04B3: 0x0445,
@@ -32,35 +33,31 @@ CASES = [
     "naïve", "Straße", "İstanbul", "ıssız",
     "½ ² 5", "abcdef", "🇹🇯 salom 👋", "file2024.pdf",
     "", "   ", "!!!???", "ǅ ǆ Ǆ", "МОСКВА москва",
+    # Decomposed diacritics exercise the ignored class: an ignored scalar must not end the token,
+    # so these collapse to one token rather than splitting in two.
+    "e\u0301galite\u0301", "a\u0301b", "\u0301ab", "ab\u0301", "a\u0301\u0308b",
+    # U+05B0 is a combining mark unicode61 does not accept, so it separates.
+    "a\u05b0b",
+    # Private use is a token class; it joins rather than splitting.
+    "abc\ue000def",
 ]
 
 
 def probe_tables():
-    points = [c for c in range(0x20, 0x10000) if not (0xD800 <= c <= 0xDFFF)]
-    points += list(range(0x1F300, 0x1F320))
-    script = [
-        "PRAGMA journal_mode=OFF;",
-        f'CREATE VIRTUAL TABLE t USING fts5(x, tokenize="{TOKENIZE}");',
-        "BEGIN;",
-    ]
-    script += [f"INSERT INTO t(rowid,x) VALUES({c},char({c}));" for c in points]
-    script += ["COMMIT;", "CREATE VIRTUAL TABLE v USING fts5vocab(t, instance);", "SELECT doc,term FROM v;"]
-    out = subprocess.run(["sqlite3", ":memory:"], input="\n".join(script), capture_output=True, text=True)
-    if out.returncode:
-        sys.exit(f"sqlite3 failed: {out.stderr[:400]}")
-
-    terms = {}
-    for line in out.stdout.split("\n"):
-        if line and "|" in line:
-            doc, term = line.split("|", 1)
-            terms[int(doc)] = term
-    token_chars = {c for c in points if c in terms}
-    folds = {c: ord(terms[c]) for c in token_chars if terms[c] != chr(c)}
-    return token_chars, folds
+    """Reuses the context-aware probe so both generators read the same measured classes."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tables", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "generate-search-unicode-tables.py"))
+    tables = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tables)
+    classes, folds = tables.build_and_run()
+    return classes, folds
 
 
 def main():
-    token_chars, folds = probe_tables()
+    classes, folds = probe_tables()
+    TOKEN, IGNORED = 1, 2
 
     def base_fold(text):
         return "".join(chr(folds.get(ord(ch), ord(ch))) for ch in text)
@@ -69,10 +66,14 @@ def main():
         return "".join(chr(TAJIK_FOLDS.get(ord(ch), ord(ch))) for ch in text)
 
     def tokenize(text):
+        """The three-class state machine. Ignored diacritics neither extend nor end a token."""
         out, cur = [], []
         for ch in text:
-            if ord(ch) in token_chars:
+            kind = classes.get(ord(ch), TOKEN)
+            if kind == TOKEN:
                 cur.append(ch)
+            elif kind == IGNORED:
+                continue
             elif cur:
                 out.append("".join(cur)); cur = []
         if cur:

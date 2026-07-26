@@ -1,14 +1,22 @@
 import Foundation
 
-/// The two MATCH expressions a single user query expands into.
+/// The two column-qualified MATCH expressions a single user query expands into.
 ///
-/// `exact` is tried first and its hits rank above `folded`'s — see the two-tier query in
-/// `MessageSearchStore`. `folded` is `nil` when the query contains nothing foldable and no Latin
-/// transliteration, which is the common case for pure-Latin input; the caller then runs one query
-/// instead of two.
+/// `exact` searches only the exact columns and `folded` only the folded ones, so a hit's tier is
+/// unambiguous: whichever expression returned it. The store runs `exact` first and `folded` for
+/// what it missed, which is what makes "exact ranks above folded" a property of the query plan
+/// rather than a scoring heuristic.
+///
+/// Unlike version 2, `folded` is **never nil**. Its predecessor omitted the folded tier whenever
+/// the query itself contained nothing foldable, which silently broke the common case: `точики` is
+/// unchanged by Tajik folding, so no folded tier ran, so it could not reach a stored `тоҷикӣ` —
+/// exactly the query the folded column exists to serve.
 nonisolated struct SearchPattern: Equatable, Sendable {
+    /// Restricted to ``SearchIndexSchema/exactColumns``.
     let exact: String
-    let folded: String?
+    /// Restricted to ``SearchIndexSchema/foldedColumns``. Includes the Latin transliteration
+    /// alternative, which belongs here because it produces Cyrillic in folded space.
+    let folded: String
 }
 
 /// Builds FTS5 `MATCH` expressions from untrusted user input.
@@ -20,8 +28,8 @@ nonisolated struct SearchPattern: Equatable, Sendable {
 ///
 /// So nothing is escaped or sanitized in place. Input is tokenized with ``SearchTextNormalizer``,
 /// each token is re-emitted as a quoted FTS5 phrase, and the phrases are joined with explicit
-/// operators. Operator characters cannot survive because they are not alphanumeric and therefore
-/// never appear inside a token.
+/// operators. Operator characters cannot survive because the measured tokenizer table classifies
+/// every one of them as a separator, so they never appear inside a token.
 nonisolated enum SearchPatternBuilder {
     /// Beyond this, extra terms cost query time without improving precision.
     static let maximumTerms = 8
@@ -55,24 +63,32 @@ nonisolated enum SearchPatternBuilder {
         let exactTerms = terms(in: SearchTextNormalizer.exact(clamped))
         guard !exactTerms.isEmpty else { return nil }
 
-        let exact = expression(exactTerms, prefixMatching: prefixMatching)
-
-        var alternatives: [String] = []
-        let foldedTerms = terms(in: SearchTextNormalizer.foldedForm(clamped))
-        if foldedTerms != exactTerms {
-            alternatives.append(expression(foldedTerms, prefixMatching: prefixMatching))
-        }
+        // The folded tier always runs. Its terms come from foldedForm, which equals the exact form
+        // when the query holds no Tajik letters — and that is precisely when it is needed, because
+        // a Russian-keyboard query is already in folded space while the stored Tajik text is not.
+        var foldedAlternatives = [expression(terms(in: SearchTextNormalizer.foldedForm(clamped)),
+                                             prefixMatching: prefixMatching)]
         if let candidate = SearchTextNormalizer.cyrillicCandidate(clamped) {
-            let candidateTerms = terms(in: candidate)
-            if !candidateTerms.isEmpty, candidateTerms != exactTerms, candidateTerms != foldedTerms {
-                alternatives.append(expression(candidateTerms, prefixMatching: prefixMatching))
+            let candidateTerms = terms(in: SearchTextNormalizer.foldedForm(candidate))
+            if !candidateTerms.isEmpty {
+                foldedAlternatives.append(expression(candidateTerms, prefixMatching: prefixMatching))
             }
         }
 
         return SearchPattern(
-            exact: exact,
-            folded: alternatives.isEmpty ? nil : alternatives.joined(separator: " OR ")
+            exact: qualify(expression(exactTerms, prefixMatching: prefixMatching),
+                           with: SearchIndexSchema.exactColumns),
+            folded: qualify(foldedAlternatives.joined(separator: " OR "),
+                            with: SearchIndexSchema.foldedColumns)
         )
+    }
+
+    /// Restricts an expression to a column set using FTS5's `{a b} : (...)` filter.
+    ///
+    /// The parentheses matter: a column filter binds to the phrase that follows it, so
+    /// `{exact} : "a" AND "b"` would restrict only `"a"` and let `"b"` match any column.
+    static func qualify(_ expression: String, with columns: [String]) -> String {
+        "{\(columns.joined(separator: " "))} : (\(expression))"
     }
 
     /// Restricts an expression to one dialog using the indexed `dialog_token` column.
@@ -136,7 +152,6 @@ nonisolated enum SearchPatternBuilder {
 
     private static func terms(in normalized: String) -> [Term] {
         SearchTextNormalizer.tokens(normalized)
-            .filter(isSearchable)
             .prefix(maximumTerms)
             .map { token in
                 guard token.count > maximumTermLength else {
@@ -146,11 +161,4 @@ nonisolated enum SearchPatternBuilder {
             }
     }
 
-    /// Drops tokens the tokenizer would reduce to nothing — a run of combining marks, for example.
-    /// An empty phrase (`""`) is a syntax error in FTS5, so these must never reach the expression.
-    private static func isSearchable(_ token: String) -> Bool {
-        token.unicodeScalars.contains { scalar in
-            scalar.properties.isAlphabetic || CharacterSet.decimalDigits.contains(scalar)
-        }
-    }
 }

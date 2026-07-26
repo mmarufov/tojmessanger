@@ -1,61 +1,67 @@
 #!/usr/bin/env python3
-"""Regenerates Toj/Core/Search/SearchUnicodeTables.swift.
+"""Regenerates Toj/Core/Search/SearchUnicodeTables.swift from the bundled SQLCipher tokenizer.
 
-The search normalizer must agree with the FTS5 tokenizer that indexes its output, and later with
-the Bun implementation that backs server search. Rather than hand-transcribe Unicode rules — the
-approach that produced the wrong table the first time — this probes the *actual* tokenizer and
-emits what it observes.
+Compiles scripts/probe-fts5-tokenizer.c against Pods/SQLCipher/sqlite3.c — the amalgamation that
+ships in the app, not the system sqlite3 — and probes every valid Unicode scalar in context.
 
-Every scalar in the BMP (plus supplementary samples) is inserted as its own row into an FTS5 table
-configured exactly as `SearchIndexSchema` configures the real one. `fts5vocab(instance)` then
-reports the term each scalar produced, which yields two facts per scalar:
+Three classes come out, and the distinction between the last two cannot be observed by probing a
+scalar on its own:
 
-  * whether it is a token character (it produced a term at all), and
-  * what `unicode61 remove_diacritics 2` folds it to.
+    token       part of a token, folded through the emitted fold table
+    ignored     removed in place without ending the token ("a" U+0301 "b" -> "ab")
+    separator   ends the token ("a" U+05B0 "b" -> "a", "b")
 
-Run with the tokenizer settings in TOKENIZE below kept in step with SearchIndexSchema. If the
-emitted table changes, bump SearchTextNormalizer.version — the on-device index must be rebuilt.
+Token characters outnumber the rest a hundred to one — unicode61 treats unassigned scalars as
+alphanumeric — so the tables store separators and ignored scalars explicitly and default to token.
+
+Requires `pod install` to have run. Keep TOKENIZE in step with SearchIndexSchema.tokenize; changing
+it changes what tokens exist and requires bumping SearchTextNormalizer.version.
 
     python3 scripts/generate-search-unicode-tables.py > Toj/Core/Search/SearchUnicodeTables.swift
 """
 
+import os
 import subprocess
 import sys
+import tempfile
 
 TOKENIZE = "unicode61 remove_diacritics 2"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# The BMP in full, plus samples from the supplementary planes: emoji (So, expected separators),
-# Linear B and Adlam (L*, expected token characters). Surrogates cannot be passed to char().
-CODEPOINTS = [c for c in range(0x20, 0x10000) if not (0xD800 <= c <= 0xDFFF)]
-CODEPOINTS += list(range(0x1F300, 0x1F320))
-CODEPOINTS += list(range(0x10000, 0x10010))
-CODEPOINTS += list(range(0x1E900, 0x1E910))
+CLASS_SEPARATOR, CLASS_TOKEN, CLASS_IGNORED = 0, 1, 2
 
 
-def probe():
-    script = [
-        "PRAGMA journal_mode=OFF;",
-        f'CREATE VIRTUAL TABLE t USING fts5(x, tokenize="{TOKENIZE}");',
-        "BEGIN;",
-    ]
-    script += [f"INSERT INTO t(rowid,x) VALUES({c},char({c}));" for c in CODEPOINTS]
-    script += [
-        "COMMIT;",
-        "CREATE VIRTUAL TABLE v USING fts5vocab(t, instance);",
-        "SELECT doc,term FROM v;",
-    ]
-    out = subprocess.run(
-        ["sqlite3", ":memory:"], input="\n".join(script), capture_output=True, text=True
+def build_and_run():
+    amalgamation = os.path.join(ROOT, "Pods", "SQLCipher", "sqlite3.c")
+    if not os.path.exists(amalgamation):
+        sys.exit("Pods/SQLCipher/sqlite3.c missing — run `pod install` first")
+
+    binary = os.path.join(tempfile.mkdtemp(), "fts5probe")
+    subprocess.run(
+        [
+            "cc", "-O1", "-o", binary,
+            os.path.join(ROOT, "scripts", "probe-fts5-tokenizer.c"), amalgamation,
+            "-I", os.path.join(ROOT, "Pods", "SQLCipher"),
+            "-DSQLITE_ENABLE_FTS5", "-DSQLITE_HAS_CODEC", "-DSQLCIPHER_CRYPTO_CC",
+            "-DSQLITE_THREADSAFE=1", "-DSQLITE_TEMP_STORE=2", "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_EXTRA_INIT=sqlcipher_extra_init",
+            "-DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown",
+            "-framework", "Security", "-framework", "Foundation",
+        ],
+        check=True,
     )
-    if out.returncode:
-        sys.exit(f"sqlite3 failed: {out.stderr[:400]}")
+    out = subprocess.run([binary, TOKENIZE], capture_output=True, text=True, check=True)
 
-    terms = {}
-    for line in out.stdout.split("\n"):
-        if line and "|" in line:
-            doc, term = line.split("|", 1)
-            terms[int(doc)] = term
-    return terms
+    classes, folds = {}, {}
+    for line in out.stdout.splitlines():
+        if not line:
+            continue
+        scalar, kind, folded = line.split("\t")
+        scalar, kind = int(scalar), int(kind)
+        classes[scalar] = kind
+        if kind == CLASS_TOKEN and folded != "-" and int(folded) != scalar:
+            folds[scalar] = int(folded)
+    return classes, folds
 
 
 def contiguous(values):
@@ -69,53 +75,69 @@ def contiguous(values):
 
 
 def literal(values, per_line=12):
-    lines, indent = [], "        "
-    for i in range(0, len(values), per_line):
-        lines.append(indent + " ".join(f"0x{v:04X}," for v in values[i : i + per_line]))
-    return "\n".join(lines)
+    return "\n".join(
+        "        " + " ".join(f"0x{v:04X}," for v in values[i : i + per_line])
+        for i in range(0, len(values), per_line)
+    )
 
 
 def main():
-    terms = probe()
-    token_chars = sorted(c for c in CODEPOINTS if c in terms)
-    folds = {c: terms[c] for c in token_chars if terms[c] != chr(c)}
+    classes, folds = build_and_run()
+    expected = 0x110000 - 0x800  # every scalar except the surrogate range
+    if len(classes) != expected:
+        sys.exit(f"probed {len(classes)} scalars, expected {expected}")
 
-    non_1to1 = {c: t for c, t in folds.items() if len(t) != 1}
-    if non_1to1:
-        sys.exit(
-            "scalar preservation is violated by: "
-            + ", ".join(f"U+{c:04X}->{t!r}" for c, t in list(non_1to1.items())[:10])
-        )
+    bad = {s: f for s, f in folds.items() if f > 0x10FFFF}
+    if bad:
+        sys.exit(f"non-scalar fold targets: {list(bad.items())[:5]}")
 
-    spans = contiguous(token_chars)
-    flat_ranges = [v for span in spans for v in span]
-    flat_folds = [v for c, t in sorted(folds.items()) for v in (c, ord(t))]
+    separators = sorted(s for s, k in classes.items() if k == CLASS_SEPARATOR)
+    ignored = sorted(s for s, k in classes.items() if k == CLASS_IGNORED)
+    spans = contiguous(separators)
+    flat_separators = [v for span in spans for v in span]
+    flat_folds = [v for s, f in sorted(folds.items()) for v in (s, f)]
 
     print(f'''// Generated by scripts/generate-search-unicode-tables.py — do not edit by hand.
 //
-// Probed from a live FTS5 table tokenized as "{TOKENIZE}", which is the configuration
-// SearchIndexSchema applies to the real index. These tables therefore describe what the tokenizer
-// actually does rather than what Unicode says it should, and they are pinned: they do not vary
-// with the ICU version Foundation happens to link at runtime, so Swift and the Bun server can
+// Probed from the FTS5 tokenizer inside our own SQLCipher pod, configured as
+// "{TOKENIZE}" exactly as SearchIndexSchema configures the index. These tables therefore
+// describe what the engine does rather than what Unicode says it should, and they are pinned: they
+// do not vary with the ICU version Foundation links at runtime, so Swift and the Bun server can
 // agree byte for byte.
 //
-// Coverage: every BMP scalar plus supplementary samples. {len(token_chars)} token characters in
-// {len(spans)} ranges, {len(folds)} folds — all of them one scalar to one scalar, which is what
-// lets SearchTextNormalizer preserve scalar count and map highlight ranges by identity.
+// All {len(classes)} valid scalars were probed in context as "a<scalar>b", which is the only way to
+// tell an ignored diacritic from a separator — both produce no token in isolation, but only a
+// separator ends the surrounding token.
+//
+// {len(classes) - len(separators) - len(ignored)} token characters, {len(separators)} separators in
+// {len(spans)} ranges, {len(ignored)} ignored scalars, {len(folds)} folds — every one of them a
+// single scalar to a single scalar, which is what lets SearchTextNormalizer preserve scalar count
+// and map highlight ranges by identity.
 
 nonisolated enum SearchUnicodeTables {{
-    /// Half-open pairs of token-character ranges: `[lower, upper, lower, upper, ...]`, inclusive
-    /// on both ends and sorted. A scalar absent from every range is a separator. This matches
-    /// unicode61's L*, N* and Co classes — notably CJK and private-use scalars are token
-    /// characters while emoji and whitespace are not.
-    static let tokenRanges: [UInt32] = [
-{literal(flat_ranges)}
+    /// Inclusive `[lower, upper, ...]` pairs of scalars that end a token, sorted.
+    ///
+    /// Separators are stored rather than token characters because unicode61 treats unassigned
+    /// scalars as alphanumeric, so token characters outnumber separators by more than a hundred to
+    /// one. Anything absent from these ranges and from ``ignoredScalars`` is a token character.
+    static let separatorRanges: [UInt32] = [
+{literal(flat_separators)}
     ]
 
-    /// Fold pairs `[from, to, from, to, ...]`, sorted by `from`. Combines case folding and Latin
-    /// diacritic removal, so `É` and `é` both arrive at `e`. Cyrillic is deliberately almost
-    /// absent — unicode61 folds neither ё nor й nor ӣ nor ӯ, which is why the Tajik folds in
-    /// SearchTextNormalizer exist as a separate, explicit step.
+    /// Diacritics `remove_diacritics=2` strips *without* ending the token, so "a" U+0301 "b" is the
+    /// single token "ab". Sorted; small enough to scan linearly.
+    ///
+    /// An ignored scalar cannot begin a token: with nothing open it is simply dropped, which is why
+    /// a leading diacritic behaves like a separator even though it is not one.
+    static let ignoredScalars: [UInt32] = [
+{literal(ignored)}
+    ]
+
+    /// Fold pairs `[from, to, ...]`, sorted by `from`. Case folding and Latin diacritic removal
+    /// combined, so `É` and `é` both arrive at `e`.
+    ///
+    /// Cyrillic is almost entirely absent: unicode61 folds neither ё nor й nor ӣ nor ӯ. That is why
+    /// the Tajik folds in SearchTextNormalizer exist as a separate, explicit step.
     static let foldPairs: [UInt32] = [
 {literal(flat_folds)}
     ]

@@ -37,12 +37,30 @@ nonisolated enum SearchIndexSchema {
     ///
     /// `dialog_token` carries the dialog UUID with hyphens stripped so it tokenizes as one term.
     /// Without it, in-chat search MATCHes the whole corpus and filters afterwards.
+    ///
+    /// ## Column layout: every text column exists in both tiers
+    ///
+    /// Three kinds of text are searchable, and each is stored twice — once exact, once folded:
+    ///
+    /// | source                     | exact tier   | folded tier         |
+    /// |----------------------------|--------------|---------------------|
+    /// | message body **and media caption** (both live in `messages.text`) | `exact` | `folded` |
+    /// | attachment filename        | `file_name`  | `file_name_folded`  |
+    /// | extracted link host + path | `link_text`  | `link_text_folded`  |
+    ///
+    /// The folded columns are populated **unconditionally**, not only when they differ from their
+    /// exact counterpart. Writing them only when different saves index space but breaks the tier
+    /// asymmetrically: a query of `тоҷикӣ` folds to `точики`, and a row whose body is literally
+    /// `точики` would have an empty folded column and so could never be reached from the Tajik
+    /// spelling. Paying for the duplicate postings makes the folded tier a complete fallback index.
     static let createVirtualTableSQL = """
         CREATE VIRTUAL TABLE message_search USING fts5(
             exact,
-            folded,
             file_name,
             link_text,
+            folded,
+            file_name_folded,
+            link_text_folded,
             dialog_token,
             tokenize = '\(tokenize)',
             prefix = '2 3 4',
@@ -50,6 +68,13 @@ nonisolated enum SearchIndexSchema {
             contentless_delete = 1
         )
         """
+
+    /// Columns the exact tier searches: what the user literally wrote.
+    static let exactColumns = ["exact", "file_name", "link_text"]
+
+    /// Columns the fallback tier searches. `dialog_token` is in neither — it is a scoping key, and
+    /// leaving it out keeps a dialog id from matching as if it were message text.
+    static let foldedColumns = ["folded", "file_name_folded", "link_text_folded"]
 
     /// Merge tuning. These are *not* valid `CREATE VIRTUAL TABLE` options — FTS5 rejects them
     /// there with "unrecognized option" — and must be applied as config inserts afterwards.
