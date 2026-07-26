@@ -350,6 +350,7 @@ final class CloudDraftsV1Tests: XCTestCase {
             useDefaultLocalStore: false,
             capabilityDefaults: defaults
         )
+        DraftModelRetainer.models.append(model)
         let selected = albumLine(id: "album-selected", msgId: 202, index: 1, count: 3)
 
         model.beginReply(to: selected)
@@ -646,7 +647,7 @@ final class CloudDraftsV1Tests: XCTestCase {
             reason: .navigation
         )
         let oldFlushSucceeded = await oldFlush.value
-        XCTAssertFalse(oldFlushSucceeded)
+        XCTAssertNotEqual(oldFlushSucceeded, .synced)
 
         let oldPending = try await store.pendingDraftMutation(
             accountId: "account-a",
@@ -907,7 +908,7 @@ final class CloudDraftsV1Tests: XCTestCase {
             reason: .navigation
         )
         let flushed = await coordinator.flush(dialogId: "dialog-a", force: true)
-        XCTAssertFalse(flushed)
+        XCTAssertEqual(flushed, .suspended)
         let pending = try await store.pendingDraftMutation(accountId: "account-a", dialogId: "dialog-a")
         XCTAssertEqual(pending?.text, "must survive auth")
         XCTAssertFalse(pending?.terminal ?? true)
@@ -1070,6 +1071,110 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertTrue(failedSnapshot.timeline.messages.allSatisfy { $0.localState == "failed" })
     }
 
+    func testServerRestoredAttachmentsSendOnAnotherDeviceAndPreserveOriginalTransferId() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-local",
+            text: "single",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let prepared = preparedUpload(0)
+        _ = try await store.stageDraftAttachment(
+            prepared: prepared,
+            accountId: "account-a",
+            dialogId: "dialog-local",
+            attachmentId: "attachment-local",
+            position: 0
+        )
+        try await store.updateDraftAttachment(
+            transferId: prepared.transferId,
+            mediaId: "media-local",
+            state: "ready",
+            progress: 1,
+            error: nil
+        )
+        let loadedLocal = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-local"
+        )
+        let local = try XCTUnwrap(loadedLocal)
+        let canonical = cloudDraft(
+            dialogId: "dialog-local",
+            operationId: local.operationId,
+            revision: 5,
+            mediaIds: ["media-local"]
+        )
+        try await store.acknowledgeDraftMutation(
+            DraftMutationResponse(draft: canonical, duplicate: false),
+            accountId: "account-a",
+            attemptedOperationId: local.operationId
+        )
+        let loadedReconciled = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-local"
+        )
+        let reconciled = try XCTUnwrap(loadedReconciled)
+        XCTAssertEqual(reconciled.attachments.first?.transferId, prepared.transferId)
+        let single = try await store.consumeDraftAsSingleMedia(
+            accountId: "account-a",
+            dialogId: "dialog-local",
+            operationId: reconciled.operationId
+        )
+        XCTAssertEqual(single.mediaId, "media-local")
+
+        let otherFixture = try makeStoreFixture()
+        let other = try CloudLocalStore(path: otherFixture.path, key: otherFixture.key)
+        let remoteAlbum = cloudDraft(
+            dialogId: "dialog-remote",
+            operationId: "operation-remote",
+            revision: 7,
+            mediaIds: ["media-1", "media-2", "media-3"]
+        )
+        try await other.applyCloudDraft(remoteAlbum, accountId: "account-a")
+        let loadedRestored = try await other.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-remote"
+        )
+        let restored = try XCTUnwrap(loadedRestored)
+        XCTAssertTrue(restored.attachments.allSatisfy { $0.transferId?.hasPrefix("server:") == true })
+        let group = try await other.consumeDraftAsMediaGroup(
+            accountId: "account-a",
+            dialogId: "dialog-remote",
+            operationId: restored.operationId
+        )
+        XCTAssertEqual(group.payload.items.map(\.mediaId), ["media-1", "media-2", "media-3"])
+    }
+
+    func testIdleAcknowledgedDraftAttachmentNeverEntersGenericTransferRetryLane() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let draft = cloudDraft(
+            dialogId: "dialog-idle",
+            operationId: "operation-idle",
+            revision: 11,
+            mediaIds: ["media-idle"]
+        )
+        try await store.applyCloudDraft(draft, accountId: "account-a")
+        let beforeChanges = try await store.debugSQLiteTotalChanges()
+        for _ in 0..<100 {
+            let ready = try await store.mediaTransfersReady()
+            let delay = try await store.nextMediaTransferDelay()
+            XCTAssertTrue(ready.isEmpty)
+            XCTAssertNil(delay)
+        }
+        let afterChanges = try await store.debugSQLiteTotalChanges()
+        XCTAssertEqual(afterChanges, beforeChanges)
+        let pending = try await store.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-idle"
+        )
+        XCTAssertNil(pending)
+    }
+
     private func preparedUpload(_ index: Int) -> PreparedMediaUpload {
         PreparedMediaUpload(
             transferId: "transfer-\(index)",
@@ -1083,6 +1188,43 @@ final class CloudDraftsV1Tests: XCTestCase {
             height: 100,
             encryptedSourcePath: "/tmp/item-\(index).tojmedia",
             encryptedThumbnailPath: "/tmp/item-\(index)-thumb.tojmedia"
+        )
+    }
+
+    private func cloudDraft(
+        dialogId: String,
+        operationId: String,
+        revision: Int64,
+        mediaIds: [String]
+    ) -> CloudDraft {
+        CloudDraft(
+            dialogId: dialogId,
+            revision: revision,
+            state: "active",
+            text: "restored caption",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: [],
+            attachments: mediaIds.enumerated().map { index, mediaId in
+                CloudDraftAttachment(
+                    attachmentId: "attachment-\(dialogId)-\(index)",
+                    mediaId: mediaId,
+                    position: index,
+                    media: CloudMedia(
+                        id: mediaId,
+                        kind: index.isMultiple(of: 2) ? "photo" : "video",
+                        contentType: index.isMultiple(of: 2) ? "image/jpeg" : "video/mp4",
+                        fileName: "restored-\(index)",
+                        byteSize: 128,
+                        durationMs: index.isMultiple(of: 2) ? nil : 1_000,
+                        width: 100,
+                        height: 100,
+                        hasThumbnail: false
+                    )
+                )
+            },
+            operationId: operationId,
+            updatedAt: "2026-07-26T12:00:00.000Z"
         )
     }
 
@@ -1116,6 +1258,10 @@ final class CloudDraftsV1Tests: XCTestCase {
             Data("cloud-drafts-v1-test-key".utf8)
         )
     }
+}
+
+private enum DraftModelRetainer {
+    @MainActor static var models: [CloudAppModel] = []
 }
 
 private final class DraftMockURLProtocol: URLProtocol {

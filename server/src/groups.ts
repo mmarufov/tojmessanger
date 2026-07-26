@@ -11,6 +11,7 @@ import {
 import { fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { loadMediaDTO, type MediaDTO } from "./media";
 import { loadProfiles, type ProfileDTO } from "./sync";
+import { purgeRevokedDialogDraftState } from "./drafts";
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -727,6 +728,7 @@ export async function removeGroupMember(sql: SQL, input: {
     await tx`
       UPDATE dialog_members SET left_at = now()
       WHERE dialog_id = ${input.dialogId} AND account_id = ${targetId}`;
+    await purgeRevokedDialogDraftState(tx, targetId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = await emitLifecycle(
       tx, input.actorAccountId, input.dialogId, "member.removed", "member.removed",
@@ -916,6 +918,7 @@ export async function leaveGroup(sql: SQL, input: {
     await tx`
       UPDATE dialog_members SET left_at = now()
       WHERE dialog_id = ${input.dialogId} AND account_id = ${input.actorAccountId}`;
+    await purgeRevokedDialogDraftState(tx, input.actorAccountId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = closed
       ? []

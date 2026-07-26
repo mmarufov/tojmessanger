@@ -243,16 +243,42 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
-  const draftMutations = await sql`
-    WITH doomed AS (
-      SELECT account_id, operation_id FROM draft_mutation_requests
+  const draftMutations = await sql.begin(async (tx) => {
+    const doomed = await tx`
+      SELECT account_id, operation_id, dialog_id, payload_fingerprint,
+             status, resulting_revision
+      FROM draft_mutation_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
-    )
-    DELETE FROM draft_mutation_requests request USING doomed
-    WHERE request.account_id = doomed.account_id
-      AND request.operation_id = doomed.operation_id
-    RETURNING request.operation_id`;
+      FOR UPDATE SKIP LOCKED`;
+    const completed = doomed.filter((row: any) => row.status === "completed");
+    if (completed.length) {
+      await tx`
+        INSERT INTO draft_mutation_tombstones (
+          account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+        )
+        SELECT request.account_id, request.operation_id, request.dialog_id,
+               request.payload_fingerprint, request.resulting_revision
+        FROM draft_mutation_requests request
+        WHERE (request.account_id, request.operation_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(completed.map((row: any) => row.account_id), "uuid")}::uuid[],
+            ${tx.array(completed.map((row: any) => row.operation_id), "uuid")}::uuid[]
+          )
+        )
+        ON CONFLICT (account_id, operation_id) DO NOTHING`;
+    }
+    if (!doomed.length) return [];
+    return await tx`
+      DELETE FROM draft_mutation_requests request
+      WHERE (request.account_id, request.operation_id) IN (
+        SELECT * FROM unnest(
+          ${tx.array(doomed.map((row: any) => row.account_id), "uuid")}::uuid[],
+          ${tx.array(doomed.map((row: any) => row.operation_id), "uuid")}::uuid[]
+        )
+      )
+      RETURNING request.operation_id`;
+  });
   const draftBudgets = await sql`
     WITH doomed AS (
       SELECT id FROM draft_mutation_budgets
@@ -261,16 +287,44 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     )
     DELETE FROM draft_mutation_budgets WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
-  const mediaGroupSends = await sql`
-    WITH doomed AS (
-      SELECT sender_account_id, client_group_id FROM media_group_send_requests
+  const mediaGroupSends = await sql.begin(async (tx) => {
+    const doomed = await tx`
+      SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+             first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+      FROM media_group_send_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
-    )
-    DELETE FROM media_group_send_requests request USING doomed
-    WHERE request.sender_account_id = doomed.sender_account_id
-      AND request.client_group_id = doomed.client_group_id
-    RETURNING request.client_group_id`;
+      FOR UPDATE SKIP LOCKED`;
+    const completed = doomed.filter((row: any) => row.status === "completed");
+    if (completed.length) {
+      await tx`
+        INSERT INTO media_group_send_tombstones (
+          sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+          first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+        )
+        SELECT request.sender_account_id, request.client_group_id, request.dialog_id,
+               request.payload_fingerprint, request.first_msg_id, request.last_msg_id,
+               request.sender_pts, request.cleared_draft_revision
+        FROM media_group_send_requests request
+        WHERE (request.sender_account_id, request.client_group_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(completed.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+            ${tx.array(completed.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+          )
+        )
+        ON CONFLICT (sender_account_id, client_group_id) DO NOTHING`;
+    }
+    if (!doomed.length) return [];
+    return await tx`
+      DELETE FROM media_group_send_requests request
+      WHERE (request.sender_account_id, request.client_group_id) IN (
+        SELECT * FROM unnest(
+          ${tx.array(doomed.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+          ${tx.array(doomed.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+        )
+      )
+      RETURNING request.client_group_id`;
+  });
   const mediaGroupBudgets = await sql`
     WITH doomed AS (
       SELECT id FROM media_group_send_budgets

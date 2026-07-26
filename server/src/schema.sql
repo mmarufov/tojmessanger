@@ -408,6 +408,16 @@ DO $$ BEGIN
        'draft.updated')) NOT VALID;
   END IF;
 END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v3')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v3') THEN
+    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v3 CHECK (type IN
+      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+       'dialog.created','member.added','member.removed','member.role_changed','member.left',
+       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
+       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+  END IF;
+END $$;
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
@@ -483,15 +493,18 @@ CREATE TABLE IF NOT EXISTS draft_mutation_requests (
       AND response_key_id IS NOT NULL AND response_nonce IS NOT NULL AND response_ciphertext IS NOT NULL)
   )
 );
-DO $$ BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'draft_mutation_requests_dialog_id_fkey'
-  ) THEN
-    ALTER TABLE draft_mutation_requests
-      DROP CONSTRAINT draft_mutation_requests_dialog_id_fkey;
-  END IF;
-END $$;
+
+-- Compact receipts outlive encrypted response cleanup. They intentionally carry no draft body:
+-- an exact delayed retry returns the current dialog draft and can never allocate a new pts.
+CREATE TABLE IF NOT EXISTS draft_mutation_tombstones (
+  account_id          UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  operation_id        UUID NOT NULL,
+  dialog_id           UUID NOT NULL,
+  payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  resulting_revision  BIGINT NOT NULL CHECK (resulting_revision > 0),
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, operation_id)
+);
 
 -- One immutable row per accepted mutation makes the 120/minute device budget a true rolling window.
 CREATE TABLE IF NOT EXISTS draft_mutation_budgets (
@@ -524,15 +537,21 @@ CREATE TABLE IF NOT EXISTS media_group_send_requests (
     (status = 'completed' AND first_msg_id IS NOT NULL AND last_msg_id IS NOT NULL AND sender_pts IS NOT NULL)
   )
 );
-DO $$ BEGIN
-  IF EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'media_group_send_requests_dialog_id_fkey'
-  ) THEN
-    ALTER TABLE media_group_send_requests
-      DROP CONSTRAINT media_group_send_requests_dialog_id_fkey;
-  END IF;
-END $$;
+
+-- A group operation remains consumed after the full response receipt expires or its messages are
+-- later removed. The fingerprint prevents a reused operation id from changing shape.
+CREATE TABLE IF NOT EXISTS media_group_send_tombstones (
+  sender_account_id   UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  client_group_id     UUID NOT NULL,
+  dialog_id           UUID NOT NULL,
+  payload_fingerprint BYTEA NOT NULL CHECK (octet_length(payload_fingerprint) = 32),
+  first_msg_id        BIGINT NOT NULL,
+  last_msg_id         BIGINT NOT NULL,
+  sender_pts          BIGINT NOT NULL,
+  cleared_draft_revision BIGINT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (sender_account_id, client_group_id)
+);
 
 -- Counts album items rather than requests so ten-item groups cannot multiply mutation ingress.
 CREATE TABLE IF NOT EXISTS media_group_send_budgets (

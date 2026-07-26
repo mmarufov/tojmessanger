@@ -3,7 +3,13 @@ import { createHash } from "node:crypto";
 import { checkVerification, startVerification } from "./auth";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
-import { DraftError, getDraft, putDraft } from "./drafts";
+import {
+  DraftError,
+  getDraft,
+  purgeAccountDraftState,
+  purgeRevokedDialogDraftState,
+  putDraft,
+} from "./drafts";
 import { cancelMediaUpload, downloadMediaChunk } from "./media";
 import {
   ALLOWED_MUTATION_INGRESS_PER_MINUTE,
@@ -177,6 +183,71 @@ describe("cloud drafts and media groups", () => {
       SELECT state FROM account_dialog_drafts
       WHERE account_id = ${alice.accountId} AND dialog_id = ${dialogId}`)
       .toEqual([expect.objectContaining({ state: "cleared" })]);
+  });
+
+  test("cleanup then newer write then stale retry cannot allocate pts or replace the newer draft", async () => {
+    const { alice, dialogId } = await pair();
+    const oldOperationId = crypto.randomUUID();
+    const old = await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: oldOperationId,
+      text: "old generation",
+    });
+    await db`
+      UPDATE draft_mutation_requests SET created_at = now() - interval '25 hours'
+      WHERE account_id = ${alice.accountId} AND operation_id = ${oldOperationId}`;
+    const cleanup = await cleanupExpiredData(db);
+    expect(cleanup.draftMutations).toBe(1);
+    expect(await db`
+      SELECT operation_id FROM draft_mutation_tombstones
+      WHERE account_id = ${alice.accountId} AND operation_id = ${oldOperationId}`)
+      .toHaveLength(1);
+
+    const newer = await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: crypto.randomUUID(),
+      text: "newer cross-device value",
+    });
+    const beforePts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts);
+    const staleRetry = await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: oldOperationId,
+      text: "old generation",
+    });
+    const afterPts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts);
+    expect(staleRetry.duplicate).toBe(true);
+    expect(staleRetry.draft.operation_id).toBe(newer.draft.operation_id);
+    expect(staleRetry.draft.text).toBe("newer cross-device value");
+    expect(staleRetry.draft.revision).toBeGreaterThan(old.draft.revision);
+    expect(afterPts).toBe(beforePts);
+  });
+
+  test("draft duplicate responses recheck current dialog authorization before returning content", async () => {
+    const { alice, dialogId } = await pair();
+    const operationId = crypto.randomUUID();
+    const request = {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId,
+      text: "must not leak",
+    };
+    await putDraft(db, request);
+    await db`
+      UPDATE dialog_members SET left_at = now()
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    await expect(putDraft(db, request)).rejects.toMatchObject({
+      status: 403,
+      code: "dialog_access_denied",
+    });
   });
 
   test("a racing send can consume only its exact generation and never clears a newer device write", async () => {
@@ -403,8 +474,13 @@ describe("cloud drafts and media groups", () => {
     };
     const first = await sendMediaGroup(db, request);
     await db`
-      DELETE FROM media_group_send_requests
+      UPDATE media_group_send_requests SET created_at = now() - interval '25 hours'
       WHERE sender_account_id = ${alice.accountId} AND client_group_id = ${clientGroupId}`;
+    expect((await cleanupExpiredData(db)).mediaGroupSends).toBe(1);
+    expect(await db`
+      SELECT client_group_id FROM media_group_send_tombstones
+      WHERE sender_account_id = ${alice.accountId} AND client_group_id = ${clientGroupId}`)
+      .toHaveLength(1);
     const reconstructed = await sendMediaGroup(db, request);
     expect(reconstructed.duplicate).toBe(true);
     expect(reconstructed.messages.map((message) => message.msg_id))
@@ -413,6 +489,87 @@ describe("cloud drafts and media groups", () => {
       SELECT msg_id FROM messages
       WHERE sender_account_id = ${alice.accountId} AND media_group_id = ${clientGroupId}`)
       .toHaveLength(2);
+  });
+
+  test("group retries use deterministic item ids and recheck access before any duplicate content", async () => {
+    const { alice, dialogId } = await pair();
+    const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId: crypto.randomUUID(),
+      items: mediaIds.map((media_id) => ({ media_id })),
+      body: "stable ids",
+    };
+    const first = await sendMediaGroup(db, request);
+    const duplicate = await sendMediaGroup(db, request);
+    expect(duplicate.messages.map((message) => message.client_msg_id))
+      .toEqual(first.messages.map((message) => message.client_msg_id));
+
+    await db`
+      UPDATE dialog_members SET left_at = now()
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    await expect(sendMediaGroup(db, request)).rejects.toMatchObject({
+      status: 403,
+      code: "dialog_access_denied",
+    });
+    await db`
+      UPDATE dialog_members SET left_at = NULL
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    await db`
+      DELETE FROM media_group_send_requests
+      WHERE sender_account_id = ${alice.accountId}
+        AND client_group_id = ${request.clientGroupId}`;
+    expect((await sendMediaGroup(db, request)).duplicate).toBe(true);
+    await db`
+      UPDATE dialog_members SET left_at = now()
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    await expect(sendMediaGroup(db, request)).rejects.toMatchObject({
+      status: 403,
+      code: "dialog_access_denied",
+    });
+  });
+
+  test("revocation and account deletion explicitly purge private draft state and draft-only media", async () => {
+    const { alice, dialogId } = await pair();
+    const firstMedia = await readyMedia(alice.accountId);
+    await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: crypto.randomUUID(),
+      text: "revoked",
+      attachments: [{
+        attachment_id: crypto.randomUUID(), media_id: firstMedia, position: 0,
+      }],
+    });
+    await purgeRevokedDialogDraftState(db, alice.accountId, dialogId);
+    expect(await getDraft(db, alice.accountId, dialogId)).toBeNull();
+    expect(await db`SELECT id FROM media_objects WHERE id = ${firstMedia}`).toHaveLength(0);
+
+    await db`
+      UPDATE dialog_members SET left_at = NULL
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    const secondMedia = await readyMedia(alice.accountId);
+    await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: crypto.randomUUID(),
+      text: "delete account",
+      attachments: [{
+        attachment_id: crypto.randomUUID(), media_id: secondMedia, position: 0,
+      }],
+    });
+    await purgeAccountDraftState(db, alice.accountId);
+    expect(await db`SELECT 1 FROM account_dialog_drafts WHERE account_id = ${alice.accountId}`)
+      .toHaveLength(0);
+    expect(await db`SELECT 1 FROM draft_mutation_requests WHERE account_id = ${alice.accountId}`)
+      .toHaveLength(0);
+    expect(await db`SELECT 1 FROM draft_mutation_tombstones WHERE account_id = ${alice.accountId}`)
+      .toHaveLength(0);
+    expect(await db`SELECT id FROM media_objects WHERE id = ${secondMedia}`).toHaveLength(0);
   });
 
   test("draft kill switch covers consumption, difference, and bootstrap without pts gaps", async () => {
@@ -493,9 +650,12 @@ describe("cloud drafts and media groups", () => {
         'messages-media-group-shape-v2',
         'messages-domain-constraints-v2',
         'account-events-type-v2',
-        'message-mutation-operation-v2'
+        'account-events-type-v3',
+        'message-mutation-operation-v2',
+        'draft-request-dialog-fk-removal-v1',
+        'media-group-request-dialog-fk-removal-v1'
       )`;
-    expect(markers).toHaveLength(5);
+    expect(markers).toHaveLength(8);
     const invalid = await db`
       SELECT conname FROM pg_constraint
       WHERE conname LIKE '%\\_v2' ESCAPE '\\' OR NOT convalidated`;

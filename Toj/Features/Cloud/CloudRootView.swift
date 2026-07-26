@@ -1,7 +1,14 @@
 import SwiftUI
 
 struct CloudRootView: View {
-    private static let isRunningUnitTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    #if DEBUG
+    private static let isRunningUnitTests =
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        && !TelegramFastUITestFixture.enabled
+    #else
+    private static let isRunningUnitTests =
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    #endif
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var model = CloudAppModel.shared

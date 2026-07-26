@@ -3,6 +3,16 @@ import Foundation
 /// Session-scoped local-first draft engine. CloudAppModel supplies session/capability changes, while
 /// this actor owns write ordering, debounce, idempotent acknowledgements, and retry timing.
 actor DraftSyncCoordinator {
+    enum FlushResult: Equatable, Sendable {
+        case synced
+        case unsupported
+        case retryable
+        case suspended
+        case terminal
+
+        var isSynced: Bool { self == .synced }
+    }
+
     enum FlushReason: Sendable {
         case idle
         case navigation
@@ -149,13 +159,14 @@ actor DraftSyncCoordinator {
     /// Navigation/background callers await this so the latest local generation is durably queued
     /// and, when supported, gets an immediate network attempt.
     @discardableResult
-    func flush(dialogId: String, force: Bool = false) async -> Bool {
+    func flush(dialogId: String, force: Bool = false) async -> FlushResult {
         debounceTasks[dialogId]?.cancel()
         debounceTasks[dialogId] = nil
         debounceTokens[dialogId] = nil
-        guard cloudEnabled, !suspended, let store, let session else { return true }
+        guard cloudEnabled else { return .unsupported }
+        guard !suspended, let store, let session else { return .suspended }
         let generation = sessionGeneration
-        guard await acquireFlushSlot(dialogId: dialogId) else { return false }
+        guard await acquireFlushSlot(dialogId: dialogId) else { return .retryable }
         defer { releaseFlushSlot(dialogId: dialogId) }
         var attemptedMutation: PendingDraftMutation?
         do {
@@ -163,10 +174,10 @@ actor DraftSyncCoordinator {
                 accountId: session.accountId,
                 dialogId: dialogId
             ) else {
-                return true
+                return .synced
             }
             try ensureCurrent(generation)
-            guard !pending.terminal else { return false }
+            guard !pending.terminal else { return .terminal }
             // A staged attachment deliberately holds the cloud mutation until all chips are ready,
             // preventing a remote device from seeing a silently incomplete album.
             let visible = try await store.loadDraft(
@@ -175,7 +186,7 @@ actor DraftSyncCoordinator {
             )
             try ensureCurrent(generation)
             guard visible?.attachments.contains(where: { $0.state != "ready" }) != true else {
-                return false
+                return .retryable
             }
             let mutation: PendingDraftMutation
             if force {
@@ -184,7 +195,7 @@ actor DraftSyncCoordinator {
                 let ready = try await store.pendingDraftMutationsReady(limit: 100)
                 try ensureCurrent(generation)
                 guard let due = ready.last(where: { $0.dialogId == dialogId }) else {
-                    return false
+                    return .retryable
                 }
                 mutation = due
             }
@@ -208,10 +219,14 @@ actor DraftSyncCoordinator {
                 attemptedOperationId: mutation.operationId
             )
             try ensureCurrent(generation)
-            return true
+            return .synced
         } catch is CancellationError {
-            return false
+            return .suspended
         } catch {
+            let disposition = cloudOperationFailureDisposition(
+                error,
+                serverAdvertisesFeature: cloudEnabled
+            )
             if let attemptedMutation {
                 await recordFailure(
                     error,
@@ -220,20 +235,26 @@ actor DraftSyncCoordinator {
                     session: session
                 )
             }
-            return false
+            switch disposition {
+            case .authenticationRequired: return .suspended
+            case .unsupportedServer: return .unsupported
+            case .transient: return .retryable
+            case .permanent: return .terminal
+            }
         }
     }
 
     /// Publishes the immutable draft operation captured by an optimistic send. New composer edits
     /// may coalesce independently without changing this dependency.
-    func flushDependency(operationId: String) async -> Bool {
-        guard cloudEnabled, !suspended, let store, let session else { return false }
+    func flushDependency(operationId: String) async -> FlushResult {
+        guard cloudEnabled else { return .unsupported }
+        guard !suspended, let store, let session else { return .suspended }
         let generation = sessionGeneration
         do {
             guard let mutation = try await store.pendingDraftDependency(operationId: operationId)
-            else { return true }
+            else { return .synced }
             try ensureCurrent(generation)
-            guard !mutation.terminal else { return false }
+            guard !mutation.terminal else { return .terminal }
             let response = try await runTracked {
                 try await self.api.updateDraft(
                     dialogId: mutation.dialogId,
@@ -253,9 +274,9 @@ actor DraftSyncCoordinator {
                 attemptedOperationId: operationId
             )
             try ensureCurrent(generation)
-            return true
+            return .synced
         } catch is CancellationError {
-            return false
+            return .suspended
         } catch {
             let disposition = cloudOperationFailureDisposition(
                 error,
@@ -281,7 +302,12 @@ actor DraftSyncCoordinator {
                     terminal: true
                 )
             }
-            return false
+            switch disposition {
+            case .authenticationRequired: return .suspended
+            case .unsupportedServer: return .unsupported
+            case .transient: return .retryable
+            case .permanent: return .terminal
+            }
         }
     }
 
@@ -296,7 +322,7 @@ actor DraftSyncCoordinator {
         }
         for dialogId in dialogIds {
             if Task.isCancelled { return }
-            guard await flush(dialogId: dialogId, force: reason.isImmediate) else { break }
+            guard await flush(dialogId: dialogId, force: reason.isImmediate) == .synced else { break }
         }
         if reason == .background {
             retryTask?.cancel()
@@ -310,7 +336,7 @@ actor DraftSyncCoordinator {
         guard let store, let session else { return nil }
         let before = try? await store.loadDraft(accountId: session.accountId, dialogId: dialogId)
         guard cloudEnabled else { return before }
-        guard await flush(dialogId: dialogId, force: true) else { return nil }
+        guard await flush(dialogId: dialogId, force: true) == .synced else { return nil }
         return try? await store.loadDraft(accountId: session.accountId, dialogId: dialogId)
     }
 
@@ -448,7 +474,7 @@ actor DraftSyncCoordinator {
         let mutations = (try? await store.pendingDraftMutationsReady(limit: 100)) ?? []
         for dialogId in Set(mutations.map(\.dialogId)).sorted() {
             if Task.isCancelled { return }
-            guard await flush(dialogId: dialogId) else { break }
+            guard await flush(dialogId: dialogId) == .synced else { break }
         }
         if let delay = try? await store.nextPendingDraftDelay() {
             scheduleRetry(after: max(0.25, delay))

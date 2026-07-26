@@ -1,6 +1,6 @@
 import type { SQL } from "bun";
 import { Client } from "pg";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { seal, open, bodyAAD, requestFingerprintHMAC } from "./crypto";
 import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
@@ -553,16 +553,26 @@ export type MediaGroupSendResult = {
 type NormalizedGroupItem = {
   mediaId: string;
   clientMsgId: string;
-  fingerprintClientMsgId: string | null;
 };
 
-function normalizeMediaGroupItems(value: unknown): NormalizedGroupItem[] {
+function deterministicGroupClientMessageId(clientGroupId: string, index: number): string {
+  const bytes = Buffer.from(requestFingerprintHMAC(
+    "media-group-client-message-id",
+    `${clientGroupId}:${index}`,
+  ).subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function normalizeMediaGroupItems(value: unknown, clientGroupId: string): NormalizedGroupItem[] {
   if (!Array.isArray(value) || value.length < 2 || value.length > 10) {
     throw new SyncError("media groups require 2 to 10 items");
   }
   const mediaIds = new Set<string>();
   const clientMessageIds = new Set<string>();
-  return value.map((raw: any) => {
+  return value.map((raw: any, index: number) => {
     const mediaId = String(raw?.media_id ?? raw?.mediaId ?? "").toLowerCase();
     if (!UUID_PATTERN.test(mediaId) || mediaIds.has(mediaId)) {
       throw new SyncError("invalid or duplicate group media id");
@@ -573,10 +583,11 @@ function normalizeMediaGroupItems(value: unknown): NormalizedGroupItem[] {
     if (fingerprintClientMsgId != null && !UUID_PATTERN.test(fingerprintClientMsgId)) {
       throw new SyncError("invalid group client message id");
     }
-    const clientMsgId = fingerprintClientMsgId ?? randomUUID();
+    const clientMsgId = fingerprintClientMsgId
+      ?? deterministicGroupClientMessageId(clientGroupId, index);
     if (clientMessageIds.has(clientMsgId)) throw new SyncError("duplicate group client message id");
     clientMessageIds.add(clientMsgId);
-    return { mediaId, clientMsgId, fingerprintClientMsgId };
+    return { mediaId, clientMsgId };
   });
 }
 
@@ -600,7 +611,7 @@ function mediaGroupFingerprint(input: {
     draft_consume_operation_id: input.draftConsumeOperationId,
     items: input.items.map((item) => ({
       media_id: item.mediaId,
-      client_msg_id: item.fingerprintClientMsgId,
+      client_msg_id: item.clientMsgId,
     })),
   }));
 }
@@ -630,7 +641,7 @@ export async function sendMediaGroup(sql: SQL, p: {
   if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
   const replyToMsgId = optionalMessageId(p.replyToMsgId);
   const mentions = normalizeMentions(p.mentions, body);
-  const items = normalizeMediaGroupItems(p.items);
+  const items = normalizeMediaGroupItems(p.items, clientGroupId);
   const draftConsumeOperationId = p.draftConsumeOperationId == null
     ? null
     : String(p.draftConsumeOperationId).toLowerCase();
@@ -650,6 +661,17 @@ export async function sendMediaGroup(sql: SQL, p: {
   });
 
   return await sql.begin(async (tx) => {
+    await requireActiveAccount(tx, p.senderAccountId);
+    await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
+    try {
+      await requireDialogReadAccess(tx, p.senderAccountId, dialogId);
+    } catch (error) {
+      if (error instanceof DialogAccessError) {
+        throw new SyncError("dialog access denied", 403, "dialog_access_denied");
+      }
+      throw error;
+    }
+
     const requestStillPresent = (await tx`
       SELECT 1 FROM media_group_send_requests
       WHERE sender_account_id = ${p.senderAccountId}
@@ -728,6 +750,29 @@ export async function sendMediaGroup(sql: SQL, p: {
         pushes: [],
       };
     }
+    const tombstone = requestStillPresent ? null : (await tx`
+      SELECT dialog_id, payload_fingerprint
+      FROM media_group_send_tombstones
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}
+      FOR SHARE`)[0];
+    if (tombstone) {
+      const existingFingerprint = buf(tombstone.payload_fingerprint);
+      if (tombstone.dialog_id !== dialogId
+        || existingFingerprint.length !== fingerprint.length
+        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+      throw new SyncError(
+        "media group result is no longer available",
+        409,
+        "media_group_result_expired",
+      );
+    }
     const claim = await tx`
       INSERT INTO media_group_send_requests (
         sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
@@ -779,8 +824,6 @@ export async function sendMediaGroup(sql: SQL, p: {
       };
     }
 
-    await requireActiveAccount(tx, p.senderAccountId);
-    await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
     const directPair = (await tx`
       SELECT account_low, account_high
       FROM direct_dialog_pairs WHERE dialog_id = ${dialogId}`)[0];

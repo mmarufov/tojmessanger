@@ -2,7 +2,11 @@ import type { SQL } from "bun";
 import { timingSafeEqual } from "node:crypto";
 import { requireActiveDevice } from "./auth";
 import { draftBodyAAD, draftResponseAAD, open, requestFingerprintHMAC, seal } from "./crypto";
-import { lockDialogForMutation, requireDialogReadAccess } from "./dialog-access";
+import {
+  DialogAccessError,
+  lockDialogForMutation,
+  requireDialogReadAccess,
+} from "./dialog-access";
 import { fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { lockAccountMutations } from "./locks";
 import { mediaDTOFromRow, type MediaDTO } from "./media";
@@ -211,6 +215,40 @@ function draftFromCachedResponse(row: any, accountId: string, operationId: strin
   }, draftResponseAAD(accountId, operationId)).toString("utf8")) as DraftDTO;
 }
 
+function requireMatchingFingerprint(
+  row: any,
+  dialogId: string,
+  fingerprint: Buffer,
+): void {
+  const existingFingerprint = buf(row.payload_fingerprint);
+  if (row.dialog_id !== dialogId
+    || existingFingerprint.length !== fingerprint.length
+    || !timingSafeEqual(existingFingerprint, fingerprint)) {
+    throw new DraftError(
+      "operation id already used with a different draft",
+      409,
+      "draft_idempotency_conflict",
+    );
+  }
+}
+
+async function authorizeDuplicate(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  dialogId: string,
+): Promise<void> {
+  await requireActiveDevice(sql, accountId, deviceId);
+  try {
+    await requireDialogReadAccess(sql, accountId, dialogId);
+  } catch (error) {
+    if (error instanceof DialogAccessError) {
+      throw new DraftError("dialog access denied", 403, "dialog_access_denied");
+    }
+    throw error;
+  }
+}
+
 /**
  * Batch-loads account-private drafts and their ready media. Bootstrap/difference callers pass a
  * bounded dialog page, so this remains two queries and never falls into per-dialog media lookups.
@@ -357,6 +395,21 @@ export async function putDraft(sql: SQL, input: {
   const fingerprint = draftFingerprint(dialogId, normalized);
 
   return await sql.begin(async (tx) => {
+    const tombstone = (await tx`
+      SELECT dialog_id, payload_fingerprint, resulting_revision
+      FROM draft_mutation_tombstones
+      WHERE account_id = ${input.accountId} AND operation_id = ${operationId}
+      FOR SHARE`)[0];
+    if (tombstone) {
+      requireMatchingFingerprint(tombstone, dialogId, fingerprint);
+      await authorizeDuplicate(tx, input.accountId, input.deviceId, dialogId);
+      const current = (await loadDrafts(tx, input.accountId, [dialogId])).get(dialogId);
+      if (!current) {
+        throw new DraftError("draft receipt no longer has a recoverable result", 409, "draft_result_expired");
+      }
+      return { draft: current, duplicate: true, pushes: [] };
+    }
+
     const claim = await tx`
       INSERT INTO draft_mutation_requests (
         account_id, operation_id, dialog_id, payload_fingerprint, status
@@ -371,16 +424,8 @@ export async function putDraft(sql: SQL, input: {
         FROM draft_mutation_requests
         WHERE account_id = ${input.accountId} AND operation_id = ${operationId}
         FOR UPDATE`)[0];
-      const existingFingerprint = buf(existing.payload_fingerprint);
-      if (existing.dialog_id !== dialogId
-        || existingFingerprint.length !== fingerprint.length
-        || !timingSafeEqual(existingFingerprint, fingerprint)) {
-        throw new DraftError(
-          "operation id already used with a different draft",
-          409,
-          "draft_idempotency_conflict",
-        );
-      }
+      requireMatchingFingerprint(existing, dialogId, fingerprint);
+      await authorizeDuplicate(tx, input.accountId, input.deviceId, dialogId);
       return {
         draft: draftFromCachedResponse(existing, input.accountId, operationId),
         duplicate: true,
@@ -584,4 +629,71 @@ export async function getDraft(
 ): Promise<DraftDTO | null> {
   await requireDialogReadAccess(sql, accountId, dialogId);
   return (await loadDrafts(sql, accountId, [dialogId])).get(dialogId) ?? null;
+}
+
+/** Removes private draft state when membership is revoked while retaining compact replay shields. */
+export async function purgeRevokedDialogDraftState(
+  sql: SQL,
+  accountId: string,
+  dialogId: string,
+): Promise<void> {
+  const media = await sql`
+    SELECT media_id FROM draft_attachments
+    WHERE account_id = ${accountId} AND dialog_id = ${dialogId}
+    FOR UPDATE`;
+  await sql`
+    INSERT INTO draft_mutation_tombstones (
+      account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+    )
+    SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+    FROM draft_mutation_requests
+    WHERE account_id = ${accountId} AND dialog_id = ${dialogId} AND status = 'completed'
+    ON CONFLICT (account_id, operation_id) DO NOTHING`;
+  await sql`
+    DELETE FROM draft_mutation_budgets budget
+    USING draft_mutation_requests request
+    WHERE request.account_id = ${accountId} AND request.dialog_id = ${dialogId}
+      AND budget.account_id = request.account_id
+      AND budget.operation_id = request.operation_id`;
+  await sql`
+    DELETE FROM draft_mutation_requests
+    WHERE account_id = ${accountId} AND dialog_id = ${dialogId}`;
+  await sql`
+    DELETE FROM account_dialog_drafts
+    WHERE account_id = ${accountId} AND dialog_id = ${dialogId}`;
+  if (media.length) {
+    const ids = media.map((row: any) => String(row.media_id));
+    await sql`
+      DELETE FROM media_objects media
+      WHERE media.id = ANY(${sql.array(ids, "uuid")}::uuid[])
+        AND media.owner_account_id = ${accountId}
+        AND NOT EXISTS (SELECT 1 FROM messages WHERE media_id = media.id)
+        AND NOT EXISTS (SELECT 1 FROM dialogs WHERE photo_media_id = media.id)
+        AND NOT EXISTS (SELECT 1 FROM draft_attachments WHERE media_id = media.id)`;
+  }
+}
+
+/** Account deletion is anonymization, not a physical account-row delete, so cascades do not run. */
+export async function purgeAccountDraftState(sql: SQL, accountId: string): Promise<void> {
+  const mediaRows = await sql`
+    SELECT media_id FROM draft_attachments
+    WHERE account_id = ${accountId}
+    FOR UPDATE`;
+  const media = [...new Set(mediaRows.map((row: any) => String(row.media_id)))];
+  await sql`DELETE FROM draft_mutation_budgets WHERE account_id = ${accountId}`;
+  await sql`DELETE FROM draft_mutation_requests WHERE account_id = ${accountId}`;
+  await sql`DELETE FROM draft_mutation_tombstones WHERE account_id = ${accountId}`;
+  await sql`DELETE FROM media_group_send_budgets WHERE account_id = ${accountId}`;
+  await sql`DELETE FROM media_group_send_requests WHERE sender_account_id = ${accountId}`;
+  await sql`DELETE FROM media_group_send_tombstones WHERE sender_account_id = ${accountId}`;
+  await sql`DELETE FROM account_dialog_drafts WHERE account_id = ${accountId}`;
+  if (media.length) {
+    await sql`
+      DELETE FROM media_objects media
+      WHERE media.id = ANY(${sql.array(media, "uuid")}::uuid[])
+        AND media.owner_account_id = ${accountId}
+        AND NOT EXISTS (SELECT 1 FROM messages WHERE media_id = media.id)
+        AND NOT EXISTS (SELECT 1 FROM dialogs WHERE photo_media_id = media.id)
+        AND NOT EXISTS (SELECT 1 FROM draft_attachments WHERE media_id = media.id)`;
+  }
 }

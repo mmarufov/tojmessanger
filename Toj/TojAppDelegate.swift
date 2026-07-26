@@ -5,6 +5,11 @@ final class TojAppDelegate: NSObject, UIApplicationDelegate {
     private var runtimePreparationTask: Task<Void, Never>?
 
     private static var shouldPrepareCloudRuntime: Bool {
+        #if DEBUG
+        if TelegramFastUITestFixture.enabled {
+            return true
+        }
+        #endif
         let environment = ProcessInfo.processInfo.environment
         return environment["XCTestConfigurationFilePath"] == nil
             && environment["TOJ_USE_M1_SKELETON"] != "1"

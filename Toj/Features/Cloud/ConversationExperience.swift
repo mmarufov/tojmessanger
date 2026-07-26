@@ -1232,6 +1232,7 @@ private struct DraftAttachmentChip: View {
                     .frame(width: 28, height: 32)
             }
             .foregroundStyle(TojTheme.secondaryText)
+            .accessibilityIdentifier("draft-attachment-menu-\(attachment.attachmentId)")
         }
         .padding(.leading, 7)
         .padding(.trailing, 4)
@@ -1251,6 +1252,7 @@ private struct DraftAttachmentChip: View {
         .accessibilityLabel(
             "Attachment \(attachment.position + 1) of \(total), \(attachment.state)"
         )
+        .accessibilityIdentifier("draft-attachment-\(attachment.attachmentId)")
         .task(id: attachment.media?.id) {
             guard let media = attachment.media,
                   media.kind == "photo" || media.kind == "video" else {
@@ -1433,7 +1435,11 @@ private struct TojMessageBubble: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(
-            line.media.map { "media-bubble-\($0.id)" } ?? "message-\(line.clientMsgId)"
+            line.mediaGroupId.map {
+                "media-group-\($0)\(line.msgId == nil ? "-pending" : "")"
+            }
+                ?? line.media.map { "media-bubble-\($0.id)" }
+                ?? "message-\(line.clientMsgId)"
         )
         .accessibilityLabel(accessibilityDescription)
         .accessibilityHint("Swipe to reply or use message actions")
@@ -1683,7 +1689,10 @@ private struct TojMessageBubble: View {
         case .seen: state = String(localized: "seen")
         case .failed: state = String(localized: "failed")
         }
-        return "\(sender): \(line.text), \(state)"
+        let content = albumLines.isEmpty
+            ? line.text
+            : "Media group, \(albumLines.count) of \(line.mediaGroupCount ?? albumLines.count) items, \(line.text)"
+        return "\(sender): \(content), \(state)"
     }
 }
 

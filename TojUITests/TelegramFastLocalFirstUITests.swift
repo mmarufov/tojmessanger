@@ -61,6 +61,107 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         )
     }
 
+    func testDraftTextReplyAndThreeReorderedAttachmentsRestoreAfterTermination() {
+        openChat(Fixture.primaryDialog)
+        let composer = app.textFields["Message"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 3))
+        XCTAssertEqual(composer.value as? String, "Persistent exact draft  ")
+        XCTAssertTrue(app.staticTexts["Replying"].exists)
+        for index in 0..<3 {
+            XCTAssertTrue(element("draft-attachment-ui-draft-\(index)").exists)
+        }
+
+        let lastMenu = element("draft-attachment-menu-ui-draft-2")
+        XCTAssertTrue(lastMenu.exists)
+        lastMenu.tap()
+        app.buttons["Move earlier"].tap()
+        lastMenu.tap()
+        app.buttons["Move earlier"].tap()
+        XCTAssertTrue(
+            element("draft-attachment-ui-draft-2").label.contains("Attachment 1 of 3")
+        )
+
+        composer.tap()
+        composer.typeText("edited")
+        app.terminate()
+        launch(reset: false)
+        openChat(Fixture.primaryDialog)
+        XCTAssertEqual(app.textFields["Message"].value as? String, "editedPersistent exact draft  ")
+        XCTAssertTrue(element("draft-attachment-ui-draft-2").label.contains("Attachment 1 of 3"))
+        XCTAssertTrue(app.staticTexts["Replying"].exists)
+    }
+
+    func testRemoteDeviceClearConvergesAfterRelaunch() {
+        openChat(Fixture.primaryDialog)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").exists)
+        app.terminate()
+        app.launchEnvironment["TOJ_UI_FIXTURE_REMOTE_CLEAR"] = "1"
+        launch(reset: false)
+        openChat(Fixture.primaryDialog)
+        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+        XCTAssertEqual(app.textFields["Message"].value as? String, "Message")
+    }
+
+    func testDraftComposerAccessibilityAtLargestTypeAndReducedMotion() {
+        app.terminate()
+        app.launchArguments += [
+            "-UIPreferredContentSizeCategoryName",
+            "UICTContentSizeCategoryAccessibilityExtraExtraExtraLarge",
+            "-UIAccessibilityReduceMotionEnabled",
+            "YES",
+        ]
+        launch(reset: false)
+        openChat(Fixture.primaryDialog)
+        XCTAssertTrue(app.textFields["Message"].isHittable)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").label.contains("ready"))
+        XCTAssertFalse(element("draft-attachment-ui-draft-0").label.isEmpty)
+    }
+
+    func testAcknowledgedAttachmentsCreateOneOptimisticGroupBeforeNetworking() {
+        openChat(Fixture.primaryDialog)
+        let send = app.buttons["Send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 3))
+        send.tap()
+        let pendingGroup = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'media-group-' AND identifier ENDSWITH '-pending'"))
+            .firstMatch
+        for _ in 0..<4 where !pendingGroup.exists {
+            app.swipeUp()
+        }
+        XCTAssertTrue(pendingGroup.waitForExistence(timeout: 5))
+        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+    }
+
+    func testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking() {
+        app.terminate()
+        app.launchEnvironment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] = "1"
+        launch(reset: true)
+        openChat(Fixture.primaryDialog)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").exists)
+        XCTAssertFalse(element("draft-attachment-ui-draft-1").exists)
+        let send = app.buttons["Send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 3))
+        send.tap()
+        XCTAssertTrue(element("media-bubble-\(Fixture.photo)").waitForExistence(timeout: 5))
+        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+    }
+
+    func testPartialAndFailedAlbumsExposeStableAccessiblePresentation() {
+        openChat(Fixture.primaryDialog)
+        let partial = element("media-group-00000000-0000-4000-8000-000000000601")
+        XCTAssertTrue(partial.waitForExistence(timeout: 3))
+        XCTAssertTrue(partial.label.localizedCaseInsensitiveContains("2 of 3"))
+
+        goBackToChats()
+        openChat(Fixture.secondDialog)
+        let failed = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'media-group-'"))
+            .matching(NSPredicate(format: "label CONTAINS[c] 'failed'"))
+            .firstMatch
+        XCTAssertTrue(failed.waitForExistence(timeout: 3))
+        XCTAssertTrue(failed.label.localizedCaseInsensitiveContains("2 of 2"))
+    }
+
     private func launch(reset: Bool) {
         app.launchEnvironment["TOJ_UI_FIXTURE"] = "telegram-fast"
         app.launchEnvironment["TOJ_UI_FIXTURE_RESET"] = reset ? "1" : "0"

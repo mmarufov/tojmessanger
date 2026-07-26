@@ -14,6 +14,7 @@ import {
   normalizeCallVersionCapabilities as normalizeVersionCapabilities,
 } from "./call-versions";
 import { handoffOwnedGroupsForDeletedAccount } from "./groups";
+import { purgeAccountDraftState } from "./drafts";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
@@ -1441,6 +1442,7 @@ export async function deleteAccountAndTerminateCalls(sql: SQL, accountId: string
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "account", accountId);
       await handoffOwnedGroupsForDeletedAccount(tx, accountId);
+      await purgeAccountDraftState(tx, accountId);
     },
   });
   const syncPushes = await flushCallHistory(sql, ended);

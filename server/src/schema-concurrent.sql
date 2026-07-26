@@ -18,7 +18,9 @@ WHERE namespace.nspname = 'public'
     'media_objects_expiry_idx',
     'media_objects_orphan_expiry_idx',
     'draft_mutation_requests_expiry_idx',
+    'draft_mutation_tombstones_dialog_idx',
     'media_group_send_requests_expiry_idx',
+    'media_group_send_tombstones_dialog_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx'
   )
@@ -61,9 +63,13 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_orphan_expiry_idx
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_mutation_requests_expiry_idx
   ON draft_mutation_requests(created_at, account_id, operation_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_mutation_tombstones_dialog_idx
+  ON draft_mutation_tombstones(account_id, dialog_id, resulting_revision DESC);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS media_group_send_requests_expiry_idx
   ON media_group_send_requests(created_at, sender_account_id, client_group_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_group_send_tombstones_dialog_idx
+  ON media_group_send_tombstones(sender_account_id, dialog_id, sender_pts DESC);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_account_idx
   ON group_action_budgets(account_id, action, created_at DESC);

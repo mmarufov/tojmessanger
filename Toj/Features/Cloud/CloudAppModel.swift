@@ -377,6 +377,9 @@ final class CloudAppModel {
     private var uploadedVoIPPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftPersistenceGenerations: [String: UInt64] = [:]
+    private var minimumObservedDraftGenerations: [String: Int64] = [:]
+    private var sessionEpoch: UInt64 = 0
+    private var sessionTearingDown = false
     private var suppressDraftPersistence = false
     private var transientUnderlyingDraftText: String?
     private var transientUnderlyingComposerMode: ComposerMode?
@@ -646,6 +649,8 @@ final class CloudAppModel {
             )
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
+            sessionEpoch &+= 1
+            sessionTearingDown = false
             storedSession = stored
             profileDetails = Self.profileDetails(from: name)
             try? await tokenStore.saveProfile(profileDetails, accountId: session.accountId)
@@ -796,6 +801,7 @@ final class CloudAppModel {
             return
         }
         #endif
+        beginSessionTeardown()
         let sessionToken = storedSession?.session.token
         if let sessionToken {
             // Save before clearing the active session. If the app is killed or offline, the next
@@ -935,6 +941,7 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        beginSessionTeardown()
         let accountId = storedSession?.session.accountId
         await draftSyncCoordinator.suspendRetries()
         var cleanupFailures: [String] = []
@@ -992,6 +999,7 @@ final class CloudAppModel {
         draftObservationTask = nil
         draftPersistenceTasks.removeAll()
         draftPersistenceGenerations.removeAll()
+        minimumObservedDraftGenerations.removeAll()
         viewportPersistenceTask = nil
         mediaDownloadTask = nil
         readReceiptRetryTask = nil
@@ -1113,6 +1121,21 @@ final class CloudAppModel {
         status = cleanupFailures.isEmpty
             ? finalStatus
             : "Signed out; local cleanup needs another attempt"
+    }
+
+    /// Changes the session epoch synchronously, before logout's first suspension point. Every
+    /// subsequently resumed operation must still match this epoch before touching store or UI.
+    private func beginSessionTeardown() {
+        guard !sessionTearingDown else { return }
+        sessionTearingDown = true
+        sessionEpoch &+= 1
+        draftObservationTask?.cancel()
+        timelineObservationTask?.cancel()
+        dialogObservationTask?.cancel()
+        composerMediaTask?.cancel()
+        for task in mediaTransferTasks.values { task.cancel() }
+        retryTask?.cancel()
+        postSyncWorkTask?.cancel()
     }
 
     func refreshMediaCacheUsage() async {
@@ -1670,6 +1693,7 @@ final class CloudAppModel {
         }
         #endif
         guard
+            !sessionTearingDown,
             !suppressDraftPersistence,
             let dialogId = activeDialogId,
             storedSession != nil
@@ -1687,13 +1711,18 @@ final class CloudAppModel {
             await previous?.value
             guard let self else { return }
             do {
-                _ = try await self.draftSyncCoordinator.mutate(
+                let saved = try await self.draftSyncCoordinator.mutate(
                     dialogId: dialogId,
                     text: text,
                     replyToMsgId: reply.0,
                     replyPreview: reply.1,
                     mentions: mentions,
                     reason: reason
+                )
+                guard !self.sessionTearingDown else { return }
+                self.minimumObservedDraftGenerations[dialogId] = max(
+                    self.minimumObservedDraftGenerations[dialogId] ?? 0,
+                    saved.localGeneration
                 )
             } catch is CancellationError {
                 return
@@ -1747,6 +1776,14 @@ final class CloudAppModel {
     }
 
     private func acceptObservedDraft(_ observed: LocalDraft?) {
+        if let dialogId = activeDialogId,
+           draftPersistenceTasks[dialogId] != nil {
+            return
+        }
+        if let observed,
+           observed.localGeneration < (minimumObservedDraftGenerations[observed.dialogId] ?? 0) {
+            return
+        }
         currentDraft = observed
         guard transientUnderlyingDraftText == nil, transientVoiceComposerMode == nil else { return }
         suppressDraftPersistence = true
@@ -2708,7 +2745,8 @@ final class CloudAppModel {
         }
 
         if consumesCloudDraft {
-            guard await draftSyncCoordinator.flush(dialogId: dialogId) else {
+            let flushResult = await draftSyncCoordinator.flush(dialogId: dialogId)
+            guard await acceptDraftFlushResult(flushResult) else {
                 status = "Queued — waiting to sync draft"
                 scheduleOutboxRetry(after: 1)
                 return
@@ -2798,10 +2836,12 @@ final class CloudAppModel {
         thumbnail: Data? = nil
     ) async throws {
         guard
+            !sessionTearingDown,
             let dialogId = activeDialogId,
             let accountId = storedSession?.session.accountId,
             let localStore
         else { throw CloudAppModelError.localStoreUnavailable }
+        let epoch = sessionEpoch
         let mediaEngine = self.mediaEngine
         let groupsEnabled = capabilities.contains(.mediaGroups)
         let transfer = try await draftSyncCoordinator.withDialogStaging(dialogId: dialogId) {
@@ -2849,8 +2889,11 @@ final class CloudAppModel {
                 throw error
             }
         }
+        guard !sessionTearingDown, sessionEpoch == epoch else {
+            throw CancellationError()
+        }
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, !self.sessionTearingDown, self.sessionEpoch == epoch else { return }
             await self.runMediaTransfer(transfer)
         }
         _ = await draftSyncCoordinator.flush(dialogId: dialogId)
@@ -3314,7 +3357,7 @@ final class CloudAppModel {
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
-            try? await localStore.drainPendingPurges()
+            _ = try? await localStore.drainPendingPurges()
         }
         scheduleOutboxRetry()
     }
@@ -3445,6 +3488,7 @@ final class CloudAppModel {
             birthday: nil,
             colorIndex: 3
         )
+        negotiatedCapabilities = .demo
         guard let store = try await ensureLocalStore() else {
             throw CloudAppModelError.localStoreUnavailable
         }
@@ -3815,6 +3859,30 @@ final class CloudAppModel {
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
             // Keep the last successfully negotiated set when the server cannot be reached.
+        }
+    }
+
+    private func acceptDraftFlushResult(
+        _ result: DraftSyncCoordinator.FlushResult
+    ) async -> Bool {
+        switch result {
+        case .synced:
+            return true
+        case .unsupported:
+            // Withdraw the lane in the same main-actor turn. Durable dependencies remain queued
+            // and excluded from retry timing until a later capability refresh re-enables them.
+            negotiatedCapabilities.remove(.cloudDrafts)
+            await draftSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                cloudEnabled: false
+            )
+            Task { [weak self] in await self?.refreshServerCapabilities() }
+            return false
+        case .retryable, .suspended:
+            return false
+        case .terminal:
+            return false
         }
     }
 
@@ -5029,9 +5097,14 @@ final class CloudAppModel {
             )
             for item in items {
                 try Task.checkCancellation()
-                if item.draftConsumeOperationId != nil,
-                   !(await draftSyncCoordinator.flush(dialogId: item.dialogId, force: true)) {
-                    return
+                if item.draftConsumeOperationId != nil {
+                    let result = await draftSyncCoordinator.flush(
+                        dialogId: item.dialogId,
+                        force: true
+                    )
+                    guard await acceptDraftFlushResult(result) else {
+                        return
+                    }
                 }
                 try await localStore.markRetrying(clientMsgId: item.clientMsgId)
                 if activeDialogId == item.dialogId {
@@ -5328,7 +5401,8 @@ final class CloudAppModel {
                     await refreshServerCapabilities()
                     return false
                 }
-                guard await draftSyncCoordinator.flushDependency(operationId: operationId) else {
+                let result = await draftSyncCoordinator.flushDependency(operationId: operationId)
+                guard await acceptDraftFlushResult(result) else {
                     scheduleOutboxRetry(after: 2)
                     return false
                 }
@@ -5574,7 +5648,8 @@ final class CloudAppModel {
                     await refreshServerCapabilities()
                     return
                 }
-                guard await draftSyncCoordinator.flushDependency(operationId: operationId) else {
+                let result = await draftSyncCoordinator.flushDependency(operationId: operationId)
+                guard await acceptDraftFlushResult(result) else {
                     scheduleOutboxRetry(after: 2)
                     return
                 }

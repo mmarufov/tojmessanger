@@ -3263,6 +3263,10 @@ actor CloudLocalStore {
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
                   AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
                   AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
@@ -3287,6 +3291,10 @@ actor CloudLocalStore {
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
                   AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
                   AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
@@ -3301,6 +3309,10 @@ actor CloudLocalStore {
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
                   AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
                   AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND media_transfers.next_retry_at > ?
@@ -3315,6 +3327,12 @@ actor CloudLocalStore {
         try dbQueue.read { db in
             try Row.fetchOne(db, sql: "SELECT * FROM media_transfers WHERE transfer_id = ?", arguments: [id])
                 .map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func debugSQLiteTotalChanges() throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
         }
     }
 
@@ -7431,20 +7449,63 @@ actor CloudLocalStore {
         )
         if draft.state == "active" {
             for attachment in draft.attachments.sorted(by: { $0.position < $1.position }) {
+                let existingTransferId = try String.fetchOne(
+                    db,
+                    sql: """
+                    SELECT transfer_id FROM media_transfers
+                    WHERE draft_attachment_id = ? OR media_id = ?
+                    ORDER BY CASE WHEN draft_attachment_id = ? THEN 0 ELSE 1 END
+                    LIMIT 1
+                    """,
+                    arguments: [
+                        attachment.attachmentId, attachment.mediaId, attachment.attachmentId,
+                    ]
+                )
+                // A different device has no staging file, but the server media id is already
+                // sufficient to send. Keep a stable local transfer row so both paths are uniform.
+                let transferId = existingTransferId ?? "server:\(attachment.attachmentId)"
                 let mediaJSON = String(
                     data: try encoder.encode(attachment.media),
                     encoding: .utf8
                 )
                 try db.execute(
                     sql: """
+                    INSERT INTO media_transfers (
+                      transfer_id, dialog_id, client_msg_id, caption, reply_to_msg_id,
+                      purpose, draft_attachment_id, kind, content_type, file_name, byte_size,
+                      sha256, duration_ms, width, height, encrypted_source_path,
+                      encrypted_thumbnail_path, media_id, upload_offset, state, created_at
+                    ) VALUES (
+                      ?, ?, ?, '', NULL, 'draft', ?, ?, ?, ?, ?, '', ?, ?, ?, '',
+                      NULL, ?, 0, 'ready_to_send', datetime('now')
+                    )
+                    ON CONFLICT(transfer_id) DO UPDATE SET
+                      media_id = excluded.media_id,
+                      purpose = 'draft',
+                      draft_attachment_id = excluded.draft_attachment_id,
+                      state = 'ready_to_send',
+                      terminal = 0,
+                      next_retry_at = NULL,
+                      last_error = NULL
+                    """,
+                    arguments: [
+                        transferId, draft.dialogId, attachment.attachmentId,
+                        attachment.attachmentId, attachment.media.kind,
+                        attachment.media.contentType, attachment.media.fileName,
+                        attachment.media.byteSize, attachment.media.durationMs,
+                        attachment.media.width, attachment.media.height, attachment.mediaId,
+                    ]
+                )
+                try db.execute(
+                    sql: """
                     INSERT INTO draft_attachments (
                       account_id, dialog_id, attachment_id, media_id, position,
-                      media_json, state, progress
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'ready', 1)
+                      media_json, transfer_id, state, progress
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1)
                     """,
                     arguments: [
                         accountId, draft.dialogId, attachment.attachmentId,
-                        attachment.mediaId, attachment.position, mediaJSON,
+                        attachment.mediaId, attachment.position, mediaJSON, transferId,
                     ]
                 )
             }
@@ -7471,12 +7532,51 @@ actor CloudLocalStore {
             """,
             arguments: [accountId, dialogId, operationId]
         )
-        guard try Int.fetchOne(
+        if try Int.fetchOne(
             db,
             sql: "SELECT COUNT(*) FROM pending_draft_dependencies WHERE operation_id = ?",
             arguments: [operationId]
-        ) == 1 else {
-            throw CloudLocalStoreBootstrapError.invalidStagedMessage
+        ) != 1 {
+            // A draft restored on another device has already been acknowledged by the server and
+            // therefore has no local mutation row. Reconstruct the exact immutable operation so
+            // the send worker can idempotently re-ack it before consuming the draft.
+            guard let draft = try Self.fetchDraft(
+                db,
+                accountId: accountId,
+                dialogId: dialogId
+            ), draft.operationId == operationId else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let payload = StoredDraftMutationPayload(
+                state: draft.state,
+                text: draft.text,
+                replyToMsgId: draft.replyToMsgId,
+                mentions: draft.mentions,
+                attachments: draft.attachments.compactMap { attachment in
+                    guard let mediaId = attachment.mediaId else { return nil }
+                    return DraftAttachmentRequest(
+                        attachmentId: attachment.attachmentId,
+                        mediaId: mediaId,
+                        position: attachment.position
+                    )
+                }
+            )
+            let payloadJSON = String(
+                data: try JSONEncoder().encode(payload),
+                encoding: .utf8
+            ) ?? "{}"
+            try db.execute(
+                sql: """
+                INSERT INTO pending_draft_dependencies (
+                  account_id, dialog_id, operation_id, local_generation, payload_json,
+                  retry_count, next_retry_at, last_error, terminal, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, 0, datetime('now'))
+                ON CONFLICT(operation_id) DO NOTHING
+                """,
+                arguments: [
+                    accountId, dialogId, operationId, draft.localGeneration, payloadJSON,
+                ]
+            )
         }
     }
 
