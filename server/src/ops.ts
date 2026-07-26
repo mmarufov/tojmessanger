@@ -124,11 +124,11 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const started = performance.now();
   await sql`SELECT 1`;
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
-  const preferenceEntrypointRequired =
-    process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED === "1"
-    && process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED !== "0";
   return {
-    status: preferenceEntrypointRequired && !preferences.ready ? "not_ready" : "ready",
+    // Preference relations and snapshot columns are linked into ordinary messaging SQL. Feature
+    // switches control entrypoints and behavior, not whether this binary can run on a pre-expand
+    // schema, so traffic admission must always fail closed while they are incomplete.
+    status: preferences.ready ? "ready" : "not_ready",
     database: "ready",
     providers,
     dialogPreferences: preferences,

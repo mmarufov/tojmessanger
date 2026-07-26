@@ -8,8 +8,10 @@ gitignored notes.
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
 - `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider
-  state. It returns `503` when the enabled dialog-preference entrypoint is not migration-ready, and
-  a database failure returns `500`; deployment tooling must require a `200` before switching traffic.
+  state. It returns `503` whenever the dialog-preference relations, runtime columns, validated event
+  constraint, migration cursor, or reconciliation state required by this binary are incomplete,
+  even when both preference rollout switches are off. A database failure returns `500`; deployment
+  tooling must require a `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
@@ -130,11 +132,13 @@ mirrors that value and emits the account PTS update needed by new clients, inclu
 new server nodes overlap. The trigger deliberately remains active when behavior is killed so a
 rollback cannot strand a durable legacy mute or create a sync gap.
 
-When the entrypoint and behavior switches are enabled, readiness additionally requires every
-preference table, a validated `account_events_type_check` that admits
-`dialog.preferences_updated`, the completed `dialog_preferences_v1` migration cursor, and an empty
-legacy reconciliation table. Until all four conditions hold, capability advertisement, the
-preference route, and preference-driven fanout remain disabled.
+Readiness always requires every preference table and runtime bootstrap column, a validated
+`account_events_type_check` that admits `dialog.preferences_updated`, the completed
+`dialog_preferences_v1` migration cursor, and an empty legacy reconciliation table. This is
+independent of the rollout switches because ordinary message fanout, direct-dialog creation, and
+bootstrap SQL are compiled against the expanded schema. Until all conditions hold, the process must
+not receive traffic; capability advertisement, the preference route, and preference-driven fanout
+also remain disabled.
 
 Run `bun run migrate` before enabling either client entrypoint. It applies a short-lock expand,
 resumable bounded backfill, concurrent indexes, separately validates the replacement event
