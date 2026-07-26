@@ -367,6 +367,7 @@ final class CloudAppModel {
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
     private var preferenceMutationTasks: [UUID: Task<Void, Never>] = [:]
     private var accountSessionGeneration: UInt64 = 1
+    private var isSessionTeardownInProgress = false
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
@@ -558,6 +559,7 @@ final class CloudAppModel {
                 return
             }
             if let saved = savedSession {
+                isSessionTeardownInProgress = false
                 storedSession = saved
                 phone = saved.phone
                 displayName = saved.displayName
@@ -642,6 +644,7 @@ final class CloudAppModel {
             )
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
+            isSessionTeardownInProgress = false
             accountSessionGeneration &+= 1
             storedSession = stored
             profileDetails = Self.profileDetails(from: name)
@@ -932,6 +935,9 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        // This guard must be set before the first suspension. UI actions and background retry
+        // callbacks can run while Keychain/SQLCipher teardown awaits cancellation.
+        isSessionTeardownInProgress = true
         let accountId = storedSession?.session.accountId
         accountSessionGeneration &+= 1
         var cleanupFailures: [String] = []
@@ -1540,6 +1546,7 @@ final class CloudAppModel {
     }
 
     func setGroupMuted(dialogId: String, muted: Bool) {
+        guard !isSessionTeardownInProgress else { return }
         if capabilities.contains(.chatOrganization) {
             launchDialogPreferenceMutation(
                 dialogId: dialogId,
@@ -1602,6 +1609,7 @@ final class CloudAppModel {
         operation: String,
         payload: GroupMutationPayload
     ) async -> Bool {
+        if operation == "notifications", isSessionTeardownInProgress { return false }
         guard
             capabilities.contains(.groups),
             let localStore,
@@ -2380,6 +2388,7 @@ final class CloudAppModel {
     }
 
     func togglePinned(_ dialogId: String) {
+        guard !isSessionTeardownInProgress else { return }
         guard capabilities.contains(.chatOrganization) else { return }
         #if DEBUG
         if isDemoMode {
@@ -2395,6 +2404,7 @@ final class CloudAppModel {
     }
 
     func toggleMuted(_ dialogId: String) {
+        guard !isSessionTeardownInProgress else { return }
         guard let dialog = dialogs.first(where: { $0.id == dialogId }) else { return }
         let supportsLegacyGroupMute = dialog.type == "group" && capabilities.contains(.groups)
         guard capabilities.contains(.chatOrganization) || supportsLegacyGroupMute else { return }
@@ -2415,6 +2425,7 @@ final class CloudAppModel {
     }
 
     func archive(_ dialogId: String) {
+        guard !isSessionTeardownInProgress else { return }
         guard capabilities.contains(.chatOrganization) else { return }
         #if DEBUG
         if isDemoMode {
@@ -2430,6 +2441,7 @@ final class CloudAppModel {
     }
 
     func unarchive(_ dialogId: String) {
+        guard !isSessionTeardownInProgress else { return }
         guard capabilities.contains(.chatOrganization) else { return }
         #if DEBUG
         if isDemoMode {
@@ -2449,7 +2461,10 @@ final class CloudAppModel {
         field: DialogPreferenceField,
         desiredValue: Bool? = nil
     ) {
-        guard let accountId = storedSession?.session.accountId else { return }
+        guard
+            !isSessionTeardownInProgress,
+            let accountId = storedSession?.session.accountId
+        else { return }
         let generation = accountSessionGeneration
         let taskId = UUID()
         let task = Task { [weak self] in
@@ -2467,7 +2482,10 @@ final class CloudAppModel {
     }
 
     private func launchLegacyGroupMute(dialogId: String, muted: Bool) {
-        guard let accountId = storedSession?.session.accountId else { return }
+        guard
+            !isSessionTeardownInProgress,
+            let accountId = storedSession?.session.accountId
+        else { return }
         let generation = accountSessionGeneration
         let taskId = UUID()
         let task = Task { [weak self] in
@@ -2517,6 +2535,7 @@ final class CloudAppModel {
         expectedAccountId: String? = nil,
         sessionGeneration: UInt64? = nil
     ) async -> Bool {
+        guard !isSessionTeardownInProgress else { return false }
         guard capabilities.contains(.chatOrganization) else { return false }
         #if DEBUG
         if isDemoMode {
@@ -2580,6 +2599,7 @@ final class CloudAppModel {
     }
 
     private func retryPendingDialogPreferences() async {
+        guard !isSessionTeardownInProgress else { return }
         guard
             capabilities.contains(.chatOrganization),
             let localStore,
@@ -3208,6 +3228,7 @@ final class CloudAppModel {
         }
         let fixtureSession = TelegramFastUITestFixture.session
         try await tokenStore.save(fixtureSession)
+        isSessionTeardownInProgress = false
         storedSession = fixtureSession
         phone = fixtureSession.phone
         displayName = fixtureSession.displayName
@@ -3517,6 +3538,7 @@ final class CloudAppModel {
     }
 
     private func refreshServerCapabilities() async {
+        guard !isSessionTeardownInProgress else { return }
         let generation = accountSessionGeneration
         let expectedAccountId = storedSession?.session.accountId
         do {
@@ -3561,20 +3583,32 @@ final class CloudAppModel {
                 Int(resolved.subtracting(.videoCalls).rawValue),
                 forKey: capabilityCacheKey
             )
-            if !resolved.contains(.chatOrganization),
-               resolved.contains(.groups),
-               let localStore,
-               let accountId = storedSession?.session.accountId {
-                let moved = (try? await localStore.movePendingGroupMutesToLegacy(
-                    accountId: accountId
-                )) ?? 0
-                guard
-                    !Task.isCancelled,
-                    generation == accountSessionGeneration,
-                    expectedAccountId == storedSession?.session.accountId
-                else { return }
-                if moved > 0 {
-                    await retryPendingGroupMutations()
+            if let localStore, let accountId = storedSession?.session.accountId {
+                if resolved.contains(.chatOrganization) {
+                    let reactivated = (try? await localStore
+                        .reactivateDormantDialogPreferences(accountId: accountId)) ?? 0
+                    guard
+                        !Task.isCancelled,
+                        !isSessionTeardownInProgress,
+                        generation == accountSessionGeneration,
+                        expectedAccountId == storedSession?.session.accountId
+                    else { return }
+                    if reactivated > 0 {
+                        await retryPendingDialogPreferences()
+                    }
+                } else if resolved.contains(.groups) {
+                    let moved = (try? await localStore.movePendingGroupMutesToLegacy(
+                        accountId: accountId
+                    )) ?? 0
+                    guard
+                        !Task.isCancelled,
+                        !isSessionTeardownInProgress,
+                        generation == accountSessionGeneration,
+                        expectedAccountId == storedSession?.session.accountId
+                    else { return }
+                    if moved > 0 {
+                        await retryPendingGroupMutations()
+                    }
                 }
             }
         } catch let error as CloudAPIError where error.status == 404 {
@@ -4888,8 +4922,11 @@ final class CloudAppModel {
 
     private func retryPendingGroupMutations() async {
         guard capabilities.contains(.groups),
+              !isSessionTeardownInProgress,
+              let accountId = storedSession?.session.accountId,
               let token = storedSession?.session.token,
               let localStore else { return }
+        let generation = accountSessionGeneration
         let mutations: [PendingGroupMutation]
         do {
             mutations = try await localStore.pendingGroupMutationsReady()
@@ -4898,12 +4935,28 @@ final class CloudAppModel {
             return
         }
         for mutation in mutations {
-            if Task.isCancelled || storedSession?.session.token != token { return }
+            if Task.isCancelled
+                || isSessionTeardownInProgress
+                || accountSessionGeneration != generation
+                || storedSession?.session.accountId != accountId
+                || storedSession?.session.token != token {
+                return
+            }
             do {
                 guard
                     let data = mutation.payloadJSON.data(using: .utf8),
                     let payload = try? JSONDecoder().decode(GroupMutationPayload.self, from: data)
                 else { throw CloudAppModelError.invalidGroupMutation }
+                try await localStore.markGroupMutationAttempted(
+                    clientMutationId: mutation.clientMutationId
+                )
+                guard
+                    !Task.isCancelled,
+                    !isSessionTeardownInProgress,
+                    accountSessionGeneration == generation,
+                    storedSession?.session.accountId == accountId,
+                    storedSession?.session.token == token
+                else { return }
                 let envelope: CloudGroupEnvelope?
                 switch mutation.operation {
                 case "update_title":
@@ -4974,6 +5027,13 @@ final class CloudAppModel {
                 default:
                     throw CloudAppModelError.invalidGroupMutation
                 }
+                guard
+                    !Task.isCancelled,
+                    !isSessionTeardownInProgress,
+                    accountSessionGeneration == generation,
+                    storedSession?.session.accountId == accountId,
+                    storedSession?.session.token == token
+                else { return }
                 if let envelope {
                     try await localStore.applyGroupEnvelope(envelope)
                 }
@@ -4989,6 +5049,13 @@ final class CloudAppModel {
             } catch is CancellationError {
                 return
             } catch {
+                guard
+                    !Task.isCancelled,
+                    !isSessionTeardownInProgress,
+                    accountSessionGeneration == generation,
+                    storedSession?.session.accountId == accountId,
+                    storedSession?.session.token == token
+                else { return }
                 if let apiError = error as? CloudAPIError, apiError.status == 410 {
                     try? await localStore.revokeGroupAccess(
                         dialogId: mutation.dialogId,
@@ -5009,6 +5076,8 @@ final class CloudAppModel {
                         terminal: false
                     )
                     publishTransportFailure(error)
+                    await refreshDialogs()
+                    return
                 case .authenticationRequired:
                     try? await localStore.failGroupMutation(
                         clientMutationId: mutation.clientMutationId,
@@ -5016,6 +5085,8 @@ final class CloudAppModel {
                         error: "Sign in required",
                         terminal: false
                     )
+                    await refreshDialogs()
+                    return
                 case .unsupportedServer, .permanent:
                     try? await localStore.failGroupMutation(
                         clientMutationId: mutation.clientMutationId,
@@ -5644,8 +5715,14 @@ final class CloudAppModel {
     }
 
     #if DEBUG
+    func beginSessionTeardownForTesting() {
+        isSessionTeardownInProgress = true
+        accountSessionGeneration &+= 1
+    }
+
     func enterDemoMode() {
         isDemoMode = true
+        isSessionTeardownInProgress = false
         accountSessionGeneration &+= 1
         storedSession = StoredCloudSession(
             session: CloudSession(accountId: "debug-demo-account", deviceId: "debug-demo-device", token: "debug-demo-token"),
@@ -5699,6 +5776,7 @@ final class CloudAppModel {
 
     private func leaveDemoMode() {
         isDemoMode = false
+        isSessionTeardownInProgress = true
         accountSessionGeneration &+= 1
         storedSession = nil
         activeDialogId = nil

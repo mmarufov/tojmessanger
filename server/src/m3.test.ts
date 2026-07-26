@@ -16,7 +16,19 @@ import {
 import { bodyAAD, hashToken, mediaFileNameAAD, open, pushTokenAAD } from "./crypto";
 import { CLOUD_CAPABILITIES, startCloudServer } from "./cloud";
 import { updateDialogPreferences } from "./dialog-preferences";
-import { cleanupExpiredData, OperationalMetrics, requestIdFrom, safeRoute } from "./ops";
+import {
+  cleanupExpiredData,
+  drainExpiredData,
+  OperationalMetrics,
+  readiness,
+  requestIdFrom,
+  safeRoute,
+} from "./ops";
+import {
+  clearDialogPreferenceReadinessCache,
+  dialogPreferenceSchemaState,
+} from "./dialog-preference-readiness";
+import { fanoutDialogEvent } from "./fanout";
 import {
   buildAPNsPayload,
   processPushBatch,
@@ -400,6 +412,54 @@ describe("M3 cloud sync", () => {
       SELECT id FROM devices WHERE account_id = ${account.accountId} AND revoked_at IS NULL`).toHaveLength(0);
   });
 
+  test("legacy notification writes serialize with account deletion", async () => {
+    const { alice, dialogId } = await makePair();
+    const deletion = await startAccountDeletion(db, alice.accountId);
+    if (!deletion.code) throw new Error("missing deletion code");
+    let reachedCommit!: () => void;
+    const atCommit = new Promise<void>((resolve) => { reachedCommit = resolve; });
+    let releaseCommit!: () => void;
+    const released = new Promise<void>((resolve) => { releaseCommit = resolve; });
+
+    const deleting = deleteAccount(db, alice.accountId, deletion.code, {
+      beforeCommit: async () => {
+        reachedCommit();
+        await released;
+      },
+    });
+    await atCommit;
+
+    let writeSettled = false;
+    const legacyWrite = (async () => {
+      try {
+        await db`
+          UPDATE dialog_members
+          SET notification_mode = 'muted'
+          WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+        return null;
+      } catch (error) {
+        return error;
+      } finally {
+        writeSettled = true;
+      }
+    })();
+    await Bun.sleep(40);
+    expect(writeSettled).toBe(false);
+    releaseCommit();
+    await deleting;
+    const writeError = await legacyWrite;
+    expect(String((writeError as Error)?.message)).toContain(
+      "dialog_preference_account_unavailable",
+    );
+    expect(await db`
+      SELECT dialog_id FROM dialog_preferences WHERE account_id = ${alice.accountId}`)
+      .toHaveLength(0);
+    expect(await db`
+      SELECT pts FROM account_events
+      WHERE account_id = ${alice.accountId}
+        AND type = 'dialog.preferences_updated'`).toHaveLength(0);
+  }, 10_000);
+
   test("account deletion HTTP flow requires auth and invalidates the session", async () => {
     const server = startCloudServer(0, db, null, null);
     const base = `http://127.0.0.1:${server.port}`;
@@ -574,15 +634,105 @@ describe("M3 cloud sync", () => {
       snapshots: 1,
       pushDeliveries: 0,
       mediaUploads: 1,
-      dialogPreferenceRequests: 1,
+      dialogPreferenceRequests: 0,
       dialogPreferenceBudgets: 1,
     });
     expect(await db`SELECT id FROM bootstrap_snapshots`).toHaveLength(0);
     expect(await db`SELECT id FROM media_objects WHERE status = 'uploading'`).toHaveLength(0);
     expect(await db`
       SELECT client_mutation_id FROM dialog_preference_requests
-      WHERE account_id = ${account.accountId}`)
-      .toEqual([expect.objectContaining({ client_mutation_id: pendingPreferenceRequest })]);
+      WHERE account_id = ${account.accountId}
+      ORDER BY client_mutation_id`)
+      .toEqual([
+        completedPreferenceRequest,
+        pendingPreferenceRequest,
+      ].sort().map((client_mutation_id) => expect.objectContaining({ client_mutation_id })));
+  });
+
+  test("maintenance drains sustained ingress within explicit row and runtime budgets", async () => {
+    const account = await makeAccount(testPhone(127), "Cleanup drain");
+    await db`
+      INSERT INTO dialog_preference_action_budgets (
+        account_id, bucket_started, mutation_count, updated_at
+      )
+      SELECT ${account.accountId},
+             date_trunc('hour', now() - interval '48 hours') + series * interval '1 minute',
+             1,
+             now() - interval '48 hours'
+      FROM generate_series(1, 25) AS series`;
+    const first = await drainExpiredData(db, {
+      batchSize: 3,
+      maxRows: 20,
+      maxRuntimeMs: 10_000,
+    });
+    expect(first.rows).toBe(20);
+    expect(first.passes).toBeGreaterThan(1);
+    expect(first.exhausted).toBe(true);
+
+    await db`
+      INSERT INTO dialog_preference_action_budgets (
+        account_id, bucket_started, mutation_count, updated_at
+      )
+      SELECT ${account.accountId},
+             date_trunc('hour', now() - interval '72 hours') + series * interval '1 minute',
+             1,
+             now() - interval '72 hours'
+      FROM generate_series(1, 7) AS series`;
+    const second = await drainExpiredData(db, {
+      batchSize: 2,
+      maxRows: 100,
+      maxRuntimeMs: 10_000,
+    });
+    expect(second.rows).toBe(12);
+    expect(await db`
+      SELECT account_id FROM dialog_preference_action_budgets
+      WHERE updated_at < now() - interval '24 hours'`).toHaveLength(0);
+  });
+
+  test("preference readiness fails closed for every partial schema state", async () => {
+    const ready = await readiness(db, { sms: "configured", push: "configured" });
+    expect(ready.status).toBe("ready");
+
+    await db`
+      UPDATE online_migration_cursors
+      SET completed_at = NULL
+      WHERE migration_name = 'dialog_preferences_v1'`;
+    clearDialogPreferenceReadinessCache(db);
+    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
+    await db`
+      UPDATE online_migration_cursors
+      SET completed_at = now()
+      WHERE migration_name = 'dialog_preferences_v1'`;
+
+    const account = await makeAccount(testPhone(128), "Readiness");
+    const { dialogId } = await getOrCreateDirectDialog(
+      db,
+      account.accountId,
+      (await makeAccount(testPhone(129), "Readiness peer")).accountId,
+    );
+    await db`
+      INSERT INTO dialog_preference_legacy_reconciliation (dialog_id, account_id)
+      VALUES (${dialogId}, ${account.accountId})`;
+    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
+    await db`DELETE FROM dialog_preference_legacy_reconciliation`;
+
+    await db`ALTER TABLE dialog_preference_action_budgets RENAME TO dialog_preference_action_budgets_incomplete`;
+    const missing = await dialogPreferenceSchemaState(db, { bypassCache: true });
+    expect(missing.ready).toBe(false);
+    expect(missing.missingTables).toContain("dialog_preference_action_budgets");
+    await db`ALTER TABLE dialog_preference_action_budgets_incomplete RENAME TO dialog_preference_action_budgets`;
+
+    await db`ALTER TABLE account_events DROP CONSTRAINT account_events_type_check`;
+    await db`
+      ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
+        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+         'dialog.created','member.added','member.removed','member.role_changed','member.left',
+         'dialog.profile_updated','dialog.closed','dialog.access_revoked',
+         'dialog.preferences_updated','profile.updated')) NOT VALID`;
+    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
+    await db`ALTER TABLE account_events VALIDATE CONSTRAINT account_events_type_check`;
+    clearDialogPreferenceReadinessCache(db);
+    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(true);
   });
 
   test("failed OTP delivery consumes the unusable challenge", async () => {
@@ -1477,6 +1627,58 @@ describe("M3 cloud sync", () => {
       .toBe(before);
   });
 
+  test("lost preference responses remain idempotent after retention and a newer device change", async () => {
+    const { alice, dialogId } = await makePair();
+    const secondDevice = await addIOSDevice(alice.accountId);
+    const firstMutationId = crypto.randomUUID();
+    const first = await updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      clientMutationId: firstMutationId,
+      patch: { muted: true },
+    });
+    const second = await updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: secondDevice.deviceId,
+      dialogId,
+      clientMutationId: crypto.randomUUID(),
+      patch: { muted: false },
+    });
+    await db`
+      UPDATE dialog_preference_requests
+      SET created_at = now() - interval '90 days'
+      WHERE account_id = ${alice.accountId}
+        AND client_mutation_id = ${firstMutationId}`;
+    await cleanupExpiredData(db, 1_000);
+    expect(await db`
+      SELECT client_mutation_id
+      FROM dialog_preference_requests
+      WHERE account_id = ${alice.accountId}
+        AND client_mutation_id = ${firstMutationId}`).toHaveLength(1);
+
+    const ptsBeforeRetry = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts);
+    const retry = await updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      clientMutationId: firstMutationId,
+      patch: { muted: true },
+    });
+    expect(retry.duplicate).toBe(true);
+    expect(retry.pts).toBe(first.pts);
+    expect(second.pts).toBeGreaterThan(first.pts);
+    expect(Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts))
+      .toBe(ptsBeforeRetry);
+    expect((await db`
+      SELECT is_muted
+      FROM dialog_preferences
+      WHERE account_id = ${alice.accountId} AND dialog_id = ${dialogId}`)[0].is_muted)
+      .toBe(false);
+  });
+
   test("muted messages stay silent and only unmuted incoming messages auto-unarchive", async () => {
     const { alice, bob, dialogId } = await makePair();
     await registerPushToken(db, bob.deviceId, "92".repeat(32), "sandbox");
@@ -1547,6 +1749,53 @@ describe("M3 cloud sync", () => {
         archived: false,
       },
     });
+  });
+
+  test("the behavior switch applies to every fanout event path", async () => {
+    const { alice, bob, dialogId } = await makePair();
+    await registerPushToken(db, bob.deviceId, "9f".repeat(32), "sandbox");
+    await db`
+      UPDATE dialog_preferences
+      SET is_muted = TRUE
+      WHERE dialog_id = ${dialogId} AND account_id = ${bob.accountId}`;
+    expect((await db`
+      SELECT notification_mode
+      FROM dialog_members
+      WHERE dialog_id = ${dialogId} AND account_id = ${bob.accountId}`)[0].notification_mode)
+      .toBe("all");
+
+    const previous = process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
+    process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = "0";
+    try {
+      for (const type of [
+        "dialog.profile_updated",
+        "member.added",
+        "message.edited",
+        "reaction.updated",
+        "read.updated",
+      ]) {
+        await fanoutDialogEvent(db, {
+          dialogId,
+          type,
+          actorAccountId: alice.accountId,
+          sourceDeviceId: alice.deviceId,
+          recipientAccountIds: [bob.accountId],
+        });
+      }
+      const deliveries = await db`
+        SELECT alert
+        FROM push_deliveries
+        WHERE account_id = ${bob.accountId}
+        ORDER BY pts`;
+      expect(deliveries).toHaveLength(5);
+      expect(deliveries.every((delivery: any) => delivery.alert === true)).toBe(true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
+      } else {
+        process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = previous;
+      }
+    }
   });
 
   test("mute and incoming-message races follow commit order without losing archive intent", async () => {

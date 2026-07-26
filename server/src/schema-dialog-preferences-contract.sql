@@ -31,7 +31,21 @@ AS $$
 DECLARE
   next_pts BIGINT;
   preference_row dialog_preferences%ROWTYPE;
+  account_status TEXT;
+  budget_count INTEGER;
 BEGIN
+  -- Serialize with the account row update used by deletion. If deletion won, rejecting here rolls
+  -- back both the old-node dialog_members write and every compatibility side effect.
+  SELECT status INTO account_status
+  FROM accounts
+  WHERE id = NEW.account_id
+  FOR KEY SHARE;
+  IF account_status IS NULL OR account_status NOT IN ('active', 'limited') THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'P0001',
+      MESSAGE = 'dialog_preference_account_unavailable';
+  END IF;
+
   INSERT INTO dialog_preferences (dialog_id, account_id, is_muted)
   VALUES (NEW.dialog_id, NEW.account_id, NEW.notification_mode = 'muted')
   ON CONFLICT (dialog_id, account_id) DO UPDATE SET
@@ -43,6 +57,22 @@ BEGIN
   IF TG_OP = 'INSERT'
      OR preference_row.dialog_id IS NULL THEN
     RETURN NEW;
+  END IF;
+
+  INSERT INTO dialog_preference_action_budgets (
+    account_id, bucket_started, mutation_count
+  ) VALUES (
+    NEW.account_id, date_trunc('hour', now()), 1
+  )
+  ON CONFLICT (account_id, bucket_started) DO UPDATE SET
+    mutation_count = dialog_preference_action_budgets.mutation_count + 1,
+    updated_at = now()
+  WHERE dialog_preference_action_budgets.mutation_count < 240
+  RETURNING mutation_count INTO budget_count;
+  IF budget_count IS NULL THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'P0001',
+      MESSAGE = 'dialog_preference_rate_limited';
   END IF;
 
   UPDATE account_sync_states

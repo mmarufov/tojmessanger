@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
 
 export type FanoutPush = { accountId: string; pts: number; ptsCount: number };
 
@@ -22,7 +23,8 @@ const n = (value: unknown) => Number(value as any);
  * account_sync_states are acquired in account UUID order before the set-based update.
  */
 export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promise<FanoutPush[]> {
-  const useDialogPreferences = options.useDialogPreferences !== false;
+  const useDialogPreferences = options.useDialogPreferences
+    ?? await dialogPreferenceBehaviorAvailable(sql);
   const unarchived = options.unarchiveOnIncomingMessage && useDialogPreferences
     ? await sql`
         UPDATE dialog_preferences
@@ -90,12 +92,26 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
            ${options.msgId ?? null}, ${options.actorAccountId},
            ${JSON.stringify(options.data ?? {})}::text::jsonb ||
            CASE
+             WHEN ${options.type === "dialog.created"} THEN jsonb_build_object(
+               'preferences',
+               jsonb_build_object(
+                 'dialogId', ${options.dialogId}::uuid,
+                 'pinned', COALESCE(preference.is_pinned, FALSE),
+                 'pinnedAt', preference.pinned_at,
+                 'muted', COALESCE(
+                   preference.is_muted,
+                   member.notification_mode = 'muted'
+                 ),
+                 'archived', COALESCE(preference.is_archived, FALSE),
+                 'updatedAt', COALESCE(preference.updated_at, member.joined_at)
+               )
+             )
              WHEN bumped.account_id = ANY(
                ${sql.array(unarchivedAccountIds, "uuid")}::uuid[]
              ) THEN jsonb_build_object(
                'preferences',
                jsonb_build_object(
-                 'dialogId', preference.dialog_id,
+                 'dialogId', ${options.dialogId}::uuid,
                  'pinned', preference.is_pinned,
                  'pinnedAt', preference.pinned_at,
                  'muted', preference.is_muted,
@@ -109,6 +125,9 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     LEFT JOIN dialog_preferences preference
       ON preference.dialog_id = ${options.dialogId}
      AND preference.account_id = bumped.account_id
+    LEFT JOIN dialog_members member
+      ON member.dialog_id = ${options.dialogId}
+     AND member.account_id = bumped.account_id
     ORDER BY bumped.account_id
     RETURNING account_id, pts`;
 

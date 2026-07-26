@@ -109,6 +109,7 @@ import {
   DialogPreferenceError,
   updateDialogPreferences,
 } from "./dialog-preferences";
+import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -264,7 +265,7 @@ export function startCloudServer(
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
-  const dialogPreferencesAvailable = dialogPreferencesCapabilityEnabled();
+  const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -294,10 +295,11 @@ export function startCloudServer(
         if (url.pathname === "/health") response = new Response("ok");
 
         else if (url.pathname === "/ready") {
-          response = json(await readiness(db, {
+          const state = await readiness(db, {
             sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
             push: pushSender ? "configured" : "disabled",
-          }));
+          });
+          response = json(state, state.status === "ready" ? 200 : 503);
         }
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
@@ -309,7 +311,7 @@ export function startCloudServer(
             callsAvailable,
             accountVideoAvailable,
             groupsAvailable,
-            dialogPreferencesAvailable,
+            dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
           ));
         }
 
@@ -361,9 +363,15 @@ export function startCloudServer(
 
         else if (
           /^\/v1\/dialogs\/[0-9a-f-]+\/preferences$/i.test(url.pathname)
-          && !dialogPreferencesAvailable
+          && (
+            !dialogPreferencesConfigured
+            || !await dialogPreferenceBehaviorAvailable(db)
+          )
         ) {
-          response = new Response("not found", { status: 404 });
+          response = json({
+            error: "dialog preferences capability unavailable",
+            code: "capability_unavailable",
+          }, 404);
         }
 
         else {
@@ -541,6 +549,8 @@ export function startCloudServer(
         }
 
         if (groupNotificationsMatch && req.method === "PUT") {
+          const dialogPreferencesAvailable = dialogPreferencesConfigured
+            && await dialogPreferenceBehaviorAvailable(db);
           const result = await updateGroupNotifications(db, {
             actorAccountId: session.accountId,
             actorDeviceId: session.deviceId,

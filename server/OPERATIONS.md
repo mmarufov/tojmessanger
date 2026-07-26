@@ -7,8 +7,9 @@ gitignored notes.
 ## Probes and request logs
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
-- `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider state. A database
-  failure returns `500`, so deployment tooling must require a `200` before switching traffic.
+- `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider
+  state. It returns `503` when the enabled dialog-preference entrypoint is not migration-ready, and
+  a database failure returns `500`; deployment tooling must require a `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
@@ -17,13 +18,18 @@ gitignored notes.
 
 ## Maintenance
 
-The server runs an hourly, bounded cleanup. Each table deletes at most 1,000 eligible rows per run:
-expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal push deliveries
-older than seven days. Incomplete media uploads are resumable for 24 hours and are then removed with
-their encrypted chunks; expired upload-attempt rate records and unattached completed media are also
-removed. Completed dialog-preference idempotency records are retained for 24 hours; pending records
-are never aged out. Message history, attached media, and the account event log are never deleted by
-this worker.
+The server runs an hourly, bounded cleanup. It repeatedly claims eligible rows with `SKIP LOCKED`
+until the row or runtime budget is exhausted. Defaults are 1,000 rows per table per pass, 10,000 total
+rows, and five seconds; deployments can tune `TOJ_MAINTENANCE_BATCH_SIZE`,
+`TOJ_MAINTENANCE_MAX_ROWS_PER_TICK`, and `TOJ_MAINTENANCE_MAX_RUNTIME_MS`.
+
+Cleanup covers expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal
+push deliveries older than seven days. Incomplete media uploads are resumable for 24 hours and are
+then removed with their encrypted chunks; expired upload-attempt rate records and unattached
+completed media are also removed. Completed dialog-preference idempotency records are retained until
+account deletion because an offline client can retry a lost response after any fixed cleanup window.
+Pending records are also never aged out. Message history and attached media are not deleted by this
+worker; account events follow the separately configured synchronization retention floor.
 
 ## Media storage
 
@@ -114,15 +120,21 @@ both switches permit them at process startup:
 
 - `TOJ_DIALOG_PREFERENCES_V1_ENABLED=1` enables the client entrypoint (capability and route).
 - `TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED=0` is the behavior kill switch. It suppresses the
-  capability/route, disables preference-driven auto-unarchive, and makes message push fanout read
-  the legacy notification mode. Its secure rollout default is enabled when unset so existing
-  deployments need only gate the client entrypoint.
+  capability/route, disables preference-driven auto-unarchive, and makes every application fanout
+  path read the legacy notification mode. Its secure rollout default is enabled when unset so
+  existing deployments need only gate the client entrypoint.
 
 With either gate closed, the preference route family hard-404s. The legacy group-notification route
 stays available and writes `dialog_members.notification_mode`. The database compatibility trigger
 mirrors that value and emits the account PTS update needed by new clients, including while old and
 new server nodes overlap. The trigger deliberately remains active when behavior is killed so a
 rollback cannot strand a durable legacy mute or create a sync gap.
+
+When the entrypoint and behavior switches are enabled, readiness additionally requires every
+preference table, a validated `account_events_type_check` that admits
+`dialog.preferences_updated`, the completed `dialog_preferences_v1` migration cursor, and an empty
+legacy reconciliation table. Until all four conditions hold, capability advertisement, the
+preference route, and preference-driven fanout remain disabled.
 
 Run `bun run migrate` before enabling either client entrypoint. It applies a short-lock expand,
 resumable bounded backfill, concurrent indexes, separately validates the replacement event

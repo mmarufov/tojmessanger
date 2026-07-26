@@ -114,7 +114,22 @@ CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  account_status TEXT;
 BEGIN
+  -- Serialize with account deletion even during the expand/backfill window. The deletion status
+  -- update conflicts with this key-share lock, so a compatibility write commits before cleanup or
+  -- wakes afterward and rolls back.
+  SELECT status INTO account_status
+  FROM accounts
+  WHERE id = NEW.account_id
+  FOR KEY SHARE;
+  IF account_status IS NULL OR account_status NOT IN ('active', 'limited') THEN
+    RAISE EXCEPTION USING
+      ERRCODE = 'P0001',
+      MESSAGE = 'dialog_preference_account_unavailable';
+  END IF;
+
   INSERT INTO dialog_preferences (dialog_id, account_id, is_muted)
   VALUES (NEW.dialog_id, NEW.account_id, NEW.notification_mode = 'muted')
   ON CONFLICT (dialog_id, account_id) DO UPDATE SET

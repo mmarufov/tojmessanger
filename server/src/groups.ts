@@ -982,6 +982,20 @@ export async function updateGroupNotifications(sql: SQL, input: {
         envelope: await envelope(tx, input.actorAccountId, input.dialogId),
         pushes: [],
       };
+    }).catch((error: any) => {
+      if (error?.message?.includes("dialog_preference_rate_limited")) {
+        throw new GroupError(
+          "dialog preference rate limit reached",
+          "rate_limited",
+          429,
+          {},
+          3600,
+        );
+      }
+      if (error?.message?.includes("dialog_preference_account_unavailable")) {
+        throw new GroupError("account unavailable", "account_unavailable", 403);
+      }
+      throw error;
     });
   }
   const result = await updateDialogPreferences(sql, {

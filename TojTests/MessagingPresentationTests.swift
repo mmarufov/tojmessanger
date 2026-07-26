@@ -669,6 +669,25 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testPreferenceActionsAreBlockedAsSoonAsSessionTeardownBegins() async {
+        let model = CloudAppModel(useDefaultLocalStore: false)
+        model.enterDemoMode()
+        let dialogId = "demo-mehrona"
+        let before = model.dialogs.first(where: { $0.id == dialogId })
+
+        model.beginSessionTeardownForTesting()
+        model.toggleMuted(dialogId)
+        model.togglePinned(dialogId)
+        model.archive(dialogId)
+
+        let after = model.dialogs.first(where: { $0.id == dialogId })
+        XCTAssertEqual(after?.isMuted, before?.isMuted)
+        XCTAssertEqual(after?.isPinned, before?.isPinned)
+        XCTAssertEqual(after?.isArchived, before?.isArchived)
+        await Task.yield()
+    }
+
+    @MainActor
     func testDemoReactionAndDeletionUpdateTheActiveConversation() async throws {
         let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()

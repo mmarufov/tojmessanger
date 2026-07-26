@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
+import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const CLEANUP_BATCH_SIZE = 1_000;
@@ -96,9 +97,8 @@ export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> 
     SELECT
       (SELECT count(*) FROM dialog_preference_requests WHERE status = 'pending')
         AS pending_requests,
-      (SELECT count(*) FROM dialog_preference_requests
-       WHERE status = 'completed' AND created_at < now() - interval '24 hours')
-        AS expired_completed_requests,
+      (SELECT count(*) FROM dialog_preference_requests WHERE status = 'completed')
+        AS retained_completed_requests,
       (SELECT count(*) FROM dialog_preference_action_budgets
        WHERE updated_at < now() - interval '24 hours')
         AS expired_budget_rows`)[0];
@@ -106,9 +106,11 @@ export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> 
     "# HELP toj_dialog_preference_pending_requests Pending idempotency claims.",
     "# TYPE toj_dialog_preference_pending_requests gauge",
     `toj_dialog_preference_pending_requests ${Number(row.pending_requests)}`,
-    "# HELP toj_dialog_preference_cleanup_backlog_rows Expired rows awaiting bounded cleanup.",
+    "# HELP toj_dialog_preference_retained_idempotency_rows Completed durable dedupe records.",
+    "# TYPE toj_dialog_preference_retained_idempotency_rows gauge",
+    `toj_dialog_preference_retained_idempotency_rows ${Number(row.retained_completed_requests)}`,
+    "# HELP toj_dialog_preference_cleanup_backlog_rows Expired bounded-lifecycle rows awaiting cleanup.",
     "# TYPE toj_dialog_preference_cleanup_backlog_rows gauge",
-    `toj_dialog_preference_cleanup_backlog_rows{table="requests"} ${Number(row.expired_completed_requests)}`,
     `toj_dialog_preference_cleanup_backlog_rows{table="budgets"} ${Number(row.expired_budget_rows)}`,
     "",
   ].join("\n");
@@ -121,10 +123,15 @@ export function providerState(value: unknown): ProviderState {
 export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState }) {
   const started = performance.now();
   await sql`SELECT 1`;
+  const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+  const preferenceEntrypointRequired =
+    process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED === "1"
+    && process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED !== "0";
   return {
-    status: "ready",
+    status: preferenceEntrypointRequired && !preferences.ready ? "not_ready" : "ready",
     database: "ready",
     providers,
+    dialogPreferences: preferences,
     databaseLatencyMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10),
   };
 }
@@ -136,6 +143,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM otp_challenges
       WHERE expires_at < now() - interval '24 hours'
       ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM otp_challenges WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -144,6 +152,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM bootstrap_snapshots
       WHERE expires_at < now()
       ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM bootstrap_snapshots WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -152,6 +161,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM push_deliveries
       WHERE status IN ('sent', 'dead') AND created_at < now() - interval '7 days'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM push_deliveries WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -160,6 +170,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM contact_lookup_attempts
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM contact_lookup_attempts WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -168,6 +179,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM media_objects
       WHERE status IN ('uploading', 'rejected') AND expires_at < now()
       ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -176,6 +188,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT id FROM media_upload_attempts
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM media_upload_attempts WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -186,6 +199,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
       ORDER BY mo.completed_at LIMIT ${batchSize}
+      FOR UPDATE OF mo SKIP LOCKED
     )
     DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
@@ -194,6 +208,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT sender_account_id, client_msg_id FROM send_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM send_requests request USING doomed
     WHERE request.sender_account_id = doomed.sender_account_id
@@ -204,6 +219,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT actor_account_id, client_mutation_id FROM message_mutation_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM message_mutation_requests request USING doomed
     WHERE request.actor_account_id = doomed.actor_account_id
@@ -214,6 +230,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT creator_account_id, client_group_id FROM group_create_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM group_create_requests request USING doomed
     WHERE request.creator_account_id = doomed.creator_account_id
@@ -224,26 +241,22 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT actor_account_id, client_mutation_id FROM group_mutation_requests
       WHERE created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM group_mutation_requests request USING doomed
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
-  const dialogPreferenceRequests = await sql`
-    WITH doomed AS (
-      SELECT account_id, client_mutation_id FROM dialog_preference_requests
-      WHERE status = 'completed' AND created_at < now() - interval '24 hours'
-      ORDER BY created_at LIMIT ${batchSize}
-    )
-    DELETE FROM dialog_preference_requests request USING doomed
-    WHERE request.account_id = doomed.account_id
-      AND request.client_mutation_id = doomed.client_mutation_id
-    RETURNING request.client_mutation_id`;
+  // Preference mutation IDs are client-generated and can be retried after an arbitrarily long
+  // offline period or lost response. Keep completed dedupe state until account deletion so a
+  // committed patch can never be interpreted as a new mutation.
+  const dialogPreferenceRequests: any[] = [];
   const dialogPreferenceBudgets = await sql`
     WITH doomed AS (
       SELECT account_id, bucket_started FROM dialog_preference_action_budgets
       WHERE updated_at < now() - interval '24 hours'
       ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
     )
     DELETE FROM dialog_preference_action_budgets budget USING doomed
     WHERE budget.account_id = doomed.account_id
@@ -307,6 +320,50 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   };
 }
 
+function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
+  return value.otp + value.snapshots + value.pushDeliveries + value.contactLookups
+    + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
+    + value.messageMutations + value.groupCreates + value.groupMutations
+    + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
+    + Object.values(value.callData).reduce((sum, count) => sum + count, 0);
+}
+
+export async function drainExpiredData(
+  sql: SQL,
+  options: { batchSize?: number; maxRows?: number; maxRuntimeMs?: number } = {},
+) {
+  const batchSize = Math.max(1, options.batchSize ?? Number(
+    process.env.TOJ_MAINTENANCE_BATCH_SIZE ?? CLEANUP_BATCH_SIZE,
+  ));
+  const maxRows = Math.max(batchSize, options.maxRows ?? Number(
+    process.env.TOJ_MAINTENANCE_MAX_ROWS_PER_TICK ?? 10_000,
+  ));
+  const maxRuntimeMs = Math.max(1, options.maxRuntimeMs ?? Number(
+    process.env.TOJ_MAINTENANCE_MAX_RUNTIME_MS ?? 5_000,
+  ));
+  const startedAt = performance.now();
+  let rows = 0;
+  let passes = 0;
+  let last = await cleanupExpiredData(sql, Math.min(batchSize, maxRows));
+  while (true) {
+    passes += 1;
+    const deleted = cleanupCount(last);
+    rows += deleted;
+    if (
+      deleted === 0
+      || rows >= maxRows
+      || performance.now() - startedAt >= maxRuntimeMs
+    ) break;
+    last = await cleanupExpiredData(sql, Math.min(batchSize, maxRows - rows));
+  }
+  return {
+    rows,
+    passes,
+    runtimeMs: Math.round((performance.now() - startedAt) * 10) / 10,
+    exhausted: rows >= maxRows || performance.now() - startedAt >= maxRuntimeMs,
+  };
+}
+
 function cleanError(value: unknown): string {
   return (value instanceof Error ? value.message : String(value)).replace(/[\r\n]+/g, " ").slice(0, 300);
 }
@@ -317,14 +374,9 @@ export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): 
     if (running) return;
     running = true;
     try {
-      const deleted = await cleanupExpiredData(sql);
-      if (deleted.otp || deleted.snapshots || deleted.pushDeliveries || deleted.contactLookups ||
-          deleted.mediaUploads || deleted.mediaAttempts || deleted.mediaOrphans ||
-          deleted.sendRequests || deleted.messageMutations || deleted.groupCreates ||
-          deleted.groupMutations || deleted.dialogPreferenceRequests ||
-          deleted.dialogPreferenceBudgets || deleted.accountEvents
-          || Object.values(deleted.callData).some((value) => value > 0)) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", deleted }));
+      const drained = await drainExpiredData(sql);
+      if (drained.rows > 0) {
+        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", drained }));
       }
     } catch (error) {
       console.error(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.error", error: cleanError(error) }));

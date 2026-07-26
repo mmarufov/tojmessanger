@@ -83,6 +83,8 @@ nonisolated struct PendingGroupMutation: Identifiable, Equatable, Sendable {
     let nextRetryAt: String?
     let lastError: String?
     let terminal: Bool
+    let localOrder: Int64
+    let attemptedAt: String?
 }
 
 nonisolated enum DialogPreferenceField: String, CaseIterable, Sendable {
@@ -102,6 +104,9 @@ nonisolated struct PendingDialogPreferenceMutation: Identifiable, Equatable, Sen
     let nextRetryAt: String?
     let acknowledgedPts: Int64?
     let lastError: String?
+    let localOrder: Int64
+    let attemptedAt: String?
+    let dormant: Bool
 }
 
 nonisolated struct LocalLaunchSnapshot: Equatable, Sendable {
@@ -870,6 +875,8 @@ actor CloudLocalStore {
                 SELECT *
                 FROM pending_dialog_preference_mutations
                 WHERE account_id = ? AND dialog_id = ? AND field = ? AND terminal = 0
+                ORDER BY local_order DESC
+                LIMIT 1
                 """,
                 arguments: [accountId, dialogId, field.rawValue]
             )
@@ -897,36 +904,48 @@ actor CloudLocalStore {
             // Preserve sub-second toggle order and use the same lexical shape as server-authored
             // pinned_at values so rapid offline pins sort deterministically.
             let desiredAt = Self.preferenceTimestamp(Date())
-            try db.execute(
-                sql: """
-                INSERT INTO pending_dialog_preference_mutations (
-                  account_id, dialog_id, field, desired_value, desired_at,
-                  client_mutation_id, acknowledged_pts, retry_count,
-                  next_retry_at, last_error, terminal
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL, 0)
-                ON CONFLICT(account_id, dialog_id, field) DO UPDATE SET
-                  desired_value = excluded.desired_value,
-                  desired_at = excluded.desired_at,
-                  client_mutation_id = excluded.client_mutation_id,
-                  acknowledged_pts = NULL,
-                  retry_count = 0,
-                  next_retry_at = NULL,
-                  last_error = NULL,
-                  terminal = 0
-                """,
-                arguments: [
-                    accountId, dialogId, field.rawValue, desiredValue,
-                    desiredAt, mutationId,
-                ]
-            )
+            let localOrder = try Self.nextLocalMutationOrder(db)
+            let coalescedMutationId: String?
+            if let existing,
+               (existing["attempted_at"] as String?) == nil,
+               (existing["acknowledged_pts"] as Int64?) == nil {
+                let existingId: String = existing["client_mutation_id"]
+                try db.execute(
+                    sql: """
+                    UPDATE pending_dialog_preference_mutations
+                    SET desired_value = ?, desired_at = ?, local_order = ?,
+                        retry_count = 0, next_retry_at = NULL, last_error = NULL,
+                        terminal = 0, dormant = 0
+                    WHERE client_mutation_id = ?
+                    """,
+                    arguments: [desiredValue, desiredAt, localOrder, existingId]
+                )
+                coalescedMutationId = existingId
+            } else {
+                try db.execute(
+                    sql: """
+                    INSERT INTO pending_dialog_preference_mutations (
+                      account_id, dialog_id, field, desired_value, desired_at,
+                      client_mutation_id, acknowledged_pts, retry_count,
+                      next_retry_at, last_error, terminal, local_order,
+                      attempted_at, dormant
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL, 0, ?, NULL, 0)
+                    """,
+                    arguments: [
+                        accountId, dialogId, field.rawValue, desiredValue,
+                        desiredAt, mutationId, localOrder,
+                    ]
+                )
+                coalescedMutationId = mutationId
+            }
             return try Row.fetchOne(
                 db,
                 sql: """
                 SELECT *
                 FROM pending_dialog_preference_mutations
-                WHERE account_id = ? AND dialog_id = ? AND field = ?
+                WHERE account_id = ? AND client_mutation_id = ?
                 """,
-                arguments: [accountId, dialogId, field.rawValue]
+                arguments: [accountId, coalescedMutationId]
             ).map(Self.pendingDialogPreference(from:))
         }
     }
@@ -943,13 +962,48 @@ actor CloudLocalStore {
                 FROM pending_dialog_preference_mutations
                 WHERE account_id = ?
                   AND terminal = 0
+                  AND dormant = 0
                   AND acknowledged_pts IS NULL
                   AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
-                ORDER BY desired_at, dialog_id, field
+                ORDER BY local_order
                 LIMIT ?
                 """,
                 arguments: [accountId, max(1, min(limit, 200))]
             ).map(Self.pendingDialogPreference(from:))
+        }
+    }
+
+    func markDialogPreferenceAttempted(
+        accountId: String,
+        clientMutationId: String
+    ) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_dialog_preference_mutations
+                SET attempted_at = COALESCE(attempted_at, ?)
+                WHERE account_id = ? AND client_mutation_id = ?
+                  AND terminal = 0 AND acknowledged_pts IS NULL
+                """,
+                arguments: [
+                    Self.preferenceTimestamp(Date()), accountId, clientMutationId,
+                ]
+            )
+        }
+    }
+
+    func reactivateDormantDialogPreferences(accountId: String) throws -> Int {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_dialog_preference_mutations
+                SET dormant = 0, next_retry_at = NULL, last_error = NULL
+                WHERE account_id = ? AND terminal = 0
+                  AND acknowledged_pts IS NULL AND dormant = 1
+                """,
+                arguments: [accountId]
+            )
+            return db.changesCount
         }
     }
 
@@ -1002,6 +1056,7 @@ actor CloudLocalStore {
                 FROM pending_dialog_preference_mutations
                 WHERE account_id = ?
                   AND terminal = 0
+                  AND dormant = 0
                   AND acknowledged_pts IS NULL
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
                 """,
@@ -1015,6 +1070,7 @@ actor CloudLocalStore {
                 FROM pending_dialog_preference_mutations
                 WHERE account_id = ?
                   AND terminal = 0
+                  AND dormant = 0
                   AND acknowledged_pts IS NULL
                   AND next_retry_at > ?
                 """,
@@ -1029,7 +1085,8 @@ actor CloudLocalStore {
         clientMutationId: String,
         retryAfter: TimeInterval?,
         error: String,
-        terminal: Bool
+        terminal: Bool,
+        dormant: Bool = false
     ) throws {
         let nextRetryAt = retryAfter.map {
             Self.sqliteTimestamp(Date().addingTimeInterval(max(1, $0)))
@@ -1041,11 +1098,13 @@ actor CloudLocalStore {
                 SET retry_count = retry_count + 1,
                     next_retry_at = ?,
                     last_error = ?,
-                    terminal = ?
+                    terminal = ?,
+                    dormant = ?
                 WHERE account_id = ? AND client_mutation_id = ?
                 """,
                 arguments: [
-                    nextRetryAt, error, terminal, accountId, clientMutationId,
+                    nextRetryAt, error, terminal, dormant,
+                    accountId, clientMutationId,
                 ]
             )
         }
@@ -1360,53 +1419,34 @@ actor CloudLocalStore {
         accountId: String? = nil
     ) throws {
         try dbQueue.write { db in
+            let localOrder = try Self.nextLocalMutationOrder(db)
+            let createdAt = Self.preferenceTimestamp(Date())
+            if operation == "notifications" {
+                // Coalesce only rows that provably never left this process. Attempted rows retain
+                // their mutation ID and order until the server resolves them.
+                try db.execute(
+                    sql: """
+                    DELETE FROM pending_group_mutations
+                    WHERE dialog_id = ? AND operation = 'notifications'
+                      AND terminal = 0 AND attempted_at IS NULL
+                    """,
+                    arguments: [dialogId]
+                )
+            }
             try db.execute(
                 sql: """
                 INSERT INTO pending_group_mutations (
-                  client_mutation_id, dialog_id, operation, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, datetime('now'))
+                  client_mutation_id, dialog_id, operation, payload_json,
+                  created_at, local_order, attempted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(client_mutation_id) DO NOTHING
                 """,
-                arguments: [clientMutationId, dialogId, operation, payloadJSON]
+                arguments: [
+                    clientMutationId, dialogId, operation, payloadJSON,
+                    createdAt, localOrder,
+                ]
             )
-            if operation == "notifications" {
-                let muted = try Bool.fetchOne(
-                    db,
-                    sql: "SELECT json_extract(?, '$.mode') = 'muted'",
-                    arguments: [payloadJSON]
-                ) ?? false
-                try db.execute(
-                    sql: """
-                    UPDATE dialogs
-                    SET notification_mode = ?
-                    WHERE dialog_id = ?
-                    """,
-                    arguments: [muted ? "muted" : "all", dialogId]
-                )
-                if let accountId {
-                    try db.execute(
-                        sql: """
-                        UPDATE dialog_preferences
-                        SET is_muted = ?, server_updated_at = datetime('now')
-                        WHERE dialog_id = ? AND account_id = ?
-                        """,
-                        arguments: [muted, dialogId, accountId]
-                    )
-                } else {
-                    try db.execute(
-                        sql: """
-                        UPDATE dialog_preferences
-                        SET is_muted = ?, server_updated_at = datetime('now')
-                        WHERE dialog_id = ?
-                          AND account_id = (
-                            SELECT account_id FROM sync_state
-                            ORDER BY updated_at DESC LIMIT 1
-                          )
-                        """,
-                        arguments: [muted, dialogId]
-                    )
-                }
-            }
+            _ = accountId
         }
     }
 
@@ -1415,70 +1455,95 @@ actor CloudLocalStore {
             let rows = try Row.fetchAll(
                 db,
                 sql: """
-                SELECT pending.dialog_id, pending.desired_value,
-                       pending.desired_at, pending.client_mutation_id,
-                       pending.retry_count, pending.next_retry_at,
-                       pending.last_error, pending.terminal
+                SELECT pending.*
                 FROM pending_dialog_preference_mutations pending
                 JOIN dialogs dialog ON dialog.dialog_id = pending.dialog_id
                 WHERE pending.account_id = ?
                   AND pending.field = 'muted'
                   AND pending.terminal = 0
                   AND pending.acknowledged_pts IS NULL
+                  AND pending.attempted_at IS NULL
                   AND dialog.type = 'group'
-                ORDER BY pending.desired_at, pending.dialog_id
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pending_dialog_preference_mutations attempted
+                    WHERE attempted.account_id = pending.account_id
+                      AND attempted.dialog_id = pending.dialog_id
+                      AND attempted.field = pending.field
+                      AND attempted.terminal = 0
+                      AND attempted.acknowledged_pts IS NULL
+                      AND attempted.attempted_at IS NOT NULL
+                  )
+                  AND pending.local_order = (
+                    SELECT MAX(latest.local_order)
+                    FROM pending_dialog_preference_mutations latest
+                    WHERE latest.account_id = pending.account_id
+                      AND latest.dialog_id = pending.dialog_id
+                      AND latest.field = pending.field
+                      AND latest.terminal = 0
+                      AND latest.acknowledged_pts IS NULL
+                  )
+                ORDER BY pending.local_order
                 """,
                 arguments: [accountId]
             )
             for row in rows {
                 let desired = (row["desired_value"] as Int) != 0
                 let payload = desired ? #"{"mode":"muted"}"# : #"{"mode":"all"}"#
-                try db.execute(
+                let dialogId: String = row["dialog_id"]
+                let localOrder: Int64 = row["local_order"]
+                let newerLegacyOrder = try Int64.fetchOne(
+                    db,
                     sql: """
-                    INSERT INTO pending_group_mutations (
-                      client_mutation_id, dialog_id, operation, payload_json, created_at,
-                      retry_count, next_retry_at, last_error, terminal
-                    ) VALUES (?, ?, 'notifications', ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(client_mutation_id) DO UPDATE SET
-                      payload_json = excluded.payload_json,
-                      retry_count = excluded.retry_count,
-                      next_retry_at = excluded.next_retry_at,
-                      last_error = excluded.last_error,
-                      terminal = excluded.terminal
+                    SELECT MAX(local_order)
+                    FROM pending_group_mutations
+                    WHERE dialog_id = ? AND operation = 'notifications'
+                      AND terminal = 0 AND attempted_at IS NULL
                     """,
-                    arguments: [
-                        row["client_mutation_id"], row["dialog_id"], payload,
-                        row["desired_at"], row["retry_count"], nil,
-                        nil, row["terminal"],
-                    ]
+                    arguments: [dialogId]
                 )
-                try db.execute(
-                    sql: """
-                    UPDATE dialog_preferences
-                    SET is_muted = ?, server_updated_at = datetime('now')
-                    WHERE account_id = ? AND dialog_id = ?
-                    """,
-                    arguments: [desired, accountId, row["dialog_id"]]
-                )
-                try db.execute(
-                    sql: "UPDATE dialogs SET notification_mode = ? WHERE dialog_id = ?",
-                    arguments: [desired ? "muted" : "all", row["dialog_id"]]
-                )
-            }
-            if !rows.isEmpty {
+                if newerLegacyOrder == nil || newerLegacyOrder! <= localOrder {
+                    try db.execute(
+                        sql: """
+                        DELETE FROM pending_group_mutations
+                        WHERE dialog_id = ? AND operation = 'notifications'
+                          AND terminal = 0 AND attempted_at IS NULL
+                        """,
+                        arguments: [dialogId]
+                    )
+                    try db.execute(
+                        sql: """
+                        INSERT INTO pending_group_mutations (
+                          client_mutation_id, dialog_id, operation, payload_json,
+                          created_at, retry_count, next_retry_at, last_error,
+                          terminal, local_order, attempted_at
+                        ) VALUES (?, ?, 'notifications', ?, ?, ?, NULL, NULL, 0, ?, NULL)
+                        """,
+                        arguments: [
+                            row["client_mutation_id"], dialogId, payload,
+                            row["desired_at"], row["retry_count"], localOrder,
+                        ]
+                    )
+                }
                 try db.execute(
                     sql: """
                     DELETE FROM pending_dialog_preference_mutations
-                    WHERE account_id = ? AND field = 'muted'
-                      AND client_mutation_id IN (
-                        SELECT group_mutation.client_mutation_id
-                        FROM pending_group_mutations group_mutation
-                        WHERE group_mutation.operation = 'notifications'
-                      )
+                    WHERE account_id = ? AND dialog_id = ? AND field = 'muted'
+                      AND terminal = 0 AND acknowledged_pts IS NULL
+                      AND attempted_at IS NULL
                     """,
-                    arguments: [accountId]
+                    arguments: [accountId, dialogId]
                 )
             }
+            try db.execute(
+                sql: """
+                UPDATE pending_dialog_preference_mutations
+                SET dormant = 1, next_retry_at = NULL
+                WHERE account_id = ? AND terminal = 0
+                  AND acknowledged_pts IS NULL
+                """,
+                arguments: [accountId]
+            )
             return rows.count
         }
     }
@@ -1500,12 +1565,24 @@ actor CloudLocalStore {
                     pending_group_mutations.next_retry_at IS NULL
                     OR pending_group_mutations.next_retry_at <= ?
                   )
-                ORDER BY pending_group_mutations.created_at,
-                         pending_group_mutations.client_mutation_id
+                ORDER BY pending_group_mutations.local_order
                 LIMIT ?
                 """,
                 arguments: [Self.sqliteTimestamp(now), max(1, min(100, limit))]
             ).map(Self.pendingGroupMutation(from:))
+        }
+    }
+
+    func markGroupMutationAttempted(clientMutationId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_group_mutations
+                SET attempted_at = COALESCE(attempted_at, ?)
+                WHERE client_mutation_id = ? AND terminal = 0
+                """,
+                arguments: [Self.preferenceTimestamp(Date()), clientMutationId]
+            )
         }
     }
 
@@ -2364,6 +2441,14 @@ actor CloudLocalStore {
                         )
                         if let group = update.group {
                             try applyGroupMetadata(db, group: group)
+                        }
+                        if let preferences = update.preferences {
+                            try upsertDialogPreferences(
+                                db,
+                                preferences: preferences,
+                                accountId: accountId,
+                                clientMutationId: update.clientMutationId
+                            )
                         }
                         if let peerAccountId = update.peerAccountId {
                             try upsertMember(
@@ -4160,6 +4245,103 @@ actor CloudLocalStore {
             }
         }
 
+        migrator.registerMigration("v11-ordered-preference-outbox") { db in
+            try db.execute(sql: """
+            CREATE TEMP TABLE mutation_order_seed AS
+            SELECT domain, mutation_id, sort_at,
+                   row_number() OVER (
+                     ORDER BY sort_at, domain, mutation_id
+                   ) AS local_order
+            FROM (
+              SELECT 'preference' AS domain,
+                     client_mutation_id AS mutation_id,
+                     desired_at AS sort_at
+              FROM pending_dialog_preference_mutations
+              UNION ALL
+              SELECT 'group' AS domain,
+                     client_mutation_id AS mutation_id,
+                     created_at AS sort_at
+              FROM pending_group_mutations
+            );
+
+            CREATE TABLE pending_dialog_preference_mutations_v11 (
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL REFERENCES dialogs(dialog_id) ON DELETE CASCADE,
+              field TEXT NOT NULL CHECK (field IN ('pinned','muted','archived')),
+              desired_value INTEGER NOT NULL CHECK (desired_value IN (0, 1)),
+              desired_at TEXT NOT NULL,
+              client_mutation_id TEXT PRIMARY KEY,
+              acknowledged_pts INTEGER,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              local_order INTEGER NOT NULL,
+              attempted_at TEXT,
+              dormant INTEGER NOT NULL DEFAULT 0 CHECK (dormant IN (0, 1))
+            );
+            INSERT INTO pending_dialog_preference_mutations_v11 (
+              account_id, dialog_id, field, desired_value, desired_at,
+              client_mutation_id, acknowledged_pts, retry_count, next_retry_at,
+              last_error, terminal, local_order, attempted_at, dormant
+            )
+            SELECT
+              pending.account_id, pending.dialog_id, pending.field,
+              pending.desired_value, pending.desired_at,
+              pending.client_mutation_id, pending.acknowledged_pts,
+              pending.retry_count, pending.next_retry_at, pending.last_error,
+              pending.terminal, seed.local_order,
+              CASE WHEN pending.retry_count > 0 THEN pending.desired_at END,
+              0
+            FROM pending_dialog_preference_mutations pending
+            JOIN mutation_order_seed seed
+              ON seed.domain = 'preference'
+             AND seed.mutation_id = pending.client_mutation_id;
+            DROP TABLE pending_dialog_preference_mutations;
+            ALTER TABLE pending_dialog_preference_mutations_v11
+              RENAME TO pending_dialog_preference_mutations;
+            CREATE INDEX pending_dialog_preferences_ready_idx
+              ON pending_dialog_preference_mutations(
+                account_id, terminal, dormant, acknowledged_pts,
+                next_retry_at, local_order
+              );
+            CREATE INDEX pending_dialog_preferences_overlay_idx
+              ON pending_dialog_preference_mutations(
+                account_id, dialog_id, field, terminal, local_order DESC
+              );
+
+            ALTER TABLE pending_group_mutations
+              ADD COLUMN local_order INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE pending_group_mutations
+              ADD COLUMN attempted_at TEXT;
+            UPDATE pending_group_mutations
+            SET local_order = (
+                  SELECT seed.local_order
+                  FROM mutation_order_seed seed
+                  WHERE seed.domain = 'group'
+                    AND seed.mutation_id = pending_group_mutations.client_mutation_id
+                ),
+                attempted_at = CASE
+                  WHEN retry_count > 0 THEN created_at
+                  ELSE attempted_at
+                END;
+            DROP INDEX IF EXISTS pending_group_mutations_ready_idx;
+            CREATE INDEX pending_group_mutations_ready_idx
+              ON pending_group_mutations(
+                terminal, next_retry_at, local_order
+              );
+
+            CREATE TABLE local_mutation_sequence (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              next_order INTEGER NOT NULL
+            );
+            INSERT INTO local_mutation_sequence (singleton, next_order)
+            SELECT 1, COALESCE(MAX(local_order), 0) + 1
+            FROM mutation_order_seed;
+            DROP TABLE mutation_order_seed;
+            """)
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -4520,7 +4702,17 @@ actor CloudLocalStore {
                   THEN CASE WHEN pending_pin.desired_value = 1 THEN pending_pin.desired_at ELSE NULL END
                 ELSE preference.pinned_at
               END AS pinned_at,
-              COALESCE(pending_mute.desired_value, preference.is_muted, 0) AS is_muted,
+              CASE
+                WHEN pending_mute.local_order IS NOT NULL
+                  AND (
+                    pending_legacy_mute.local_order IS NULL
+                    OR pending_mute.local_order >= pending_legacy_mute.local_order
+                  )
+                  THEN pending_mute.desired_value
+                WHEN pending_legacy_mute.local_order IS NOT NULL
+                  THEN json_extract(pending_legacy_mute.payload_json, '$.mode') = 'muted'
+                ELSE COALESCE(preference.is_muted, 0)
+              END AS is_muted,
               COALESCE(pending_archive.desired_value, preference.is_archived, 0) AS is_archived,
               peer.account_id AS peer_account_id,
               profile.bio AS peer_bio,
@@ -4548,16 +4740,51 @@ actor CloudLocalStore {
              AND pending_pin.account_id = ?
              AND pending_pin.field = 'pinned'
              AND pending_pin.terminal = 0
+             AND pending_pin.local_order = (
+               SELECT MAX(latest.local_order)
+               FROM pending_dialog_preference_mutations latest
+               WHERE latest.account_id = pending_pin.account_id
+                 AND latest.dialog_id = pending_pin.dialog_id
+                 AND latest.field = pending_pin.field
+                 AND latest.terminal = 0
+             )
             LEFT JOIN pending_dialog_preference_mutations pending_mute
               ON pending_mute.dialog_id = d.dialog_id
              AND pending_mute.account_id = ?
              AND pending_mute.field = 'muted'
              AND pending_mute.terminal = 0
+             AND pending_mute.local_order = (
+               SELECT MAX(latest.local_order)
+               FROM pending_dialog_preference_mutations latest
+               WHERE latest.account_id = pending_mute.account_id
+                 AND latest.dialog_id = pending_mute.dialog_id
+                 AND latest.field = pending_mute.field
+                 AND latest.terminal = 0
+             )
+            LEFT JOIN pending_group_mutations pending_legacy_mute
+              ON pending_legacy_mute.dialog_id = d.dialog_id
+             AND pending_legacy_mute.operation = 'notifications'
+             AND pending_legacy_mute.terminal = 0
+             AND pending_legacy_mute.local_order = (
+               SELECT MAX(latest.local_order)
+               FROM pending_group_mutations latest
+               WHERE latest.dialog_id = pending_legacy_mute.dialog_id
+                 AND latest.operation = 'notifications'
+                 AND latest.terminal = 0
+             )
             LEFT JOIN pending_dialog_preference_mutations pending_archive
               ON pending_archive.dialog_id = d.dialog_id
              AND pending_archive.account_id = ?
              AND pending_archive.field = 'archived'
              AND pending_archive.terminal = 0
+             AND pending_archive.local_order = (
+               SELECT MAX(latest.local_order)
+               FROM pending_dialog_preference_mutations latest
+               WHERE latest.account_id = pending_archive.account_id
+                 AND latest.dialog_id = pending_archive.dialog_id
+                 AND latest.field = pending_archive.field
+                 AND latest.terminal = 0
+             )
             WHERE d.access_state IN ('pending','active')
             ORDER BY
               is_pinned DESC,
@@ -6005,7 +6232,9 @@ actor CloudLocalStore {
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"],
             lastError: row["last_error"],
-            terminal: (row["terminal"] as Int) != 0
+            terminal: (row["terminal"] as Int) != 0,
+            localOrder: row["local_order"],
+            attemptedAt: row["attempted_at"]
         )
     }
 
@@ -6021,7 +6250,10 @@ actor CloudLocalStore {
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"],
             acknowledgedPts: row["acknowledged_pts"],
-            lastError: row["last_error"]
+            lastError: row["last_error"],
+            localOrder: row["local_order"],
+            attemptedAt: row["attempted_at"],
+            dormant: (row["dormant"] as Int) != 0
         )
     }
 
@@ -6077,6 +6309,22 @@ actor CloudLocalStore {
 
     nonisolated static func sqliteTimestamp(_ date: Date) -> String {
         makeSQLiteDateFormatter().string(from: date)
+    }
+
+    nonisolated private static func nextLocalMutationOrder(_ db: Database) throws -> Int64 {
+        let order = try Int64.fetchOne(
+            db,
+            sql: "SELECT next_order FROM local_mutation_sequence WHERE singleton = 1"
+        ) ?? 1
+        try db.execute(
+            sql: """
+            INSERT INTO local_mutation_sequence (singleton, next_order)
+            VALUES (1, ?)
+            ON CONFLICT(singleton) DO UPDATE SET next_order = excluded.next_order
+            """,
+            arguments: [order + 1]
+        )
+        return order
     }
 
     nonisolated private static func preferenceTimestamp(_ date: Date) -> String {

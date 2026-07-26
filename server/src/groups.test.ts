@@ -395,6 +395,80 @@ describe("Groups v1", () => {
     });
   });
 
+  test("stranger-muted invitations carry recipient preferences in dialog.created", async () => {
+    const { owner, alice } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      creatorDeviceId: owner.deviceId,
+      groupId,
+      title: "Stranger invitation",
+      memberIds: [alice.accountId],
+    });
+    const difference = await getDifference(db, alice.accountId, 0);
+    if (difference.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    const created = difference.updates.find((update) => update.type === "dialog.created");
+    expect(created).toMatchObject({
+      dialog_id: groupId,
+      preferences: {
+        dialogId: groupId,
+        muted: true,
+        pinned: false,
+        archived: false,
+      },
+    });
+    expect((await db`
+      SELECT preference.is_muted, member.notification_mode
+      FROM dialog_preferences preference
+      JOIN dialog_members member
+        ON member.dialog_id = preference.dialog_id
+       AND member.account_id = preference.account_id
+      WHERE preference.dialog_id = ${groupId}
+        AND preference.account_id = ${alice.accountId}`)[0]).toMatchObject({
+      is_muted: true,
+      notification_mode: "muted",
+    });
+  });
+
+  test("legacy notification toggles share the durable 240-per-hour budget", async () => {
+    const { owner, alice } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      creatorDeviceId: owner.deviceId,
+      groupId,
+      title: "Budgeted notifications",
+      memberIds: [alice.accountId],
+    });
+    for (let index = 0; index < 240; index += 1) {
+      await updateGroupNotifications(db, {
+        actorAccountId: owner.accountId,
+        actorDeviceId: owner.deviceId,
+        dialogId: groupId,
+        mode: index % 2 === 0 ? "muted" : "all",
+        clientMutationId: crypto.randomUUID(),
+        usePreferenceService: false,
+      });
+    }
+    await expect(updateGroupNotifications(db, {
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
+      dialogId: groupId,
+      mode: "muted",
+      clientMutationId: crypto.randomUUID(),
+      usePreferenceService: false,
+    })).rejects.toMatchObject({
+      code: "rate_limited",
+      status: 429,
+      retryAfter: 3600,
+    });
+    expect(Number((await db`
+      SELECT mutation_count
+      FROM dialog_preference_action_budgets
+      WHERE account_id = ${owner.accountId}
+        AND bucket_started = date_trunc('hour', now())`)[0].mutation_count)).toBe(240);
+  }, 15_000);
+
   test("an incoming message cannot unarchive a removed member's retained preference", async () => {
     const { owner, alice } = await threeAccounts();
     const groupId = crypto.randomUUID();

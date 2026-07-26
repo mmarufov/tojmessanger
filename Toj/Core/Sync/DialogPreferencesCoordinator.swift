@@ -100,6 +100,11 @@ actor DialogPreferencesCoordinator {
                 try validate(accountId: accountId, sessionGeneration: sessionGeneration)
                 processed += 1
                 do {
+                    try await store.markDialogPreferenceAttempted(
+                        accountId: accountId,
+                        clientMutationId: item.clientMutationId
+                    )
+                    try validate(accountId: accountId, sessionGeneration: sessionGeneration)
                     let request = Task {
                         try await api.updateDialogPreferences(
                             dialogId: item.dialogId,
@@ -127,6 +132,9 @@ actor DialogPreferencesCoordinator {
                 } catch let error as URLError where error.code == .cancelled {
                     throw CancellationError()
                 } catch {
+                    // A request can finish concurrently with logout or an account switch. Never
+                    // touch the old account's SQLCipher outbox after the session was invalidated.
+                    try validate(accountId: accountId, sessionGeneration: sessionGeneration)
                     let disposition = dialogPreferenceFailureDisposition(
                         error,
                         serverAdvertisesFeature: serverAdvertisesFeature
@@ -164,7 +172,8 @@ actor DialogPreferencesCoordinator {
                             clientMutationId: item.clientMutationId,
                             retryAfter: delay,
                             error: "Server capability changed",
-                            terminal: false
+                            terminal: false,
+                            dormant: true
                         )
                         result.capabilityRefreshRequired = true
                         result.recordRetry(after: delay)
@@ -194,10 +203,15 @@ nonisolated func dialogPreferenceFailureDisposition(
     _ error: Error,
     serverAdvertisesFeature: Bool
 ) -> CloudFailureDisposition {
-    if let apiError = error as? CloudAPIError, apiError.status == 404 {
+    if let apiError = error as? CloudAPIError,
+       apiError.status == 404,
+       apiError.code == "capability_unavailable" {
         // The rollout route hard-404s when capability or server behavior is withdrawn. Refresh
         // negotiation and retain the durable intent; membership failures use explicit 403/410.
         return .unsupportedServer
+    }
+    if let apiError = error as? CloudAPIError, apiError.status == 404 {
+        return .permanent
     }
     if let apiError = error as? CloudAPIError, apiError.status == 403 {
         // The session is still valid, but this account can no longer mutate the dialog. Keeping the

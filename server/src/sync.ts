@@ -247,7 +247,28 @@ export async function getOrCreateDirectDialog(
     await tx`INSERT INTO dialog_members (dialog_id, account_id, role) VALUES (${dialogId}, ${low}, 'member'), (${dialogId}, ${high}, 'member')`;
     for (const acc of [low, high]) { // already ascending
       const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${acc} RETURNING pts`;
-      await tx`INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id) VALUES (${acc}, ${n(upd[0].pts)}, 'dialog.created', ${dialogId}, ${aId})`;
+      await tx`
+        INSERT INTO account_events (
+          account_id, pts, type, dialog_id, actor_account_id, data
+        )
+        SELECT ${acc}, ${n(upd[0].pts)}, 'dialog.created', ${dialogId}, ${aId},
+               jsonb_build_object(
+                 'preferences',
+                 jsonb_build_object(
+                   'dialogId', ${dialogId}::uuid,
+                   'pinned', COALESCE(preference.is_pinned, FALSE),
+                   'pinnedAt', preference.pinned_at,
+                   'muted', COALESCE(preference.is_muted, member.notification_mode = 'muted'),
+                   'archived', COALESCE(preference.is_archived, FALSE),
+                   'updatedAt', COALESCE(preference.updated_at, member.joined_at)
+                 )
+               )
+        FROM dialog_members member
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = member.dialog_id
+         AND preference.account_id = member.account_id
+        WHERE member.dialog_id = ${dialogId}
+          AND member.account_id = ${acc}`;
     }
     return { dialogId, created: true };
   });
@@ -446,7 +467,6 @@ export async function sendMessage(sql: SQL, p: {
       actorAccountId: p.senderAccountId,
       sourceDeviceId: p.senderDeviceId,
       unarchiveOnIncomingMessage: true,
-      useDialogPreferences: process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED !== "0",
     });
     const senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
 

@@ -720,6 +720,32 @@ final class CloudLocalStoreTests: XCTestCase {
         CloudAPIMockURLProtocol.handler = { request in
             (
                 try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 404, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"error":"dialog not found","code":"group_not_found"}"#.utf8)
+            )
+        }
+        _ = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        let missingDialog = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true
+        )
+        XCTAssertEqual(missingDialog.permanentErrors, ["dialog not found"])
+        let dialogsAfterMissing = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(try XCTUnwrap(dialogsAfterMissing.first).isPinned)
+
+        CloudAPIMockURLProtocol.handler = { request in
+            (
+                try XCTUnwrap(HTTPURLResponse(
                     url: request.url!, statusCode: 401, httpVersion: "HTTP/1.1",
                     headerFields: ["content-type": "application/json"]
                 )),
@@ -813,7 +839,7 @@ final class CloudLocalStoreTests: XCTestCase {
         }
     }
 
-    func testWithdrawnDialogPreferenceCapabilityPreservesAndConvertsQueuedGroupMute() async throws {
+    func testCommittedUnknownOutcomeStaysDormantWhenCapabilityIsWithdrawn() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
         let api = CloudAPI(
@@ -843,6 +869,27 @@ final class CloudLocalStoreTests: XCTestCase {
         let requests = LockedCounter()
         CloudAPIMockURLProtocol.handler = { request in
             requests.increment()
+            throw URLError(.networkConnectionLost)
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let lostResponse = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true,
+            sessionGeneration: 12
+        )
+        XCTAssertNotNil(lostResponse.retryAfter)
+        try await store.failDialogPreference(
+            accountId: accountId,
+            clientMutationId: queued.clientMutationId,
+            retryAfter: nil,
+            error: "Retry after capability refresh",
+            terminal: false
+        )
+        CloudAPIMockURLProtocol.handler = { request in
+            requests.increment()
             return (
                 try XCTUnwrap(HTTPURLResponse(
                     url: request.url!,
@@ -850,10 +897,12 @@ final class CloudLocalStoreTests: XCTestCase {
                     httpVersion: "HTTP/1.1",
                     headerFields: ["content-type": "application/json"]
                 )),
-                Data(#"{"error":"not found"}"#.utf8)
+                Data(
+                    #"{"error":"dialog preferences capability unavailable","code":"capability_unavailable"}"#
+                        .utf8
+                )
             )
         }
-        defer { CloudAPIMockURLProtocol.handler = nil }
 
         let result = try await coordinator.drain(
             store: store,
@@ -862,20 +911,100 @@ final class CloudLocalStoreTests: XCTestCase {
             serverAdvertisesFeature: true,
             sessionGeneration: 12
         )
-        XCTAssertEqual(requests.value, 1)
+        XCTAssertEqual(requests.value, 2)
         XCTAssertTrue(result.capabilityRefreshRequired)
         let pendingCount = try await store.pendingDestructiveLogoutItemCount()
         XCTAssertEqual(pendingCount, 1)
 
         let moved = try await store.movePendingGroupMutesToLegacy(accountId: accountId)
-        XCTAssertEqual(moved, 1)
+        XCTAssertEqual(moved, 0)
         let remainingPreferences = try await store.pendingDialogPreferencesReady(
             accountId: accountId
         )
-        XCTAssertTrue(remainingPreferences.isEmpty)
+        XCTAssertTrue(remainingPreferences.isEmpty, "Unknown-outcome requests stay dormant")
         let fallback = try await store.pendingGroupMutationsReady()
-        XCTAssertEqual(fallback.map(\.clientMutationId), [queued.clientMutationId])
-        XCTAssertEqual(fallback.first?.payloadJSON, #"{"mode":"muted"}"#)
+        XCTAssertTrue(fallback.isEmpty, "The mutation must not cross idempotency domains")
+        let reactivatedCount = try await store.reactivateDormantDialogPreferences(
+            accountId: accountId
+        )
+        XCTAssertEqual(reactivatedCount, 1)
+        let reactivated = try await store.pendingDialogPreferencesReady(accountId: accountId)
+        XCTAssertEqual(reactivated.map(\.clientMutationId), [queued.clientMutationId])
+    }
+
+    func testConvertedMuteIsCoalescedByANewerLegacyUnmute() async throws {
+        let store = try makeStore()
+        let accountId = "account-converted-order"
+        let dialogId = "dialog-converted-order"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Ordered fallback",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMute = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let mute = try XCTUnwrap(queuedMute)
+        let moved = try await store.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 1)
+        let convertedMutations = try await store.pendingGroupMutationsReady()
+        let converted = try XCTUnwrap(convertedMutations.first)
+        XCTAssertEqual(converted.clientMutationId, mute.clientMutationId)
+        XCTAssertEqual(converted.payloadJSON, #"{"mode":"muted"}"#)
+
+        try await store.enqueueGroupMutation(
+            dialogId: dialogId,
+            operation: "notifications",
+            payloadJSON: #"{"mode":"all"}"#,
+            clientMutationId: "newer-unmute",
+            accountId: accountId
+        )
+        let ready = try await store.pendingGroupMutationsReady()
+        XCTAssertEqual(ready.map(\.clientMutationId), ["newer-unmute"])
+        XCTAssertEqual(ready.first?.payloadJSON, #"{"mode":"all"}"#)
+        XCTAssertGreaterThan(try XCTUnwrap(ready.first?.localOrder), converted.localOrder)
+        let dialogsAfterUnmute = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(try XCTUnwrap(dialogsAfterUnmute.first).isMuted)
+    }
+
+    func testTerminalLegacyNotificationFailureRestoresCanonicalMute() async throws {
+        let store = try makeStore()
+        let accountId = "account-legacy-rollback"
+        let dialogId = "dialog-legacy-rollback"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Rollback",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        try await store.savePts(1, accountId: accountId)
+        try await store.enqueueGroupMutation(
+            dialogId: dialogId,
+            operation: "notifications",
+            payloadJSON: #"{"mode":"muted"}"#,
+            clientMutationId: "terminal-legacy-mute",
+            accountId: accountId
+        )
+        let optimisticDialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertTrue(try XCTUnwrap(optimisticDialogs.first).isMuted)
+        try await store.markGroupMutationAttempted(
+            clientMutationId: "terminal-legacy-mute"
+        )
+        try await store.failGroupMutation(
+            clientMutationId: "terminal-legacy-mute",
+            retryAfter: nil,
+            error: "not a member",
+            terminal: true
+        )
+        let rolledBackDialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(
+            try XCTUnwrap(rolledBackDialogs.first).isMuted,
+            "A terminal 4xx must remove the optimistic overlay"
+        )
     }
 
     func testPreferenceDrainCancellationWaitsForSuspendedRequestAndPreservesAccountIntent() async throws {
@@ -1604,6 +1733,53 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDialogCreatedAppliesRecipientPreferencesAtomically() async throws {
+        let store = try makeStore()
+        let accountId = "account-stranger-invite"
+        let dialogId = "dialog-stranger-invite"
+        let preferences = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: true,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 1),
+                updates: [
+                    CloudUpdate(
+                        pts: 1,
+                        ptsCount: 1,
+                        type: "dialog.created",
+                        dialogId: dialogId,
+                        dialogTitle: "Stranger invitation",
+                        dialogType: "group",
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: preferences
+                    )
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let dialogs = try await store.dialogs(accountId: accountId)
+        let dialog = try XCTUnwrap(dialogs.first)
+        XCTAssertEqual(dialog.dialogId, dialogId)
+        XCTAssertTrue(dialog.isMuted)
+        XCTAssertTrue(dialog.isArchived)
+        XCTAssertEqual(dialog.notificationMode, "muted")
+        let pts = try await store.loadPts(accountId: accountId)
+        XCTAssertEqual(pts, 1)
+    }
+
+    @MainActor
     func testBootstrapPageDoesNotAdvancePtsUntilFinished() async throws {
         let store = try makeStore()
         let accountId = "account-a"
@@ -2161,10 +2337,36 @@ final class CloudLocalStoreTests: XCTestCase {
                 UPDATE dialogs
                 SET notification_mode = 'muted'
                 WHERE dialog_id = '\(dialogId)';
+                CREATE TABLE pending_group_mutations_v9 (
+                  client_mutation_id TEXT PRIMARY KEY,
+                  dialog_id TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  retry_count INTEGER NOT NULL DEFAULT 0,
+                  next_retry_at TEXT,
+                  last_error TEXT,
+                  terminal INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO pending_group_mutations_v9 (
+                  client_mutation_id, dialog_id, operation, payload_json,
+                  retry_count, next_retry_at, last_error, terminal, created_at
+                )
+                SELECT client_mutation_id, dialog_id, operation, payload_json,
+                       retry_count, next_retry_at, last_error, terminal, created_at
+                FROM pending_group_mutations;
+                DROP TABLE pending_group_mutations;
+                ALTER TABLE pending_group_mutations_v9 RENAME TO pending_group_mutations;
+                CREATE INDEX pending_group_mutations_ready_idx
+                  ON pending_group_mutations(terminal, next_retry_at, created_at);
                 DROP TABLE pending_dialog_preference_mutations;
                 DROP TABLE dialog_preferences;
+                DROP TABLE local_mutation_sequence;
                 DELETE FROM grdb_migrations
-                WHERE identifier = 'v10-dialog-preferences';
+                WHERE identifier IN (
+                  'v10-dialog-preferences',
+                  'v11-ordered-preference-outbox'
+                );
                 """)
             }
         }
