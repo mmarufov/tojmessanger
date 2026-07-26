@@ -1906,7 +1906,20 @@
 
     },
     "Remove" : {
-
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нест кардан"
+          }
+        }
+      }
     },
     "Remove Birthday" : {
       "comment" : "A button that removes a user's birthday.",
@@ -2860,7 +2873,9 @@
     "Try offline copy again" : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Повторить открытие офлайн-копии"}},"tg":{"stringUnit":{"state":"translated","value":"Нусхаи офлайнро дубора кушоед"}}}},
     "Unavailable" : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Недоступно"}},"tg":{"stringUnit":{"state":"translated","value":"Дастнорас"}}}},
     "Unavailable on this server" : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Недоступно на этом сервере"}},"tg":{"stringUnit":{"state":"translated","value":"Дар ин сервер дастнорас аст"}}}},
-    "You are no longer a member of this group. Its offline copy was removed." : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Вы больше не состоите в этой группе. Её офлайн-копия удалена."}},"tg":{"stringUnit":{"state":"translated","value":"Шумо дигар узви ин гурӯҳ нестед. Нусхаи офлайни он ҳазф шуд."}}}}
+    "You are no longer a member of this group. Its offline copy was removed." : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Вы больше не состоите в этой группе. Её офлайн-копия удалена."}},"tg":{"stringUnit":{"state":"translated","value":"Шумо дигар узви ин гурӯҳ нестед. Нусхаи офлайни он ҳазф шуд."}}}},
+    "Saved Messages access ended" : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Доступ к Избранному прекращён"}},"tg":{"stringUnit":{"state":"translated","value":"Дастрасӣ ба Паёмҳои захирашуда қатъ шуд"}}}},
+    "The unauthorized Saved Messages offline copy was removed." : {"localizations":{"ru":{"stringUnit":{"state":"translated","value":"Несанкционированная офлайн-копия Избранного удалена."}},"tg":{"stringUnit":{"state":"translated","value":"Нусхаи офлайни беиҷозати Паёмҳои захирашуда нест карда шуд."}}}}
   },
   "version" : "1.1"
 }

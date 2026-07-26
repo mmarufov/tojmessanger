@@ -8,7 +8,7 @@ import {
   requireGroupRole,
   type DialogAccess,
 } from "./dialog-access";
-import { fanoutDialogEvent, type FanoutPush } from "./fanout";
+import { appendAccessRevokedEvent, fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { loadMediaDTO, type MediaDTO } from "./media";
 import { loadProfiles, type ProfileDTO } from "./sync";
 
@@ -274,32 +274,6 @@ async function emitLifecycle(
       service_data: serviceData,
     },
   });
-}
-
-async function appendRevocationEvent(
-  sql: SQL,
-  accountId: string,
-  dialogId: string,
-  actorAccountId: string,
-): Promise<FanoutPush> {
-  const state = (await sql`
-    UPDATE account_sync_states
-    SET pts = pts + 1, updated_at = now()
-    WHERE account_id = ${accountId}
-    RETURNING pts`)[0];
-  const pts = n(state.pts);
-  await sql`
-    INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id, data)
-    VALUES (${accountId}, ${pts}, 'dialog.access_revoked', ${dialogId}, ${actorAccountId},
-            '{"dialog_type":"group"}'::jsonb)`;
-  await sql`
-    INSERT INTO push_deliveries (account_id, pts, device_id, alert)
-    SELECT ${accountId}, ${pts}, id, false
-    FROM devices
-    WHERE account_id = ${accountId} AND platform = 'ios' AND revoked_at IS NULL
-      AND push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL
-    ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
-  return { accountId, pts, ptsCount: 1 };
 }
 
 async function enforceCreateBudget(sql: SQL, creatorId: string): Promise<void> {
@@ -733,7 +707,9 @@ export async function removeGroupMember(sql: SQL, input: {
       { actor_account_id: input.actorAccountId, subject_account_id: targetId },
       input.actorDeviceId,
     );
-    pushes.push(await appendRevocationEvent(tx, targetId, input.dialogId, input.actorAccountId));
+    pushes.push(await appendAccessRevokedEvent(
+      tx, targetId, input.dialogId, input.actorAccountId, "group",
+    ));
     await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
     return envelope(tx, input.actorAccountId, input.dialogId, { pushes });
   });
@@ -927,8 +903,8 @@ export async function leaveGroup(sql: SQL, input: {
           },
           input.actorDeviceId,
         );
-    pushes.push(await appendRevocationEvent(
-      tx, input.actorAccountId, input.dialogId, input.actorAccountId,
+    pushes.push(await appendAccessRevokedEvent(
+      tx, input.actorAccountId, input.dialogId, input.actorAccountId, "group",
     ));
     await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
     return { left: true, closed, pushes };

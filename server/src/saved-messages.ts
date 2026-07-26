@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import type { SQL } from "bun";
 import { requireActiveDevice } from "./auth";
-import { fanoutDialogEvent, type FanoutPush } from "./fanout";
+import {
+  appendAccessRevokedEvent,
+  fanoutDialogEvent,
+  type FanoutPush,
+} from "./fanout";
 import { lockAccountMutations } from "./locks";
 
 export class SavedMessagesError extends Error {
@@ -34,6 +38,106 @@ const SYNC_NOTIFY_CHANNEL = "toj_sync_events";
 
 export function savedMessagesConfigured(): boolean {
   return process.env.TOJ_SAVED_MESSAGES_V1_ENABLED === "1";
+}
+
+export type SavedMessagesSchemaReadiness = {
+  ready: boolean;
+  missing: string[];
+};
+
+/** Fail-closed catalog check used by readiness, capability advertisement, and the ensure route. */
+export async function savedMessagesSchemaReadiness(
+  sql: SQL,
+): Promise<SavedMessagesSchemaReadiness> {
+  const row = (await sql`
+    SELECT
+      EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass('public.messages')
+          AND attname = 'is_forwarded' AND NOT attisdropped AND attnotnull
+      ) AS marker_column,
+      EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass('public.messages')
+          AND conname = 'messages_forward_marker_check' AND convalidated
+      ) AS marker_constraint,
+      EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass('public.dialogs')
+          AND conname = 'dialogs_type_check' AND convalidated
+          AND pg_get_constraintdef(oid) LIKE '%saved%'
+      ) AS dialog_type_constraint,
+      EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = to_regclass('public.dialogs')
+          AND conname = 'dialogs_saved_owner_check' AND convalidated
+      ) AS dialog_owner_constraint,
+      EXISTS (
+        SELECT 1
+        FROM pg_class class
+        JOIN pg_index index ON index.indexrelid = class.oid
+        WHERE class.oid = to_regclass('public.dialogs_one_saved_per_account_idx')
+          AND index.indisvalid AND index.indisready AND index.indisunique
+      ) AS saved_unique_index,
+      EXISTS (
+        SELECT 1
+        FROM pg_class class
+        JOIN pg_index index ON index.indexrelid = class.oid
+        WHERE class.oid = to_regclass('public.messages_forward_provenance_idx')
+          AND index.indisvalid AND index.indisready
+      ) AS forward_index,
+      EXISTS (
+        SELECT 1
+        FROM pg_class class
+        JOIN pg_index index ON index.indexrelid = class.oid
+        WHERE class.oid = to_regclass('public.messages_reply_target_idx')
+          AND index.indisvalid AND index.indisready
+      ) AS reply_index,
+      (
+        SELECT count(*) = 6
+        FROM pg_attribute
+        WHERE attrelid = to_regclass('public.saved_messages_backfill_claims')
+          AND attname = ANY(ARRAY[
+            'account_id','worker_id','claimed_at','completed_at','attempts','last_error'
+          ])
+          AND NOT attisdropped
+      ) AS claims_schema,
+      EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = to_regclass('public.messages')
+          AND tgname = 'messages_derive_forward_marker' AND tgenabled <> 'D'
+      ) AS writer_trigger,
+      EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgrelid = to_regclass('public.accounts')
+          AND tgname = 'accounts_cleanup_saved_messages' AND tgenabled <> 'D'
+      ) AS deletion_trigger,
+      to_regclass('public.schema_migration_progress') IS NOT NULL AS progress_schema`)[0];
+
+  const checks: Array<[string, boolean]> = [
+    ["messages.is_forwarded", Boolean(row.marker_column)],
+    ["messages_forward_marker_check", Boolean(row.marker_constraint)],
+    ["dialogs_type_check", Boolean(row.dialog_type_constraint)],
+    ["dialogs_saved_owner_check", Boolean(row.dialog_owner_constraint)],
+    ["dialogs_one_saved_per_account_idx", Boolean(row.saved_unique_index)],
+    ["messages_forward_provenance_idx", Boolean(row.forward_index)],
+    ["messages_reply_target_idx", Boolean(row.reply_index)],
+    ["saved_messages_backfill_claims", Boolean(row.claims_schema)],
+    ["messages_derive_forward_marker", Boolean(row.writer_trigger)],
+    ["accounts_cleanup_saved_messages", Boolean(row.deletion_trigger)],
+    ["schema_migration_progress", Boolean(row.progress_schema)],
+  ];
+  if (row.progress_schema) {
+    const progress = await sql`
+      SELECT 1
+      FROM schema_migration_progress
+      WHERE migration_name = ${"messages_is_forwarded_v1"} AND completed_at IS NOT NULL`;
+    checks.push(["messages_is_forwarded_v1", progress.length === 1]);
+  } else {
+    checks.push(["messages_is_forwarded_v1", false]);
+  }
+  const missing = checks.filter(([, present]) => !present).map(([name]) => name);
+  return { ready: missing.length === 0, missing };
 }
 
 /** Stable per-account rollout. The global switch is always the outer kill switch. */
@@ -106,6 +210,16 @@ export async function ensureSavedMessages(
       DELETE FROM dialog_members
       WHERE dialog_id = ${dialogId} AND account_id <> ${accountId}
       RETURNING account_id`;
+    const revokedPushes: FanoutPush[] = [];
+    for (const row of removed) {
+      revokedPushes.push(await appendAccessRevokedEvent(
+        tx,
+        String(row.account_id),
+        dialogId,
+        accountId,
+        "saved",
+      ));
+    }
     const previous = (await tx`
       SELECT role, notification_mode, left_at
       FROM dialog_members
@@ -135,7 +249,7 @@ export async function ensureSavedMessages(
       return { dialogId, type: "saved", created: false, repaired: false, pushes: [] };
     }
 
-    const pushes = await fanoutDialogEvent(tx, {
+    const ownerPushes = await fanoutDialogEvent(tx, {
       dialogId,
       type: "dialog.created",
       actorAccountId: accountId,
@@ -148,13 +262,14 @@ export async function ensureSavedMessages(
         self_role: "owner",
       },
     });
+    const pushes = [...revokedPushes, ...ownerPushes];
     await notifySyncWakeups(tx, pushes);
     return {
       dialogId,
       type: "saved",
       created,
       repaired,
-      eventPts: pushes.find((push) => push.accountId === accountId)?.pts,
+      eventPts: ownerPushes.find((push) => push.accountId === accountId)?.pts,
       pushes,
     };
   });

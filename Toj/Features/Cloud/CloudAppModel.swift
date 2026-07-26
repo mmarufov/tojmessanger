@@ -254,6 +254,9 @@ final class CloudAppModel {
                 savedMessagesSessionGeneration &+= 1
                 savedMessagesCapabilityState = .unknown
             }
+            if storedSession != nil {
+                sessionTeardownActive = false
+            }
         }
     }
     private(set) var launchPhase: LaunchPhase = .restoringLocal
@@ -406,6 +409,12 @@ final class CloudAppModel {
     private var timelineLoadGeneration: UInt64 = 0
     private var openingAnchorHydrationGeneration: UInt64 = 0
     private var savedMessagesSessionGeneration: UInt64 = 0
+    private(set) var sessionTeardownActive = false
+    private struct TrackedSavedOperation {
+        let cancel: () -> Void
+        let wait: () async -> Void
+    }
+    private var trackedSavedOperations: [UUID: TrackedSavedOperation] = [:]
     private var appliedSyncBatches = 0
     private var lastForegroundSyncFailure: ReplicaSyncState?
     private var timelineForwardCursorByDialog: [String: Int64] = [:]
@@ -456,6 +465,7 @@ final class CloudAppModel {
 
     init(
         config: CloudConfig = .current,
+        api injectedAPI: CloudAPI? = nil,
         tokenStore: TokenStore = TokenStore(),
         pushCenter: PushRegistrationCenter = .shared,
         voipPushCenter: VoIPPushRegistrationCenter = .shared,
@@ -465,7 +475,7 @@ final class CloudAppModel {
         useDefaultLocalStore: Bool = true,
         capabilityDefaults: UserDefaults = .standard
     ) {
-        self.api = CloudAPI(config: config)
+        self.api = injectedAPI ?? CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
         self.voipPushCenter = voipPushCenter
@@ -946,9 +956,20 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        // This flag changes synchronously before the first suspension point. User actions cannot
+        // enqueue new Saved/forward SQL while teardown is waiting on older work.
+        sessionTeardownActive = true
         // Prevent an old ensure from publishing while its exact task is cancelled and awaited.
         savedMessagesSessionGeneration &+= 1
         savedMessagesCapabilityState = .unknown
+        let savedOperations = Array(trackedSavedOperations.values)
+        trackedSavedOperations.removeAll()
+        savedOperations.forEach { $0.cancel() }
+        // Saved setup owns a nested, coalesced provisioning task inside the service actor. Reset
+        // that exact task before awaiting the user-facing wrapper; otherwise an unstructured
+        // network task that ignores parent cancellation could keep teardown waiting forever.
+        await savedMessagesService.reset()
+        for operation in savedOperations { await operation.wait() }
         let accountId = storedSession?.session.accountId
         var cleanupFailures: [String] = []
         do {
@@ -977,7 +998,6 @@ final class CloudAppModel {
         hintSocket = nil
         await replicaSyncCoordinator.stop()
         await mediaPrefetchScheduler.stop()
-        await savedMessagesService.reset()
         mediaSchedulerForegrounded = false
         await BackgroundRuntimeCoordinator.shared.removeWorkHandlersAndWait()
         for task in backgroundTasks { await task.value }
@@ -2128,13 +2148,35 @@ final class CloudAppModel {
 
     @discardableResult
     func ensureSavedMessages(presentsFailure: Bool = true) async -> String? {
+        guard !sessionTeardownActive else { return nil }
+        return await runTrackedSavedOperation {
+            await self.ensureSavedMessagesCore(presentsFailure: presentsFailure)
+        } ?? nil
+    }
+
+    private func ensureSavedMessagesCore(presentsFailure: Bool) async -> String? {
         guard
+            !sessionTeardownActive,
             let accountId = storedSession?.session.accountId,
             let token = storedSession?.session.token,
             let localStore
         else { return nil }
         let generation = savedMessagesSessionGeneration
-        if let savedMessagesDialogId { return savedMessagesDialogId }
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ) else { return nil }
+        if let savedMessagesDialogId {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
+            return savedMessagesDialogId
+        }
         if let local = try? await savedMessagesService.localDialogId(
             store: localStore,
             accountId: accountId
@@ -2222,23 +2264,48 @@ final class CloudAppModel {
         store: CloudLocalStore,
         generation: UInt64
     ) -> Bool {
-        savedMessagesSessionGeneration == generation
+        !sessionTeardownActive
+            && savedMessagesSessionGeneration == generation
             && storedSession?.session.accountId == accountId
             && storedSession?.session.token == token
             && localStore === store
     }
 
     func saveMessage(_ line: Line) async {
+        guard !sessionTeardownActive else { return }
+        _ = await runTrackedSavedOperation {
+            await self.saveMessageCore(line)
+        }
+    }
+
+    private func saveMessageCore(_ line: Line) async {
         guard
+            !sessionTeardownActive,
             !line.isDeleted,
             line.msgId != nil,
             line.dialogId != savedMessagesDialogId,
-            let targetDialogId = await ensureSavedMessages()
+            let targetDialogId = await ensureSavedMessagesCore(presentsFailure: true)
         else { return }
-        await forwardMessage(line, to: targetDialogId)
+        await forwardMessageCore(line, to: targetDialogId)
         if status == "Forwarded" {
             status = String(localized: "Saved to Saved Messages")
         }
+    }
+
+    private func runTrackedSavedOperation<T: Sendable>(
+        _ operation: @escaping @MainActor () async -> T
+    ) async -> T? {
+        guard !sessionTeardownActive else { return nil }
+        let id = UUID()
+        let task = Task { await operation() }
+        trackedSavedOperations[id] = TrackedSavedOperation(
+            cancel: { task.cancel() },
+            wait: { _ = await task.result }
+        )
+        let result = await task.value
+        trackedSavedOperations.removeValue(forKey: id)
+        guard !sessionTeardownActive, !Task.isCancelled else { return nil }
+        return result
     }
 
     func startVoiceCall(dialogId: String) async {
@@ -2453,7 +2520,10 @@ final class CloudAppModel {
         }
         if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
         if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
-        if case .failed = line.delivery { actions.append(.retry) }
+        if case .failed = line.delivery {
+            actions.append(.retry)
+            actions.append(.remove)
+        }
         actions.append(.inspect)
         return actions
     }
@@ -2473,12 +2543,33 @@ final class CloudAppModel {
         }
     }
 
+    func removeFailedMessage(_ line: Line) {
+        guard case .failed = line.delivery, !sessionTeardownActive else { return }
+        Task { [weak self] in
+            guard let self, !self.sessionTeardownActive, let localStore = self.localStore else {
+                return
+            }
+            try? await localStore.removePendingOutboxMessage(clientMsgId: line.clientMsgId)
+            if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                await self.loadLocalLines(dialogId: dialogId)
+            }
+            await self.refreshDialogs()
+        }
+    }
+
     func removeFailedMedia(_ line: Line) {
         guard line.media != nil else { return }
         Task { [weak self] in
-            guard let self, let localStore,
-                  let transfer = try? await localStore.mediaTransfer(clientMsgId: line.clientMsgId)
-            else { return }
+            guard let self, !self.sessionTeardownActive, let localStore else { return }
+            guard let transfer = try? await localStore.mediaTransfer(clientMsgId: line.clientMsgId)
+            else {
+                try? await localStore.removePendingOutboxMessage(clientMsgId: line.clientMsgId)
+                if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                    await self.loadLocalLines(dialogId: dialogId)
+                }
+                await self.refreshDialogs()
+                return
+            }
             if let activeTask = mediaTransferTasks[transfer.transferId] {
                 activeTask.cancel()
                 await activeTask.value
@@ -2504,12 +2595,27 @@ final class CloudAppModel {
 
     func toggleMuted(_ dialogId: String) {
         guard capabilities.contains(.chatOrganization) else { return }
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         updateDialog(dialogId) { $0.isMuted.toggle() }
     }
 
     func archive(_ dialogId: String) {
         guard capabilities.contains(.chatOrganization) else { return }
+        // Saved Messages is the permanent self-dialog. It can be pinned but is neither muted nor
+        // archived; legacy local archived state is ignored by the forwarding picker.
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         updateDialog(dialogId) { $0.isArchived = true }
+    }
+
+    nonisolated static func forwardingPickerDialogs(_ dialogs: [Dialog]) -> [Dialog] {
+        dialogs
+            .filter { $0.type == "saved" || !$0.isArchived }
+            .sorted {
+                if ($0.type == "saved") != ($1.type == "saved") {
+                    return $0.type == "saved"
+                }
+                return $0.updatedAt > $1.updatedAt
+            }
     }
 
     private func updateDialog(_ dialogId: String, mutation: (inout Dialog) -> Void) {
@@ -2982,7 +3088,7 @@ final class CloudAppModel {
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
-            try? await localStore.drainPendingPurges()
+            _ = try? await localStore.drainPendingPurges()
         }
         scheduleOutboxRetry()
     }
@@ -3242,13 +3348,18 @@ final class CloudAppModel {
         savedMessagesDialogId = localDialogs.first(where: { $0.type == "saved" })?.dialogId
         sortDialogsForPresentation()
         if let activeDialogId,
-           previous[activeDialogId]?.type == "group",
+           let removedType = previous[activeDialogId]?.type,
+           removedType == "group" || removedType == "saved",
            !dialogs.contains(where: { $0.id == activeDialogId }) {
             self.activeDialogId = nil
             lines = []
             presentNotice(
-                "Group access ended",
-                message: String(localized: "You are no longer a member of this group. Its offline copy was removed.")
+                removedType == "saved"
+                    ? String(localized: "Saved Messages access ended")
+                    : String(localized: "Group access ended"),
+                message: removedType == "saved"
+                    ? String(localized: "The unauthorized Saved Messages offline copy was removed.")
+                    : String(localized: "You are no longer a member of this group. Its offline copy was removed.")
             )
         }
     }
@@ -5324,6 +5435,13 @@ final class CloudAppModel {
     }
 
     func forwardMessage(_ line: Line, to targetDialogId: String) async {
+        guard !sessionTeardownActive else { return }
+        _ = await runTrackedSavedOperation {
+            await self.forwardMessageCore(line, to: targetDialogId)
+        }
+    }
+
+    private func forwardMessageCore(_ line: Line, to targetDialogId: String) async {
         #if DEBUG
         if isDemoMode {
             status = "Forwarded"
@@ -5331,45 +5449,88 @@ final class CloudAppModel {
         }
         #endif
         guard
+            !sessionTeardownActive,
             !line.isDeleted,
             let token = storedSession?.session.token,
             let accountId = storedSession?.session.accountId,
+            let localStore,
             let sourceDialogId = line.dialogId,
             let sourceMsgId = line.msgId
         else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ) else { return }
         let clientMsgId = UUID().uuidString.lowercased()
         do {
-            if let localStore {
-                _ = try await localStore.insertSending(
-                    dialogId: targetDialogId,
-                    clientMsgId: clientMsgId,
-                    text: line.text,
-                    senderAccountId: accountId,
-                    forwardedFromAccountId: line.senderAccountId,
-                    forwardedFromDialogId: sourceDialogId,
-                    forwardedFromMsgId: sourceMsgId
-                )
-            }
+            _ = try await localStore.insertSending(
+                dialogId: targetDialogId,
+                clientMsgId: clientMsgId,
+                text: line.text,
+                senderAccountId: accountId,
+                forwardedFromAccountId: line.senderAccountId,
+                forwardedFromDialogId: sourceDialogId,
+                forwardedFromMsgId: sourceMsgId,
+                kind: line.kind,
+                media: line.media
+            )
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { throw CancellationError() }
             await refreshDialogs()
-            try await sendOutboxItem(
-                PendingOutboxItem(
-                    clientMsgId: clientMsgId,
-                    dialogId: targetDialogId,
-                    body: line.text,
-                    replyToMsgId: nil,
-                    forwardedFromDialogId: sourceDialogId,
-                    forwardedFromMsgId: sourceMsgId,
-                    retryCount: 0,
-                    nextRetryAt: nil
-                ),
+            let response = try await api.forwardMessage(
+                dialogId: targetDialogId,
+                clientMsgId: clientMsgId,
+                sourceDialogId: sourceDialogId,
+                sourceMsgId: sourceMsgId,
                 token: token
             )
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { throw CancellationError() }
+            try await localStore.markSent(response, senderAccountId: accountId)
+            if activeDialogId == response.dialogId {
+                await loadLocalLines(dialogId: response.dialogId)
+            }
+            await refreshDialogs()
+            scheduleSync()
             status = "Forwarded"
+        } catch is CancellationError {
+            return
         } catch {
-            if let localStore {
-                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: retryDelay(forRetryCount: 1))
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return }
+            let disposition = cloudOperationFailureDisposition(
+                error,
+                serverAdvertisesFeature: capabilities.contains(.forwarding)
+            )
+            switch disposition {
+            case let .transient(retryAfter):
+                let delay = retryAfter ?? retryDelay(forRetryCount: 1)
+                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: delay)
                 await refreshDialogs()
-                scheduleOutboxRetry(after: retryDelay(forRetryCount: 1))
+                scheduleOutboxRetry(after: delay)
+                publishTransportFailure(error)
+            case .authenticationRequired, .unsupportedServer, .permanent:
+                // Source deletion/inaccessibility is permanent. Keep one terminal bubble with an
+                // explicit atomic Remove action instead of retrying forever.
+                try? await localStore.markFailed(clientMsgId: clientMsgId, terminal: true)
+                await refreshDialogs()
             }
             status = "Forward failed: \(error.localizedDescription)"
         }

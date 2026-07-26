@@ -189,7 +189,11 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       reply_to_msg_id: row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id),
       edit_version: row.edit_version,
       // Source identifiers stay server-side. Recipients only need the marker.
-      forwarded: row.is_forwarded === true,
+      // During the rolling backfill, old rows and old writers may still rely on complete
+      // provenance. Detached copies retain the durable marker after their source is deleted.
+      forwarded: row.is_forwarded === true || (
+        row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null
+      ),
       reactions: reactions.get(key) ?? [],
       mentions: mentions.get(key) ?? [],
       media: row.state === "deleted_for_all" ? null : media,
@@ -304,6 +308,53 @@ export async function sendMessage(sql: SQL, p: {
     let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     let mentions = normalizeMentions(p.mentions, body);
+    const recoverCanonical = async (): Promise<SendResult | null> => {
+      const canonical = (await tx`
+        SELECT dialog_id, msg_id
+        FROM messages
+        WHERE sender_account_id = ${p.senderAccountId}
+          AND client_msg_id = ${p.clientMsgId}
+        FOR SHARE`)[0];
+      if (!canonical) return null;
+      const dialogId = String(canonical.dialog_id);
+      const msgId = n(canonical.msg_id);
+      const event = (await tx`
+        SELECT pts
+        FROM account_events
+        WHERE account_id = ${p.senderAccountId}
+          AND dialog_id = ${dialogId}
+          AND msg_id = ${msgId}
+          AND type = 'message.new'
+        ORDER BY pts DESC
+        LIMIT 1`)[0];
+      const senderPts = event == null ? 0 : n(event.pts);
+      await tx`
+        UPDATE send_requests
+        SET status = 'completed', dialog_id = ${dialogId}, msg_id = ${msgId},
+            sender_pts = ${senderPts}
+        WHERE sender_account_id = ${p.senderAccountId}
+          AND client_msg_id = ${p.clientMsgId}`;
+      const msg = await loadMessage(tx, dialogId, msgId);
+      if (p.internalService === true && (
+        dialogId !== p.dialogId
+        || msg?.sender_account_id !== p.senderAccountId
+        || msg?.kind !== "service"
+        || msg?.text !== body
+      )) {
+        throw new SyncError("internal send idempotency conflict");
+      }
+      return {
+        dialogId,
+        clientMsgId: p.clientMsgId,
+        msgId,
+        senderPts,
+        duplicate: true,
+        pushes: [],
+        serverTs: msg?.server_ts,
+        text: msg?.text,
+        senderAccountId: msg?.sender_account_id,
+      };
+    };
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
       INSERT INTO send_requests (sender_account_id, client_msg_id, dialog_id, status)
@@ -315,7 +366,11 @@ export async function sendMessage(sql: SQL, p: {
         FROM send_requests
         WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}
         FOR UPDATE`)[0];
-      if (row.status !== "completed") throw new SyncError("send already in progress");
+      if (row.status !== "completed") {
+        const recovered = await recoverCanonical();
+        if (recovered) return recovered;
+        throw new SyncError("send already in progress");
+      }
       const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id));
       if (p.internalService === true && (
         row.dialog_id !== p.dialogId
@@ -331,6 +386,10 @@ export async function sendMessage(sql: SQL, p: {
         serverTs: msg?.server_ts, text: msg?.text, senderAccountId: msg?.sender_account_id,
       };
     }
+    // Older cleanup jobs removed completed receipts after 24 hours while leaving the canonical
+    // message. Rebuild the receipt before touching counters so a very late retry stays idempotent.
+    const recovered = await recoverCanonical();
+    if (recovered) return recovered;
 
     // Lifecycle service rows are authored by the original actor even if account deletion and call
     // termination commit together. `internalService` is never accepted from an HTTP request.
@@ -865,8 +924,11 @@ export async function getDifference(
 
   const revokedDialogs = new Set(rows
     .filter((event: any) =>
-      event.dialog_type === "group"
-      && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
+      event.type === "dialog.access_revoked"
+      || (
+        event.dialog_type === "group"
+        && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
+      )
     )
     .map((event: any) => String(event.dialog_id)));
   const messageKeys: MessageKey[] = rows.flatMap((event) =>
@@ -889,7 +951,7 @@ export async function getDifference(
         ptsCount: 1,
         type: "dialog.access_revoked",
         dialog_id: ev.dialog_id,
-        dialog_type: "group",
+        dialog_type: ev.dialog_type ?? ev.data?.dialog_type ?? "group",
       };
     } else if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
       const message = messages.get(`${ev.dialog_id}:${n(ev.msg_id)}`) ?? null;

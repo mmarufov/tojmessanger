@@ -13,6 +13,9 @@ WHERE namespace.nspname = 'public'
     'dialog_members_active_owner_idx',
     'dialog_members_active_page_idx',
     'dialogs_one_saved_per_account_idx',
+    'messages_forward_provenance_idx',
+    'messages_reply_target_idx',
+    'messages_forward_marker_backfill_idx',
     'message_mentions_account_idx',
     'account_events_retention_idx',
     'group_action_budgets_account_idx',
@@ -40,6 +43,14 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_members_active_page_idx
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS dialogs_one_saved_per_account_idx
   ON dialogs(created_by)
   WHERE type = 'saved';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_forward_provenance_idx
+  ON messages(forwarded_from_dialog_id, forwarded_from_msg_id)
+  WHERE forwarded_from_dialog_id IS NOT NULL AND forwarded_from_msg_id IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_reply_target_idx
+  ON messages(dialog_id, reply_to_msg_id)
+  WHERE reply_to_msg_id IS NOT NULL;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mentions_account_idx
   ON message_mentions(account_id, dialog_id, msg_id);

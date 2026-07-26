@@ -60,6 +60,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     case forward
     case delete
     case retry
+    case remove
     case inspect
 
     var id: String { rawValue }
@@ -74,6 +75,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .forward: String(localized: "Forward")
         case .delete: String(localized: "Delete")
         case .retry: String(localized: "Retry")
+        case .remove: String(localized: "Remove")
         case .inspect: String(localized: "Details")
         }
     }
@@ -88,6 +90,7 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .forward: "arrowshape.turn.up.right"
         case .delete: "trash"
         case .retry: "arrow.clockwise"
+        case .remove: "trash"
         case .inspect: "info.circle"
         }
     }

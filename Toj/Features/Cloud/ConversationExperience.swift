@@ -964,6 +964,8 @@ struct TojConversationExperience: View {
             deleteLine = line
         case .retry:
             model.retryFailedMessage(line)
+        case .remove:
+            model.removeFailedMessage(line)
         case .inspect:
             detailsLine = line
         }
@@ -1281,7 +1283,7 @@ private struct TojMessageBubble: View {
         )
         .contextMenu {
             ForEach(actions) { action in
-                Button(role: action == .delete ? .destructive : nil) {
+                Button(role: action == .delete || action == .remove ? .destructive : nil) {
                     onAction(action)
                 } label: {
                     Label(action.title, systemImage: action.systemImage)
@@ -3774,12 +3776,7 @@ private struct DemoForwardingView: View {
 
     var body: some View {
         NavigationStack {
-            List(dialogs.filter { !$0.isArchived }.sorted {
-                if ($0.type == "saved") != ($1.type == "saved") {
-                    return $0.type == "saved"
-                }
-                return $0.updatedAt > $1.updatedAt
-            }) { dialog in
+            List(CloudAppModel.forwardingPickerDialogs(dialogs)) { dialog in
                 Button {
                     TojFeedback.sent()
                     onDone(dialog.id)

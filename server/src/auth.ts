@@ -572,17 +572,15 @@ export async function deleteAccount(
     // explicit forwarded marker and every destination copy.
     await tx`
       UPDATE messages AS copy
-      SET forwarded_from_account_id = NULL,
+      SET is_forwarded = TRUE,
+          forwarded_from_account_id = NULL,
           forwarded_from_dialog_id = NULL,
           forwarded_from_msg_id = NULL
-      WHERE copy.is_forwarded = TRUE
-        AND EXISTS (
-          SELECT 1
-          FROM dialogs source
-          WHERE source.id = copy.forwarded_from_dialog_id
-            AND source.type = 'saved'
-            AND source.created_by = ${accountId}
-        )`;
+      FROM dialogs AS source
+      WHERE copy.forwarded_from_dialog_id = source.id
+        AND copy.forwarded_from_msg_id IS NOT NULL
+        AND source.type = 'saved'
+        AND source.created_by = ${accountId}`;
     // Saved Messages is the account owner's private cloud archive. Unlike direct/group history it
     // has no other participant who can retain the conversation after account deletion.
     await tx`

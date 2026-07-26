@@ -7,8 +7,10 @@ gitignored notes.
 ## Probes and request logs
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
-- `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider state. A database
-  failure returns `500`, so deployment tooling must require a `200` before switching traffic.
+- `GET /ready` checks PostgreSQL and the complete Saved Messages catalog contract. It returns `503`
+  until the forward marker column, validated constraints, unique/index contracts, claims table,
+  mixed-writer and deletion triggers, and completed migration progress row are all present. A
+  database failure returns `500`; deployment tooling must require `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
@@ -21,7 +23,9 @@ The server runs an hourly, bounded cleanup. Each table deletes at most 1,000 eli
 expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal push deliveries
 older than seven days. Incomplete media uploads are resumable for 24 hours and are then removed with
 their encrypted chunks; expired upload-attempt rate records and unattached completed media are also
-removed. Message history, attached media, and the account event log are never deleted by this worker.
+removed. Only abandoned `pending` send claims expire after 24 hours. Completed send receipts are
+durable so a device retrying after days can recover the canonical `client_msg_id`. Message history,
+attached media, and the account event log are never deleted by this worker.
 
 ## Media storage
 
@@ -153,10 +157,30 @@ processed account, defaults to 25 ms, and is bounded to 60 seconds.
 The dialog type constraint deploys in expand/validate/contract phases. `schema-dialogs-expand.sql`
 adds the wider constraint as `NOT VALID`, PostgreSQL validates it without blocking ordinary
 reads/writes, and `schema-dialogs-swap.sql` holds `ACCESS EXCLUSIVE` only for the short name swap.
-Keep Saved Messages at zero percent until the swap completes. Rolling application binaries back is
-safe after the swap: older binaries continue writing `direct` and `group`, while the database keeps
-accepting already-created `saved` rows. Do not roll the database constraint back while Saved rows
-exist; disable advertisement/ensure instead.
+The forward marker has its own expand/backfill/contract sequence. Expand adds the column and trigger;
+old writers that omit the marker are classified from complete provenance. The temporary partial
+index contains only unfinished legacy rows, and the Bun worker advances a durable `(dialog_id,
+msg_id)` cursor in bounded transactions. Contract validates the invariant and removes the empty
+temporary index. Normal `schema.sql` reruns never update `messages.is_forwarded`, and completed
+migrations skip both temporary-index creation and the keyset worker.
+
+Keep Saved Messages at zero percent until both contracts complete. An application rollback is safe
+only while these database artifacts remain installed. The account-status trigger performs Saved
+archive deletion and provenance detachment at the database boundary, so an older application binary
+cannot strand an archive or cascade-delete forwarded copies. The new binary also refuses readiness
+and capability advertisement if that trigger or any required catalog object is absent. Never roll
+the database contract back while Saved rows may exist; close advertisement/ensure with the feature
+switch instead. The mixed-node regression covers old-writer insertion, new-reader derivation, and
+account deletion. The production-like migration test is:
+
+```bash
+bun run test:migration:forward
+```
+
+It refuses non-local databases unless the database name ends in `_migration_test`, loads 100,000
+messages, runs concurrent writes during bounded backfill, verifies WAL/runtime budgets and both query
+plans, checks interrupted-index cleanup, and reruns the normal migration twice. It does not run the
+production Saved-dialog provisioning backfill.
 
 Protected `/metrics` output includes `toj_saved_messages_ensure_total` by bounded result,
 ensure duration sum/count, and `toj_saved_messages_invariant_violation_total`. Page immediately on

@@ -28,6 +28,7 @@ actor SavedMessagesService {
     private var activeScope: Scope?
     private var inFlight: InFlight?
     private var cancellationBarrier: CancellationBarrier?
+    private var isResetting = false
 
     func localDialogId(store: CloudLocalStore, accountId: String) async throws -> String? {
         try await store.savedMessagesDialogId(accountId: accountId)
@@ -41,6 +42,7 @@ actor SavedMessagesService {
         token: String,
         generation: UInt64
     ) async throws -> String {
+        guard !isResetting else { throw SavedMessagesServiceError.staleSession }
         let scope = Scope(
             accountId: accountId,
             token: token,
@@ -94,19 +96,28 @@ actor SavedMessagesService {
 
     /// Invalidates the active session and does not return until its exact provisioning task exits.
     func reset() async {
+        if isResetting {
+            await awaitCancellationBarrier()
+            return
+        }
+        isResetting = true
         activeScope = nil
         await cancelAndAwaitInFlight()
         await awaitCancellationBarrier()
+        isResetting = false
     }
 
     private func transition(to scope: Scope) async throws {
+        guard !isResetting else { throw SavedMessagesServiceError.staleSession }
         if activeScope != scope {
             activeScope = scope
             await cancelAndAwaitInFlight()
         }
         await awaitCancellationBarrier()
         try Task.checkCancellation()
-        guard activeScope == scope else { throw SavedMessagesServiceError.staleSession }
+        guard !isResetting, activeScope == scope else {
+            throw SavedMessagesServiceError.staleSession
+        }
     }
 
     private func cancelAndAwaitInFlight() async {

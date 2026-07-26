@@ -549,14 +549,16 @@ private struct CloudChatsView: View {
                                         Button(dialog.isPinned ? "Unpin" : "Pin", systemImage: dialog.isPinned ? "pin.slash" : "pin") {
                                             model.togglePinned(dialog.id)
                                         }
-                                        Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
-                                            model.toggleMuted(dialog.id)
+                                        if dialog.type != "saved" {
+                                            Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
+                                                model.toggleMuted(dialog.id)
+                                            }
+                                            Button("Archive", systemImage: "archivebox") { model.archive(dialog.id) }
                                         }
-                                        Button("Archive", systemImage: "archivebox") { model.archive(dialog.id) }
                                     }
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    if model.capabilities.contains(.chatOrganization) {
+                                    if model.capabilities.contains(.chatOrganization), dialog.type != "saved" {
                                         Button { model.archive(dialog.id) } label: {
                                             Label("Archive", systemImage: "archivebox")
                                         }
@@ -744,19 +746,21 @@ private struct CloudChatsView: View {
             if isEditing, model.capabilities.contains(.chatOrganization) {
                 HStack(spacing: 0) {
                     CloudDialogRow(dialog: dialog)
-                    Button {
-                        withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
-                            model.archive(dialog.id)
+                    if dialog.type != "saved" {
+                        Button {
+                            withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
+                                model.archive(dialog.id)
+                            }
+                        } label: {
+                            Image(systemName: "archivebox.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(TojTheme.gold)
+                                .frame(width: 44, height: 44)
+                                .background(TojTheme.raised, in: Circle())
                         }
-                    } label: {
-                        Image(systemName: "archivebox.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(TojTheme.gold)
-                            .frame(width: 44, height: 44)
-                            .background(TojTheme.raised, in: Circle())
+                        .buttonStyle(.tojPressable)
+                        .accessibilityLabel("Archive")
                     }
-                    .buttonStyle(.tojPressable)
-                    .accessibilityLabel("Archive")
                 }
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             } else if let onOpen {

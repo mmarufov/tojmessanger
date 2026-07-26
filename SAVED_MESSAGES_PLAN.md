@@ -1,8 +1,10 @@
 # Saved Messages v1 - Engineering Plan
 
-Status: implementation and review-remediation complete on `mmarufov/saved-messages-plan`;
-automated backend, iOS unit/UI, exact forwarding/account-deletion, and Release build gates verified
-2026-07-25. Physical-device performance and production rollout/canary gates remain open.
+Status: implementation plus independent launch-review remediation complete on
+`mmarufov/saved-messages-plan`. Automated backend, production-sized migration, serialized iOS
+unit/UI, exact forwarding/account-deletion, and Release simulator/device compile gates were
+reverified 2026-07-26. Physical-device runtime performance and production rollout/canary gates
+remain open; the production provisioning backfill has not been run.
 
 Baseline: `0df5aa9` (`origin/main`)
 
@@ -987,6 +989,30 @@ Never emit dialog ids, account ids, text, file names, phone numbers, tokens, or 
 8. Run the bounded backfill only after the 100% client capability is stable.
 9. Keep the flag for rollback. Rollback closes provisioning and advertisement but preserves existing
    local/server data.
+
+Launch-review Definition of Done:
+
+- [x] Forward marker migration is expand / bounded keyset backfill / validate-contract; a completed
+  normal migration rerun never creates the temporary index or enters the backfill worker.
+- [x] Mixed nodes are safe: old provenance-only writes derive the marker, new reads temporarily use
+  marker-or-provenance, and deletion detaches provenance while preserving the marker and copy.
+- [x] Concurrent partial provenance/reply indexes have invalid-shell cleanup and production-sized
+  query-plan proof.
+- [x] Database-boundary deletion cleanup makes application rollback compatible while Saved rows
+  exist; new binaries fail readiness if the cleanup fence or any schema prerequisite is missing.
+- [x] Saved setup/Save/forward are session-generation, token, account, and SQLCipher-store scoped;
+  synchronous teardown cancels and awaits tracked work before erasure.
+- [x] Optimistic forwarding clones photo/video/file/voice metadata and target `message_media`,
+  survives offline and response-before-difference process death, and reconciles by `client_msg_id`.
+- [x] Permanent forward failures terminate immediately and atomic Remove drops only the pending
+  target reference, retaining shared encrypted cache bytes.
+- [x] Completed send receipts are durable; a legacy missing receipt is rebuilt from the canonical
+  message without consuming a new message id.
+- [x] Unauthorized Saved membership repair emits access revocation, silent push, sync wakeup, and
+  causes the receiving SQLCipher replica and encrypted media ledger to purge.
+- [x] Saved Messages cannot be muted or newly archived and remains first/available in the forwarding
+  picker even if an old in-memory archive flag is present.
+- [x] Russian and Tajik cover all new setup, failure, purge, retry, Remove, and Saved copy.
 
 Old clients decode dialog types as strings and should not corrupt data, but they may present a saved
 dialog as a degraded direct chat. Because account events are shared across devices, rollout must favor

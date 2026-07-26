@@ -305,12 +305,9 @@ CREATE TABLE IF NOT EXISTS messages (
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_account_id UUID REFERENCES accounts(id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_dialog_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS forwarded_from_msg_id BIGINT;
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;
-UPDATE messages
-SET is_forwarded = TRUE
-WHERE is_forwarded = FALSE
-  AND forwarded_from_dialog_id IS NOT NULL
-  AND forwarded_from_msg_id IS NOT NULL;
+-- Existing deployments add/backfill/validate is_forwarded in the dedicated
+-- schema-message-forward-{expand,contract}.sql migration. Keeping that work out of this normally
+-- rerun schema file prevents an unbounded messages scan on every deploy.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_objects(id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_data JSONB;
@@ -378,7 +375,8 @@ ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
 ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
   ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
    'dialog.created','member.added','member.removed','member.role_changed','member.left',
-   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated'));
+   'dialog.profile_updated','dialog.closed','dialog.access_revoked','dialog.preferences_updated',
+   'profile.updated'));
 
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (

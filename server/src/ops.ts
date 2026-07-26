@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
+import { savedMessagesSchemaReadiness } from "./saved-messages";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 const CLEANUP_BATCH_SIZE = 1_000;
@@ -127,10 +128,13 @@ export function providerState(value: unknown): ProviderState {
 export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState }) {
   const started = performance.now();
   await sql`SELECT 1`;
+  const savedMessages = await savedMessagesSchemaReadiness(sql);
   return {
-    status: "ready",
+    status: savedMessages.ready ? "ready" : "not_ready",
     database: "ready",
     providers,
+    savedMessagesSchema: savedMessages.ready ? "ready" : "incomplete",
+    missingSchemaObjects: savedMessages.missing,
     databaseLatencyMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10),
   };
 }
@@ -198,7 +202,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const sendRequests = await sql`
     WITH doomed AS (
       SELECT sender_account_id, client_msg_id FROM send_requests
-      WHERE created_at < now() - interval '24 hours'
+      WHERE status = 'pending' AND created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
     )
     DELETE FROM send_requests request USING doomed

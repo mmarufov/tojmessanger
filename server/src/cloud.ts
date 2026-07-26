@@ -107,6 +107,7 @@ import {
   ensureSavedMessages,
   savedMessagesConfigured,
   savedMessagesEnabledForAccount,
+  savedMessagesSchemaReadiness,
   SavedMessagesError,
 } from "./saved-messages";
 
@@ -293,10 +294,11 @@ export function startCloudServer(
         if (url.pathname === "/health") response = new Response("ok");
 
         else if (url.pathname === "/ready") {
-          response = json(await readiness(db, {
+          const state = await readiness(db, {
             sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
             push: pushSender ? "configured" : "disabled",
-          }));
+          });
+          response = json(state, state.status === "ready" ? 200 : 503);
         }
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
@@ -306,7 +308,8 @@ export function startCloudServer(
             ? videoCallsEnabledForAccount(capabilitySession.accountId, videoAvailable)
             : false;
           const accountSavedMessagesAvailable = capabilitySession
-            ? savedMessagesEnabledForAccount(capabilitySession.accountId)
+            ? (await savedMessagesSchemaReadiness(db)).ready
+              && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
           response = json(cloudCapabilities(
             callsAvailable,
@@ -362,7 +365,10 @@ export function startCloudServer(
         else if (
           url.pathname === "/v1/dialogs/saved"
           && req.method === "POST"
-          && !savedMessagesConfigured()
+          && (
+            !savedMessagesConfigured()
+            || !(await savedMessagesSchemaReadiness(db)).ready
+          )
         ) {
           response = new Response("not found", { status: 404 });
         }

@@ -1368,13 +1368,18 @@ actor CloudLocalStore {
         mentions: [CloudMention] = [],
         forwardedFromAccountId: String? = nil,
         forwardedFromDialogId: String? = nil,
-        forwardedFromMsgId: Int64? = nil
+        forwardedFromMsgId: Int64? = nil,
+        kind: String = "text",
+        media: CloudMedia? = nil
     ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
         let mentionsJSON = try String(
             data: JSONEncoder().encode(mentions),
             encoding: .utf8
         ) ?? "[]"
+        let mediaJSON = media
+            .flatMap { try? JSONEncoder().encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
         try dbQueue.write { db in
             try upsertDialog(db, dialogId: dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
             try db.execute(
@@ -1383,10 +1388,11 @@ actor CloudLocalStore {
                   local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
                   reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
                   forwarded_from_msg_id, is_forwarded, mentions_json,
-                  edit_version, state, server_ts, local_state
+                  media_json, edit_version, state, server_ts, local_state
                 )
-                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
+                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
                 ON CONFLICT(client_msg_id) DO UPDATE SET
+                  kind = excluded.kind,
                   text = excluded.text,
                   reply_to_msg_id = excluded.reply_to_msg_id,
                   forwarded_from_account_id = excluded.forwarded_from_account_id,
@@ -1394,14 +1400,24 @@ actor CloudLocalStore {
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   is_forwarded = excluded.is_forwarded,
                   mentions_json = excluded.mentions_json,
+                  media_json = excluded.media_json,
                   local_state = 'sending'
                 """,
                 arguments: [
-                    localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId,
+                    localId, dialogId, clientMsgId, senderAccountId, kind, text, replyToMsgId,
                     forwardedFromAccountId, forwardedFromDialogId, forwardedFromMsgId,
-                    forwardedFromMsgId != nil, mentionsJSON
+                    forwardedFromMsgId != nil, mentionsJSON, mediaJSON
                 ]
             )
+            if let media {
+                try Self.upsertMessageMedia(
+                    db,
+                    localId: localId,
+                    dialogId: dialogId,
+                    msgId: nil,
+                    media: media
+                )
+            }
             try db.execute(
                 sql: """
                 INSERT INTO pending_outbox (
@@ -1432,7 +1448,7 @@ actor CloudLocalStore {
             clientMsgId: clientMsgId,
             senderAccountId: senderAccountId,
             senderDisplayName: nil,
-            kind: "text",
+            kind: kind,
             text: text,
             replyToMsgId: replyToMsgId,
             forwardedFromAccountId: forwardedFromAccountId,
@@ -1441,7 +1457,7 @@ actor CloudLocalStore {
             isForwarded: forwardedFromMsgId != nil,
             reactions: [],
             mentions: mentions,
-            media: nil,
+            media: media,
             serviceType: nil,
             serviceData: nil,
             editVersion: 0,
@@ -1496,6 +1512,45 @@ actor CloudLocalStore {
                 arguments: [nextRetryAt, terminal, clientMsgId]
             )
             if let dialogId { try refreshDialogSummary(db, dialogId: dialogId) }
+        }
+    }
+
+    /// Atomically removes a terminal optimistic send and its target attachment reference. Cached
+    /// bytes are keyed by media_id and intentionally remain because the source message may share
+    /// them.
+    func removePendingOutboxMessage(clientMsgId: String) throws {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT local_id, dialog_id
+                FROM messages
+                WHERE client_msg_id = ? AND msg_id IS NULL
+                """,
+                arguments: [clientMsgId]
+            ) else {
+                try db.execute(
+                    sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                    arguments: [clientMsgId]
+                )
+                return
+            }
+            let localId: String = row["local_id"]
+            let dialogId: String = row["dialog_id"]
+            try db.execute(
+                sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
+            try db.execute(
+                sql: "DELETE FROM message_media WHERE local_id = ?",
+                arguments: [localId]
+            )
+            try db.execute(
+                sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
+                arguments: [clientMsgId]
+            )
+            try refreshDialogSummary(db, dialogId: dialogId)
+            try refreshAllUnreadSummaries(db, dialogId: dialogId)
         }
     }
 
@@ -1983,6 +2038,12 @@ actor CloudLocalStore {
                             localState: "sent",
                             refreshSummaries: false
                         )
+                        // A push/difference can beat the HTTP response or arrive after a process
+                        // relaunch. Canonical client_msg_id acknowledgement owns outbox cleanup.
+                        try db.execute(
+                            sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                            arguments: [message.clientMsgId]
+                        )
                         let isUnread = message.state == "visible"
                             && message.senderAccountId != accountId
                             && message.msgId > currentRead
@@ -2054,11 +2115,14 @@ actor CloudLocalStore {
                         }
                     case "dialog.access_revoked":
                         guard let dialogId = update.dialogId else { continue }
+                        let reason = update.dialogType == "saved"
+                            ? "This Saved Messages archive is no longer authorized for this account."
+                            : "You no longer have access to this group."
                         try revokeGroupAccess(
                             db,
                             dialogId: dialogId,
                             accessState: "removed",
-                            reason: "You no longer have access to this group."
+                            reason: reason
                         )
                     case "read.updated":
                         guard

@@ -6,6 +6,7 @@
     "start": "bun run server.ts",
     "cloud": "bun run src/cloud.ts",
     "migrate": "bun run src/migrate.ts",
+    "test:migration:forward": "bun run scripts/test-message-forward-migration.ts",
     "backfill:saved-messages": "bun run scripts/backfill-saved-messages.ts",
     "backup": "bash scripts/backup-postgres.sh",
     "restore-drill": "bash scripts/restore-drill.sh",

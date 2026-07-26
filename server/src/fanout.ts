@@ -91,3 +91,33 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     ptsCount: 1,
   }));
 }
+
+/** Emits a purge-only event after membership has already been removed. */
+export async function appendAccessRevokedEvent(
+  sql: SQL,
+  accountId: string,
+  dialogId: string,
+  actorAccountId: string,
+  dialogType: "group" | "saved",
+): Promise<FanoutPush> {
+  const state = (await sql`
+    UPDATE account_sync_states
+    SET pts = pts + 1, updated_at = now()
+    WHERE account_id = ${accountId}
+    RETURNING pts`)[0];
+  const pts = n(state.pts);
+  await sql`
+    INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id, data)
+    VALUES (
+      ${accountId}, ${pts}, 'dialog.access_revoked', ${dialogId}, ${actorAccountId},
+      ${JSON.stringify({ dialog_type: dialogType })}::jsonb
+    )`;
+  await sql`
+    INSERT INTO push_deliveries (account_id, pts, device_id, alert)
+    SELECT ${accountId}, ${pts}, id, false
+    FROM devices
+    WHERE account_id = ${accountId} AND platform = 'ios' AND revoked_at IS NULL
+      AND push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL
+    ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
+  return { accountId, pts, ptsCount: 1 };
+}

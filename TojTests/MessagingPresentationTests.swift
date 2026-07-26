@@ -47,6 +47,29 @@ final class MessagingPresentationTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testForwardingPickerKeepsArchivedSavedMessagesFirst() {
+        var saved = CloudAppModel.Dialog(
+            id: "saved", title: "Saved Messages", type: "saved", subtitle: "",
+            updatedAt: "2026-01-01T00:00:00Z", isPending: false, unreadCount: 0
+        )
+        saved.isArchived = true
+        var hidden = CloudAppModel.Dialog(
+            id: "hidden", title: "Archived", subtitle: "",
+            updatedAt: "2026-07-26T00:00:00Z", isPending: false, unreadCount: 0
+        )
+        hidden.isArchived = true
+        let recent = CloudAppModel.Dialog(
+            id: "recent", title: "Recent", subtitle: "",
+            updatedAt: "2026-07-25T00:00:00Z", isPending: false, unreadCount: 0
+        )
+
+        XCTAssertEqual(
+            CloudAppModel.forwardingPickerDialogs([recent, hidden, saved]).map(\.id),
+            ["saved", "recent"]
+        )
+    }
+
     func testMediaBubbleGeometryPreservesNormalRatiosAndBoundsExtremes() {
         XCTAssertEqual(MediaBubbleLayout.size(width: 1_000, height: 1_000), CGSize(width: 268, height: 268))
         XCTAssertEqual(MediaBubbleLayout.size(width: 1_600, height: 900).width, 268)

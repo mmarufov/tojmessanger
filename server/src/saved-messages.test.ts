@@ -7,6 +7,7 @@ import {
   startVerification,
 } from "./auth";
 import { startCloudServer } from "./cloud";
+import { bodyAAD, seal } from "./crypto";
 import { makeSql } from "./db";
 import { createGroup } from "./groups";
 import {
@@ -15,6 +16,7 @@ import {
   downloadMediaChunk,
   uploadMediaChunk,
 } from "./media";
+import { registerPushToken } from "./push";
 import {
   claimSavedMessagesBackfillAccounts,
   completeSavedMessagesBackfillClaim,
@@ -23,6 +25,7 @@ import {
   requireSavedMessagesBackfillAuthorization,
   savedMessagesBackfillThrottleMs,
   savedMessagesEnabledForAccount,
+  savedMessagesSchemaReadiness,
   SavedMessagesError,
 } from "./saved-messages";
 import {
@@ -204,6 +207,12 @@ describe("Saved Messages v1", () => {
     await db`
       INSERT INTO dialog_members (dialog_id, account_id, role)
       VALUES (${saved.dialogId}, ${outsider.accountId}, 'member')`;
+    await registerPushToken(
+      db,
+      outsider.deviceId,
+      "a".repeat(64),
+      "sandbox",
+    );
 
     const repaired = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
     expect(repaired).toMatchObject({ dialogId: saved.dialogId, created: false, repaired: true });
@@ -221,6 +230,27 @@ describe("Saved Messages v1", () => {
       title: null,
       closed_at: null,
     });
+    expect(repaired.pushes).toContainEqual(expect.objectContaining({
+      accountId: outsider.accountId,
+      ptsCount: 1,
+    }));
+    const outsiderDifference = await getDifference(db, outsider.accountId, 0);
+    if (outsiderDifference.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(outsiderDifference.updates).toContainEqual(expect.objectContaining({
+      type: "dialog.access_revoked",
+      dialog_id: saved.dialogId,
+      dialog_type: "saved",
+    }));
+    expect((await db`
+      SELECT alert FROM push_deliveries
+      WHERE account_id = ${outsider.accountId} AND device_id = ${outsider.deviceId}
+      ORDER BY pts DESC LIMIT 1`)[0]).toMatchObject({ alert: false });
+    const ptsAfterRepair = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${outsider.accountId}`)[0].pts);
+    await ensureSavedMessages(db, owner.accountId, owner.deviceId);
+    expect(Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${outsider.accountId}`)[0].pts))
+      .toBe(ptsAfterRepair);
   });
 
   test("reuses ordinary send, difference, history, and bootstrap pipelines", async () => {
@@ -342,6 +372,58 @@ describe("Saved Messages v1", () => {
     expect(swap).toContain("COMMIT;");
   });
 
+  test("readiness fails closed for every Saved Messages schema contract", async () => {
+    expect(await savedMessagesSchemaReadiness(db)).toEqual({ ready: true, missing: [] });
+
+    await db`ALTER TABLE messages ALTER COLUMN is_forwarded DROP NOT NULL`;
+    try {
+      expect((await savedMessagesSchemaReadiness(db)).missing).toContain("messages.is_forwarded");
+    } finally {
+      await db`ALTER TABLE messages ALTER COLUMN is_forwarded SET NOT NULL`;
+    }
+
+    await db`ALTER TABLE messages DROP CONSTRAINT messages_forward_marker_check`;
+    await db`
+      ALTER TABLE messages ADD CONSTRAINT messages_forward_marker_check
+      CHECK (
+        forwarded_from_dialog_id IS NULL
+        OR forwarded_from_msg_id IS NULL
+        OR is_forwarded = TRUE
+      ) NOT VALID`;
+    expect((await savedMessagesSchemaReadiness(db)).missing)
+      .toContain("messages_forward_marker_check");
+    await db`ALTER TABLE messages VALIDATE CONSTRAINT messages_forward_marker_check`;
+
+    await db`DROP INDEX dialogs_one_saved_per_account_idx`;
+    try {
+      expect((await savedMessagesSchemaReadiness(db)).missing)
+        .toContain("dialogs_one_saved_per_account_idx");
+    } finally {
+      await db`
+        CREATE UNIQUE INDEX dialogs_one_saved_per_account_idx
+        ON dialogs(created_by) WHERE type = 'saved'`;
+    }
+
+    await db`ALTER TABLE saved_messages_backfill_claims RENAME COLUMN worker_id TO worker_id_missing`;
+    try {
+      expect((await savedMessagesSchemaReadiness(db)).missing)
+        .toContain("saved_messages_backfill_claims");
+    } finally {
+      await db`
+        ALTER TABLE saved_messages_backfill_claims
+        RENAME COLUMN worker_id_missing TO worker_id`;
+    }
+
+    await db`
+      UPDATE schema_migration_progress SET completed_at = NULL
+      WHERE migration_name = 'messages_is_forwarded_v1'`;
+    expect((await savedMessagesSchemaReadiness(db)).missing).toContain("messages_is_forwarded_v1");
+    await db`
+      UPDATE schema_migration_progress SET completed_at = now()
+      WHERE migration_name = 'messages_is_forwarded_v1'`;
+    expect(await savedMessagesSchemaReadiness(db)).toEqual({ ready: true, missing: [] });
+  });
+
   test("account deletion removes Saved Messages and its history", async () => {
     const owner = await account("+16505554106", "Owner");
     const saved = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
@@ -395,6 +477,86 @@ describe("Saved Messages v1", () => {
              forwarded_from_msg_id
       FROM messages
       WHERE dialog_id = ${direct.dialogId} AND msg_id = ${copy.msgId}`)[0]).toMatchObject({
+      is_forwarded: true,
+      forwarded_from_account_id: null,
+      forwarded_from_dialog_id: null,
+      forwarded_from_msg_id: null,
+    });
+  });
+
+  test("old writer, new reader, and account deletion stay safe during marker backfill", async () => {
+    const owner = await account("+16505554112", "Legacy Owner");
+    const peer = await account("+16505554113", "Legacy Peer");
+    const saved = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
+    const source = await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "legacy forwarded body",
+    });
+    const direct = await getOrCreateDirectDialog(db, owner.accountId, peer.accountId);
+    const legacyMsgId = 9_999;
+    const legacyClientId = crypto.randomUUID();
+    const encrypted = seal(
+      "legacy forwarded body",
+      bodyAAD(direct.dialogId, legacyMsgId, owner.accountId),
+    );
+
+    // This is the old binary's INSERT shape: provenance is present and is_forwarded is omitted.
+    await db`
+      INSERT INTO messages (
+        dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
+        body_key_id, body_nonce, body_ciphertext,
+        forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id
+      ) VALUES (
+        ${direct.dialogId}, ${legacyMsgId}, ${owner.accountId}, ${owner.deviceId},
+        ${legacyClientId}, 'text', ${encrypted.keyId}, ${encrypted.nonce},
+        ${encrypted.ciphertext}, ${owner.accountId}, ${saved.dialogId}, ${source.msgId}
+      )`;
+    expect(Boolean((await db`
+      SELECT is_forwarded FROM messages
+      WHERE dialog_id = ${direct.dialogId} AND msg_id = ${legacyMsgId}`)[0].is_forwarded)).toBe(true);
+
+    // Model a row that predates the trigger and has not yet been reached by the keyset worker.
+    await db`ALTER TABLE messages DROP CONSTRAINT messages_forward_marker_check`;
+    await db`ALTER TABLE messages DISABLE TRIGGER messages_derive_forward_marker`;
+    try {
+      await db`
+        UPDATE messages SET is_forwarded = FALSE
+        WHERE dialog_id = ${direct.dialogId} AND msg_id = ${legacyMsgId}`;
+    } finally {
+      await db`ALTER TABLE messages ENABLE TRIGGER messages_derive_forward_marker`;
+      await db`
+        ALTER TABLE messages ADD CONSTRAINT messages_forward_marker_check
+        CHECK (
+          forwarded_from_dialog_id IS NULL
+          OR forwarded_from_msg_id IS NULL
+          OR is_forwarded = TRUE
+        ) NOT VALID`;
+    }
+
+    const mixedHistory = await getHistory(db, peer.accountId, direct.dialogId);
+    expect(mixedHistory.messages.find((message) => message.msg_id === legacyMsgId)).toMatchObject({
+      text: "legacy forwarded body",
+      forwarded: true,
+    });
+
+    const deletion = await startAccountDeletion(db, owner.accountId);
+    await deleteAccount(db, owner.accountId, deletion.code!);
+    await db`ALTER TABLE messages VALIDATE CONSTRAINT messages_forward_marker_check`;
+
+    const preserved = await getHistory(db, peer.accountId, direct.dialogId);
+    expect(preserved.messages.find((message) => message.msg_id === legacyMsgId)).toMatchObject({
+      text: "legacy forwarded body",
+      forwarded: true,
+      state: "visible",
+    });
+    expect((await db`
+      SELECT is_forwarded, forwarded_from_account_id, forwarded_from_dialog_id,
+             forwarded_from_msg_id
+      FROM messages
+      WHERE dialog_id = ${direct.dialogId} AND msg_id = ${legacyMsgId}`)[0]).toMatchObject({
       is_forwarded: true,
       forwarded_from_account_id: null,
       forwarded_from_dialog_id: null,
