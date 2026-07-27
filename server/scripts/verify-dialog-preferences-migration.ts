@@ -117,17 +117,42 @@ try {
         (SELECT convalidated FROM pg_constraint
          WHERE conrelid = 'account_events'::regclass
            AND conname = 'account_events_type_check'),
-        (SELECT count(*) FROM dialog_preference_legacy_reconciliation)
+        (SELECT count(*) FROM dialog_preference_legacy_reconciliation),
+        (SELECT contract_version = 1 AND contract_completed_at IS NOT NULL
+         FROM online_migration_cursors
+         WHERE migration_name = 'dialog_preferences_v1'),
+        EXISTS (
+          SELECT 1
+          FROM pg_trigger trigger_row
+          JOIN pg_proc function_row ON function_row.oid = trigger_row.tgfoid
+          WHERE trigger_row.tgrelid = 'dialog_members'::regclass
+            AND trigger_row.tgname = 'dialog_members_notification_mode_mirror'
+            AND trigger_row.tgenabled = 'O'
+            AND function_row.proname =
+              'mirror_dialog_notification_mode_to_preferences_v1_final'
+        ),
+        to_regclass('public.dialog_preference_reconciliation_account_idx') IS NOT NULL
     `}`.quiet().text()
   ).trim().split("|");
-  const [preferenceCount, processedCount, completed, constraintValidated, backlog] =
-    verification;
+  const [
+    preferenceCount,
+    processedCount,
+    completed,
+    constraintValidated,
+    backlog,
+    contractCompleted,
+    finalTrigger,
+    reconciliationIndex,
+  ] = verification;
   if (
     Number(preferenceCount) !== fixtureRows
     || Number(processedCount) !== fixtureRows
     || completed !== "t"
     || constraintValidated !== "t"
     || Number(backlog) !== 0
+    || contractCompleted !== "t"
+    || finalTrigger !== "t"
+    || reconciliationIndex !== "t"
   ) {
     throw new Error(`migration verification mismatch: ${verification.join("|")}`);
   }

@@ -56,15 +56,29 @@ CREATE TABLE IF NOT EXISTS online_migration_cursors (
   last_account_id UUID,
   rows_processed BIGINT NOT NULL DEFAULT 0,
   completed_at TIMESTAMPTZ,
+  contract_version INTEGER NOT NULL DEFAULT 0,
+  contract_completed_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK (
     (last_dialog_id IS NULL AND last_account_id IS NULL)
     OR (last_dialog_id IS NOT NULL AND last_account_id IS NOT NULL)
   )
 );
-INSERT INTO online_migration_cursors (migration_name)
-VALUES ('dialog_preferences_v1')
-ON CONFLICT (migration_name) DO NOTHING;
+ALTER TABLE online_migration_cursors
+  ADD COLUMN IF NOT EXISTS contract_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE online_migration_cursors
+  ADD COLUMN IF NOT EXISTS contract_completed_at TIMESTAMPTZ;
+-- Invalidate the final contract in the same short transaction that installs staging behavior.
+-- If any later expand DDL fails, PostgreSQL rolls both changes back and the prior final contract
+-- remains live. Rerunning expand on a contracted database therefore cannot fail open.
+INSERT INTO online_migration_cursors (
+  migration_name, contract_version, contract_completed_at
+)
+VALUES ('dialog_preferences_v1', 0, NULL)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = 0,
+  contract_completed_at = NULL,
+  updated_at = statement_timestamp();
 
 ALTER TABLE bootstrap_snapshot_dialogs
   ADD COLUMN IF NOT EXISTS preferences_captured BOOLEAN NOT NULL DEFAULT FALSE;
@@ -87,7 +101,9 @@ BEGIN
     FROM pg_constraint
     WHERE conrelid = 'account_events'::regclass
       AND conname = 'account_events_type_check'
-      AND pg_get_constraintdef(oid) LIKE '%dialog.preferences_updated%'
+      AND contype = 'c'
+      AND convalidated
+      AND pg_get_expr(conbin, conrelid, TRUE) = $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text])$constraint$
   ) THEN
     RETURN;
   END IF;
@@ -110,7 +126,7 @@ $$;
 
 -- During the backfill, protect rows inserted or muted by an old server. This version only mirrors
 -- state: it cannot emit the new event until the replacement account_events constraint is live.
-CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences()
+CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_staging()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
@@ -151,6 +167,6 @@ DROP TRIGGER IF EXISTS dialog_members_notification_mode_mirror ON dialog_members
 CREATE TRIGGER dialog_members_notification_mode_mirror
 AFTER INSERT OR UPDATE OF notification_mode ON dialog_members
 FOR EACH ROW
-EXECUTE FUNCTION mirror_dialog_notification_mode_to_preferences();
+EXECUTE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_staging();
 
 COMMIT;

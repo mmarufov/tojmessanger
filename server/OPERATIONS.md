@@ -8,15 +8,19 @@ gitignored notes.
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
 - `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider
-  state. It returns `503` whenever the dialog-preference relations, runtime columns, validated event
-  constraint, migration cursor, or reconciliation state required by this binary are incomplete,
+  state. It returns `503` whenever the dialog-preference relations, exact runtime column signatures,
+  conflict-key constraints, final compatibility trigger, exact validated event constraint, versioned
+  contract marker, migration cursor, or reconciliation state required by this binary are incomplete,
   even when both preference rollout switches are off. A database failure returns `500`; deployment
   tooling must require a `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
 - `GET /metrics` exists only when `TOJ_METRICS_TOKEN` is set and requires that value as a bearer token.
-  Metrics use normalized route labels to avoid secrets and unbounded label cardinality.
+  Metrics use normalized route labels to avoid secrets and unbounded label cardinality. Preference
+  metrics remain available before expand and report `toj_dialog_preference_schema_available 0`;
+  retained idempotency size uses PostgreSQL's planner estimate rather than scanning the permanently
+  retained dedupe table.
 
 ## Maintenance
 
@@ -132,13 +136,16 @@ mirrors that value and emits the account PTS update needed by new clients, inclu
 new server nodes overlap. The trigger deliberately remains active when behavior is killed so a
 rollback cannot strand a durable legacy mute or create a sync gap.
 
-Readiness always requires every preference table and runtime bootstrap column, a validated
-`account_events_type_check` that admits `dialog.preferences_updated`, the completed
-`dialog_preferences_v1` migration cursor, and an empty legacy reconciliation table. This is
+Readiness always requires every preference table and exact runtime column signature, every primary
+or unique constraint used by `ON CONFLICT`, the enabled
+`dialog_members_notification_mode_mirror` trigger bound to the final versioned function, the exact
+validated `account_events_type_check`, contract version 1 with its completion timestamp, the
+completed `dialog_preferences_v1` backfill cursor, and an empty legacy reconciliation table. This is
 independent of the rollout switches because ordinary message fanout, direct-dialog creation, and
 bootstrap SQL are compiled against the expanded schema. Until all conditions hold, the process must
 not receive traffic; capability advertisement, the preference route, and preference-driven fanout
-also remain disabled.
+also remain disabled. Rerunning only the expand phase atomically clears the contract marker and
+installs the versioned staging trigger, so readiness remains `503` until contract completes again.
 
 Run `bun run migrate` before enabling either client entrypoint. It applies a short-lock expand,
 resumable bounded backfill, concurrent indexes, separately validates the replacement event

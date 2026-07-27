@@ -4,12 +4,26 @@ export type DialogPreferenceSchemaState = {
   ready: boolean;
   missingTables: string[];
   missingColumns: string[];
+  invalidColumns: string[];
+  missingUniqueConstraints: string[];
   eventConstraintValidated: boolean;
+  compatibilityTriggerReady: boolean;
   migrationCompleted: boolean;
+  contractVersion: number;
+  contractCompleted: boolean;
   reconciliationBacklog: number;
 };
 
+type ColumnContract = {
+  table: string;
+  column: string;
+  type: string;
+  notNull: boolean;
+  default: string | null;
+};
+
 const REQUIRED_TABLES = [
+  "dialog_members",
   "dialog_preferences",
   "dialog_preference_requests",
   "dialog_preference_action_budgets",
@@ -17,53 +31,83 @@ const REQUIRED_TABLES = [
   "online_migration_cursors",
   "bootstrap_snapshot_dialogs",
   "account_events",
+  "push_deliveries",
 ] as const;
 
-// These columns are referenced by the running binary even when capability advertisement and
-// preference-authored behavior are disabled. In particular, ordinary direct-dialog creation and
-// fanout join dialog_preferences, while every bootstrap captures and reads the snapshot columns.
-// getDifference reads the resulting account_events payload and has no additional preference join.
-const REQUIRED_COLUMNS = [
-  ["dialog_preferences", "dialog_id"],
-  ["dialog_preferences", "account_id"],
-  ["dialog_preferences", "is_pinned"],
-  ["dialog_preferences", "pinned_at"],
-  ["dialog_preferences", "is_muted"],
-  ["dialog_preferences", "is_archived"],
-  ["dialog_preferences", "updated_at"],
-  ["dialog_preference_requests", "account_id"],
-  ["dialog_preference_requests", "client_mutation_id"],
-  ["dialog_preference_requests", "dialog_id"],
-  ["dialog_preference_requests", "fingerprint"],
-  ["dialog_preference_requests", "status"],
-  ["dialog_preference_requests", "result_pts"],
-  ["dialog_preference_requests", "result_json"],
-  ["dialog_preference_requests", "created_at"],
-  ["dialog_preference_action_budgets", "account_id"],
-  ["dialog_preference_action_budgets", "bucket_started"],
-  ["dialog_preference_action_budgets", "mutation_count"],
-  ["dialog_preference_action_budgets", "updated_at"],
-  ["dialog_preference_legacy_reconciliation", "dialog_id"],
-  ["dialog_preference_legacy_reconciliation", "account_id"],
-  ["dialog_preference_legacy_reconciliation", "created_at"],
-  ["online_migration_cursors", "migration_name"],
-  ["online_migration_cursors", "last_dialog_id"],
-  ["online_migration_cursors", "last_account_id"],
-  ["online_migration_cursors", "rows_processed"],
-  ["online_migration_cursors", "completed_at"],
-  ["online_migration_cursors", "updated_at"],
-  ["bootstrap_snapshot_dialogs", "preferences_captured"],
-  ["bootstrap_snapshot_dialogs", "preference_is_pinned"],
-  ["bootstrap_snapshot_dialogs", "preference_pinned_at"],
-  ["bootstrap_snapshot_dialogs", "preference_is_muted"],
-  ["bootstrap_snapshot_dialogs", "preference_is_archived"],
-  ["bootstrap_snapshot_dialogs", "preference_updated_at"],
-  ["account_events", "type"],
-  ["account_events", "data"],
+// These signatures are part of the executable SQL contract, not merely migration documentation.
+// Checking defaults and nullability catches partially applied ALTERs that would otherwise admit
+// traffic and then subtly change optimistic state, idempotency, or snapshot semantics.
+const REQUIRED_COLUMNS: readonly ColumnContract[] = [
+  { table: "dialog_members", column: "notification_mode", type: "text", notNull: true, default: "'all'::text" },
+  { table: "dialog_preferences", column: "dialog_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preferences", column: "account_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preferences", column: "is_pinned", type: "boolean", notNull: true, default: "false" },
+  { table: "dialog_preferences", column: "pinned_at", type: "timestamp with time zone", notNull: false, default: null },
+  { table: "dialog_preferences", column: "is_muted", type: "boolean", notNull: true, default: "false" },
+  { table: "dialog_preferences", column: "is_archived", type: "boolean", notNull: true, default: "false" },
+  { table: "dialog_preferences", column: "updated_at", type: "timestamp with time zone", notNull: true, default: "now()" },
+  { table: "dialog_preference_requests", column: "account_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_requests", column: "client_mutation_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_requests", column: "dialog_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_requests", column: "fingerprint", type: "bytea", notNull: true, default: null },
+  { table: "dialog_preference_requests", column: "status", type: "text", notNull: true, default: "'pending'::text" },
+  { table: "dialog_preference_requests", column: "result_pts", type: "bigint", notNull: false, default: null },
+  { table: "dialog_preference_requests", column: "result_json", type: "jsonb", notNull: false, default: null },
+  { table: "dialog_preference_requests", column: "created_at", type: "timestamp with time zone", notNull: true, default: "now()" },
+  { table: "dialog_preference_action_budgets", column: "account_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_action_budgets", column: "bucket_started", type: "timestamp with time zone", notNull: true, default: null },
+  { table: "dialog_preference_action_budgets", column: "mutation_count", type: "integer", notNull: true, default: "0" },
+  { table: "dialog_preference_action_budgets", column: "updated_at", type: "timestamp with time zone", notNull: true, default: "now()" },
+  { table: "dialog_preference_legacy_reconciliation", column: "dialog_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_legacy_reconciliation", column: "account_id", type: "uuid", notNull: true, default: null },
+  { table: "dialog_preference_legacy_reconciliation", column: "created_at", type: "timestamp with time zone", notNull: true, default: "now()" },
+  { table: "online_migration_cursors", column: "migration_name", type: "text", notNull: true, default: null },
+  { table: "online_migration_cursors", column: "last_dialog_id", type: "uuid", notNull: false, default: null },
+  { table: "online_migration_cursors", column: "last_account_id", type: "uuid", notNull: false, default: null },
+  { table: "online_migration_cursors", column: "rows_processed", type: "bigint", notNull: true, default: "0" },
+  { table: "online_migration_cursors", column: "completed_at", type: "timestamp with time zone", notNull: false, default: null },
+  { table: "online_migration_cursors", column: "contract_version", type: "integer", notNull: true, default: "0" },
+  { table: "online_migration_cursors", column: "contract_completed_at", type: "timestamp with time zone", notNull: false, default: null },
+  { table: "online_migration_cursors", column: "updated_at", type: "timestamp with time zone", notNull: true, default: "now()" },
+  { table: "bootstrap_snapshot_dialogs", column: "preferences_captured", type: "boolean", notNull: true, default: "false" },
+  { table: "bootstrap_snapshot_dialogs", column: "preference_is_pinned", type: "boolean", notNull: false, default: null },
+  { table: "bootstrap_snapshot_dialogs", column: "preference_pinned_at", type: "timestamp with time zone", notNull: false, default: null },
+  { table: "bootstrap_snapshot_dialogs", column: "preference_is_muted", type: "boolean", notNull: false, default: null },
+  { table: "bootstrap_snapshot_dialogs", column: "preference_is_archived", type: "boolean", notNull: false, default: null },
+  { table: "bootstrap_snapshot_dialogs", column: "preference_updated_at", type: "timestamp with time zone", notNull: false, default: null },
+  { table: "account_events", column: "type", type: "text", notNull: true, default: null },
+  { table: "account_events", column: "data", type: "jsonb", notNull: true, default: "'{}'::jsonb" },
+  { table: "push_deliveries", column: "account_id", type: "uuid", notNull: true, default: null },
+  { table: "push_deliveries", column: "pts", type: "bigint", notNull: true, default: null },
+  { table: "push_deliveries", column: "device_id", type: "uuid", notNull: true, default: null },
 ] as const;
+
+const REQUIRED_UNIQUE_CONSTRAINTS = [
+  { table: "dialog_members", columns: ["dialog_id", "account_id"] },
+  { table: "dialog_preferences", columns: ["dialog_id", "account_id"] },
+  { table: "dialog_preference_requests", columns: ["account_id", "client_mutation_id"] },
+  { table: "dialog_preference_action_budgets", columns: ["account_id", "bucket_started"] },
+  { table: "dialog_preference_legacy_reconciliation", columns: ["dialog_id", "account_id"] },
+  { table: "online_migration_cursors", columns: ["migration_name"] },
+  { table: "push_deliveries", columns: ["account_id", "pts", "device_id"] },
+] as const;
+
+const EXPECTED_EVENT_CONSTRAINT =
+  "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
+  "'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
+  "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
+  "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
+  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text])";
+const FINAL_TRIGGER_FUNCTION = "mirror_dialog_notification_mode_to_preferences_v1_final";
+const FINAL_CONTRACT_VERSION = 1;
 
 type CachedState = { expiresAt: number; value: DialogPreferenceSchemaState };
 const cache = new WeakMap<object, CachedState>();
+
+function normalizedExpression(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return String(value).replace(/\s+/g, " ").trim();
+}
 
 export function clearDialogPreferenceReadinessCache(sql?: SQL): void {
   if (sql) cache.delete(sql as unknown as object);
@@ -85,58 +129,157 @@ export async function dialogPreferenceSchemaState(
   const missingTables = tables
     .filter((row: any) => !row.present)
     .map((row: any) => String(row.name));
-  const columns = await sql`
-    SELECT required.table_name, required.column_name,
-           columns.column_name IS NOT NULL AS present
-    FROM unnest(
-      ${sql.array(REQUIRED_COLUMNS.map(([table]) => table), "text")}::text[],
-      ${sql.array(REQUIRED_COLUMNS.map(([, column]) => column), "text")}::text[]
-    ) AS required(table_name, column_name)
-    LEFT JOIN information_schema.columns columns
-      ON columns.table_schema = 'public'
-     AND columns.table_name = required.table_name
-     AND columns.column_name = required.column_name
-    WHERE to_regclass('public.' || required.table_name) IS NOT NULL`;
-  const missingColumns = columns
-    .filter((row: any) => !row.present)
-    .map((row: any) => `${row.table_name}.${row.column_name}`);
+
+  const existingColumns = await sql`
+    SELECT relation.relname AS table_name,
+           attribute.attname AS column_name,
+           format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+           attribute.attnotnull AS not_null,
+           pg_get_expr(column_default.adbin, column_default.adrelid) AS column_default
+    FROM pg_attribute attribute
+    JOIN pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_attrdef column_default
+      ON column_default.adrelid = relation.oid
+     AND column_default.adnum = attribute.attnum
+    WHERE namespace.nspname = 'public'
+      AND relation.relname = ANY(${sql.array([...new Set(REQUIRED_COLUMNS.map((column) => column.table))], "text")}::text[])
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped`;
+  const actualColumns = new Map(
+    existingColumns.map((row: any) => [
+      `${row.table_name}.${row.column_name}`,
+      {
+        type: String(row.data_type),
+        notNull: Boolean(row.not_null),
+        default: normalizedExpression(row.column_default),
+      },
+    ]),
+  );
+  const missingColumns: string[] = [];
+  const invalidColumns: string[] = [];
+  for (const expected of REQUIRED_COLUMNS) {
+    if (missingTables.includes(expected.table)) continue;
+    const key = `${expected.table}.${expected.column}`;
+    const actual = actualColumns.get(key);
+    if (!actual) {
+      missingColumns.push(key);
+      continue;
+    }
+    if (
+      actual.type !== expected.type
+      || actual.notNull !== expected.notNull
+      || actual.default !== normalizedExpression(expected.default)
+    ) {
+      invalidColumns.push(key);
+    }
+  }
+
+  const constraintRows = await sql`
+    SELECT relation.relname AS table_name,
+           array_agg(attribute.attname ORDER BY key.ordinality) AS columns
+    FROM pg_constraint constraint_row
+    JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key(attnum, ordinality)
+    JOIN pg_attribute attribute
+      ON attribute.attrelid = relation.oid
+     AND attribute.attnum = key.attnum
+    WHERE namespace.nspname = 'public'
+      AND constraint_row.contype IN ('p', 'u')
+      AND constraint_row.convalidated
+      AND relation.relname = ANY(${sql.array([...new Set(REQUIRED_UNIQUE_CONSTRAINTS.map((constraint) => constraint.table))], "text")}::text[])
+    GROUP BY relation.relname, constraint_row.oid`;
+  const existingUniqueConstraints = new Set(
+    constraintRows.map((row: any) => `${row.table_name}(${row.columns.join(",")})`),
+  );
+  const missingUniqueConstraints = REQUIRED_UNIQUE_CONSTRAINTS
+    .map((constraint) => `${constraint.table}(${constraint.columns.join(",")})`)
+    .filter((constraint) => !existingUniqueConstraints.has(constraint));
 
   let eventConstraintValidated = false;
+  let compatibilityTriggerReady = false;
   let migrationCompleted = false;
+  let contractVersion = -1;
+  let contractCompleted = false;
   let reconciliationBacklog = -1;
-  if (missingTables.length === 0 && missingColumns.length === 0) {
+  if (
+    missingTables.length === 0
+    && missingColumns.length === 0
+    && invalidColumns.length === 0
+    && missingUniqueConstraints.length === 0
+  ) {
     const state = (await sql`
       SELECT
+        COALESCE((
+          SELECT constraint_row.convalidated
+             AND pg_get_expr(constraint_row.conbin, constraint_row.conrelid, TRUE)
+                 = ${EXPECTED_EVENT_CONSTRAINT}
+          FROM pg_constraint constraint_row
+          WHERE constraint_row.conrelid = 'account_events'::regclass
+            AND constraint_row.conname = 'account_events_type_check'
+            AND constraint_row.contype = 'c'
+        ), FALSE) AS event_constraint_validated,
         EXISTS (
           SELECT 1
-          FROM pg_constraint
-          WHERE conrelid = 'account_events'::regclass
-            AND conname = 'account_events_type_check'
-            AND convalidated
-            AND pg_get_constraintdef(oid) LIKE '%dialog.preferences_updated%'
-        ) AS event_constraint_validated,
+          FROM pg_trigger trigger_row
+          JOIN pg_proc function_row ON function_row.oid = trigger_row.tgfoid
+          JOIN pg_namespace function_namespace ON function_namespace.oid = function_row.pronamespace
+          WHERE trigger_row.tgrelid = 'dialog_members'::regclass
+            AND trigger_row.tgname = 'dialog_members_notification_mode_mirror'
+            AND NOT trigger_row.tgisinternal
+            AND trigger_row.tgenabled = 'O'
+            AND function_namespace.nspname = 'public'
+            AND function_row.proname = ${FINAL_TRIGGER_FUNCTION}
+            AND pg_get_function_identity_arguments(function_row.oid) = ''
+        ) AS compatibility_trigger_ready,
         COALESCE((
           SELECT completed_at IS NOT NULL
           FROM online_migration_cursors
           WHERE migration_name = 'dialog_preferences_v1'
         ), FALSE) AS migration_completed,
-        (SELECT count(*)::int FROM dialog_preference_legacy_reconciliation)
-          AS reconciliation_backlog`)[0];
+        COALESCE((
+          SELECT contract_version
+          FROM online_migration_cursors
+          WHERE migration_name = 'dialog_preferences_v1'
+        ), -1) AS contract_version,
+        COALESCE((
+          SELECT contract_version = ${FINAL_CONTRACT_VERSION}
+             AND contract_completed_at IS NOT NULL
+          FROM online_migration_cursors
+          WHERE migration_name = 'dialog_preferences_v1'
+        ), FALSE) AS contract_completed,
+        EXISTS (
+          SELECT 1 FROM dialog_preference_legacy_reconciliation LIMIT 1
+        ) AS has_reconciliation_backlog`)[0];
     eventConstraintValidated = Boolean(state?.event_constraint_validated);
+    compatibilityTriggerReady = Boolean(state?.compatibility_trigger_ready);
     migrationCompleted = Boolean(state?.migration_completed);
-    reconciliationBacklog = Number(state?.reconciliation_backlog ?? -1);
+    contractVersion = Number(state?.contract_version ?? -1);
+    contractCompleted = Boolean(state?.contract_completed);
+    reconciliationBacklog = state?.has_reconciliation_backlog ? 1 : 0;
   }
 
   const value = {
     ready: missingTables.length === 0
       && missingColumns.length === 0
+      && invalidColumns.length === 0
+      && missingUniqueConstraints.length === 0
       && eventConstraintValidated
+      && compatibilityTriggerReady
       && migrationCompleted
+      && contractVersion === FINAL_CONTRACT_VERSION
+      && contractCompleted
       && reconciliationBacklog === 0,
     missingTables,
     missingColumns,
+    invalidColumns,
+    missingUniqueConstraints,
     eventConstraintValidated,
+    compatibilityTriggerReady,
     migrationCompleted,
+    contractVersion,
+    contractCompleted,
     reconciliationBacklog,
   };
   const ttlMs = Math.max(

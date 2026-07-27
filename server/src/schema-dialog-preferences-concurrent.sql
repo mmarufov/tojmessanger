@@ -11,7 +11,8 @@ WHERE namespace.nspname = 'public'
     'dialog_preferences_account_idx',
     'dialog_preferences_pinned_order_idx',
     'dialog_preference_requests_retention_idx',
-    'dialog_preference_action_budgets_account_idx'
+    'dialog_preference_action_budgets_account_idx',
+    'dialog_preference_reconciliation_account_idx'
   )
   AND NOT idx.indisvalid
 \gexec
@@ -25,3 +26,5 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_requests_retention_idx
   ON dialog_preference_requests(created_at);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_action_budgets_account_idx
   ON dialog_preference_action_budgets(updated_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_reconciliation_account_idx
+  ON dialog_preference_legacy_reconciliation(account_id, dialog_id);

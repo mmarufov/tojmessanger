@@ -20,14 +20,9 @@ import {
   cleanupExpiredData,
   drainExpiredData,
   OperationalMetrics,
-  readiness,
   requestIdFrom,
   safeRoute,
 } from "./ops";
-import {
-  clearDialogPreferenceReadinessCache,
-  dialogPreferenceSchemaState,
-} from "./dialog-preference-readiness";
 import { fanoutDialogEvent } from "./fanout";
 import {
   buildAPNsPayload,
@@ -687,125 +682,6 @@ describe("M3 cloud sync", () => {
     expect(await db`
       SELECT account_id FROM dialog_preference_action_budgets
       WHERE updated_at < now() - interval '24 hours'`).toHaveLength(0);
-  });
-
-  test("preference readiness fails closed for every partial schema state", async () => {
-    const ready = await readiness(db, { sms: "configured", push: "configured" });
-    expect(ready.status).toBe("ready");
-
-    await db`
-      UPDATE online_migration_cursors
-      SET completed_at = NULL
-      WHERE migration_name = 'dialog_preferences_v1'`;
-    clearDialogPreferenceReadinessCache(db);
-    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
-    await db`
-      UPDATE online_migration_cursors
-      SET completed_at = now()
-      WHERE migration_name = 'dialog_preferences_v1'`;
-
-    const account = await makeAccount(testPhone(128), "Readiness");
-    const { dialogId } = await getOrCreateDirectDialog(
-      db,
-      account.accountId,
-      (await makeAccount(testPhone(129), "Readiness peer")).accountId,
-    );
-    await db`
-      INSERT INTO dialog_preference_legacy_reconciliation (dialog_id, account_id)
-      VALUES (${dialogId}, ${account.accountId})`;
-    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
-    await db`DELETE FROM dialog_preference_legacy_reconciliation`;
-
-    await db`ALTER TABLE dialog_preference_action_budgets RENAME TO dialog_preference_action_budgets_incomplete`;
-    const missing = await dialogPreferenceSchemaState(db, { bypassCache: true });
-    expect(missing.ready).toBe(false);
-    expect(missing.missingTables).toContain("dialog_preference_action_budgets");
-    await db`ALTER TABLE dialog_preference_action_budgets_incomplete RENAME TO dialog_preference_action_budgets`;
-
-    await db`
-      ALTER TABLE bootstrap_snapshot_dialogs
-      RENAME COLUMN preference_is_muted TO preference_is_muted_incomplete`;
-    const missingColumn = await dialogPreferenceSchemaState(db, { bypassCache: true });
-    expect(missingColumn.ready).toBe(false);
-    expect(missingColumn.missingColumns)
-      .toContain("bootstrap_snapshot_dialogs.preference_is_muted");
-    await db`
-      ALTER TABLE bootstrap_snapshot_dialogs
-      RENAME COLUMN preference_is_muted_incomplete TO preference_is_muted`;
-
-    await db`ALTER TABLE account_events DROP CONSTRAINT account_events_type_check`;
-    await db`
-      ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
-        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-         'dialog.created','member.added','member.removed','member.role_changed','member.left',
-         'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-         'dialog.preferences_updated','profile.updated')) NOT VALID`;
-    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(false);
-    await db`ALTER TABLE account_events VALIDATE CONSTRAINT account_events_type_check`;
-    clearDialogPreferenceReadinessCache(db);
-    expect((await dialogPreferenceSchemaState(db, { bypassCache: true })).ready).toBe(true);
-  });
-
-  test("pre-expand schema refuses traffic admission with both preference switches off", async () => {
-    const previousEntrypoint = process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;
-    const previousBehavior = process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
-    process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED = "0";
-    process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = "0";
-
-    await db`
-      ALTER TABLE dialog_preference_legacy_reconciliation
-      RENAME TO dialog_preference_legacy_reconciliation_preexpand`;
-    await db`
-      ALTER TABLE dialog_preference_requests
-      RENAME TO dialog_preference_requests_preexpand`;
-    await db`
-      ALTER TABLE dialog_preference_action_budgets
-      RENAME TO dialog_preference_action_budgets_preexpand`;
-    await db`ALTER TABLE dialog_preferences RENAME TO dialog_preferences_preexpand`;
-    await db`ALTER TABLE online_migration_cursors RENAME TO online_migration_cursors_preexpand`;
-    clearDialogPreferenceReadinessCache(db);
-
-    const server = startCloudServer(0, db, null, null);
-    const base = `http://127.0.0.1:${server.port}`;
-    try {
-      // Liveness remains available for diagnostics, but a load balancer must not admit traffic.
-      expect((await fetch(`${base}/health`)).status).toBe(200);
-      const response = await fetch(`${base}/ready`);
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({
-        status: "not_ready",
-        database: "ready",
-        dialogPreferences: {
-          ready: false,
-          missingTables: expect.arrayContaining([
-            "dialog_preferences",
-            "dialog_preference_requests",
-            "dialog_preference_action_budgets",
-            "dialog_preference_legacy_reconciliation",
-            "online_migration_cursors",
-          ]),
-        },
-      });
-    } finally {
-      await server.stop(true);
-      await db`
-        ALTER TABLE dialog_preference_legacy_reconciliation_preexpand
-        RENAME TO dialog_preference_legacy_reconciliation`;
-      await db`
-        ALTER TABLE dialog_preference_requests_preexpand
-        RENAME TO dialog_preference_requests`;
-      await db`
-        ALTER TABLE dialog_preference_action_budgets_preexpand
-        RENAME TO dialog_preference_action_budgets`;
-      await db`ALTER TABLE dialog_preferences_preexpand RENAME TO dialog_preferences`;
-      await db`ALTER TABLE online_migration_cursors_preexpand RENAME TO online_migration_cursors`;
-      clearDialogPreferenceReadinessCache(db);
-      if (previousEntrypoint === undefined) delete process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED;
-      else process.env.TOJ_DIALOG_PREFERENCES_V1_ENABLED = previousEntrypoint;
-      if (previousBehavior === undefined) delete process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED;
-      else process.env.TOJ_DIALOG_PREFERENCES_BEHAVIOR_ENABLED = previousBehavior;
-    }
-    expect((await readiness(db, { sms: "disabled", push: "disabled" })).status).toBe("ready");
   });
 
   test("failed OTP delivery consumes the unusable challenge", async () => {

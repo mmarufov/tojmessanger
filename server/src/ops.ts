@@ -93,22 +93,40 @@ export class OperationalMetrics {
 }
 
 export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> {
+  const schema = (await sql`
+    SELECT to_regclass('public.dialog_preference_requests') IS NOT NULL
+             AS requests_present,
+           to_regclass('public.dialog_preference_action_budgets') IS NOT NULL
+             AS budgets_present`)[0];
+  if (!schema?.requests_present || !schema?.budgets_present) {
+    return [
+      "# HELP toj_dialog_preference_schema_available Whether preference metrics relations exist.",
+      "# TYPE toj_dialog_preference_schema_available gauge",
+      "toj_dialog_preference_schema_available 0",
+      "",
+    ].join("\n");
+  }
   const row = (await sql`
     SELECT
       (SELECT count(*) FROM dialog_preference_requests WHERE status = 'pending')
         AS pending_requests,
-      (SELECT count(*) FROM dialog_preference_requests WHERE status = 'completed')
-        AS retained_completed_requests,
+      (SELECT GREATEST(reltuples, 0)::bigint
+       FROM pg_class
+       WHERE oid = 'dialog_preference_requests'::regclass)
+        AS retained_request_estimate,
       (SELECT count(*) FROM dialog_preference_action_budgets
        WHERE updated_at < now() - interval '24 hours')
         AS expired_budget_rows`)[0];
   return [
+    "# HELP toj_dialog_preference_schema_available Whether preference metrics relations exist.",
+    "# TYPE toj_dialog_preference_schema_available gauge",
+    "toj_dialog_preference_schema_available 1",
     "# HELP toj_dialog_preference_pending_requests Pending idempotency claims.",
     "# TYPE toj_dialog_preference_pending_requests gauge",
     `toj_dialog_preference_pending_requests ${Number(row.pending_requests)}`,
-    "# HELP toj_dialog_preference_retained_idempotency_rows Completed durable dedupe records.",
-    "# TYPE toj_dialog_preference_retained_idempotency_rows gauge",
-    `toj_dialog_preference_retained_idempotency_rows ${Number(row.retained_completed_requests)}`,
+    "# HELP toj_dialog_preference_idempotency_rows_estimate Planner estimate of durable dedupe rows.",
+    "# TYPE toj_dialog_preference_idempotency_rows_estimate gauge",
+    `toj_dialog_preference_idempotency_rows_estimate ${Number(row.retained_request_estimate)}`,
     "# HELP toj_dialog_preference_cleanup_backlog_rows Expired bounded-lifecycle rows awaiting cleanup.",
     "# TYPE toj_dialog_preference_cleanup_backlog_rows gauge",
     `toj_dialog_preference_cleanup_backlog_rows{table="budgets"} ${Number(row.expired_budget_rows)}`,

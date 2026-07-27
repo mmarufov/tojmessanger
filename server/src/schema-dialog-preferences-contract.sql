@@ -24,7 +24,7 @@ $$;
 -- gives that account a canonical snapshot, one PTS event, durable silent pushes, and a pg_notify
 -- wake-up. New preference-service writes update the canonical row first, so the mirror's
 -- conditional upsert returns no row and cannot duplicate that service-authored event.
-CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences()
+CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_final()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
@@ -125,5 +125,30 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+DROP TRIGGER IF EXISTS dialog_members_notification_mode_mirror ON dialog_members;
+CREATE TRIGGER dialog_members_notification_mode_mirror
+AFTER INSERT OR UPDATE OF notification_mode ON dialog_members
+FOR EACH ROW
+EXECUTE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_final();
+
+-- The marker and final trigger become visible in the same commit. Readiness requires both, so no
+-- process can advertise the contracted schema while staging behavior is still attached.
+DO $$
+BEGIN
+  UPDATE online_migration_cursors
+  SET contract_version = 1,
+      contract_completed_at = statement_timestamp(),
+      updated_at = statement_timestamp()
+  WHERE migration_name = 'dialog_preferences_v1';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'dialog_preferences_v1 migration marker is missing';
+  END IF;
+END;
+$$;
+
+-- Remove the pre-versioned implementation after its trigger dependency has moved. The versioned
+-- staging function remains available for a future expand rerun without replacing the final body.
+DROP FUNCTION IF EXISTS mirror_dialog_notification_mode_to_preferences();
 
 COMMIT;
