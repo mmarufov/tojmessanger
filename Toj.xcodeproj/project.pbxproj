@@ -10,6 +10,8 @@
 		0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A7237A13A5A375D4580965 /* TojTests.swift */; };
 		160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
+		9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */; };
+		9A41C7E1000AB23D45E6F708 /* SearchQueryContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */; };
 		9A41C7E10008B23D45E6F708 /* search-normalizer-vectors.json in Resources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */; };
 		9A41C7E10006B23D45E6F708 /* MessageSearchFTS5Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */; };
 		9A41C7E10004B23D45E6F708 /* SearchPatternBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */; };
@@ -71,6 +73,8 @@
 		E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EncryptedProfilePhotoStoreTests.swift; sourceTree = "<group>"; };
 		F0C03914F0029DBF5289BE42 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackoffPolicyTests.swift; sourceTree = "<group>"; };
+		9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchIndexSizeBenchmark.swift; sourceTree = "<group>"; };
+		9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchQueryContractTests.swift; sourceTree = "<group>"; };
 		9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.json; name = search-normalizer-vectors.json; path = server/src/search-normalizer-vectors.json; sourceTree = SOURCE_ROOT; };
 		9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchFTS5Tests.swift; sourceTree = "<group>"; };
 		9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchPatternBuilderTests.swift; sourceTree = "<group>"; };
@@ -121,6 +125,8 @@
 			children = (
 				A6A7237A13A5A375D4580965 /* TojTests.swift */,
 				FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */,
+				9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */,
+				9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */,
 				9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */,
 				9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */,
 				9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */,
@@ -403,6 +409,8 @@
 			files = (
 				0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */,
 				2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */,
+				9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */,
+				9A41C7E1000AB23D45E6F708 /* SearchQueryContractTests.swift in Sources */,
 				9A41C7E10006B23D45E6F708 /* MessageSearchFTS5Tests.swift in Sources */,
 				9A41C7E10004B23D45E6F708 /* SearchPatternBuilderTests.swift in Sources */,
 				9A41C7E10002B23D45E6F708 /* SearchTextNormalizerTests.swift in Sources */,

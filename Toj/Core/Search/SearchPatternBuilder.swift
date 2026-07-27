@@ -2,15 +2,8 @@ import Foundation
 
 /// The two column-qualified MATCH expressions a single user query expands into.
 ///
-/// `exact` searches only the exact columns and `folded` only the folded ones, so a hit's tier is
-/// unambiguous: whichever expression returned it. The store runs `exact` first and `folded` for
-/// what it missed, which is what makes "exact ranks above folded" a property of the query plan
-/// rather than a scoring heuristic.
-///
-/// Unlike version 2, `folded` is **never nil**. Its predecessor omitted the folded tier whenever
-/// the query itself contained nothing foldable, which silently broke the common case: `точики` is
-/// unchanged by Tajik folding, so no folded tier ran, so it could not reach a stored `тоҷикӣ` —
-/// exactly the query the folded column exists to serve.
+/// A flattened view of ``PreparedSearchQuery`` for callers that only need the SQL. Anything that
+/// also highlights should hold the plan instead, so it applies the same limits and prefix flags.
 nonisolated struct SearchPattern: Equatable, Sendable {
     /// Restricted to ``SearchIndexSchema/exactColumns``.
     let exact: String
@@ -19,7 +12,7 @@ nonisolated struct SearchPattern: Equatable, Sendable {
     let folded: String
 }
 
-/// Builds FTS5 `MATCH` expressions from untrusted user input.
+/// Reduces untrusted user input to a bounded ``PreparedSearchQuery``.
 ///
 /// **User input must never reach `MATCH` verbatim.** In FTS5 `"`, `*`, `^`, `:`, `-`, `(`, `)` and
 /// the bare words `AND` / `OR` / `NOT` / `NEAR` are operators, so a query as ordinary as `AND` or
@@ -53,34 +46,43 @@ nonisolated enum SearchPatternBuilder {
     /// each, so a scalar-only cap still admits a 2 KB query; this bounds the byte cost too.
     static let maximumQueryBytes = 1024
 
-    /// Builds the MATCH expressions for `query`, or `nil` when it contains nothing searchable
-    /// (whitespace, punctuation, or emoji only).
+    /// Reduces `query` to the bounded plan both MATCH construction and highlighting consume, or
+    /// `nil` when it holds nothing searchable (whitespace, punctuation, or an emoji the tokenizer
+    /// treats as a separator).
     ///
     /// - Parameter prefixMatching: Whether the final term matches as a prefix. True while the user
     ///   is typing; false once they submit, where whole-word matching is less surprising.
-    static func pattern(for query: String, prefixMatching: Bool = true) -> SearchPattern? {
+    static func prepare(_ query: String, prefixMatching: Bool = true) -> PreparedSearchQuery? {
         let clamped = clamp(query)
-        let exactTerms = terms(in: SearchTextNormalizer.exact(clamped))
+        let exactTerms = terms(in: SearchTextNormalizer.exact(clamped), prefixMatching: prefixMatching)
         guard !exactTerms.isEmpty else { return nil }
 
         // The folded tier always runs. Its terms come from foldedForm, which equals the exact form
         // when the query holds no Tajik letters — and that is precisely when it is needed, because
         // a Russian-keyboard query is already in folded space while the stored Tajik text is not.
-        var foldedAlternatives = [expression(terms(in: SearchTextNormalizer.foldedForm(clamped)),
-                                             prefixMatching: prefixMatching)]
+        var alternatives = [
+            terms(in: SearchTextNormalizer.foldedForm(clamped), prefixMatching: prefixMatching)
+        ]
         if let candidate = SearchTextNormalizer.cyrillicCandidate(clamped) {
-            let candidateTerms = terms(in: SearchTextNormalizer.foldedForm(candidate))
-            if !candidateTerms.isEmpty {
-                foldedAlternatives.append(expression(candidateTerms, prefixMatching: prefixMatching))
-            }
+            let candidateTerms = terms(
+                in: SearchTextNormalizer.foldedForm(candidate), prefixMatching: prefixMatching
+            )
+            if !candidateTerms.isEmpty { alternatives.append(candidateTerms) }
         }
 
-        return SearchPattern(
-            exact: qualify(expression(exactTerms, prefixMatching: prefixMatching),
-                           with: SearchIndexSchema.exactColumns),
-            folded: qualify(foldedAlternatives.joined(separator: " OR "),
-                            with: SearchIndexSchema.foldedColumns)
+        return PreparedSearchQuery(
+            exactTerms: exactTerms,
+            foldedAlternatives: alternatives,
+            prefixMatching: prefixMatching
         )
+    }
+
+    /// The MATCH expressions alone. Equivalent to ``prepare(_:prefixMatching:)`` followed by the
+    /// plan's expression properties.
+    static func pattern(for query: String, prefixMatching: Bool = true) -> SearchPattern? {
+        prepare(query, prefixMatching: prefixMatching).map {
+            SearchPattern(exact: $0.exactExpression, folded: $0.foldedExpression)
+        }
     }
 
     /// Restricts an expression to a column set using FTS5's `{a b} : (...)` filter.
@@ -95,7 +97,7 @@ nonisolated enum SearchPatternBuilder {
     ///
     /// Without this the in-chat search MATCHes the whole corpus and filters afterwards, which
     /// degrades badly in a large group. The column filter binds only to the dialog phrase; the
-    /// trailing expression stays unrestricted, which is what lets it match any text column.
+    /// trailing expression keeps its own column qualification.
     static func scoped(_ expression: String, toDialog dialogId: String) -> String {
         "{dialog_token} : \(quote(dialogToken(dialogId))) AND (\(expression))"
     }
@@ -108,22 +110,9 @@ nonisolated enum SearchPatternBuilder {
         SearchTextNormalizer.exact(dialogId).replacingOccurrences(of: "-", with: "")
     }
 
-    // MARK: - Internals
-
-    /// Joins terms with `AND`, marking the last one as a prefix when requested.
-    private static func expression(_ terms: [Term], prefixMatching: Bool) -> String {
-        terms.enumerated().map { index, term in
-            let isLast = index == terms.count - 1
-            let usePrefix = term.forcePrefix
-                || (prefixMatching && isLast && term.text.count >= minimumPrefixLength)
-            return quote(term.text) + (usePrefix ? "*" : "")
-        }
-        .joined(separator: " AND ")
-    }
-
     /// Emits an FTS5 string literal. Doubling `"` is the only escape the grammar defines, and
     /// tokens cannot contain `"` anyway — this is belt-and-braces for a token rule that changes.
-    private static func quote(_ text: String) -> String {
+    static func quote(_ text: String) -> String {
         "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
@@ -144,21 +133,27 @@ nonisolated enum SearchPatternBuilder {
         return String(scalars)
     }
 
-    private struct Term: Equatable {
-        let text: String
-        /// Set when the term was truncated, so the shortened form still matches the original word.
-        let forcePrefix: Bool
-    }
+    // MARK: - Internals
 
-    private static func terms(in normalized: String) -> [Term] {
-        SearchTextNormalizer.tokens(normalized)
-            .prefix(maximumTerms)
-            .map { token in
-                guard token.count > maximumTermLength else {
-                    return Term(text: token, forcePrefix: false)
-                }
-                return Term(text: String(token.prefix(maximumTermLength)), forcePrefix: true)
+    /// Applies the term cap, truncation and prefix rules in one place, so the plan is the only
+    /// description of what will be searched.
+    private static func terms(
+        in normalized: String, prefixMatching: Bool
+    ) -> [PreparedSearchQuery.Term] {
+        let tokens = Array(SearchTextNormalizer.tokens(normalized).prefix(maximumTerms))
+        return tokens.enumerated().map { index, token in
+            if token.count > maximumTermLength {
+                // Truncated terms are always prefixes, even mid-query, so the shortened form still
+                // reaches the word it came from.
+                return PreparedSearchQuery.Term(
+                    text: String(token.prefix(maximumTermLength)), isPrefix: true
+                )
             }
+            let isLast = index == tokens.count - 1
+            return PreparedSearchQuery.Term(
+                text: token,
+                isPrefix: prefixMatching && isLast && token.count >= minimumPrefixLength
+            )
+        }
     }
-
 }

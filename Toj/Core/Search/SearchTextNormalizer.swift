@@ -152,8 +152,13 @@ nonisolated enum SearchTextNormalizer {
 
     // MARK: - Highlighting
 
-    /// Locates `query`'s tokens inside `original`, returning ranges into the **original,
+    /// Locates a prepared query's terms inside `original`, returning ranges into the **original,
     /// unmodified** text so display keeps its accents and letter forms.
+    ///
+    /// Takes a ``PreparedSearchQuery`` rather than a raw string so highlighting sees exactly what
+    /// was searched: the same clamp, the same eight-term cap, the same truncation, and the same
+    /// per-term prefix flags. Re-deriving terms here is what let a query of `a` — which emits the
+    /// non-prefix phrase `"a"` — highlight `apple` in a row FTS5 had never matched.
     ///
     /// This is the payoff of scalar preservation. Folding maps scalar *i* of the original to scalar
     /// *i* of the folded form, so a match found in folded space is the same range in original
@@ -163,32 +168,52 @@ nonisolated enum SearchTextNormalizer {
     /// Because the token walker skips ignored diacritics rather than stopping at them, a match
     /// spans them: `cafe` highlights all of `Cafe◌́`, and `egalite` highlights all of `e◌́galite◌́`.
     ///
-    /// Matching is token-aligned and prefix-based, mirroring the MATCH pattern, and considers the
-    /// same Latin transliteration alternative the folded tier searches — so `chon`, which reaches
-    /// `ҷон` through the index, also highlights it.
-    static func highlightRanges(of query: String, in original: String) -> [Range<String.Index>] {
-        var needles = Set(tokens(foldedForm(query)))
-        if let candidate = cyrillicCandidate(query) {
-            needles.formUnion(tokens(foldedForm(candidate)))
-        }
-        guard !needles.isEmpty else { return [] }
+    /// Terms from both tiers are considered, since a row may have been returned by either.
+    static func highlightRanges(
+        of plan: PreparedSearchQuery, in original: String
+    ) -> [Range<String.Index>] {
+        guard !plan.isEmpty else { return [] }
 
-        let folded = foldedForm(original)
+        // Exact space, because a token's folded form is derivable from it one scalar at a time.
+        // Both forms share token boundaries: Tajik folding is one-to-one and maps token characters
+        // to token characters, so it cannot move a boundary.
+        let exactText = exact(original)
+
+        // Hoisted: previously rebuilt inside the loop, so a message with a thousand matches
+        // allocated a thousand copies of its own scalar array.
+        let scalars = Array(exactText.unicodeScalars)
         var boundaries = Array(original.unicodeScalars.indices)
         boundaries.append(original.unicodeScalars.endIndex)
-        guard folded.unicodeScalars.count == boundaries.count - 1 else { return [] }
+        guard scalars.count == boundaries.count - 1 else { return [] }  // invariant 2 broke; degrade
+
+        let exactTerms = plan.exactTerms
+        let foldedTerms = plan.foldedAlternatives.flatMap { $0 }
 
         var ranges: [Range<String.Index>] = []
-        forEachToken(in: folded) { token, span in
-            guard needles.contains(where: token.hasPrefix) else { return }
+        forEachToken(in: exactText) { token, span in
+            let matched = exactTerms.contains { $0.matches(token) }
+                || foldedTerms.contains { $0.matches(tajikFolded(token)) }
+            guard matched else { return }
+
             // Extend across trailing ignored diacritics so an accent is not orphaned outside the
             // highlight when the source is in decomposed form.
             var end = span.upperBound
-            let scalars = Array(folded.unicodeScalars)
             while end < scalars.count, classify(scalars[end]) == .ignored { end += 1 }
             ranges.append(boundaries[span.lowerBound]..<boundaries[end])
         }
         return ranges
+    }
+
+    /// Convenience for callers that have not prepared a plan. Prefer the plan overload anywhere the
+    /// same query also drives a MATCH, so the two cannot disagree.
+    static func highlightRanges(of query: String, in original: String) -> [Range<String.Index>] {
+        guard let plan = SearchPatternBuilder.prepare(query) else { return [] }
+        return highlightRanges(of: plan, in: original)
+    }
+
+    /// Applies only the Tajik step, for text already in exact form.
+    private static func tajikFolded(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.map(tajikFold)))
     }
 
     // MARK: - Latin transliteration

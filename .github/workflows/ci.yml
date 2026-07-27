@@ -79,6 +79,13 @@ jobs:
         run: |
           test -d "${DEVELOPER_DIR}"
           pod install
+      - name: Verify search tables match the locked SQLCipher
+        run: |
+          # The tokenizer tables and normalizer vectors are probed from Pods/SQLCipher rather than
+          # written by hand. Regenerate and diff so a pod bump, or a hand edit, cannot silently
+          # leave on-device indexes disagreeing with the code that queries them.
+          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF:-main}" || true
+          scripts/verify-search-tables.sh "origin/${GITHUB_BASE_REF:-main}"
       - name: Compile real WebRTC Release path
         env:
           DERIVED_DATA: ${{ runner.temp }}/TojDerivedData
