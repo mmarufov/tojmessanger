@@ -708,6 +708,7 @@ actor EncryptedMediaCache {
     private var representations: [MediaCacheLedgerKey: ThumbnailEntry] = [:]
     private var activeAccessCounts: [String: Int] = [:]
     private var removedLedgerKeys: Set<MediaCacheLedgerKey> = []
+    private var revokedMediaIds: Set<String> = []
     private var lastRetentionSweep: Date?
 
     init(
@@ -833,6 +834,7 @@ actor EncryptedMediaCache {
     }
 
     func promoteUpload(_ transfer: MediaTransferRecord, mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let sourceData = try uploadData(for: transfer)
         guard Int64(sourceData.count) == transfer.byteSize else { throw MediaCacheError.invalidState }
@@ -909,6 +911,7 @@ actor EncryptedMediaCache {
     }
 
     func storeThumbnail(_ data: Data, mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let url = root.appending(path: "thumbnails/\(mediaId).tojthumb")
         let oldSize = thumbnails[mediaId]?.cipherBytes ?? 0
@@ -951,6 +954,7 @@ actor EncryptedMediaCache {
         mediaId: String,
         variant: MediaPresentationVariant
     ) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         guard !data.isEmpty, data.count <= 8 * 1_024 * 1_024 else {
             throw MediaCacheError.unsupportedSize
         }
@@ -995,6 +999,7 @@ actor EncryptedMediaCache {
     }
 
     func storeDownloadChunk(_ data: Data, mediaId: String, offset: Int64) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let url = chunkURL(mediaId: mediaId, offset: offset)
         let oldCipherSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
@@ -1219,6 +1224,7 @@ actor EncryptedMediaCache {
     }
 
     func beginAccess(mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         activeAccessCounts[mediaId, default: 0] += 1
         try touchMedia(mediaId: mediaId)
@@ -1370,6 +1376,9 @@ actor EncryptedMediaCache {
         additionalEncryptedPaths: Set<String>
     ) throws {
         try loadIndexIfNeeded()
+        // Install the fence before touching disk. Foreground, background, streaming, and
+        // presentation-representation continuations that arrive after this point are rejected.
+        revokedMediaIds.formUnion(mediaIds)
         for mediaId in mediaIds {
             activeAccessCounts[mediaId] = nil
             removeCachedMedia(mediaId: mediaId)
@@ -3146,7 +3155,7 @@ nonisolated final class EncryptedMediaResourceLoader: NSObject, AVAssetResourceL
 
 enum MediaCacheError: LocalizedError {
     case unsupportedSize, thumbnailTooLarge, localQuotaExceeded, encryptionFailed, invalidState
-    case uploadExpired, automaticDownloadDeferred
+    case uploadExpired, automaticDownloadDeferred, accessRevoked
 
     var errorDescription: String? {
         switch self {
@@ -3157,6 +3166,7 @@ enum MediaCacheError: LocalizedError {
         case .invalidState: String(localized: "The media transfer could not be resumed")
         case .uploadExpired: String(localized: "The upload expired and must be restarted")
         case .automaticDownloadDeferred: String(localized: "Automatic media download was deferred")
+        case .accessRevoked: String(localized: "Media access was revoked")
         }
     }
 }

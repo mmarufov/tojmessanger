@@ -70,6 +70,7 @@ AS $$
 DECLARE
   revoked RECORD;
   next_pts BIGINT;
+  orphan_media_candidates UUID[] := ARRAY[]::UUID[];
 BEGIN
   FOR revoked IN
     SELECT dialog.id AS dialog_id, member.account_id
@@ -128,13 +129,24 @@ BEGIN
     AND source.type = 'saved'
     AND source.created_by = target_account_id;
 
+  -- Snapshot only media referenced by the archive being deleted. Ownership is deliberately not a
+  -- filter: a Saved row can be the last reference to media uploaded by another account. Restricting
+  -- the delete to this bounded candidate set avoids sweeping unrelated global orphans.
+  SELECT COALESCE(array_agg(DISTINCT message.media_id), ARRAY[]::UUID[])
+  INTO orphan_media_candidates
+  FROM messages AS message
+  JOIN dialogs AS saved ON saved.id = message.dialog_id
+  WHERE saved.type = 'saved'
+    AND saved.created_by = target_account_id
+    AND message.media_id IS NOT NULL;
+
   DELETE FROM dialogs
   WHERE type = 'saved' AND created_by = target_account_id;
 
   -- media_chunks cascades from media_objects. Any message reference, including a tombstone, keeps
   -- the object alive; forwarded destination rows therefore retain their shared encrypted media.
   DELETE FROM media_objects AS media
-  WHERE media.owner_account_id = target_account_id
+  WHERE media.id = ANY(orphan_media_candidates)
     AND media.purpose = 'message'
     AND NOT EXISTS (
       SELECT 1 FROM messages message WHERE message.media_id = media.id

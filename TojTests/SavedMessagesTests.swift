@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 @testable import Toj
 
 final class SavedMessagesTests: XCTestCase {
@@ -614,6 +615,353 @@ final class SavedMessagesTests: XCTestCase {
     }
 
     @MainActor
+    func testLegacyReceiptReplayAfterReconciliationCannotRestoreDialogOrProfile() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "legacy-rogue"
+        let ownerId = "saved-owner-profile"
+        let dialogId = "legacy-reconciled-saved"
+        let authorizedDialogId = "legacy-authorized-direct"
+        let authorizedPeerId = "legacy-authorized-peer"
+        try await store.ensureSavedDialog(dialogId: dialogId, accountId: accountId, updatedAt: nil)
+        let message = CloudMessage(
+            dialogId: dialogId, msgId: 1, senderAccountId: ownerId,
+            clientMsgId: UUID().uuidString.lowercased(), kind: "text",
+            text: "private legacy receipt", editVersion: 0, state: "visible",
+            serverTs: "2026-07-27T00:00:00Z"
+        )
+        let authorizedMessage = CloudMessage(
+            dialogId: authorizedDialogId, msgId: 1, senderAccountId: authorizedPeerId,
+            clientMsgId: UUID().uuidString.lowercased(), kind: "text",
+            text: "authorized receipt", editVersion: 0, state: "visible",
+            serverTs: "2026-07-27T00:00:01Z"
+        )
+        let receipt = DifferenceResponse(
+            kind: "difference", state: .init(pts: 3),
+            updates: [
+                CloudUpdate(
+                    pts: 1, ptsCount: 1, type: "message.new", dialogId: dialogId,
+                    dialogTitle: "Saved Messages", dialogType: "saved", message: message,
+                    readerAccountId: nil, maxReadMsgId: nil
+                ),
+                CloudUpdate(
+                    pts: 2, ptsCount: 1, type: "dialog.access_revoked", dialogId: dialogId,
+                    dialogTitle: nil, dialogType: "saved", message: nil,
+                    readerAccountId: nil, maxReadMsgId: nil
+                ),
+                CloudUpdate(
+                    pts: 3, ptsCount: 1, type: "message.new",
+                    dialogId: authorizedDialogId, dialogTitle: "Authorized",
+                    dialogType: "direct", message: authorizedMessage,
+                    readerAccountId: nil, maxReadMsgId: nil
+                ),
+            ],
+            profiles: [
+                CloudProfile(
+                    accountId: ownerId, firstName: "Private", lastName: "Owner",
+                    displayName: "Private Owner", bio: "must not persist", birthday: nil,
+                    colorIndex: 3, updatedAt: "2026-07-27T00:00:00Z"
+                ),
+                CloudProfile(
+                    accountId: authorizedPeerId, firstName: "Authorized", lastName: "Peer",
+                    displayName: "Authorized Peer", bio: "", birthday: nil,
+                    colorIndex: 4, updatedAt: "2026-07-27T00:00:01Z"
+                ),
+            ],
+            hasMore: false
+        )
+        try await store.applyDifference(receipt, accountId: accountId)
+        let profilePersistedBeforeDrain = try await store.containsProfile(accountId: ownerId)
+        let authorizedProfilePersisted = try await store.containsProfile(
+            accountId: authorizedPeerId
+        )
+        XCTAssertFalse(profilePersistedBeforeDrain)
+        XCTAssertTrue(authorizedProfilePersisted)
+
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "legacy-replay-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x31, count: 32), limitBytes: 1_000_000
+        )
+        _ = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: accountId, token: "legacy-token", generation: 1, store: store
+            ),
+            store: store,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            isCurrent: { true },
+            invalidatePresentation: { _ in }
+        )
+
+        try await store.applyDifference(receipt, accountId: accountId)
+        let replayDialogs = try await store.dialogs(accountId: accountId)
+        let replayTimeline = try await store.timeline(dialogId: dialogId)
+        let replayProfilePersisted = try await store.containsProfile(accountId: ownerId)
+        let replayPurgeCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(replayDialogs.map(\.dialogId), [authorizedDialogId])
+        XCTAssertTrue(replayTimeline.messages.isEmpty)
+        XCTAssertFalse(replayProfilePersisted)
+        XCTAssertEqual(replayPurgeCount, 0)
+    }
+
+    func testDelayedHistoryMutationAndDifferenceWritesRespectRevocationFence() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "delayed-writes-account"
+        let dialogId = "delayed-writes-saved"
+        let clientMsgId = UUID().uuidString.lowercased()
+        try await store.ensureSavedDialog(dialogId: dialogId, accountId: accountId, updatedAt: nil)
+        try await Self.applyRevocation(
+            store: store, accountId: accountId, dialogId: dialogId, pts: 1
+        )
+        let delayed = CloudMessage(
+            dialogId: dialogId, msgId: 7, senderAccountId: accountId,
+            clientMsgId: clientMsgId, kind: "text", text: "must stay revoked",
+            editVersion: 1, state: "visible", serverTs: "2026-07-27T00:00:01Z"
+        )
+        let profile = CloudProfile(
+            accountId: "revoked-profile", firstName: "Revoked", lastName: "Profile",
+            displayName: "Revoked Profile", bio: "", birthday: nil, colorIndex: 1,
+            updatedAt: "2026-07-27T00:00:01Z"
+        )
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: dialogId, messages: [delayed], profiles: [profile],
+            nextBeforeMsgId: nil, hasMore: false
+        ))
+        try await store.applyTargetedHistoryPage(HistoryPageResponse(
+            dialogId: dialogId, messages: [delayed], profiles: [profile],
+            nextBeforeMsgId: nil, hasMore: false
+        ))
+        try await store.applyMessageMutation(MessageMutationResponse(
+            dialogId: dialogId, msgId: 7, actorPts: 2, duplicate: false, message: delayed
+        ))
+        try await store.markSent(SendMessageResponse(
+            dialogId: dialogId, clientMsgId: clientMsgId, msgId: 7,
+            senderPts: 2, duplicate: false, serverTs: delayed.serverTs, text: delayed.text
+        ), senderAccountId: accountId)
+        try await store.applyDifference(DifferenceResponse(
+            kind: "difference", state: .init(pts: 3),
+            updates: [CloudUpdate(
+                pts: 3, ptsCount: 1, type: "message.new", dialogId: dialogId,
+                dialogTitle: "Saved Messages", dialogType: "saved", message: delayed,
+                readerAccountId: nil, maxReadMsgId: nil
+            )],
+            profiles: [profile], hasMore: false
+        ), accountId: accountId)
+        do {
+            _ = try await store.insertSending(
+                dialogId: dialogId, clientMsgId: UUID().uuidString.lowercased(),
+                text: "rejected", senderAccountId: accountId
+            )
+            XCTFail("revoked outbox write must be rejected")
+        } catch CloudLocalStoreAccessError.revoked {
+            // Expected.
+        }
+        do {
+            try await store.enqueueMessageMutation(
+                clientMutationId: UUID().uuidString.lowercased(), operation: "delete",
+                dialogId: dialogId, msgId: 7
+            )
+            XCTFail("revoked mutation write must be rejected")
+        } catch CloudLocalStoreAccessError.revoked {
+            // Expected.
+        }
+        let delayedTimeline = try await store.timeline(dialogId: dialogId)
+        let delayedProfilePersisted = try await store.containsProfile(
+            accountId: profile.accountId
+        )
+        XCTAssertTrue(delayedTimeline.messages.isEmpty)
+        XCTAssertFalse(delayedProfilePersisted)
+    }
+
+    @MainActor
+    func testLateForegroundBackgroundStreamingAndPresentationWritesAreFenced() async throws {
+        let fixture = try makeStoreFixture()
+        let mediaId = "late-revoked-media"
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "late-write-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x41, count: 32), limitBytes: 1_000_000
+        )
+        try await cache.storeDownloadChunk(Data([1, 2, 3]), mediaId: mediaId, offset: 0)
+        try await cache.purgeRevokedMedia(mediaIds: [mediaId], additionalEncryptedPaths: [])
+
+        for operation in [
+            { try await cache.storeDownloadChunk(Data([4]), mediaId: mediaId, offset: 0) },
+            { try await cache.storeThumbnail(Data([5]), mediaId: mediaId) },
+            {
+                try await cache.storeRepresentation(
+                    Data([6]), mediaId: mediaId, variant: .bubble720
+                )
+            },
+            { try await cache.beginAccess(mediaId: mediaId) },
+        ] {
+            do {
+                try await operation()
+                XCTFail("late media write must be rejected")
+            } catch MediaCacheError.accessRevoked {
+                // Foreground, background callback, streaming, and representation share this fence.
+            }
+        }
+
+        let presentation = MediaPresentationCache.shared
+        presentation.removeAll()
+        let gate = SavedMessagesAsyncGate()
+        let key = MediaPresentationKey(mediaId: mediaId, variant: .bubble720)
+        let delayedPresentation = Task {
+            await presentation.image(for: key) {
+                await gate.wait()
+                return SafeDecodedImage(image: UIImage(), pixelWidth: 1, pixelHeight: 1)
+            }
+        }
+        await gate.waitUntilBlocked()
+        presentation.revoke(mediaIds: [mediaId])
+        await gate.open()
+        let delayedImage = await delayedPresentation.value
+        XCTAssertNil(delayedImage)
+        XCTAssertFalse(presentation.contains(key))
+        presentation.resetForSession()
+    }
+
+    @MainActor
+    func testRevokingChatADoesNotCancelChatBUploadTask() async throws {
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://task-scope.invalid"))),
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        let aCancelled = SavedMessagesCancellationProbe()
+        let bCancelled = SavedMessagesCancellationProbe()
+        let taskA = Task {
+            do { try await Task.sleep(for: .seconds(30)) }
+            catch { await aCancelled.markCancelled() }
+        }
+        let taskB = Task {
+            do { try await Task.sleep(for: .seconds(30)) }
+            catch { await bCancelled.markCancelled() }
+        }
+        model.testTrackMediaTransferTask(transferId: "upload-a", dialogId: "chat-a", task: taskA)
+        model.testTrackMediaTransferTask(transferId: "upload-b", dialogId: "chat-b", task: taskB)
+        await model.testInvalidatePresentationForAccessPurge(AccessPurgeJob(
+            id: "purge-a", dialogId: "chat-a", allMediaIds: ["media-a"],
+            purgeMediaIds: ["media-a"], encryptedPaths: [], phase: .staged,
+            attempts: 0, lastError: nil
+        ))
+
+        let didCancelA = await aCancelled.value
+        let didCancelB = await bCancelled.value
+        XCTAssertTrue(didCancelA)
+        XCTAssertFalse(didCancelB)
+        XCTAssertFalse(model.testHasTrackedMediaTransfer("upload-a"))
+        XCTAssertTrue(model.testHasTrackedMediaTransfer("upload-b"))
+        await model.testCancelTrackedMediaTransfer("upload-b")
+    }
+
+    @MainActor
+    func testPurgeJobFailureIsIsolatedAndDurableForNextLaunch() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        for dialogId in ["bad-purge", "good-purge"] {
+            try await store.upsertDialog(dialogId: dialogId, type: "group", title: dialogId)
+            try await store.revokeGroupAccess(dialogId: dialogId, reason: "dialog.access_revoked")
+        }
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "isolated-purge-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x42, count: 32), limitBytes: 1_000_000
+        )
+        let result = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: "isolation-account", token: "token", generation: 1, store: store
+            ),
+            store: store,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            isCurrent: { true },
+            invalidatePresentation: { _ in },
+            purgeFilesOverride: { job in
+                if job.dialogId == "bad-purge" { throw SavedMessagesInjectedPurgeError() }
+            }
+        )
+        XCTAssertEqual(result.finalized, 1)
+        XCTAssertEqual(result.failed, 1)
+        let remaining = try await store.pendingAccessPurgeJobs()
+        XCTAssertEqual(remaining.map(\.dialogId), ["bad-purge"])
+        XCTAssertEqual(remaining.first?.attempts, 1)
+        XCTAssertNotNil(remaining.first?.lastError)
+        let goodTimeline = try await store.timeline(dialogId: "good-purge")
+        XCTAssertTrue(goodTimeline.messages.isEmpty)
+    }
+
+    @MainActor
+    func testLargeMediaBearingLaunchPurgeDrainsEveryBatchBeforePublishing() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "large-launch-account"
+        let cacheRoot = URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+            .appending(path: "large-launch-cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot, keyData: Data(repeating: 0x43, count: 32),
+            limitBytes: 5_000_000
+        )
+        for index in 0..<25 {
+            let dialogId = "large-revoked-\(index)"
+            let mediaId = "large-media-\(index)"
+            let media = CloudMedia(
+                id: mediaId, kind: "file", contentType: "application/octet-stream",
+                fileName: "\(index).bin", byteSize: 32, durationMs: nil,
+                width: nil, height: nil, hasThumbnail: false
+            )
+            try await cache.storeDownloadChunk(
+                Data(repeating: UInt8(index), count: 32), mediaId: mediaId, offset: 0
+            )
+            try await store.upsertMediaCacheEntry(MediaCacheEntry(
+                mediaId: mediaId, variant: "full",
+                encryptedPath: cacheRoot.appending(path: "downloads/\(mediaId)").path,
+                byteSize: 32, cachedBytes: 60, contiguousOffset: 32, state: "complete",
+                lastAccessedAt: "2026-07-27 00:00:00", protectedUntil: nil
+            ))
+            try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Revoked")
+            try await Self.applyCanonicalMedia(
+                store: store, accountId: accountId, dialogId: dialogId,
+                dialogType: "group", media: media, pts: Int64(index + 1), msgId: 1
+            )
+            try await store.revokeGroupAccess(dialogId: dialogId, reason: "dialog.access_revoked")
+        }
+        let stagedPurgeCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(stagedPurgeCount, 25)
+
+        let tokenStore = TokenStore(service: "com.toj.large-launch.\(UUID().uuidString)")
+        try await tokenStore.save(StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId, deviceId: "large-device", token: "large-token"
+            ),
+            phone: "+992900000099", displayName: "Large Launch"
+        ))
+        let model = CloudAppModel(
+            config: CloudConfig(
+                baseURL: try XCTUnwrap(URL(string: "https://large-launch.invalid"))
+            ),
+            tokenStore: tokenStore,
+            localStore: store,
+            useDefaultLocalStore: false,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        await model.prepareForBackgroundRuntime()
+
+        XCTAssertEqual(model.launchPhase, .localReady)
+        XCTAssertTrue(model.dialogs.isEmpty)
+        let remainingPurgeCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(remainingPurgeCount, 0)
+        for index in 0..<25 {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: cacheRoot.appending(path: "downloads/large-media-\(index)").path
+            ))
+        }
+        try await tokenStore.clear()
+    }
+
+    @MainActor
     func testAccessPurgeDeletesRealEncryptedFilesDuringPlaybackAndZerosPayloads() async throws {
         let fixture = try makeStoreFixture()
         let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
@@ -644,7 +992,7 @@ final class SavedMessagesTests: XCTestCase {
             lastAccessedAt: "2026-07-27 00:00:00", protectedUntil: nil
         ))
         try await store.ensureSavedDialog(dialogId: dialogId, accountId: accountId, updatedAt: nil)
-        try await applyCanonicalMedia(
+        try await Self.applyCanonicalMedia(
             store: store, accountId: accountId, dialogId: dialogId,
             dialogType: "saved", media: media, pts: 1, msgId: 1
         )
@@ -673,7 +1021,7 @@ final class SavedMessagesTests: XCTestCase {
         )
         await engine.beginMediaAccess(mediaId)
 
-        try await applyRevocation(
+        try await Self.applyRevocation(
             store: store, accountId: accountId, dialogId: dialogId, pts: 2
         )
         let stagedOutbox = try await store.pendingOutboxReady()
@@ -750,15 +1098,15 @@ final class SavedMessagesTests: XCTestCase {
         ))
         try await store.ensureSavedDialog(dialogId: savedId, accountId: accountId, updatedAt: nil)
         try await store.upsertDialog(dialogId: targetId, type: "direct", title: "Peer")
-        try await applyCanonicalMedia(
+        try await Self.applyCanonicalMedia(
             store: store, accountId: accountId, dialogId: savedId,
             dialogType: "saved", media: media, pts: 1, msgId: 1
         )
-        try await applyCanonicalMedia(
+        try await Self.applyCanonicalMedia(
             store: store, accountId: accountId, dialogId: targetId,
             dialogType: "direct", media: media, pts: 2, msgId: 1, forwarded: true
         )
-        try await applyRevocation(
+        try await Self.applyRevocation(
             store: store, accountId: accountId, dialogId: savedId, pts: 3
         )
         let stagedJobs = try await store.pendingAccessPurgeJobs()
@@ -987,6 +1335,7 @@ final class SavedMessagesTests: XCTestCase {
             "Connect once to set up Saved Messages",
             "Connect to set up",
             "Keep notes, media, links and files here. Downloaded items stay available offline.",
+            "Media access was revoked",
             "Offline conversation could not be opened",
             "Save something for yourself",
             "Saved Messages could not be set up",
@@ -994,6 +1343,7 @@ final class SavedMessagesTests: XCTestCase {
             "Saved to Saved Messages",
             "Setting up…",
             "Synced across your devices",
+            "The dialog is no longer authorized for this account",
             "The unauthorized Saved Messages offline copy was removed.",
             "Try offline copy again",
             "Unavailable",
@@ -1036,7 +1386,7 @@ final class SavedMessagesTests: XCTestCase {
         )
     }
 
-    private func applyCanonicalMedia(
+    private static func applyCanonicalMedia(
         store: CloudLocalStore,
         accountId: String,
         dialogId: String,
@@ -1069,7 +1419,7 @@ final class SavedMessagesTests: XCTestCase {
         )
     }
 
-    private func applyRevocation(
+    private static func applyRevocation(
         store: CloudLocalStore,
         accountId: String,
         dialogId: String,
@@ -1088,6 +1438,50 @@ final class SavedMessagesTests: XCTestCase {
             ),
             accountId: accountId
         )
+    }
+}
+
+private struct SavedMessagesInjectedPurgeError: LocalizedError {
+    var errorDescription: String? { "deterministic purge failure" }
+}
+
+private actor SavedMessagesCancellationProbe {
+    private var cancelled = false
+
+    func markCancelled() {
+        cancelled = true
+    }
+
+    var value: Bool { cancelled }
+}
+
+private actor SavedMessagesAsyncGate {
+    private var waitContinuation: CheckedContinuation<Void, Never>?
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var isBlocked = false
+    private var isOpen = false
+
+    func wait() async {
+        if isOpen { return }
+        isBlocked = true
+        blockedContinuation?.resume()
+        blockedContinuation = nil
+        await withCheckedContinuation { continuation in
+            waitContinuation = continuation
+        }
+    }
+
+    func waitUntilBlocked() async {
+        if isBlocked { return }
+        await withCheckedContinuation { continuation in
+            blockedContinuation = continuation
+        }
+    }
+
+    func open() {
+        isOpen = true
+        waitContinuation?.resume()
+        waitContinuation = nil
     }
 }
 

@@ -317,7 +317,14 @@ describe("Saved Messages v1", () => {
       dialog_id: saved.dialogId,
       dialog_type: "saved",
     })]);
+    expect(legacyDifference.profiles).toEqual([]);
     expect(JSON.stringify(legacyDifference.updates)).not.toContain("owner private note");
+    const replayedLegacyReceipt = await getDifference(db, rogue.accountId, legacyPts - 1);
+    if (replayedLegacyReceipt.kind === "difference_too_long") {
+      throw new Error("unexpected rebuild");
+    }
+    expect(replayedLegacyReceipt.updates).toEqual(legacyDifference.updates);
+    expect(replayedLegacyReceipt.profiles).toEqual([]);
 
     await sendMessage(db, {
       senderAccountId: owner.accountId,
@@ -879,6 +886,33 @@ describe("Saved Messages v1", () => {
       body: "",
       mediaId: orphanUpload.mediaId,
     });
+    const foreignOrphanBytes = Buffer.from("foreign-owned orphan must also be erased");
+    const foreignOrphanUpload = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "file",
+      contentType: "application/octet-stream",
+      fileName: "foreign-orphan.bin",
+      byteSize: foreignOrphanBytes.length,
+      sha256: createHash("sha256").update(foreignOrphanBytes).digest("hex"),
+    });
+    await uploadMediaChunk(
+      db, owner.accountId, owner.deviceId,
+      foreignOrphanUpload.mediaId, 0, foreignOrphanBytes,
+    );
+    await completeMediaUpload(
+      db, owner.accountId, owner.deviceId, foreignOrphanUpload.mediaId,
+    );
+    await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "",
+      mediaId: foreignOrphanUpload.mediaId,
+    });
+    await db`
+      UPDATE media_objects
+      SET owner_account_id = ${peer.accountId}
+      WHERE id = ${foreignOrphanUpload.mediaId}`;
     const roguePts = Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${rogue.accountId}`)[0].pts);
 
@@ -923,6 +957,105 @@ describe("Saved Messages v1", () => {
       .toHaveLength(0);
     expect(await db`SELECT media_id FROM media_chunks WHERE media_id = ${orphanUpload.mediaId}`)
       .toHaveLength(0);
+    expect(await db`SELECT id FROM media_objects WHERE id = ${foreignOrphanUpload.mediaId}`)
+      .toHaveLength(0);
+    expect(await db`
+      SELECT media_id FROM media_chunks WHERE media_id = ${foreignOrphanUpload.mediaId}
+    `).toHaveLength(0);
+  });
+
+  test("account cleanup trigger failure is atomic and retry replays one ordered revocation", async () => {
+    const owner = await account("+16505554170", "Rollback Owner");
+    const rogue = await account("+16505554171", "Rollback Rogue");
+    const peer = await account("+16505554172", "Rollback Peer");
+    const saved = await ensureSavedMessages(db, owner.accountId, owner.deviceId);
+    await insertLegacyRogueSavedMember(saved.dialogId, rogue.accountId);
+    const source = await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: saved.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "rollback source",
+    });
+    const direct = await getOrCreateDirectDialog(db, owner.accountId, peer.accountId);
+    const forwarded = await sendMessage(db, {
+      senderAccountId: owner.accountId,
+      senderDeviceId: owner.deviceId,
+      dialogId: direct.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      forwardedFrom: { dialogId: saved.dialogId, msgId: source.msgId },
+    });
+    const initialPts = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${rogue.accountId}
+    `)[0].pts);
+
+    await db`
+      CREATE OR REPLACE FUNCTION toj_test_fail_saved_revocation()
+      RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.type = 'dialog.access_revoked' THEN
+          RAISE EXCEPTION 'deterministic revocation outbox failure';
+        END IF;
+        RETURN NEW;
+      END
+      $$`;
+    await db`
+      CREATE TRIGGER toj_test_fail_saved_revocation
+      BEFORE INSERT ON account_events
+      FOR EACH ROW EXECUTE FUNCTION toj_test_fail_saved_revocation()`;
+    var failure = "";
+    try {
+      try {
+        await db`UPDATE accounts SET status = 'deleted' WHERE id = ${owner.accountId}`;
+      } catch (error) {
+        failure = String(error);
+      }
+    } finally {
+      await db`DROP TRIGGER IF EXISTS toj_test_fail_saved_revocation ON account_events`;
+      await db`DROP FUNCTION IF EXISTS toj_test_fail_saved_revocation()`;
+    }
+    expect(failure).toContain("deterministic revocation outbox failure");
+
+    expect((await db`SELECT status FROM accounts WHERE id = ${owner.accountId}`)[0].status)
+      .toBe("active");
+    expect(await db`SELECT id FROM dialogs WHERE id = ${saved.dialogId}`).toHaveLength(1);
+    expect(await db`
+      SELECT account_id FROM dialog_members
+      WHERE dialog_id = ${saved.dialogId} AND account_id = ${rogue.accountId}
+    `).toHaveLength(1);
+    expect(Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${rogue.accountId}
+    `)[0].pts)).toBe(initialPts);
+    const rolledBackCopy = (await db`
+      SELECT is_forwarded, forwarded_from_dialog_id, forwarded_from_msg_id
+      FROM messages
+      WHERE dialog_id = ${direct.dialogId} AND msg_id = ${forwarded.msgId}
+    `)[0];
+    expect(rolledBackCopy).toMatchObject({
+      is_forwarded: true,
+      forwarded_from_dialog_id: saved.dialogId,
+    });
+    expect(Number(rolledBackCopy.forwarded_from_msg_id)).toBe(source.msgId);
+
+    await db`UPDATE accounts SET status = 'deleted' WHERE id = ${owner.accountId}`;
+    expect(await db`SELECT id FROM dialogs WHERE id = ${saved.dialogId}`).toHaveLength(0);
+    expect((await db`
+      SELECT is_forwarded, forwarded_from_dialog_id, forwarded_from_msg_id
+      FROM messages
+      WHERE dialog_id = ${direct.dialogId} AND msg_id = ${forwarded.msgId}
+    `)[0]).toMatchObject({
+      is_forwarded: true,
+      forwarded_from_dialog_id: null,
+      forwarded_from_msg_id: null,
+    });
+    expect((await db`
+      SELECT pts, type FROM account_events
+      WHERE account_id = ${rogue.accountId} AND pts > ${initialPts}
+      ORDER BY pts
+    `).map((event) => ({ pts: Number(event.pts), type: event.type }))).toEqual([{
+      pts: initialPts + 1,
+      type: "dialog.access_revoked",
+    }]);
   });
 
   test("rollout flag hard-closes the route and authenticated capability", async () => {

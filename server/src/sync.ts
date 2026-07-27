@@ -997,9 +997,46 @@ export async function getDifference(
     lastPts = pts;
   }
   const hasMore = truncated || (rows.length === maxEvents && lastPts < statePts);
-  const profiles: ProfileDTO[] = rows.length
+  const rawProfiles: ProfileDTO[] = rows.length
     ? (typeof rows[0].profiles === "string" ? JSON.parse(rows[0].profiles) : rows[0].profiles)
     : [];
+  // The SQL page is intentionally materialized before authorization is reconciled. Do not let a
+  // legacy unauthorized event smuggle the Saved owner profile alongside its replacement
+  // dialog.access_revoked update. Keep only profiles explicitly referenced by visible updates.
+  const visibleProfileIds = new Set<string>();
+  const collectProfileIds = (value: unknown, key = ""): void => {
+    if (typeof value === "string") {
+      if ([
+        "actor_account_id", "peer_account_id", "subject_account_id",
+        "sender_account_id", "forwarded_from_account_id", "account_id",
+      ].includes(key)) visibleProfileIds.add(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      if (key === "member_account_ids") {
+        for (const item of value) if (typeof item === "string") visibleProfileIds.add(item);
+      } else {
+        for (const item of value) collectProfileIds(item);
+      }
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        collectProfileIds(childValue, childKey);
+      }
+    }
+  };
+  for (const [index, update] of updates.entries()) {
+    collectProfileIds(update);
+    // Lifecycle payloads do not always repeat the account_events actor in data. Preserve that
+    // authorized actor profile for ordinary group/direct events while never retaining the actor
+    // attached to an access-revoked replacement.
+    if (update.type !== "dialog.access_revoked") {
+      const actorAccountId = rows[index]?.actor_account_id;
+      if (typeof actorAccountId === "string") visibleProfileIds.add(actorAccountId);
+    }
+  }
+  const profiles = rawProfiles.filter((profile) => visibleProfileIds.has(profile.accountId));
   return {
     kind: hasMore ? "difference_slice" : "difference",
     state: { pts: hasMore ? lastPts : statePts },

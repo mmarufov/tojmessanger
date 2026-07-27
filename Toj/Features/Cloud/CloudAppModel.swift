@@ -384,6 +384,7 @@ final class CloudAppModel {
     private var composerMediaOperationId: UUID?
     private var activeComposerTransferId: String?
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
+    private var mediaTransferDialogIds: [String: String] = [:]
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
@@ -474,6 +475,7 @@ final class CloudAppModel {
         callPreferences: CallPrivacyPreferences = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
         useDefaultLocalStore: Bool = true,
+        mediaEngine injectedMediaEngine: CloudMediaTransferEngine? = nil,
         capabilityDefaults: UserDefaults = .standard
     ) {
         self.api = injectedAPI ?? CloudAPI(config: config)
@@ -482,7 +484,7 @@ final class CloudAppModel {
         self.voipPushCenter = voipPushCenter
         self.callCoordinator = callCoordinator
         self.callPreferences = callPreferences
-        self.mediaEngine = CloudMediaTransferEngine(config: config)
+        self.mediaEngine = injectedMediaEngine ?? CloudMediaTransferEngine(config: config)
         self.opensDefaultLocalStore = useDefaultLocalStore && injectedLocalStore == nil
         self.capabilityDefaults = capabilityDefaults
         self.capabilityCacheKey = "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
@@ -1026,6 +1028,7 @@ final class CloudAppModel {
         composerMediaOperationId = nil
         activeComposerTransferId = nil
         mediaTransferTasks.removeAll()
+        mediaTransferDialogIds.removeAll()
         mediaTransfersInFlight.removeAll()
         messageMutationsInFlight.removeAll()
         mutationTargetsBeingQueued.removeAll()
@@ -1037,7 +1040,7 @@ final class CloudAppModel {
         retryInFlight = false
 
         await mediaEngine.destroyLocalStateForLogout()
-        MediaPresentationCache.shared.removeAll()
+        MediaPresentationCache.shared.resetForSession()
         backgroundMediaRuntimePrepared = false
         mediaCacheBytes = 0
 
@@ -3142,28 +3145,40 @@ final class CloudAppModel {
 
     private func invalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
         let dialogId = job.dialogId
-        MediaPresentationCache.shared.invalidate(mediaIds: job.allMediaIds)
+        // Shared media remains valid in a forwarded copy. Only globally orphaned media receives a
+        // process-wide presentation tombstone.
+        MediaPresentationCache.shared.revoke(mediaIds: job.purgeMediaIds)
 
-        let cancellableTasks = Array(mediaTransferTasks.values)
+        let transferIds = Set(mediaTransferDialogIds.compactMap { transferId, taskDialogId in
+            taskDialogId == dialogId ? transferId : nil
+        })
+        let cancellableTasks = transferIds.compactMap { mediaTransferTasks[$0] }
         cancellableTasks.forEach { $0.cancel() }
-        mediaDownloadTask?.cancel()
-        retryTask?.cancel()
-        composerMediaTask?.cancel()
-        historyHydrationTask?.cancel()
-        await mediaPrefetchScheduler.stop()
+        let cancelsActiveConversationWork = activeDialogId == dialogId
+        if cancelsActiveConversationWork {
+            mediaDownloadTask?.cancel()
+            historyHydrationTask?.cancel()
+        }
+        let cancelsComposer = activeComposerTransferId.map(transferIds.contains) == true
+        if cancelsComposer { composerMediaTask?.cancel() }
         for task in cancellableTasks { await task.value }
-        await mediaDownloadTask?.value
-        await retryTask?.value
-        await composerMediaTask?.value
-        await historyHydrationTask?.value
-        mediaTransferTasks.removeAll()
-        mediaTransfersInFlight.removeAll()
-        mediaDownloadTask = nil
-        retryTask = nil
-        composerMediaTask = nil
-        historyHydrationTask = nil
-        activeComposerTransferId = nil
-        composerMediaOperationId = nil
+        for transferId in transferIds {
+            mediaTransferTasks[transferId] = nil
+            mediaTransferDialogIds[transferId] = nil
+            mediaTransfersInFlight.remove(transferId)
+        }
+        if cancelsActiveConversationWork {
+            await mediaDownloadTask?.value
+            await historyHydrationTask?.value
+            mediaDownloadTask = nil
+            historyHydrationTask = nil
+        }
+        if cancelsComposer {
+            await composerMediaTask?.value
+            composerMediaTask = nil
+            activeComposerTransferId = nil
+            composerMediaOperationId = nil
+        }
 
         cachedLinesByDialog[dialogId] = nil
         cachedLocalMessagesByDialog[dialogId] = nil
@@ -3183,6 +3198,34 @@ final class CloudAppModel {
             canLoadEarlier = false
         }
     }
+
+    #if DEBUG
+    func testTrackMediaTransferTask(
+        transferId: String,
+        dialogId: String,
+        task: Task<Void, Never>
+    ) {
+        mediaTransferTasks[transferId] = task
+        mediaTransferDialogIds[transferId] = dialogId
+        mediaTransfersInFlight.insert(transferId)
+    }
+
+    func testInvalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
+        await invalidatePresentationForAccessPurge(job)
+    }
+
+    func testHasTrackedMediaTransfer(_ transferId: String) -> Bool {
+        mediaTransferTasks[transferId] != nil
+    }
+
+    func testCancelTrackedMediaTransfer(_ transferId: String) async {
+        guard let task = mediaTransferTasks.removeValue(forKey: transferId) else { return }
+        mediaTransferDialogIds[transferId] = nil
+        mediaTransfersInFlight.remove(transferId)
+        task.cancel()
+        await task.value
+    }
+    #endif
 
     private func startReplicaIntegrityVerification(store: CloudLocalStore, accountId: String) {
         replicaIntegrityTask?.cancel()
@@ -5136,12 +5179,14 @@ final class CloudAppModel {
             await self.processMediaTransfer(transfer)
         }
         mediaTransferTasks[transfer.transferId] = task
+        mediaTransferDialogIds[transfer.transferId] = transfer.dialogId
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
             task.cancel()
         }
         mediaTransferTasks.removeValue(forKey: transfer.transferId)
+        mediaTransferDialogIds.removeValue(forKey: transfer.transferId)
     }
 
     private func processMediaTransfer(_ initial: MediaTransferRecord) async {
@@ -5150,6 +5195,14 @@ final class CloudAppModel {
             let token = storedSession?.session.token,
             let accountId = storedSession?.session.accountId,
             let localStore
+        else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ), (try? await localStore.isDialogAccessRevoked(dialogId: initial.dialogId)) == false
         else { return }
         mediaTransfersInFlight.insert(initial.transferId)
         defer { mediaTransfersInFlight.remove(initial.transferId) }
@@ -5195,6 +5248,18 @@ final class CloudAppModel {
                     clientMutationId: ready.transferId,
                     token: token
                 )
+                try Task.checkCancellation()
+                guard
+                    isCurrentSavedMessagesSession(
+                        accountId: accountId,
+                        token: token,
+                        store: localStore,
+                        generation: generation
+                    ),
+                    (try? await localStore.isDialogAccessRevoked(
+                        dialogId: ready.dialogId
+                    )) == false
+                else { throw CancellationError() }
                 try await localStore.applyGroupEnvelope(envelope)
                 let promotedToCache = await mediaEngine.finishUpload(ready, localStore: localStore)
                 try await localStore.completeMediaTransfer(transferId: ready.transferId)
@@ -5213,8 +5278,13 @@ final class CloudAppModel {
             if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
             try Task.checkCancellation()
             guard
-                storedSession?.session.token == token,
-                storedSession?.session.accountId == accountId
+                isCurrentSavedMessagesSession(
+                    accountId: accountId,
+                    token: token,
+                    store: localStore,
+                    generation: generation
+                ),
+                (try? await localStore.isDialogAccessRevoked(dialogId: ready.dialogId)) == false
             else { throw CancellationError() }
             // Once the idempotent send request begins it is the commit point. Hide the upload cancel
             // control so the UI never promises cancellation after the server may have committed.
@@ -5227,6 +5297,16 @@ final class CloudAppModel {
                 body: ready.caption, mediaId: mediaId, replyToMsgId: ready.replyToMsgId,
                 token: token
             )
+            try Task.checkCancellation()
+            guard
+                isCurrentSavedMessagesSession(
+                    accountId: accountId,
+                    token: token,
+                    store: localStore,
+                    generation: generation
+                ),
+                (try? await localStore.isDialogAccessRevoked(dialogId: ready.dialogId)) == false
+            else { throw CancellationError() }
             try await localStore.markSent(response, senderAccountId: accountId)
             let promotedToCache = await mediaEngine.finishUpload(ready, localStore: localStore)
             try await localStore.completeMediaTransfer(transferId: ready.transferId)
@@ -5243,6 +5323,13 @@ final class CloudAppModel {
             await cancelMediaTransfer(current, token: token)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
         } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: initial.dialogId)) == false
+            else { return }
             let current = try? await localStore.mediaTransfer(id: initial.transferId)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
             switch cloudOperationFailureDisposition(
@@ -5660,7 +5747,19 @@ final class CloudAppModel {
 
     private func processMessageMutation(_ mutation: PendingMessageMutation) async {
         guard !messageMutationsInFlight.contains(mutation.clientMutationId) else { return }
-        guard let token = storedSession?.session.token, let localStore else { return }
+        guard
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+        else { return }
         messageMutationsInFlight.insert(mutation.clientMutationId)
         defer { messageMutationsInFlight.remove(mutation.clientMutationId) }
 
@@ -5698,6 +5797,14 @@ final class CloudAppModel {
                 throw CloudAppModelError.localStoreUnavailable
             }
 
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+            else { return }
             try await localStore.applyMessageMutation(response)
             try await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
             if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
@@ -5705,7 +5812,16 @@ final class CloudAppModel {
             setReplicaSyncState(.ready)
             status = response.duplicate ? "Change confirmed" : "Updated"
             scheduleSync()
+        } catch is CancellationError {
+            return
         } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+            else { return }
             if let apiError = error as? CloudAPIError, apiError.status == 409 {
                 try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
                 await syncNow()

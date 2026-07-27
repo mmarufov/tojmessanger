@@ -17,6 +17,13 @@ nonisolated struct AccessPurgeScope: Equatable, Sendable {
 nonisolated struct AccessPurgeDrainResult: Equatable, Sendable {
     let finalized: Int
     let batches: Int
+    let failed: Int
+
+    init(finalized: Int, batches: Int, failed: Int = 0) {
+        self.finalized = finalized
+        self.batches = batches
+        self.failed = failed
+    }
 }
 
 enum AccessPurgeCoordinatorError: Error {
@@ -40,7 +47,8 @@ actor AccessPurgeCoordinator {
         store: CloudLocalStore,
         mediaEngine: CloudMediaTransferEngine,
         isCurrent: @escaping @MainActor @Sendable () -> Bool,
-        invalidatePresentation: @escaping @MainActor @Sendable (AccessPurgeJob) async -> Void
+        invalidatePresentation: @escaping @MainActor @Sendable (AccessPurgeJob) async -> Void,
+        purgeFilesOverride: (@Sendable (AccessPurgeJob) async throws -> Void)? = nil
     ) async throws -> AccessPurgeDrainResult {
         guard !resetting else { throw AccessPurgeCoordinatorError.staleSession }
         if activeScope != scope {
@@ -54,57 +62,81 @@ actor AccessPurgeCoordinator {
         let task = Task {
             var finalized = 0
             var batches = 0
+            var failedJobIds: Set<String> = []
             while !Task.isCancelled {
                 guard await isCurrent() else { throw AccessPurgeCoordinatorError.staleSession }
-                let jobs = try await store.pendingAccessPurgeJobs(limit: 20)
+                let jobs = try await store.pendingAccessPurgeJobs(
+                    limit: 20,
+                    excluding: failedJobIds
+                )
                 if jobs.isEmpty { break }
                 batches += 1
                 for queuedJob in jobs {
-                    try Task.checkCancellation()
-                    guard await isCurrent() else {
-                        throw AccessPurgeCoordinatorError.staleSession
-                    }
-                    await invalidatePresentation(queuedJob)
-                    try Task.checkCancellation()
-                    guard await isCurrent() else {
-                        throw AccessPurgeCoordinatorError.staleSession
-                    }
-                    let job: AccessPurgeJob
-                    if queuedJob.phase == .staged {
-                        guard let refreshed = try await store.refreshAccessPurgeJob(
-                            id: queuedJob.id
-                        ) else { continue }
-                        job = refreshed
-                    } else {
-                        job = queuedJob
-                    }
-                    try Task.checkCancellation()
-                    guard await isCurrent() else {
-                        throw AccessPurgeCoordinatorError.staleSession
-                    }
-                    if job.phase == .staged {
-                        try await mediaEngine.purgeRevokedAccess(
-                            allMediaIds: job.allMediaIds,
-                            purgeMediaIds: job.purgeMediaIds,
-                            encryptedPaths: job.encryptedPaths,
-                            localStore: store
-                        )
+                    do {
                         try Task.checkCancellation()
                         guard await isCurrent() else {
                             throw AccessPurgeCoordinatorError.staleSession
                         }
-                        try await store.markAccessPurgeFilesDeleted(id: job.id)
-                    }
-                    try Task.checkCancellation()
-                    guard await isCurrent() else {
+                        await invalidatePresentation(queuedJob)
+                        try Task.checkCancellation()
+                        guard await isCurrent() else {
+                            throw AccessPurgeCoordinatorError.staleSession
+                        }
+                        let job: AccessPurgeJob
+                        if queuedJob.phase == .staged {
+                            guard let refreshed = try await store.refreshAccessPurgeJob(
+                                id: queuedJob.id
+                            ) else { continue }
+                            job = refreshed
+                        } else {
+                            job = queuedJob
+                        }
+                        try Task.checkCancellation()
+                        guard await isCurrent() else {
+                            throw AccessPurgeCoordinatorError.staleSession
+                        }
+                        if job.phase == .staged {
+                            if let purgeFilesOverride {
+                                try await purgeFilesOverride(job)
+                            } else {
+                                try await mediaEngine.purgeRevokedAccess(
+                                    allMediaIds: job.allMediaIds,
+                                    purgeMediaIds: job.purgeMediaIds,
+                                    encryptedPaths: job.encryptedPaths,
+                                    localStore: store
+                                )
+                            }
+                            try Task.checkCancellation()
+                            guard await isCurrent() else {
+                                throw AccessPurgeCoordinatorError.staleSession
+                            }
+                            try await store.markAccessPurgeFilesDeleted(id: job.id)
+                        }
+                        try Task.checkCancellation()
+                        guard await isCurrent() else {
+                            throw AccessPurgeCoordinatorError.staleSession
+                        }
+                        try await store.finalizeAccessPurge(id: job.id)
+                        finalized += 1
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch AccessPurgeCoordinatorError.staleSession {
                         throw AccessPurgeCoordinatorError.staleSession
+                    } catch {
+                        failedJobIds.insert(queuedJob.id)
+                        try? await store.markAccessPurgeFailed(
+                            id: queuedJob.id,
+                            error: error.localizedDescription
+                        )
                     }
-                    try await store.finalizeAccessPurge(id: job.id)
-                    finalized += 1
                 }
                 await Task.yield()
             }
-            return AccessPurgeDrainResult(finalized: finalized, batches: batches)
+            return AccessPurgeDrainResult(
+                finalized: finalized,
+                batches: batches,
+                failed: failedJobIds.count
+            )
         }
         inFlight = InFlight(scope: scope, task: task)
         defer {
@@ -117,7 +149,7 @@ actor AccessPurgeCoordinator {
 
     func reset() async {
         if resetting {
-            await inFlight?.task.result
+            _ = await inFlight?.task.result
             return
         }
         resetting = true
