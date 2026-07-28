@@ -94,9 +94,9 @@ export class OperationalMetrics {
 
 export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> {
   const schema = (await sql`
-    SELECT to_regclass('public.dialog_preference_requests') IS NOT NULL
+    SELECT pg_catalog.to_regclass('public.dialog_preference_requests') IS NOT NULL
              AS requests_present,
-           to_regclass('public.dialog_preference_action_budgets') IS NOT NULL
+           pg_catalog.to_regclass('public.dialog_preference_action_budgets') IS NOT NULL
              AS budgets_present`)[0];
   if (!schema?.requests_present || !schema?.budgets_present) {
     return [
@@ -108,13 +108,16 @@ export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> 
   }
   const row = (await sql`
     SELECT
-      (SELECT count(*) FROM dialog_preference_requests WHERE status = 'pending')
+      (SELECT pg_catalog.count(*)
+       FROM public.dialog_preference_requests
+       WHERE status = 'pending')
         AS pending_requests,
       (SELECT GREATEST(reltuples, 0)::bigint
-       FROM pg_class
-       WHERE oid = 'dialog_preference_requests'::regclass)
+       FROM pg_catalog.pg_class
+       WHERE oid = 'public.dialog_preference_requests'::pg_catalog.regclass)
         AS retained_request_estimate,
-      (SELECT count(*) FROM dialog_preference_action_budgets
+      (SELECT pg_catalog.count(*)
+       FROM public.dialog_preference_action_budgets
        WHERE updated_at < now() - interval '24 hours')
         AS expired_budget_rows`)[0];
   return [

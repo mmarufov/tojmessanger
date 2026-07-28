@@ -124,8 +124,10 @@ export async function dialogPreferenceSchemaState(
 
   const tables = await sql`
     SELECT required.name,
-           to_regclass('public.' || required.name) IS NOT NULL AS present
-    FROM unnest(${sql.array([...REQUIRED_TABLES], "text")}::text[]) AS required(name)`;
+           pg_catalog.to_regclass('public.' || required.name) IS NOT NULL AS present
+    FROM pg_catalog.unnest(
+      ${sql.array([...REQUIRED_TABLES], "text")}::text[]
+    ) AS required(name)`;
   const missingTables = tables
     .filter((row: any) => !row.present)
     .map((row: any) => String(row.name));
@@ -133,13 +135,16 @@ export async function dialogPreferenceSchemaState(
   const existingColumns = await sql`
     SELECT relation.relname AS table_name,
            attribute.attname AS column_name,
-           format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+           pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
            attribute.attnotnull AS not_null,
-           pg_get_expr(column_default.adbin, column_default.adrelid) AS column_default
-    FROM pg_attribute attribute
-    JOIN pg_class relation ON relation.oid = attribute.attrelid
-    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-    LEFT JOIN pg_attrdef column_default
+           pg_catalog.pg_get_expr(
+             column_default.adbin,
+             column_default.adrelid
+           ) AS column_default
+    FROM pg_catalog.pg_attribute attribute
+    JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef column_default
       ON column_default.adrelid = relation.oid
      AND column_default.adnum = attribute.attnum
     WHERE namespace.nspname = 'public'
@@ -177,17 +182,32 @@ export async function dialogPreferenceSchemaState(
 
   const constraintRows = await sql`
     SELECT relation.relname AS table_name,
-           array_agg(attribute.attname ORDER BY key.ordinality) AS columns
-    FROM pg_constraint constraint_row
-    JOIN pg_class relation ON relation.oid = constraint_row.conrelid
-    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-    CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY AS key(attnum, ordinality)
-    JOIN pg_attribute attribute
+           pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS columns
+    FROM pg_catalog.pg_constraint constraint_row
+    JOIN pg_catalog.pg_class relation ON relation.oid = constraint_row.conrelid
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_catalog.pg_index conflict_index
+      ON conflict_index.indexrelid = constraint_row.conindid
+     AND conflict_index.indrelid = constraint_row.conrelid
+    CROSS JOIN LATERAL pg_catalog.unnest(constraint_row.conkey)
+      WITH ORDINALITY AS key(attnum, ordinality)
+    JOIN pg_catalog.pg_attribute attribute
       ON attribute.attrelid = relation.oid
      AND attribute.attnum = key.attnum
     WHERE namespace.nspname = 'public'
       AND constraint_row.contype IN ('p', 'u')
       AND constraint_row.convalidated
+      AND NOT constraint_row.condeferrable
+      AND NOT constraint_row.condeferred
+      AND conflict_index.indisunique
+      AND conflict_index.indimmediate
+      AND conflict_index.indisvalid
+      AND conflict_index.indisready
+      AND conflict_index.indislive
+      AND conflict_index.indpred IS NULL
+      AND conflict_index.indexprs IS NULL
+      AND conflict_index.indnkeyatts =
+          pg_catalog.array_length(constraint_row.conkey, 1)
       AND relation.relname = ANY(${sql.array([...new Set(REQUIRED_UNIQUE_CONSTRAINTS.map((constraint) => constraint.table))], "text")}::text[])
     GROUP BY relation.relname, constraint_row.oid`;
   const existingUniqueConstraints = new Set(
@@ -213,44 +233,82 @@ export async function dialogPreferenceSchemaState(
       SELECT
         COALESCE((
           SELECT constraint_row.convalidated
-             AND pg_get_expr(constraint_row.conbin, constraint_row.conrelid, TRUE)
+             AND pg_catalog.pg_get_expr(
+                   constraint_row.conbin,
+                   constraint_row.conrelid,
+                   TRUE
+                 )
                  = ${EXPECTED_EVENT_CONSTRAINT}
-          FROM pg_constraint constraint_row
-          WHERE constraint_row.conrelid = 'account_events'::regclass
+          FROM pg_catalog.pg_constraint constraint_row
+          WHERE constraint_row.conrelid = 'public.account_events'::pg_catalog.regclass
             AND constraint_row.conname = 'account_events_type_check'
             AND constraint_row.contype = 'c'
         ), FALSE) AS event_constraint_validated,
-        EXISTS (
-          SELECT 1
-          FROM pg_trigger trigger_row
-          JOIN pg_proc function_row ON function_row.oid = trigger_row.tgfoid
-          JOIN pg_namespace function_namespace ON function_namespace.oid = function_row.pronamespace
-          WHERE trigger_row.tgrelid = 'dialog_members'::regclass
-            AND trigger_row.tgname = 'dialog_members_notification_mode_mirror'
+        (
+          SELECT pg_catalog.count(*) = 1
+          FROM pg_catalog.pg_trigger trigger_row
+          JOIN pg_catalog.pg_proc function_row
+            ON function_row.oid = trigger_row.tgfoid
+          JOIN pg_catalog.pg_namespace function_namespace
+            ON function_namespace.oid = function_row.pronamespace
+          JOIN pg_catalog.pg_attribute notification_column
+            ON notification_column.attrelid = trigger_row.tgrelid
+           AND notification_column.attname = 'notification_mode'
+           AND NOT notification_column.attisdropped
+          WHERE trigger_row.tgrelid =
+                  'public.dialog_members'::pg_catalog.regclass
+            AND trigger_row.tgname =
+                  'dialog_members_notification_mode_mirror'
             AND NOT trigger_row.tgisinternal
             AND trigger_row.tgenabled = 'O'
+            -- AFTER + ROW + INSERT + UPDATE, and no other event kind.
+            AND trigger_row.tgtype = 21
+            AND pg_catalog.cardinality(trigger_row.tgattr::smallint[]) = 1
+            AND trigger_row.tgattr::smallint[] @>
+                ARRAY[notification_column.attnum::smallint]
+            AND trigger_row.tgconstraint = 0
+            AND NOT trigger_row.tgdeferrable
+            AND NOT trigger_row.tginitdeferred
+            AND trigger_row.tgqual IS NULL
+            AND trigger_row.tgoldtable IS NULL
+            AND trigger_row.tgnewtable IS NULL
+            AND trigger_row.tgnargs = 0
             AND function_namespace.nspname = 'public'
             AND function_row.proname = ${FINAL_TRIGGER_FUNCTION}
-            AND pg_get_function_identity_arguments(function_row.oid) = ''
+            AND pg_catalog.pg_get_function_identity_arguments(function_row.oid) = ''
+        )
+        AND (
+          SELECT pg_catalog.count(*) = 1
+          FROM pg_catalog.pg_trigger topology_trigger
+          JOIN pg_catalog.pg_proc topology_function
+            ON topology_function.oid = topology_trigger.tgfoid
+          WHERE NOT topology_trigger.tgisinternal
+            AND topology_function.proname = ANY(ARRAY[
+              ${FINAL_TRIGGER_FUNCTION},
+              'mirror_dialog_notification_mode_to_preferences_v1_staging',
+              'mirror_dialog_notification_mode_to_preferences'
+            ]::text[])
         ) AS compatibility_trigger_ready,
         COALESCE((
           SELECT completed_at IS NOT NULL
-          FROM online_migration_cursors
+          FROM public.online_migration_cursors
           WHERE migration_name = 'dialog_preferences_v1'
         ), FALSE) AS migration_completed,
         COALESCE((
           SELECT contract_version
-          FROM online_migration_cursors
+          FROM public.online_migration_cursors
           WHERE migration_name = 'dialog_preferences_v1'
         ), -1) AS contract_version,
         COALESCE((
           SELECT contract_version = ${FINAL_CONTRACT_VERSION}
              AND contract_completed_at IS NOT NULL
-          FROM online_migration_cursors
+          FROM public.online_migration_cursors
           WHERE migration_name = 'dialog_preferences_v1'
         ), FALSE) AS contract_completed,
         EXISTS (
-          SELECT 1 FROM dialog_preference_legacy_reconciliation LIMIT 1
+          SELECT 1
+          FROM public.dialog_preference_legacy_reconciliation
+          LIMIT 1
         ) AS has_reconciliation_backlog`)[0];
     eventConstraintValidated = Boolean(state?.event_constraint_validated);
     compatibilityTriggerReady = Boolean(state?.compatibility_trigger_ready);

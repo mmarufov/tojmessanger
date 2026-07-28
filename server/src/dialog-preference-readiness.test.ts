@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
+import { dialogPreferenceBacklogMetrics } from "./ops";
 
 const sourceURL = new URL(
   process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test",
@@ -110,16 +111,28 @@ test("rerunning expand invalidates a completed contract until final contract is 
 test("readiness requires the enabled compatibility trigger bound to the final function", async () => {
   await withDisposableDatabase({ migrated: true }, async ({ sql, runFile }) => {
     await sql`
-      ALTER TABLE dialog_members
+      ALTER TABLE public.dialog_members
       DISABLE TRIGGER dialog_members_notification_mode_mirror`;
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(false);
 
     await sql`
-      ALTER TABLE dialog_members
+      ALTER TABLE public.dialog_members
       ENABLE TRIGGER dialog_members_notification_mode_mirror`;
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(true);
 
-    await sql`DROP TRIGGER dialog_members_notification_mode_mirror ON dialog_members`;
+    await sql`
+      ALTER TABLE public.dialog_members
+      ENABLE ALWAYS TRIGGER dialog_members_notification_mode_mirror`;
+    expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(false);
+
+    await sql`
+      ALTER TABLE public.dialog_members
+      ENABLE TRIGGER dialog_members_notification_mode_mirror`;
+    expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(true);
+
+    await sql`
+      DROP TRIGGER dialog_members_notification_mode_mirror
+      ON public.dialog_members`;
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(false);
 
     await runFile(contract);
@@ -127,11 +140,118 @@ test("readiness requires the enabled compatibility trigger bound to the final fu
   });
 }, 120_000);
 
+const MALFORMED_TRIGGER_DEFINITIONS = [
+  [
+    "before instead of after",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     BEFORE INSERT OR UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH ROW
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final()`,
+  ],
+  [
+    "missing the insert event",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH ROW
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final()`,
+  ],
+  [
+    "statement-level instead of row-level",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER INSERT OR UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH STATEMENT
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final()`,
+  ],
+  [
+    "watching the wrong update column",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER INSERT OR UPDATE OF role ON public.dialog_members
+     FOR EACH ROW
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final()`,
+  ],
+  [
+    "conditional execution",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER INSERT OR UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH ROW
+     WHEN (NEW.notification_mode = 'muted')
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final()`,
+  ],
+  [
+    "unexpected trigger arguments",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER INSERT OR UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH ROW
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_final('unexpected')`,
+  ],
+  [
+    "staging function still attached",
+    `CREATE TRIGGER dialog_members_notification_mode_mirror
+     AFTER INSERT OR UPDATE OF notification_mode ON public.dialog_members
+     FOR EACH ROW
+     EXECUTE FUNCTION public.mirror_dialog_notification_mode_to_preferences_v1_staging()`,
+  ],
+] as const;
+
+test("readiness rejects every malformed compatibility trigger topology", async () => {
+  for (const [description, definition] of MALFORMED_TRIGGER_DEFINITIONS) {
+    await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+      await sql`
+        DROP TRIGGER dialog_members_notification_mode_mirror
+        ON public.dialog_members`;
+      await sql.unsafe(definition);
+      const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+      expect(state.compatibilityTriggerReady, description).toBe(false);
+      expect(state.ready, description).toBe(false);
+    });
+  }
+}, 240_000);
+
+test("readiness rejects additional compatibility triggers in any schema", async () => {
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    await sql`
+      CREATE TRIGGER dialog_members_notification_mode_staging_duplicate
+      AFTER UPDATE OF notification_mode ON public.dialog_members
+      FOR EACH ROW
+      EXECUTE FUNCTION
+        public.mirror_dialog_notification_mode_to_preferences_v1_staging()`;
+    const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+    expect(state.compatibilityTriggerReady).toBe(false);
+    expect(state.ready).toBe(false);
+  });
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    await sql`CREATE SCHEMA readiness_shadow`;
+    await sql.unsafe(`
+      CREATE FUNCTION
+        readiness_shadow.mirror_dialog_notification_mode_to_preferences_v1_staging()
+      RETURNS TRIGGER
+      LANGUAGE plpgsql
+      AS $$
+      BEGIN
+        RETURN NEW;
+      END;
+      $$
+    `);
+    await sql`
+      CREATE TRIGGER dialog_members_notification_mode_shadow_duplicate
+      AFTER UPDATE OF notification_mode ON public.dialog_members
+      FOR EACH ROW
+      EXECUTE FUNCTION
+        readiness_shadow.mirror_dialog_notification_mode_to_preferences_v1_staging()`;
+    const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+    expect(state.compatibilityTriggerReady).toBe(false);
+    expect(state.ready).toBe(false);
+  });
+}, 120_000);
+
 test("readiness requires the exact validated account event constraint", async () => {
   await withDisposableDatabase({ migrated: true }, async ({ sql, runFile }) => {
-    await sql`ALTER TABLE account_events DROP CONSTRAINT account_events_type_check`;
     await sql`
-      ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
+      ALTER TABLE public.account_events
+      DROP CONSTRAINT account_events_type_check`;
+    await sql`
+      ALTER TABLE public.account_events
+      ADD CONSTRAINT account_events_type_check CHECK (type IN
         ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
          'dialog.created','member.added','member.removed','member.role_changed','member.left',
          'dialog.profile_updated','dialog.closed','dialog.access_revoked',
@@ -141,52 +261,130 @@ test("readiness requires the exact validated account event constraint", async ()
     expect(permissive.ready).toBe(false);
 
     await runFile(expand);
-    await sql`ALTER TABLE account_events VALIDATE CONSTRAINT account_events_type_check_v5`;
+    await sql`
+      ALTER TABLE public.account_events
+      VALIDATE CONSTRAINT account_events_type_check_v5`;
     await runFile(contract);
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(true);
   });
 }, 120_000);
 
 const UNIQUE_INVARIANTS = [
-  ["dialog_members", "dialog_members_pkey", "dialog_members(dialog_id,account_id)"],
-  ["dialog_preferences", "dialog_preferences_pkey", "dialog_preferences(dialog_id,account_id)"],
+  [
+    "dialog_members",
+    "dialog_members_pkey",
+    "dialog_members(dialog_id,account_id)",
+    "dialog_id, account_id",
+  ],
+  [
+    "dialog_preferences",
+    "dialog_preferences_pkey",
+    "dialog_preferences(dialog_id,account_id)",
+    "dialog_id, account_id",
+  ],
   [
     "dialog_preference_requests",
     "dialog_preference_requests_pkey",
     "dialog_preference_requests(account_id,client_mutation_id)",
+    "account_id, client_mutation_id",
   ],
   [
     "dialog_preference_action_budgets",
     "dialog_preference_action_budgets_pkey",
     "dialog_preference_action_budgets(account_id,bucket_started)",
+    "account_id, bucket_started",
   ],
   [
     "dialog_preference_legacy_reconciliation",
     "dialog_preference_legacy_reconciliation_pkey",
     "dialog_preference_legacy_reconciliation(dialog_id,account_id)",
+    "dialog_id, account_id",
   ],
   [
     "online_migration_cursors",
     "online_migration_cursors_pkey",
     "online_migration_cursors(migration_name)",
+    "migration_name",
   ],
   [
     "push_deliveries",
     "push_deliveries_account_id_pts_device_id_key",
     "push_deliveries(account_id,pts,device_id)",
+    "account_id, pts, device_id",
   ],
 ] as const;
 
 test("readiness rejects every missing ON CONFLICT uniqueness invariant", async () => {
   for (const [table, constraint, readinessName] of UNIQUE_INVARIANTS) {
     await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
-      await sql.unsafe(`ALTER TABLE ${table} DROP CONSTRAINT ${constraint} CASCADE`);
+      await sql.unsafe(
+        `ALTER TABLE public.${table} DROP CONSTRAINT ${constraint} CASCADE`,
+      );
       const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
       expect(state.ready).toBe(false);
       expect(state.missingUniqueConstraints).toContain(readinessName);
     });
   }
 }, 240_000);
+
+test("readiness rejects every deferrable ON CONFLICT uniqueness invariant", async () => {
+  for (const [table, constraint, readinessName, columns] of UNIQUE_INVARIANTS) {
+    await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+      await sql.unsafe(
+        `ALTER TABLE public.${table} DROP CONSTRAINT ${constraint} CASCADE`,
+      );
+      await sql.unsafe(
+        `ALTER TABLE public.${table} ADD CONSTRAINT ${constraint} ` +
+        `UNIQUE (${columns}) DEFERRABLE INITIALLY IMMEDIATE`,
+      );
+      const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+      expect(state.ready).toBe(false);
+      expect(state.missingUniqueConstraints).toContain(readinessName);
+    });
+  }
+}, 240_000);
+
+test("readiness rejects every invalid ON CONFLICT uniqueness index", async () => {
+  for (const [table, constraint, readinessName] of UNIQUE_INVARIANTS) {
+    await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+      await sql.begin(async (tx) => {
+        await tx`SET LOCAL allow_system_table_mods = on`;
+        await tx.unsafe(`
+          UPDATE pg_catalog.pg_index
+          SET indisvalid = FALSE
+          WHERE indexrelid = (
+            SELECT conindid
+            FROM pg_catalog.pg_constraint
+            WHERE conrelid = 'public.${table}'::pg_catalog.regclass
+              AND conname = '${constraint}'
+          )
+        `);
+      });
+      const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+      expect(state.ready).toBe(false);
+      expect(state.missingUniqueConstraints).toContain(readinessName);
+    });
+  }
+}, 240_000);
+
+test("readiness rejects conflict indexes that are not ready or live", async () => {
+  for (const catalogFlag of ["indisready", "indislive"] as const) {
+    await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+      await sql.begin(async (tx) => {
+        await tx`SET LOCAL allow_system_table_mods = on`;
+        await tx.unsafe(`
+          UPDATE pg_catalog.pg_index
+          SET ${catalogFlag} = FALSE
+          WHERE indexrelid = 'public.dialog_preferences_pkey'::pg_catalog.regclass
+        `);
+      });
+      const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+      expect(state.ready, catalogFlag).toBe(false);
+      expect(state.missingUniqueConstraints)
+        .toContain("dialog_preferences(dialog_id,account_id)");
+    });
+  }
+}, 120_000);
 
 test("readiness rejects wrong preference column type, default, and nullability", async () => {
   await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
@@ -221,6 +419,58 @@ test("readiness rejects wrong preference column type, default, and nullability",
       ALTER COLUMN result_json DROP NOT NULL`;
 
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(true);
+  });
+}, 120_000);
+
+test("readiness and metrics ignore search-path shadow relations", async () => {
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    await sql`CREATE SCHEMA readiness_shadow`;
+    await sql`
+      CREATE TABLE readiness_shadow.online_migration_cursors (
+        migration_name TEXT PRIMARY KEY,
+        completed_at TIMESTAMPTZ,
+        contract_version INTEGER NOT NULL,
+        contract_completed_at TIMESTAMPTZ
+      )`;
+    await sql`
+      INSERT INTO readiness_shadow.online_migration_cursors (
+        migration_name, completed_at, contract_version, contract_completed_at
+      ) VALUES ('dialog_preferences_v1', NULL, 0, NULL)`;
+    await sql`
+      CREATE TABLE readiness_shadow.dialog_preference_legacy_reconciliation (
+        marker INTEGER
+      )`;
+    await sql`
+      INSERT INTO readiness_shadow.dialog_preference_legacy_reconciliation
+      VALUES (1)`;
+    await sql`
+      CREATE TABLE readiness_shadow.dialog_preference_requests (
+        status TEXT NOT NULL
+      )`;
+    await sql`
+      INSERT INTO readiness_shadow.dialog_preference_requests
+      VALUES ('pending'), ('pending')`;
+    await sql`
+      CREATE TABLE readiness_shadow.dialog_preference_action_budgets (
+        updated_at TIMESTAMPTZ NOT NULL
+      )`;
+    await sql`
+      INSERT INTO readiness_shadow.dialog_preference_action_budgets
+      VALUES (now() - interval '48 hours')`;
+
+    await sql.begin(async (tx) => {
+      await tx`SET LOCAL search_path = readiness_shadow, pg_catalog`;
+      const state = await dialogPreferenceSchemaState(
+        tx as unknown as SQL,
+        { bypassCache: true },
+      );
+      expect(state.ready).toBe(true);
+      const metrics = await dialogPreferenceBacklogMetrics(tx as unknown as SQL);
+      expect(metrics).toContain("toj_dialog_preference_schema_available 1");
+      expect(metrics).toContain("toj_dialog_preference_pending_requests 0");
+      expect(metrics)
+        .toContain('toj_dialog_preference_cleanup_backlog_rows{table="budgets"} 0');
+    });
   });
 }, 120_000);
 
