@@ -15,3 +15,11 @@ export function accountMutationKey(accountId: string): string {
 export async function lockAccountMutations(sql: SQL, accountIds: string[]): Promise<void> {
   await lockMutationKeys(sql, accountIds.map(accountMutationKey));
 }
+
+export function draftMutationReceiptKey(accountId: string, operationId: string): string {
+  return `draft-mutation-receipt:${accountId}:${operationId}`;
+}
+
+export function mediaGroupReceiptKey(accountId: string, clientGroupId: string): string {
+  return `media-group-receipt:${accountId}:${clientGroupId}`;
+}

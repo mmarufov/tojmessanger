@@ -1106,7 +1106,8 @@ final class CloudDraftsV1Tests: XCTestCase {
             dialogId: "dialog-local",
             operationId: local.operationId,
             revision: 5,
-            mediaIds: ["media-local"]
+            mediaIds: ["media-local"],
+            attachmentIds: ["attachment-local"]
         )
         try await store.acknowledgeDraftMutation(
             DraftMutationResponse(draft: canonical, duplicate: false),
@@ -1147,6 +1148,143 @@ final class CloudDraftsV1Tests: XCTestCase {
             operationId: restored.operationId
         )
         XCTAssertEqual(group.payload.items.map(\.mediaId), ["media-1", "media-2", "media-3"])
+    }
+
+    func testDraftAttachmentReadyCommitSurvivesImmediateTerminateAndReopen() async throws {
+        let fixture = try makeStoreFixture()
+        var store: CloudLocalStore? = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store?.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-atomic",
+            text: "atomic upload",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let prepared = preparedUpload(7)
+        _ = try await store?.stageDraftAttachment(
+            prepared: prepared,
+            accountId: "account-a",
+            dialogId: "dialog-atomic",
+            attachmentId: "attachment-atomic",
+            position: 0
+        )
+
+        // This is the former crash boundary: transfer readiness used to commit here and draft
+        // attachment readiness in a later transaction. Terminate immediately after the one new
+        // atomic operation, then prove both durable rows and the outbox payload agree.
+        try await store?.updateDraftAttachment(
+            transferId: prepared.transferId,
+            mediaId: "media-atomic",
+            state: "ready",
+            progress: 1,
+            error: nil
+        )
+        store = nil
+
+        let reopened = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let reopenedTransfer = try await reopened.mediaTransfer(id: prepared.transferId)
+        let transfer = try XCTUnwrap(reopenedTransfer)
+        XCTAssertEqual(transfer.state, "ready_to_send")
+        XCTAssertEqual(transfer.mediaId, "media-atomic")
+        XCTAssertEqual(transfer.uploadOffset, prepared.byteSize)
+        let reopenedDraft = try await reopened.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-atomic"
+        )
+        let draft = try XCTUnwrap(reopenedDraft)
+        XCTAssertEqual(draft.attachments.map(\.state), ["ready"])
+        XCTAssertEqual(draft.attachments.map(\.mediaId), ["media-atomic"])
+        let reopenedMutation = try await reopened.pendingDraftMutation(
+            accountId: "account-a",
+            dialogId: "dialog-atomic"
+        )
+        let mutation = try XCTUnwrap(reopenedMutation)
+        XCTAssertEqual(mutation.attachments.map(\.mediaId), ["media-atomic"])
+    }
+
+    func testSharedMediaNeverReusesTransferAcrossDialogsAccountsOrPurposes() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let sharedMediaId = "media-shared"
+        let first = cloudDraft(
+            dialogId: "dialog-one",
+            operationId: "operation-one",
+            revision: 1,
+            mediaIds: [sharedMediaId]
+        )
+        try await store.applyCloudDraft(first, accountId: "account-a")
+        let loadedFirst = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-one"
+        )
+        let firstTransferId = try XCTUnwrap(
+            try XCTUnwrap(loadedFirst).attachments.first?.transferId
+        )
+
+        let second = cloudDraft(
+            dialogId: "dialog-two",
+            operationId: "operation-two",
+            revision: 2,
+            mediaIds: [sharedMediaId]
+        )
+        try await store.applyCloudDraft(second, accountId: "account-a")
+        let loadedSecond = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-two"
+        )
+        let secondTransferId = try XCTUnwrap(
+            try XCTUnwrap(loadedSecond).attachments.first?.transferId
+        )
+        XCTAssertNotEqual(secondTransferId, firstTransferId)
+        let firstTransfer = try await store.mediaTransfer(id: firstTransferId)
+        let secondTransfer = try await store.mediaTransfer(id: secondTransferId)
+        XCTAssertEqual(firstTransfer?.dialogId, "dialog-one")
+        XCTAssertEqual(secondTransfer?.dialogId, "dialog-two")
+
+        try await store.applyCloudDraft(second, accountId: "account-b")
+        let loadedOtherAccount = try await store.loadDraft(
+            accountId: "account-b",
+            dialogId: "dialog-two"
+        )
+        let otherAccountTransferId = try XCTUnwrap(
+            try XCTUnwrap(loadedOtherAccount).attachments.first?.transferId
+        )
+        XCTAssertNotEqual(otherAccountTransferId, secondTransferId)
+
+        let messagePrepared = preparedUpload(8)
+        try await store.insertMediaTransfer(
+            prepared: messagePrepared,
+            dialogId: "dialog-message",
+            clientMsgId: "message-client-id",
+            caption: "",
+            replyToMsgId: nil,
+            purpose: "message"
+        )
+        try await store.updateMediaTransfer(
+            transferId: messagePrepared.transferId,
+            mediaId: sharedMediaId,
+            uploadOffset: messagePrepared.byteSize,
+            state: "ready_to_send",
+            error: nil
+        )
+        let third = cloudDraft(
+            dialogId: "dialog-three",
+            operationId: "operation-three",
+            revision: 3,
+            mediaIds: [sharedMediaId]
+        )
+        try await store.applyCloudDraft(third, accountId: "account-a")
+        let loadedThird = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-three"
+        )
+        let thirdTransferId = try XCTUnwrap(
+            try XCTUnwrap(loadedThird).attachments.first?.transferId
+        )
+        XCTAssertNotEqual(thirdTransferId, messagePrepared.transferId)
+        let messageTransfer = try await store.mediaTransfer(id: messagePrepared.transferId)
+        XCTAssertEqual(messageTransfer?.purpose, "message")
     }
 
     func testIdleAcknowledgedDraftAttachmentNeverEntersGenericTransferRetryLane() async throws {
@@ -1195,7 +1333,8 @@ final class CloudDraftsV1Tests: XCTestCase {
         dialogId: String,
         operationId: String,
         revision: Int64,
-        mediaIds: [String]
+        mediaIds: [String],
+        attachmentIds: [String]? = nil
     ) -> CloudDraft {
         CloudDraft(
             dialogId: dialogId,
@@ -1207,7 +1346,7 @@ final class CloudDraftsV1Tests: XCTestCase {
             mentions: [],
             attachments: mediaIds.enumerated().map { index, mediaId in
                 CloudDraftAttachment(
-                    attachmentId: "attachment-\(dialogId)-\(index)",
+                    attachmentId: attachmentIds?[index] ?? "attachment-\(dialogId)-\(index)",
                     mediaId: mediaId,
                     position: index,
                     media: CloudMedia(

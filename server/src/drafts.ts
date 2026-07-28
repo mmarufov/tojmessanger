@@ -8,7 +8,11 @@ import {
   requireDialogReadAccess,
 } from "./dialog-access";
 import { fanoutDialogEvent, type FanoutPush } from "./fanout";
-import { lockAccountMutations } from "./locks";
+import {
+  draftMutationReceiptKey,
+  lockAccountMutations,
+  lockMutationKeys,
+} from "./locks";
 import { mediaDTOFromRow, type MediaDTO } from "./media";
 import { notifySyncWakeups } from "./sync-wakeup";
 
@@ -395,6 +399,12 @@ export async function putDraft(sql: SQL, input: {
   const fingerprint = draftFingerprint(dialogId, normalized);
 
   return await sql.begin(async (tx) => {
+    // Cleanup moves completed receipts into compact tombstones under this same lock. Taking it
+    // before either table is read makes the receipt+tombstone pair one serialized namespace:
+    // cleanup can never delete the live row between this read and the idempotency claim.
+    await lockMutationKeys(tx, [
+      draftMutationReceiptKey(input.accountId, operationId),
+    ]);
     const tombstone = (await tx`
       SELECT dialog_id, payload_fingerprint, resulting_revision
       FROM draft_mutation_tombstones

@@ -1,5 +1,10 @@
 import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
+import {
+  draftMutationReceiptKey,
+  lockMutationKeys,
+  mediaGroupReceiptKey,
+} from "./locks";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -244,13 +249,30 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
   const draftMutations = await sql.begin(async (tx) => {
-    const doomed = await tx`
+    const candidates = await tx`
+      SELECT account_id, operation_id
+      FROM draft_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}`;
+    await lockMutationKeys(
+      tx,
+      candidates.map((row: any) =>
+        draftMutationReceiptKey(String(row.account_id), String(row.operation_id))
+      ),
+    );
+    const doomed = candidates.length ? await tx`
       SELECT account_id, operation_id, dialog_id, payload_fingerprint,
              status, resulting_revision
       FROM draft_mutation_requests
       WHERE created_at < now() - interval '24 hours'
-      ORDER BY created_at LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED`;
+        AND (account_id, operation_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(candidates.map((row: any) => row.account_id), "uuid")}::uuid[],
+            ${tx.array(candidates.map((row: any) => row.operation_id), "uuid")}::uuid[]
+          )
+        )
+      ORDER BY created_at
+      FOR UPDATE SKIP LOCKED` : [];
     const completed = doomed.filter((row: any) => row.status === "completed");
     if (completed.length) {
       await tx`
@@ -288,13 +310,30 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     DELETE FROM draft_mutation_budgets WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
   const mediaGroupSends = await sql.begin(async (tx) => {
-    const doomed = await tx`
+    const candidates = await tx`
+      SELECT sender_account_id, client_group_id
+      FROM media_group_send_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}`;
+    await lockMutationKeys(
+      tx,
+      candidates.map((row: any) =>
+        mediaGroupReceiptKey(String(row.sender_account_id), String(row.client_group_id))
+      ),
+    );
+    const doomed = candidates.length ? await tx`
       SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
              first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
       FROM media_group_send_requests
       WHERE created_at < now() - interval '24 hours'
-      ORDER BY created_at LIMIT ${batchSize}
-      FOR UPDATE SKIP LOCKED`;
+        AND (sender_account_id, client_group_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(candidates.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+            ${tx.array(candidates.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+          )
+        )
+      ORDER BY created_at
+      FOR UPDATE SKIP LOCKED` : [];
     const completed = doomed.filter((row: any) => row.status === "completed");
     if (completed.length) {
       await tx`

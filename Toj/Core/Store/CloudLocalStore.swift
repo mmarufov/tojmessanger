@@ -1116,11 +1116,14 @@ actor CloudLocalStore {
                 sql: """
                 UPDATE media_transfers SET
                   media_id = COALESCE(?, media_id),
+                  upload_offset = CASE WHEN ? = 'ready' THEN byte_size ELSE upload_offset END,
                   state = ?,
                   last_error = ?
                 WHERE transfer_id = ?
                 """,
-                arguments: [mediaId, state == "ready" ? "ready_to_send" : state, error, transferId]
+                arguments: [
+                    mediaId, state, state == "ready" ? "ready_to_send" : state, error, transferId,
+                ]
             )
             let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)
             try rewriteDraftMutation(
@@ -7443,27 +7446,47 @@ actor CloudLocalStore {
                 draft.updatedAt,
             ]
         )
+        // A media id is not a transfer identity: the same uploaded object can be referenced by
+        // multiple dialogs, accounts, and purposes. Only an exact existing draft attachment in
+        // this account/dialog may retain its local transfer and encrypted staging files.
+        let reusableTransferRows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT attachment.attachment_id, attachment.transfer_id
+            FROM draft_attachments attachment
+            JOIN media_transfers transfer
+              ON transfer.transfer_id = attachment.transfer_id
+            WHERE attachment.account_id = ?
+              AND attachment.dialog_id = ?
+              AND transfer.dialog_id = ?
+              AND transfer.purpose = 'draft'
+              AND attachment.transfer_id IS NOT NULL
+            """,
+            arguments: [accountId, draft.dialogId, draft.dialogId]
+        )
+        let reusableTransferByAttachment = Dictionary(
+            uniqueKeysWithValues: reusableTransferRows.compactMap { row -> (String, String)? in
+                guard
+                    let attachmentId: String = row["attachment_id"],
+                    let transferId: String = row["transfer_id"]
+                else { return nil }
+                return (attachmentId, transferId)
+            }
+        )
         try db.execute(
             sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
             arguments: [accountId, draft.dialogId]
         )
         if draft.state == "active" {
             for attachment in draft.attachments.sorted(by: { $0.position < $1.position }) {
-                let existingTransferId = try String.fetchOne(
-                    db,
-                    sql: """
-                    SELECT transfer_id FROM media_transfers
-                    WHERE draft_attachment_id = ? OR media_id = ?
-                    ORDER BY CASE WHEN draft_attachment_id = ? THEN 0 ELSE 1 END
-                    LIMIT 1
-                    """,
-                    arguments: [
-                        attachment.attachmentId, attachment.mediaId, attachment.attachmentId,
-                    ]
-                )
                 // A different device has no staging file, but the server media id is already
                 // sufficient to send. Keep a stable local transfer row so both paths are uniform.
-                let transferId = existingTransferId ?? "server:\(attachment.attachmentId)"
+                let reusableTransferId = reusableTransferByAttachment[attachment.attachmentId]
+                let transferId = reusableTransferId
+                    ?? "server:\(accountId):\(draft.dialogId):\(attachment.attachmentId)"
+                let clientMsgId = reusableTransferId == nil
+                    ? transferId
+                    : attachment.attachmentId
                 let mediaJSON = String(
                     data: try encoder.encode(attachment.media),
                     encoding: .utf8
@@ -7480,6 +7503,8 @@ actor CloudLocalStore {
                       NULL, ?, 0, 'ready_to_send', datetime('now')
                     )
                     ON CONFLICT(transfer_id) DO UPDATE SET
+                      dialog_id = excluded.dialog_id,
+                      client_msg_id = excluded.client_msg_id,
                       media_id = excluded.media_id,
                       purpose = 'draft',
                       draft_attachment_id = excluded.draft_attachment_id,
@@ -7489,7 +7514,7 @@ actor CloudLocalStore {
                       last_error = NULL
                     """,
                     arguments: [
-                        transferId, draft.dialogId, attachment.attachmentId,
+                        transferId, draft.dialogId, clientMsgId,
                         attachment.attachmentId, attachment.media.kind,
                         attachment.media.contentType, attachment.media.fileName,
                         attachment.media.byteSize, attachment.media.durationMs,

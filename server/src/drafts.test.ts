@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { Client } from "pg";
 import { checkVerification, startVerification } from "./auth";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
@@ -10,6 +11,10 @@ import {
   purgeRevokedDialogDraftState,
   putDraft,
 } from "./drafts";
+import {
+  draftMutationReceiptKey,
+  mediaGroupReceiptKey,
+} from "./locks";
 import { cancelMediaUpload, downloadMediaChunk } from "./media";
 import {
   ALLOWED_MUTATION_INGRESS_PER_MINUTE,
@@ -28,6 +33,28 @@ import {
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
+
+async function waitUntilReceiptLockIsHeld(key: string): Promise<void> {
+  const probe = new Client({ connectionString: TEST_URL });
+  await probe.connect();
+  try {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const result = await probe.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
+        [key],
+      );
+      if (!result.rows[0]?.acquired) return;
+      await probe.query(
+        "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+        [key],
+      );
+      await Bun.sleep(5);
+    }
+    throw new Error(`receipt lock was not acquired: ${key}`);
+  } finally {
+    await probe.end();
+  }
+}
 
 async function resetDb() {
   await db`TRUNCATE accounts, otp_challenges RESTART IDENTITY CASCADE`;
@@ -228,6 +255,63 @@ describe("cloud drafts and media groups", () => {
     expect(staleRetry.draft.text).toBe("newer cross-device value");
     expect(staleRetry.draft.revision).toBeGreaterThan(old.draft.revision);
     expect(afterPts).toBe(beforePts);
+  });
+
+  test("draft cleanup and a retry serialize across the live receipt and tombstone", async () => {
+    const { alice, dialogId } = await pair();
+    const operationId = crypto.randomUUID();
+    const request = {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId,
+      text: "serialized draft",
+    };
+    const first = await putDraft(db, request);
+    await db`
+      UPDATE draft_mutation_requests SET created_at = now() - interval '25 hours'
+      WHERE account_id = ${alice.accountId} AND operation_id = ${operationId}`;
+
+    // Hold the tombstone's unique-index entry open. Cleanup acquires the exact receipt lock and
+    // then deterministically blocks on this insert; the retry must wait behind cleanup.
+    const blocker = new Client({ connectionString: TEST_URL });
+    await blocker.connect();
+    await blocker.query("BEGIN");
+    try {
+      await blocker.query(
+        `INSERT INTO draft_mutation_tombstones (
+           account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+         )
+         SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+         FROM draft_mutation_requests
+         WHERE account_id = $1 AND operation_id = $2`,
+        [alice.accountId, operationId],
+      );
+      const cleanupPromise = cleanupExpiredData(db);
+      await waitUntilReceiptLockIsHeld(
+        draftMutationReceiptKey(alice.accountId, operationId),
+      );
+      const retryPromise = putDraft(db, request);
+      await blocker.query("COMMIT");
+      const [cleaned, retry] = await Promise.all([cleanupPromise, retryPromise]);
+
+      expect(cleaned.draftMutations).toBe(1);
+      expect(retry.duplicate).toBe(true);
+      expect(retry.draft.revision).toBe(first.draft.revision);
+      expect(await db`
+        SELECT operation_id FROM draft_mutation_requests
+        WHERE account_id = ${alice.accountId} AND operation_id = ${operationId}`)
+        .toHaveLength(0);
+      expect(await db`
+        SELECT operation_id FROM draft_mutation_tombstones
+        WHERE account_id = ${alice.accountId} AND operation_id = ${operationId}`)
+        .toHaveLength(1);
+    } catch (error) {
+      await blocker.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      await blocker.end();
+    }
   });
 
   test("draft duplicate responses recheck current dialog authorization before returning content", async () => {
@@ -489,6 +573,64 @@ describe("cloud drafts and media groups", () => {
       SELECT msg_id FROM messages
       WHERE sender_account_id = ${alice.accountId} AND media_group_id = ${clientGroupId}`)
       .toHaveLength(2);
+  });
+
+  test("media-group cleanup and retry serialize across the live receipt and tombstone", async () => {
+    const { alice, dialogId } = await pair();
+    const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+    const clientGroupId = crypto.randomUUID();
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId,
+      items: mediaIds.map((media_id) => ({ media_id })),
+      body: "serialized group",
+    };
+    const first = await sendMediaGroup(db, request);
+    await db`
+      UPDATE media_group_send_requests SET created_at = now() - interval '25 hours'
+      WHERE sender_account_id = ${alice.accountId} AND client_group_id = ${clientGroupId}`;
+
+    const blocker = new Client({ connectionString: TEST_URL });
+    await blocker.connect();
+    await blocker.query("BEGIN");
+    try {
+      await blocker.query(
+        `INSERT INTO media_group_send_tombstones (
+           sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+           first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+         )
+         SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+                first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+         FROM media_group_send_requests
+         WHERE sender_account_id = $1 AND client_group_id = $2`,
+        [alice.accountId, clientGroupId],
+      );
+      const cleanupPromise = cleanupExpiredData(db);
+      await waitUntilReceiptLockIsHeld(
+        mediaGroupReceiptKey(alice.accountId, clientGroupId),
+      );
+      const retryPromise = sendMediaGroup(db, request);
+      await blocker.query("COMMIT");
+      const [cleaned, retry] = await Promise.all([cleanupPromise, retryPromise]);
+
+      expect(cleaned.mediaGroupSends).toBe(1);
+      expect(retry.duplicate).toBe(true);
+      expect(retry.messages.map((message) => message.msg_id))
+        .toEqual(first.messages.map((message) => message.msg_id));
+      expect(await db`
+        SELECT msg_id FROM messages
+        WHERE sender_account_id = ${alice.accountId}
+          AND media_group_id = ${clientGroupId}
+        ORDER BY msg_id`)
+        .toHaveLength(2);
+    } catch (error) {
+      await blocker.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      await blocker.end();
+    }
   });
 
   test("group retries use deterministic item ids and recheck access before any duplicate content", async () => {

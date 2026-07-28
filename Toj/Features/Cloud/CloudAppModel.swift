@@ -5549,6 +5549,7 @@ final class CloudAppModel {
         do {
             try Task.checkCancellation()
             let mediaId: String
+            var draftReadyCommitted = false
             if initial.state == "ready_to_send", let existing = initial.mediaId {
                 mediaId = existing
             } else {
@@ -5598,22 +5599,40 @@ final class CloudAppModel {
                 } else {
                     mediaId = try await upload()
                 }
-                try await localStore.updateMediaTransfer(
-                    transferId: initial.transferId, mediaId: mediaId,
-                    uploadOffset: initial.byteSize, state: "ready_to_send", error: nil
-                )
+                if initial.purpose == "draft" {
+                    // This single SQLCipher transaction marks both the transfer and attachment
+                    // ready and rewrites the coalesced draft mutation. There is no crash boundary
+                    // where a reopened transfer is ready while its draft chip remains uploading.
+                    try await localStore.updateDraftAttachment(
+                        transferId: initial.transferId,
+                        mediaId: mediaId,
+                        state: "ready",
+                        progress: 1,
+                        error: nil
+                    )
+                    draftReadyCommitted = true
+                } else {
+                    try await localStore.updateMediaTransfer(
+                        transferId: initial.transferId, mediaId: mediaId,
+                        uploadOffset: initial.byteSize, state: "ready_to_send", error: nil
+                    )
+                }
             }
             guard let ready = try await localStore.mediaTransfer(id: initial.transferId) else {
                 throw CloudAppModelError.localStoreUnavailable
             }
             if ready.purpose == "draft" {
-                try await localStore.updateDraftAttachment(
-                    transferId: ready.transferId,
-                    mediaId: mediaId,
-                    state: "ready",
-                    progress: 1,
-                    error: nil
-                )
+                if !draftReadyCommitted {
+                    // Repairs a row persisted by an older build at the former two-transaction
+                    // boundary, while using the same atomic operation for all new completions.
+                    try await localStore.updateDraftAttachment(
+                        transferId: ready.transferId,
+                        mediaId: mediaId,
+                        state: "ready",
+                        progress: 1,
+                        error: nil
+                    )
+                }
                 _ = await draftSyncCoordinator.flush(dialogId: ready.dialogId)
                 status = "Attachment ready"
                 return

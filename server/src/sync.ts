@@ -4,7 +4,11 @@ import { timingSafeEqual } from "node:crypto";
 import { seal, open, bodyAAD, requestFingerprintHMAC } from "./crypto";
 import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
-import { lockAccountMutations } from "./locks";
+import {
+  lockAccountMutations,
+  lockMutationKeys,
+  mediaGroupReceiptKey,
+} from "./locks";
 import { fanoutDialogEvent } from "./fanout";
 import {
   consumeDraftInTransaction,
@@ -661,6 +665,12 @@ export async function sendMediaGroup(sql: SQL, p: {
   });
 
   return await sql.begin(async (tx) => {
+    // Serialize the live receipt and compact tombstone with maintenance cleanup. Without this
+    // exact-operation lock, cleanup could delete the request after our tombstone read and allow
+    // the retry's claim to succeed as a new group send.
+    await lockMutationKeys(tx, [
+      mediaGroupReceiptKey(p.senderAccountId, clientGroupId),
+    ]);
     await requireActiveAccount(tx, p.senderAccountId);
     await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
     try {
