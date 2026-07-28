@@ -382,6 +382,7 @@ final class CloudAppModel {
     private var backgroundMediaRuntimePrepared = false
     private var mediaSchedulerForegrounded = false
     private var composerMediaOperationId: UUID?
+    private var composerMediaDialogId: String?
     private var activeComposerTransferId: String?
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
     private var mediaTransferDialogIds: [String: String] = [:]
@@ -416,7 +417,12 @@ final class CloudAppModel {
         let cancel: () -> Void
         let wait: () async -> Void
     }
+    private struct SessionClearBarrier {
+        let id: UUID
+        var waiters: [CheckedContinuation<Void, Never>]
+    }
     private var trackedSavedOperations: [UUID: TrackedSavedOperation] = [:]
+    private var sessionClearBarrier: SessionClearBarrier?
     private var appliedSyncBatches = 0
     private var lastForegroundSyncFailure: ReplicaSyncState?
     private var timelineForwardCursorByDialog: [String: Int64] = [:]
@@ -959,9 +965,26 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        if sessionClearBarrier != nil {
+            await withCheckedContinuation { continuation in
+                sessionClearBarrier?.waiters.append(continuation)
+            }
+            return
+        }
         // This flag changes synchronously before the first suspension point. User actions cannot
         // enqueue new Saved/forward SQL while teardown is waiting on older work.
         sessionTeardownActive = true
+        let id = UUID()
+        sessionClearBarrier = SessionClearBarrier(id: id, waiters: [])
+        await performClearLocalSession(finalStatus: finalStatus)
+        if sessionClearBarrier?.id == id {
+            let waiters = sessionClearBarrier?.waiters ?? []
+            sessionClearBarrier = nil
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    private func performClearLocalSession(finalStatus: String) async {
         // Prevent an old ensure from publishing while its exact task is cancelled and awaited.
         savedMessagesSessionGeneration &+= 1
         savedMessagesCapabilityState = .unknown
@@ -1026,6 +1049,7 @@ final class CloudAppModel {
         readReceiptRetryTask = nil
         replicaIntegrityTask = nil
         composerMediaOperationId = nil
+        composerMediaDialogId = nil
         activeComposerTransferId = nil
         mediaTransferTasks.removeAll()
         mediaTransferDialogIds.removeAll()
@@ -2721,11 +2745,15 @@ final class CloudAppModel {
     ) async {
         composerMediaTask?.cancel()
         await composerMediaTask?.value
+        guard !sessionTeardownActive, let dialogId = activeDialogId else { return }
         let operationId = UUID()
         composerMediaOperationId = operationId
+        // Establish dialog ownership before the task can enter mediaEngine.prepare.
+        composerMediaDialogId = dialogId
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performMediaSend(
+                dialogId: dialogId,
                 data: data, kind: kind, contentType: contentType, fileName: fileName,
                 durationMs: durationMs, width: width, height: height, thumbnail: thumbnail
             )
@@ -2735,16 +2763,18 @@ final class CloudAppModel {
         if composerMediaOperationId == operationId {
             composerMediaTask = nil
             composerMediaOperationId = nil
+            composerMediaDialogId = nil
             activeComposerTransferId = nil
         }
     }
 
     private func performMediaSend(
+        dialogId: String,
         data: Data, kind: String, contentType: String, fileName: String?,
         durationMs: Int64?, width: Int?, height: Int?, thumbnail: Data?
     ) async {
         guard
-            let dialogId = activeDialogId,
+            !sessionTeardownActive,
             let accountId = storedSession?.session.accountId,
             let localStore
         else { return }
@@ -3044,8 +3074,52 @@ final class CloudAppModel {
         MediaPresentationCache.shared.storePreparedVideoAsset(asset, mediaId: media.id)
     }
 
-    func temporaryMediaURL(data: Data, fileExtension: String?) async throws -> URL {
-        try await mediaEngine.temporaryPreview(data: data, fileExtension: fileExtension)
+    @discardableResult
+    func transferTemporaryMediaURL(
+        data: Data,
+        fileExtension: String?,
+        mediaId: String,
+        dialogId: String,
+        transferOwnership: @escaping @MainActor @Sendable (URL) -> Bool
+    ) async throws -> Bool {
+        let accountId = storedSession?.session.accountId
+        let token = storedSession?.session.token
+        let generation = savedMessagesSessionGeneration
+        let store = localStore
+        #if DEBUG
+        let permitsDemoMedia = isDemoMode
+        #else
+        let permitsDemoMedia = false
+        #endif
+        guard !sessionTeardownActive,
+              permitsDemoMedia || (accountId != nil && token != nil && store != nil)
+        else {
+            throw CloudLocalStoreAccessError.revoked
+        }
+        return try await mediaEngine.temporaryPreview(
+            data: data,
+            fileExtension: fileExtension
+        ) { [weak self, store] url in
+            guard !Task.isCancelled else { return false }
+            if !permitsDemoMedia {
+                guard let store,
+                      (try? await store.isMediaPresentable(
+                        mediaId: mediaId, dialogId: dialogId
+                      )) == true
+                else { return false }
+            }
+            return await MainActor.run {
+                guard let self,
+                      !Task.isCancelled,
+                      !self.sessionTeardownActive,
+                      self.savedMessagesSessionGeneration == generation,
+                      self.storedSession?.session.accountId == accountId,
+                      self.storedSession?.session.token == token,
+                      self.localStore === store || permitsDemoMedia
+                else { return false }
+                return transferOwnership(url)
+            }
+        }
     }
 
     func removeTemporaryMediaURL(_ url: URL) async {
@@ -3159,7 +3233,8 @@ final class CloudAppModel {
             mediaDownloadTask?.cancel()
             historyHydrationTask?.cancel()
         }
-        let cancelsComposer = activeComposerTransferId.map(transferIds.contains) == true
+        let cancelsComposer = composerMediaDialogId == dialogId
+            || activeComposerTransferId.map(transferIds.contains) == true
         if cancelsComposer { composerMediaTask?.cancel() }
         for task in cancellableTasks { await task.value }
         for transferId in transferIds {
@@ -3176,6 +3251,7 @@ final class CloudAppModel {
         if cancelsComposer {
             await composerMediaTask?.value
             composerMediaTask = nil
+            composerMediaDialogId = nil
             activeComposerTransferId = nil
             composerMediaOperationId = nil
         }
@@ -3210,6 +3286,12 @@ final class CloudAppModel {
         mediaTransfersInFlight.insert(transferId)
     }
 
+    func testTrackComposerPreparation(dialogId: String, task: Task<Void, Never>) {
+        composerMediaTask = task
+        composerMediaDialogId = dialogId
+        composerMediaOperationId = UUID()
+    }
+
     func testInvalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
         await invalidatePresentationForAccessPurge(job)
     }
@@ -3224,6 +3306,14 @@ final class CloudAppModel {
         mediaTransfersInFlight.remove(transferId)
         task.cancel()
         await task.value
+    }
+
+    func testClearLocalSession() async {
+        await clearLocalSession(finalStatus: "Test session cleared")
+    }
+
+    func testHasSessionClearBarrier() -> Bool {
+        sessionClearBarrier != nil
     }
     #endif
 

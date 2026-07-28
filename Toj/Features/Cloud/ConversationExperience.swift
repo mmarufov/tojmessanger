@@ -2542,12 +2542,19 @@ private struct ProductionMediaViewer: View {
                 }
                 downloadProgress = 1
                 shareFetchTask = Task { @MainActor in
-                    guard let downloaded = try? await model.mediaData(for: media),
-                          let url = try? await model.temporaryMediaURL(
-                            data: downloaded,
-                            fileExtension: preferredFileExtension
-                          ), !Task.isCancelled else { return }
-                    temporaryURL = url
+                    guard let dialogId = line.dialogId,
+                          let downloaded = try? await model.mediaData(for: media)
+                    else { return }
+                    _ = try? await model.transferTemporaryMediaURL(
+                        data: downloaded,
+                        fileExtension: preferredFileExtension,
+                        mediaId: media.id,
+                        dialogId: dialogId
+                    ) { url in
+                        guard !Task.isCancelled else { return false }
+                        temporaryURL = url
+                        return true
+                    }
                 }
                 return
             }
@@ -2555,9 +2562,21 @@ private struct ProductionMediaViewer: View {
             let downloaded = try await model.mediaData(for: media) { value in
                 await MainActor.run { downloadProgress = value }
             }
-            temporaryURL = try await model.temporaryMediaURL(
-                data: downloaded, fileExtension: preferredFileExtension
-            )
+            try Task.checkCancellation()
+            guard let dialogId = line.dialogId else {
+                throw MediaPresentationError.unreadable
+            }
+            let transferred = try await model.transferTemporaryMediaURL(
+                data: downloaded,
+                fileExtension: preferredFileExtension,
+                mediaId: media.id,
+                dialogId: dialogId
+            ) { url in
+                guard !Task.isCancelled else { return false }
+                temporaryURL = url
+                return true
+            }
+            if !transferred { throw CancellationError() }
         } catch {
             self.error = error.localizedDescription
         }
@@ -2593,12 +2612,19 @@ private struct ProductionMediaViewer: View {
         newPlayer.play()
         isPlaying = true
         shareFetchTask = Task { @MainActor in
-            guard
-                let data = try? await model.mediaData(for: media),
-                let url = try? await model.temporaryMediaURL(data: data, fileExtension: preferredFileExtension),
-                !Task.isCancelled
+            guard let dialogId = line.dialogId,
+                  let data = try? await model.mediaData(for: media)
             else { return }
-            temporaryURL = url
+            _ = try? await model.transferTemporaryMediaURL(
+                data: data,
+                fileExtension: preferredFileExtension,
+                mediaId: media.id,
+                dialogId: dialogId
+            ) { url in
+                guard !Task.isCancelled else { return false }
+                temporaryURL = url
+                return true
+            }
         }
     }
 

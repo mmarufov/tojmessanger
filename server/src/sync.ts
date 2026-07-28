@@ -903,6 +903,8 @@ export async function getDifference(
            d.type AS dialog_type, d.created_by AS dialog_created_by,
            d.revision AS group_revision,
            self.role AS self_role, self.left_at AS self_left_at, d.closed_at,
+           prior_access.type AS prior_access_type,
+           prior_access.pts AS prior_access_pts,
            peer.id AS peer_account_id,
            CASE
              WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
@@ -916,6 +918,16 @@ export async function getDifference(
     LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
     LEFT JOIN dialog_members self
       ON self.dialog_id = d.id AND self.account_id = ${accountId}
+    LEFT JOIN LATERAL (
+      SELECT boundary.type, boundary.pts
+      FROM account_events boundary
+      WHERE boundary.account_id = ${accountId}
+        AND boundary.dialog_id = ae.dialog_id
+        AND boundary.pts <= ${sincePts}
+        AND boundary.type IN ('dialog.created', 'dialog.access_revoked')
+      ORDER BY boundary.pts DESC
+      LIMIT 1
+    ) prior_access ON true
     LEFT JOIN accounts peer ON peer.id = CASE
       WHEN pair.account_low = ${accountId} THEN pair.account_high
       WHEN pair.account_high = ${accountId} THEN pair.account_low
@@ -923,28 +935,41 @@ export async function getDifference(
     END
     ORDER BY ae.pts ASC`;
 
-  const revokedDialogs = new Set(rows
-    .filter((event: any) =>
-      event.type === "dialog.access_revoked"
-      || (
-        event.dialog_type === "group"
-        && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
-      )
-      || (
-        event.dialog_type === "saved"
-        && (
-          event.dialog_created_by !== accountId
-          || event.self_role !== "owner"
-          || event.self_left_at != null
-          || event.closed_at != null
-        )
-      )
-    )
-    .map((event: any) => String(event.dialog_id)));
-  const messageKeys: MessageKey[] = rows.flatMap((event) =>
+  const groupAccess = new Map<string, "active" | "revoked">();
+  const accessDecisions = rows.map((event: any) => {
+    const dialogId = event.dialog_id == null ? null : String(event.dialog_id);
+    if (event.type === "dialog.access_revoked") {
+      if (dialogId && event.dialog_type === "group") groupAccess.set(dialogId, "revoked");
+      return { replaceWithRevocation: true };
+    }
+    if (!dialogId) return { replaceWithRevocation: false };
+    if (event.dialog_type === "saved") {
+      const authorized = event.dialog_created_by === accountId
+        && event.self_role === "owner"
+        && event.self_left_at == null
+        && event.closed_at == null;
+      return { replaceWithRevocation: !authorized };
+    }
+    if (event.dialog_type !== "group") return { replaceWithRevocation: false };
+
+    let state = groupAccess.get(dialogId);
+    if (!state) {
+      if (event.prior_access_type === "dialog.access_revoked") state = "revoked";
+      else if (event.prior_access_type === "dialog.created") state = "active";
+      else {
+        state = event.self_role == null || event.self_left_at != null || event.closed_at != null
+          ? "revoked"
+          : "active";
+      }
+    }
+    if (event.type === "dialog.created") state = "active";
+    groupAccess.set(dialogId, state);
+    return { replaceWithRevocation: state === "revoked" };
+  });
+  const messageKeys: MessageKey[] = rows.flatMap((event, index) =>
     event.msg_id != null && [
       "message.new", "message.edited", "message.deleted", "reaction.updated",
-    ].includes(event.type) && !revokedDialogs.has(event.dialog_id)
+    ].includes(event.type) && !accessDecisions[index].replaceWithRevocation
       ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
       : []
   );
@@ -952,10 +977,10 @@ export async function getDifference(
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
-  for (const ev of rows) {
+  for (const [index, ev] of rows.entries()) {
     const pts = n(ev.pts);
     let update: any;
-    if (revokedDialogs.has(ev.dialog_id)) {
+    if (accessDecisions[index].replaceWithRevocation) {
       update = {
         pts,
         ptsCount: 1,

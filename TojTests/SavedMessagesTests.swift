@@ -1041,15 +1041,22 @@ final class SavedMessagesTests: XCTestCase {
             mediaEngine: engine,
             isCurrent: { true },
             invalidatePresentation: { _ in
-                // Model a transfer task that completed its SQL write after revocation was staged
-                // but just as cancellation was being awaited.
-                try! await store.insertMediaTransfer(
-                    prepared: latePrepared,
-                    dialogId: dialogId,
-                    clientMsgId: UUID().uuidString.lowercased(),
-                    caption: "",
-                    replyToMsgId: nil
-                )
+                // Model prepare returning after revocation. The transactional fence rejects the
+                // SQL row and the producer immediately relinquishes the newly encrypted bytes.
+                do {
+                    try await store.insertMediaTransfer(
+                        prepared: latePrepared,
+                        dialogId: dialogId,
+                        clientMsgId: UUID().uuidString.lowercased(),
+                        caption: "",
+                        replyToMsgId: nil
+                    )
+                    XCTFail("late prepared transfer must be rejected")
+                } catch CloudLocalStoreAccessError.revoked {
+                    await engine.discardPrepared(latePrepared)
+                } catch {
+                    XCTFail("unexpected late prepare error: \(error)")
+                }
             }
         )
 
@@ -1282,6 +1289,8 @@ final class SavedMessagesTests: XCTestCase {
             keyData: Data(repeating: 0x74, count: 32), limitBytes: 1_000_000
         )
         let coordinator = AccessPurgeCoordinator()
+        let oldPurgeGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
         let oldTask = Task {
             try await coordinator.drain(
                 scope: AccessPurgeScope(
@@ -1291,20 +1300,29 @@ final class SavedMessagesTests: XCTestCase {
                 mediaEngine: CloudMediaTransferEngine(cache: oldCache),
                 isCurrent: { true },
                 invalidatePresentation: { _ in
-                    try? await Task.sleep(for: .seconds(5))
+                    await withTaskCancellationHandler {
+                        await oldPurgeGate.wait()
+                    } onCancel: {
+                        Task { await cancellationObserved.open() }
+                    }
                 }
             )
         }
-        try await Task.sleep(for: .milliseconds(50))
-        let newResult = try await coordinator.drain(
-            scope: AccessPurgeScope(
-                accountId: "new-account", token: "new-token", generation: 2, store: newStore
-            ),
-            store: newStore,
-            mediaEngine: CloudMediaTransferEngine(cache: newCache),
-            isCurrent: { true },
-            invalidatePresentation: { _ in }
-        )
+        await oldPurgeGate.waitUntilBlocked()
+        let newTask = Task {
+            try await coordinator.drain(
+                scope: AccessPurgeScope(
+                    accountId: "new-account", token: "new-token", generation: 2, store: newStore
+                ),
+                store: newStore,
+                mediaEngine: CloudMediaTransferEngine(cache: newCache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in }
+            )
+        }
+        await cancellationObserved.wait()
+        await oldPurgeGate.open()
+        let newResult = try await newTask.value
         do {
             _ = try await oldTask.value
             XCTFail("old account purge must be cancelled")
@@ -1316,6 +1334,272 @@ final class SavedMessagesTests: XCTestCase {
         let newCount = try await newStore.pendingAccessPurgeCount()
         XCTAssertEqual(oldCount, 1)
         XCTAssertEqual(newCount, 0)
+    }
+
+    @MainActor
+    func testComposerPreparationIsAwaitedBeforePurgeFinalization() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let dialogId = "composer-revoked"
+        try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Composer")
+        try await store.revokeGroupAccess(dialogId: dialogId, reason: "dialog.access_revoked")
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "composer-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x75, count: 32), limitBytes: 1_000_000
+        )
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://composer.invalid"))),
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        let preparationGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
+        let released = SavedMessagesCompletionProbe()
+        let preparation = Task {
+            await withTaskCancellationHandler {
+                await preparationGate.wait()
+            } onCancel: {
+                Task { await cancellationObserved.open() }
+            }
+            await released.markCompleted()
+        }
+        await preparationGate.waitUntilBlocked()
+        model.testTrackComposerPreparation(dialogId: dialogId, task: preparation)
+        let coordinator = AccessPurgeCoordinator()
+        let drain = Task {
+            try await coordinator.drain(
+                scope: AccessPurgeScope(
+                    accountId: "composer-account", token: "token", generation: 1, store: store
+                ),
+                store: store,
+                mediaEngine: CloudMediaTransferEngine(cache: cache),
+                isCurrent: { true },
+                invalidatePresentation: { job in
+                    await model.testInvalidatePresentationForAccessPurge(job)
+                },
+                purgeFilesOverride: { _ in
+                    guard await released.value else {
+                        throw SavedMessagesInjectedPurgeError()
+                    }
+                }
+            )
+        }
+        await cancellationObserved.wait()
+        let pendingBeforeRelease = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(pendingBeforeRelease, 1)
+        await preparationGate.open()
+        let drainResult = try await drain.value
+        let pendingAfterRelease = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(drainResult.finalized, 1)
+        XCTAssertEqual(pendingAfterRelease, 0)
+    }
+
+    func testRevokedDialogRejectsPreparedAndSendingMediaAndPreparedBytesAreDiscarded() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let dialogId = "late-prepared-media"
+        try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Revoked")
+        try await store.revokeGroupAccess(dialogId: dialogId, reason: "dialog.access_revoked")
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "prepared-rejection-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x76, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let prepared = try await engine.prepare(
+            data: Data("newly prepared bytes".utf8),
+            kind: "file",
+            contentType: "application/octet-stream",
+            fileName: "late.bin"
+        )
+        do {
+            try await store.insertMediaTransfer(
+                prepared: prepared,
+                dialogId: dialogId,
+                clientMsgId: UUID().uuidString.lowercased(),
+                caption: "",
+                replyToMsgId: nil
+            )
+            XCTFail("revoked dialog accepted a prepared transfer")
+        } catch CloudLocalStoreAccessError.revoked {
+            await engine.discardPrepared(prepared)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.encryptedSourcePath))
+
+        let transfer = MediaTransferRecord(
+            transferId: prepared.transferId,
+            dialogId: dialogId,
+            clientMsgId: UUID().uuidString.lowercased(),
+            caption: "",
+            replyToMsgId: nil,
+            kind: prepared.kind,
+            contentType: prepared.contentType,
+            fileName: prepared.fileName,
+            byteSize: prepared.byteSize,
+            sha256: prepared.sha256,
+            durationMs: nil,
+            width: nil,
+            height: nil,
+            encryptedSourcePath: prepared.encryptedSourcePath,
+            encryptedThumbnailPath: nil,
+            mediaId: nil,
+            uploadOffset: 0,
+            state: "pending",
+            retryCount: 0,
+            nextRetryAt: nil,
+            lastError: nil,
+            terminal: false
+        )
+        do {
+            try await store.insertSendingMedia(transfer, senderAccountId: "account-me")
+            XCTFail("revoked dialog accepted an optimistic media row")
+        } catch CloudLocalStoreAccessError.revoked {
+            // Expected.
+        }
+    }
+
+    @MainActor
+    func testConcurrentResetCallersAwaitOneUncooperativePurgeBarrier() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        try await store.upsertDialog(dialogId: "reset-revoked", type: "group", title: "Reset")
+        try await store.revokeGroupAccess(
+            dialogId: "reset-revoked", reason: "dialog.access_revoked"
+        )
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "reset-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x77, count: 32), limitBytes: 1_000_000
+        )
+        let purgeGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
+        let coordinator = AccessPurgeCoordinator()
+        let drain = Task {
+            try await coordinator.drain(
+                scope: AccessPurgeScope(
+                    accountId: "reset-account", token: "token", generation: 1, store: store
+                ),
+                store: store,
+                mediaEngine: CloudMediaTransferEngine(cache: cache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in
+                    await withTaskCancellationHandler {
+                        await purgeGate.wait()
+                    } onCancel: {
+                        Task { await cancellationObserved.open() }
+                    }
+                }
+            )
+        }
+        await purgeGate.waitUntilBlocked()
+        let firstCompleted = SavedMessagesCompletionProbe()
+        let secondCompleted = SavedMessagesCompletionProbe()
+        let firstReset = Task {
+            await coordinator.reset()
+            await firstCompleted.markCompleted()
+        }
+        await cancellationObserved.wait()
+        while !(await coordinator.testHasResetBarrier()) { await Task.yield() }
+        let secondReset = Task {
+            await coordinator.reset()
+            await secondCompleted.markCompleted()
+        }
+        await Task.yield()
+        let firstFinishedEarly = await firstCompleted.value
+        let secondFinishedEarly = await secondCompleted.value
+        XCTAssertFalse(firstFinishedEarly)
+        XCTAssertFalse(secondFinishedEarly)
+        await purgeGate.open()
+        await firstReset.value
+        await secondReset.value
+        let firstFinished = await firstCompleted.value
+        let secondFinished = await secondCompleted.value
+        XCTAssertTrue(firstFinished)
+        XCTAssertTrue(secondFinished)
+        do {
+            _ = try await drain.value
+            XCTFail("reset must cancel the shared purge")
+        } catch is CancellationError {
+            // Expected.
+        }
+    }
+
+    @MainActor
+    func testConcurrentClearLocalSessionCallersAwaitOneUncooperativeBarrier() async throws {
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://clear.invalid"))),
+            tokenStore: TokenStore(service: "com.toj.clear.\(UUID().uuidString)"),
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        let composerGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
+        let composer = Task {
+            await withTaskCancellationHandler {
+                await composerGate.wait()
+            } onCancel: {
+                Task { await cancellationObserved.open() }
+            }
+        }
+        await composerGate.waitUntilBlocked()
+        model.testTrackComposerPreparation(dialogId: "clear-dialog", task: composer)
+
+        let firstCompleted = SavedMessagesCompletionProbe()
+        let secondCompleted = SavedMessagesCompletionProbe()
+        let firstClear = Task { @MainActor in
+            await model.testClearLocalSession()
+            await firstCompleted.markCompleted()
+        }
+        await cancellationObserved.wait()
+        XCTAssertTrue(model.testHasSessionClearBarrier())
+        let secondClear = Task { @MainActor in
+            await model.testClearLocalSession()
+            await secondCompleted.markCompleted()
+        }
+        await Task.yield()
+        let firstFinishedEarly = await firstCompleted.value
+        let secondFinishedEarly = await secondCompleted.value
+        XCTAssertFalse(firstFinishedEarly)
+        XCTAssertFalse(secondFinishedEarly)
+
+        await composerGate.open()
+        await firstClear.value
+        await secondClear.value
+        let firstFinished = await firstCompleted.value
+        let secondFinished = await secondCompleted.value
+        XCTAssertTrue(firstFinished)
+        XCTAssertTrue(secondFinished)
+        XCTAssertFalse(model.testHasSessionClearBarrier())
+    }
+
+    func testCancelledTemporaryPreviewDeletesPlaintextBeforeOwnershipTransfer() async throws {
+        let fixture = try makeStoreFixture()
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "preview-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x78, count: 32), limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let ownershipGate = SavedMessagesAsyncGate()
+        let recorder = SavedMessagesURLRecorder()
+        let previewTask = Task {
+            try await engine.temporaryPreview(
+                data: Data("plaintext preview".utf8),
+                fileExtension: "bin"
+            ) { url in
+                await recorder.record(url)
+                await ownershipGate.wait()
+                return !Task.isCancelled
+            }
+        }
+        let url = await recorder.waitForURL()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        previewTask.cancel()
+        await ownershipGate.open()
+        let transferred = try await previewTask.value
+        XCTAssertFalse(transferred)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testSavedMessagesStringsHaveRussianAndTajikTranslations() throws {
@@ -1453,6 +1737,35 @@ private actor SavedMessagesCancellationProbe {
     }
 
     var value: Bool { cancelled }
+}
+
+private actor SavedMessagesCompletionProbe {
+    private var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+
+    var value: Bool { completed }
+}
+
+private actor SavedMessagesURLRecorder {
+    private var url: URL?
+    private var waiters: [CheckedContinuation<URL, Never>] = []
+
+    func record(_ value: URL) {
+        url = value
+        let waiting = waiters
+        waiters.removeAll()
+        waiting.forEach { $0.resume(returning: value) }
+    }
+
+    func waitForURL() async -> URL {
+        if let url { return url }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
 }
 
 private actor SavedMessagesAsyncGate {

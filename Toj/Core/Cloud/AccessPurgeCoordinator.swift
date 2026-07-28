@@ -38,9 +38,14 @@ actor AccessPurgeCoordinator {
         let task: Task<AccessPurgeDrainResult, Error>
     }
 
+    private struct ResetBarrier {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
     private var activeScope: AccessPurgeScope?
     private var inFlight: InFlight?
-    private var resetting = false
+    private var resetBarrier: ResetBarrier?
 
     func drain(
         scope: AccessPurgeScope,
@@ -50,7 +55,7 @@ actor AccessPurgeCoordinator {
         invalidatePresentation: @escaping @MainActor @Sendable (AccessPurgeJob) async -> Void,
         purgeFilesOverride: (@Sendable (AccessPurgeJob) async throws -> Void)? = nil
     ) async throws -> AccessPurgeDrainResult {
-        guard !resetting else { throw AccessPurgeCoordinatorError.staleSession }
+        guard resetBarrier == nil else { throw AccessPurgeCoordinatorError.staleSession }
         if activeScope != scope {
             activeScope = scope
             await cancelAndAwait()
@@ -148,14 +153,25 @@ actor AccessPurgeCoordinator {
     }
 
     func reset() async {
-        if resetting {
-            _ = await inFlight?.task.result
+        if let resetBarrier {
+            await resetBarrier.task.value
             return
         }
-        resetting = true
+
         activeScope = nil
-        await cancelAndAwait()
-        resetting = false
+        let old = inFlight
+        inFlight = nil
+        old?.task.cancel()
+
+        let id = UUID()
+        let task = Task {
+            _ = await old?.task.result
+        }
+        resetBarrier = ResetBarrier(id: id, task: task)
+        await task.value
+        if resetBarrier?.id == id {
+            resetBarrier = nil
+        }
     }
 
     private func cancelAndAwait() async {
@@ -164,4 +180,10 @@ actor AccessPurgeCoordinator {
         old?.task.cancel()
         _ = await old?.task.result
     }
+
+    #if DEBUG
+    func testHasResetBarrier() -> Bool {
+        resetBarrier != nil
+    }
+    #endif
 }

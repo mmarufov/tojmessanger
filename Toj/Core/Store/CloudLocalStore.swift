@@ -1284,6 +1284,9 @@ actor CloudLocalStore {
 
     func applyGroupEnvelope(_ envelope: CloudGroupEnvelope) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: envelope.group.id) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             for profile in envelope.profiles {
                 try upsertProfile(db, profile: profile)
             }
@@ -1305,6 +1308,9 @@ actor CloudLocalStore {
 
     func applyGroupMembersPage(_ page: CloudGroupMembersPage, generation: String) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: page.group.id) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             for profile in page.profiles {
                 try upsertProfile(db, profile: profile)
             }
@@ -1818,10 +1824,9 @@ actor CloudLocalStore {
         caption: String, replyToMsgId: Int64?, purpose: String = "message"
     ) throws {
         try dbQueue.write { db in
-            // A preparation task may cross the revocation transaction. Keep this late row
-            // discoverable so refreshAccessPurgeJob can capture and physically delete its encrypted
-            // paths; the purge transaction has already hidden the dialog and the coordinator awaits
-            // the exact producer task before refreshing.
+            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try db.execute(
                 sql: """
                 INSERT INTO media_transfers (
@@ -1999,6 +2004,9 @@ actor CloudLocalStore {
     func insertSendingMedia(_ transfer: MediaTransferRecord, senderAccountId: String) throws {
         let mediaJSON = String(data: try JSONEncoder().encode(transfer.media), encoding: .utf8)
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: transfer.dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try upsertDialog(db, dialogId: transfer.dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
             try db.execute(
                 sql: """
@@ -2212,39 +2220,67 @@ actor CloudLocalStore {
                 return
             } else {
                 var messageDialogsToRefresh: Set<String> = []
-                let pageRevocations = (difference.updates ?? []).reduce(
-                    into: [String: CloudUpdate]()
-                ) { result, update in
-                    guard update.type == "dialog.access_revoked", let dialogId = update.dialogId
-                    else { return }
-                    if update.pts >= (result[dialogId]?.pts ?? -1) {
-                        result[dialogId] = update
-                    }
-                }
-                for (dialogId, update) in pageRevocations {
+                let updates = difference.updates ?? []
+                // Saved access is owner-only and non-regrantable. Pre-install any Saved revoke in
+                // this page so a legacy receipt that precedes it cannot persist archive/profile
+                // data. Group access remains strictly sequential to preserve remove then re-add.
+                for update in updates where update.type == "dialog.access_revoked"
+                    && update.dialogType == "saved" {
+                    guard let dialogId = update.dialogId else { continue }
                     try db.execute(
                         sql: """
-                        INSERT INTO revoked_dialogs (dialog_id, dialog_type, revoked_pts, created_at)
-                        VALUES (?, ?, ?, datetime('now'))
+                        INSERT INTO revoked_dialogs (
+                          dialog_id, dialog_type, revoked_pts, created_at
+                        ) VALUES (?, 'saved', ?, datetime('now'))
                         ON CONFLICT(dialog_id) DO UPDATE SET
-                          dialog_type = COALESCE(excluded.dialog_type, revoked_dialogs.dialog_type),
+                          dialog_type = 'saved',
                           revoked_pts = MAX(revoked_dialogs.revoked_pts, excluded.revoked_pts)
                         """,
-                        arguments: [dialogId, update.dialogType, update.pts]
+                        arguments: [dialogId, update.pts]
                     )
                 }
-                var blockedDialogIds = Set(pageRevocations.keys)
-                for update in difference.updates ?? [] {
-                    if let dialogId = update.dialogId,
-                       try Self.isDialogRevoked(db, dialogId: dialogId) {
-                        blockedDialogIds.insert(dialogId)
+                let pageDialogIds = Set(updates.compactMap(\.dialogId))
+                var simulatedRevocations: [
+                    String: (dialogType: String?, pts: Int64)
+                ] = [:]
+                for dialogId in pageDialogIds {
+                    simulatedRevocations[dialogId] = try Self.revokedDialog(
+                        db, dialogId: dialogId
+                    )
+                }
+                var blockedUpdates: [Bool] = []
+                blockedUpdates.reserveCapacity(updates.count)
+                for update in updates {
+                    guard let dialogId = update.dialogId else {
+                        blockedUpdates.append(false)
+                        continue
                     }
+                    if update.type == "dialog.access_revoked" {
+                        let previous = simulatedRevocations[dialogId]
+                        simulatedRevocations[dialogId] = (
+                            update.dialogType ?? previous?.dialogType,
+                            max(previous?.pts ?? 0, update.pts)
+                        )
+                        blockedUpdates.append(true)
+                        continue
+                    }
+                    if update.type == "dialog.created",
+                       let revoked = simulatedRevocations[dialogId],
+                       revoked.dialogType == "group",
+                       update.dialogType == "group",
+                       update.pts > revoked.pts {
+                        simulatedRevocations[dialogId] = nil
+                        blockedUpdates.append(false)
+                        continue
+                    }
+                    blockedUpdates.append(simulatedRevocations[dialogId] != nil)
                 }
                 var blockedProfileIds: Set<String> = []
                 var visibleProfileIds: Set<String> = []
                 var hasVisibleNonRevocation = false
-                for update in difference.updates ?? [] where update.type != "dialog.access_revoked" {
-                    let isBlocked = update.dialogId.map(blockedDialogIds.contains) ?? false
+                for (index, update) in updates.enumerated()
+                    where update.type != "dialog.access_revoked" {
+                    let isBlocked = blockedUpdates[index]
                     if isBlocked {
                         blockedProfileIds.formUnion(Self.referencedAccountIds(update))
                     } else {
@@ -2265,13 +2301,20 @@ actor CloudLocalStore {
                 for profile in visibleProfiles {
                     try upsertProfile(db, profile: profile)
                 }
-                for update in difference.updates ?? [] {
+                for update in updates {
                     if let dialogId = update.dialogId,
                        update.type != "dialog.access_revoked",
-                       try Self.isDialogRevoked(db, dialogId: dialogId) {
-                        // A replayed legacy receipt, delayed history/mutation response, or stale
-                        // difference can never resurrect a dialog after access revocation.
-                        continue
+                       let revoked = try Self.revokedDialog(db, dialogId: dialogId) {
+                        let isNewerGroupGrant = update.type == "dialog.created"
+                            && revoked.dialogType == "group"
+                            && update.dialogType == "group"
+                            && update.pts > revoked.pts
+                        guard isNewerGroupGrant else {
+                            // Delayed history/member/mutation receipts cannot resurrect a revoked
+                            // dialog. Saved tombstones never satisfy the group-only grant predicate.
+                            continue
+                        }
+                        try restoreGroupAccess(db, dialogId: dialogId)
                     }
                     switch update.type {
                     case "message.new", "message.edited", "message.deleted", "reaction.updated":
@@ -2403,7 +2446,9 @@ actor CloudLocalStore {
                             db,
                             dialogId: dialogId,
                             accessState: "removed",
-                            reason: reason
+                            reason: reason,
+                            revokedPts: update.pts,
+                            explicitDialogType: update.dialogType
                         )
                     case "read.updated":
                         guard
@@ -3307,6 +3352,22 @@ actor CloudLocalStore {
     func isDialogAccessRevoked(dialogId: String) throws -> Bool {
         try dbQueue.read { db in
             try Self.isDialogRevoked(db, dialogId: dialogId)
+        }
+    }
+
+    func isMediaPresentable(mediaId: String, dialogId: String) throws -> Bool {
+        try dbQueue.read { db in
+            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else { return false }
+            return try Bool.fetchOne(
+                db,
+                sql: """
+                SELECT EXISTS (
+                  SELECT 1 FROM message_media
+                  WHERE dialog_id = ? AND media_id = ?
+                )
+                """,
+                arguments: [dialogId, mediaId]
+            ) ?? false
         }
     }
 
@@ -4612,7 +4673,14 @@ actor CloudLocalStore {
     ) throws {
         let encoder = JSONEncoder()
         for dialog in page.dialogs {
-            guard try !Self.isDialogRevoked(db, dialogId: dialog.dialogId) else { continue }
+            if let revoked = try Self.revokedDialog(db, dialogId: dialog.dialogId) {
+                let isAuthoritativeGroupGrant = dialog.type == "group"
+                    && revoked.dialogType == "group"
+                    && dialog.selfRole != nil
+                    && page.state.pts > revoked.pts
+                guard isAuthoritativeGroupGrant else { continue }
+                try restoreGroupAccess(db, dialogId: dialog.dialogId)
+            }
             let photoJSON = dialog.photo
                 .flatMap { try? encoder.encode($0) }
                 .flatMap { String(data: $0, encoding: .utf8) }
@@ -5499,25 +5567,29 @@ actor CloudLocalStore {
         _ db: Database,
         dialogId: String,
         accessState: String,
-        reason: String
+        reason: String,
+        revokedPts: Int64 = 0,
+        explicitDialogType: String? = nil
     ) throws {
-        let dialogType = try String.fetchOne(
+        let storedDialogType = try String.fetchOne(
             db,
             sql: "SELECT type FROM dialogs WHERE dialog_id = ?",
             arguments: [dialogId]
         )
+        let dialogType = explicitDialogType ?? storedDialogType
         try db.execute(
             sql: """
             INSERT INTO revoked_dialogs (dialog_id, dialog_type, revoked_pts, created_at)
-            VALUES (?, ?, 0, datetime('now'))
+            VALUES (?, ?, ?, datetime('now'))
             ON CONFLICT(dialog_id) DO UPDATE SET
-              dialog_type = COALESCE(excluded.dialog_type, revoked_dialogs.dialog_type)
+              dialog_type = COALESCE(excluded.dialog_type, revoked_dialogs.dialog_type),
+              revoked_pts = MAX(revoked_dialogs.revoked_pts, excluded.revoked_pts)
             """,
-            arguments: [dialogId, dialogType]
+            arguments: [dialogId, dialogType, revokedPts]
         )
         // Receipt replay after a completed purge refreshes the durable tombstone only. It must not
         // create an empty purge job or any presentation state.
-        guard dialogType != nil else { return }
+        guard storedDialogType != nil else { return }
         let mediaIds = Set(try String.fetchAll(
             db,
             sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
@@ -5627,6 +5699,39 @@ actor CloudLocalStore {
             sql: "SELECT EXISTS(SELECT 1 FROM revoked_dialogs WHERE dialog_id = ?)",
             arguments: [dialogId]
         ) ?? false
+    }
+
+    nonisolated private static func revokedDialog(
+        _ db: Database,
+        dialogId: String
+    ) throws -> (dialogType: String?, pts: Int64)? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT dialog_type, revoked_pts
+            FROM revoked_dialogs
+            WHERE dialog_id = ?
+            """,
+            arguments: [dialogId]
+        ) else { return nil }
+        return (row["dialog_type"], row["revoked_pts"])
+    }
+
+    private func restoreGroupAccess(_ db: Database, dialogId: String) throws {
+        // A server-authored grant newer than the durable revoke PTS is the only transition that
+        // removes a group tombstone. Saved tombstones never call this path.
+        try db.execute(
+            sql: "DELETE FROM pending_access_purges WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
+        try db.execute(
+            sql: "DELETE FROM revoked_dialogs WHERE dialog_id = ? AND dialog_type = 'group'",
+            arguments: [dialogId]
+        )
+        try db.execute(
+            sql: "UPDATE dialogs SET access_state = 'active', updated_at = datetime('now') WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
     }
 
     private func upsertDialog(

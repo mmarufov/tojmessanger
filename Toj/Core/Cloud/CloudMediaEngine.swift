@@ -3010,9 +3010,29 @@ actor CloudMediaTransferEngine {
         nextDownloadSequence = 0
     }
 
-    func temporaryPreview(data: Data, fileExtension: String?) async throws -> URL {
+    private func temporaryPreview(data: Data, fileExtension: String?) async throws -> URL {
         let cache = try resolvedCache()
         return try await cache.createTemporaryPreview(data, fileExtension: fileExtension)
+    }
+
+    @discardableResult
+    func temporaryPreview(
+        data: Data,
+        fileExtension: String?,
+        transferOwnership: @escaping @Sendable (URL) async -> Bool
+    ) async throws -> Bool {
+        let url = try await temporaryPreview(data: data, fileExtension: fileExtension)
+        do {
+            try Task.checkCancellation()
+            let transferred = await transferOwnership(url)
+            if !transferred {
+                await removeTemporaryPreview(url)
+            }
+            return transferred
+        } catch {
+            await removeTemporaryPreview(url)
+            throw error
+        }
     }
 
     func removeTemporaryPreview(_ url: URL) async { await cache?.removeTemporaryPreview(url) }
