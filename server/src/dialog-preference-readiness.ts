@@ -99,6 +99,9 @@ const EXPECTED_EVENT_CONSTRAINT =
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
   "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text])";
 const FINAL_TRIGGER_FUNCTION = "mirror_dialog_notification_mode_to_preferences_v1_final";
+const STAGING_TRIGGER_FUNCTION =
+  "mirror_dialog_notification_mode_to_preferences_v1_staging";
+const LOCKED_TRIGGER_SEARCH_PATH = "search_path=pg_catalog, public, pg_temp";
 const FINAL_CONTRACT_VERSION = 1;
 
 type CachedState = { expiresAt: number; value: DialogPreferenceSchemaState };
@@ -276,18 +279,54 @@ export async function dialogPreferenceSchemaState(
             AND function_namespace.nspname = 'public'
             AND function_row.proname = ${FINAL_TRIGGER_FUNCTION}
             AND pg_catalog.pg_get_function_identity_arguments(function_row.oid) = ''
+            AND function_row.proconfig =
+                ARRAY[${LOCKED_TRIGGER_SEARCH_PATH}]::text[]
+        )
+        AND (
+          SELECT pg_catalog.count(*) = 2
+             AND pg_catalog.bool_and(
+               COALESCE(
+                 secured_function.proconfig =
+                   ARRAY[${LOCKED_TRIGGER_SEARCH_PATH}]::text[],
+                 FALSE
+               )
+             )
+          FROM pg_catalog.pg_proc secured_function
+          JOIN pg_catalog.pg_namespace secured_namespace
+            ON secured_namespace.oid = secured_function.pronamespace
+          WHERE secured_namespace.nspname = 'public'
+            AND secured_function.proname = ANY(ARRAY[
+              ${FINAL_TRIGGER_FUNCTION},
+              ${STAGING_TRIGGER_FUNCTION}
+            ]::text[])
+            AND pg_catalog.pg_get_function_identity_arguments(
+                  secured_function.oid
+                ) = ''
+            AND secured_function.prorettype =
+                'pg_catalog.trigger'::pg_catalog.regtype
         )
         AND (
           SELECT pg_catalog.count(*) = 1
           FROM pg_catalog.pg_trigger topology_trigger
-          JOIN pg_catalog.pg_proc topology_function
-            ON topology_function.oid = topology_trigger.tgfoid
           WHERE NOT topology_trigger.tgisinternal
-            AND topology_function.proname = ANY(ARRAY[
-              ${FINAL_TRIGGER_FUNCTION},
-              'mirror_dialog_notification_mode_to_preferences_v1_staging',
-              'mirror_dialog_notification_mode_to_preferences'
-            ]::text[])
+            AND topology_trigger.tgrelid =
+                'public.dialog_members'::pg_catalog.regclass
+            AND topology_trigger.tgfoid IN (
+              SELECT intended_function.oid
+              FROM pg_catalog.pg_proc intended_function
+              JOIN pg_catalog.pg_namespace intended_namespace
+                ON intended_namespace.oid = intended_function.pronamespace
+              WHERE intended_namespace.nspname = 'public'
+                AND intended_function.proname = ANY(ARRAY[
+                  ${FINAL_TRIGGER_FUNCTION},
+                  ${STAGING_TRIGGER_FUNCTION}
+                ]::text[])
+                AND pg_catalog.pg_get_function_identity_arguments(
+                      intended_function.oid
+                    ) = ''
+                AND intended_function.prorettype =
+                    'pg_catalog.trigger'::pg_catalog.regtype
+            )
         ) AS compatibility_trigger_ready,
         COALESCE((
           SELECT completed_at IS NOT NULL

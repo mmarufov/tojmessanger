@@ -130,8 +130,21 @@ try {
             AND trigger_row.tgenabled = 'O'
             AND function_row.proname =
               'mirror_dialog_notification_mode_to_preferences_v1_final'
+            AND function_row.proconfig =
+              ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
         ),
-        to_regclass('public.dialog_preference_reconciliation_account_idx') IS NOT NULL
+        EXISTS (
+          SELECT 1
+          FROM pg_proc function_row
+          JOIN pg_namespace namespace ON namespace.oid = function_row.pronamespace
+          WHERE namespace.nspname = 'public'
+            AND function_row.proname =
+              'mirror_dialog_notification_mode_to_preferences_v1_staging'
+            AND function_row.proconfig =
+              ARRAY['search_path=pg_catalog, public, pg_temp']::text[]
+        ),
+        to_regclass('public.dialog_preference_reconciliation_account_idx') IS NOT NULL,
+        to_regclass('public.dialog_preference_requests_pending_idx') IS NOT NULL
     `}`.quiet().text()
   ).trim().split("|");
   const [
@@ -142,7 +155,9 @@ try {
     backlog,
     contractCompleted,
     finalTrigger,
+    stagingSearchPath,
     reconciliationIndex,
+    pendingRequestIndex,
   ] = verification;
   if (
     Number(preferenceCount) !== fixtureRows
@@ -152,7 +167,9 @@ try {
     || Number(backlog) !== 0
     || contractCompleted !== "t"
     || finalTrigger !== "t"
+    || stagingSearchPath !== "t"
     || reconciliationIndex !== "t"
+    || pendingRequestIndex !== "t"
   ) {
     throw new Error(`migration verification mismatch: ${verification.join("|")}`);
   }

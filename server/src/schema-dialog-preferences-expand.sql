@@ -129,6 +129,7 @@ $$;
 CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_staging()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
   account_status TEXT;

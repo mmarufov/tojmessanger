@@ -11,6 +11,7 @@ WHERE namespace.nspname = 'public'
     'dialog_preferences_account_idx',
     'dialog_preferences_pinned_order_idx',
     'dialog_preference_requests_retention_idx',
+    'dialog_preference_requests_pending_idx',
     'dialog_preference_action_budgets_account_idx',
     'dialog_preference_reconciliation_account_idx'
   )
@@ -24,6 +25,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preferences_pinned_order_idx
   WHERE is_pinned = TRUE;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_requests_retention_idx
   ON dialog_preference_requests(created_at);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_requests_pending_idx
+  ON dialog_preference_requests(created_at)
+  WHERE status = 'pending';
 CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_action_budgets_account_idx
   ON dialog_preference_action_budgets(updated_at);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_preference_reconciliation_account_idx

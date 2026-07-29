@@ -82,6 +82,56 @@ async function readyStatus(sql: SQL): Promise<number> {
   }
 }
 
+const TRIGGER_ACCOUNT_ID = "00000000-0000-4000-8000-000000000091";
+const TRIGGER_DIALOG_ID = "00000000-0000-4000-8000-000000000092";
+
+async function seedTriggerMember(sql: SQL): Promise<void> {
+  await sql`
+    INSERT INTO public.accounts (
+      id, phone_lookup_hash, phone_e164_ciphertext, phone_nonce, phone_key_id,
+      display_name
+    ) VALUES (
+      ${TRIGGER_ACCOUNT_ID},
+      decode(repeat('91', 32), 'hex'),
+      decode('91', 'hex'),
+      decode('92', 'hex'),
+      'readiness-trigger-key',
+      'Readiness trigger'
+    )`;
+  await sql`
+    INSERT INTO public.account_sync_states (account_id)
+    VALUES (${TRIGGER_ACCOUNT_ID})`;
+  await sql`
+    INSERT INTO public.dialogs (id, type, title, created_by)
+    VALUES (
+      ${TRIGGER_DIALOG_ID}, 'group', 'Readiness trigger', ${TRIGGER_ACCOUNT_ID}
+    )`;
+  await sql`
+    INSERT INTO public.dialog_members (
+      dialog_id, account_id, notification_mode
+    ) VALUES (${TRIGGER_DIALOG_ID}, ${TRIGGER_ACCOUNT_ID}, 'all')`;
+}
+
+async function installTriggerShadowRelations(sql: SQL): Promise<void> {
+  await sql`CREATE SCHEMA trigger_shadow`;
+  await sql`
+    CREATE TABLE trigger_shadow.accounts (
+      id UUID PRIMARY KEY,
+      status TEXT NOT NULL
+    )`;
+  await sql`
+    INSERT INTO trigger_shadow.accounts (id, status)
+    VALUES (${TRIGGER_ACCOUNT_ID}, 'active')`;
+  await sql`
+    CREATE TABLE trigger_shadow.dialog_preferences (
+      LIKE public.dialog_preferences INCLUDING ALL
+    )`;
+  await sql`
+    CREATE TABLE trigger_shadow.dialog_preference_legacy_reconciliation (
+      LIKE public.dialog_preference_legacy_reconciliation INCLUDING ALL
+    )`;
+}
+
 test("rerunning expand invalidates a completed contract until final contract is restored", async () => {
   await withDisposableDatabase({ migrated: true }, async ({ sql, runFile }) => {
     expect(await readyStatus(sql)).toBe(200);
@@ -106,6 +156,107 @@ test("rerunning expand invalidates a completed contract until final contract is 
     });
     expect(await readyStatus(sql)).toBe(200);
   });
+}, 120_000);
+
+test("readiness requires locked search_path on both compatibility functions", async () => {
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    const functions = await sql`
+      SELECT function_row.proname, function_row.proconfig
+      FROM pg_catalog.pg_proc function_row
+      JOIN pg_catalog.pg_namespace namespace
+        ON namespace.oid = function_row.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND function_row.proname IN (
+          'mirror_dialog_notification_mode_to_preferences_v1_staging',
+          'mirror_dialog_notification_mode_to_preferences_v1_final'
+        )
+      ORDER BY function_row.proname`;
+    expect(functions).toHaveLength(2);
+    expect(functions.every((row: any) =>
+      row.proconfig?.length === 1
+      && row.proconfig[0] === "search_path=pg_catalog, public, pg_temp"
+    )).toBe(true);
+
+    await sql`
+      ALTER FUNCTION
+        public.mirror_dialog_notification_mode_to_preferences_v1_final()
+      SET search_path = public, pg_catalog, pg_temp`;
+    expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready)
+      .toBe(false);
+    await sql`
+      ALTER FUNCTION
+        public.mirror_dialog_notification_mode_to_preferences_v1_final()
+      SET search_path = pg_catalog, public, pg_temp`;
+    expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready)
+      .toBe(true);
+
+    await sql`
+      ALTER FUNCTION
+        public.mirror_dialog_notification_mode_to_preferences_v1_staging()
+      RESET search_path`;
+    expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready)
+      .toBe(false);
+  });
+}, 120_000);
+
+test("staging and final triggers use public relations under a shadow search_path", async () => {
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    await seedTriggerMember(sql);
+    await installTriggerShadowRelations(sql);
+    await sql.begin(async (tx) => {
+      await tx`SET LOCAL search_path = trigger_shadow, public, pg_catalog`;
+      await tx`
+        UPDATE public.dialog_members
+        SET notification_mode = 'muted'
+        WHERE dialog_id = ${TRIGGER_DIALOG_ID}
+          AND account_id = ${TRIGGER_ACCOUNT_ID}`;
+    });
+    expect(Boolean((await sql`
+      SELECT is_muted
+      FROM public.dialog_preferences
+      WHERE dialog_id = ${TRIGGER_DIALOG_ID}
+        AND account_id = ${TRIGGER_ACCOUNT_ID}`)[0]?.is_muted)).toBe(true);
+    expect(await sql`SELECT account_id FROM trigger_shadow.dialog_preferences`)
+      .toHaveLength(0);
+    expect(await sql`
+      SELECT pts
+      FROM public.account_events
+      WHERE account_id = ${TRIGGER_ACCOUNT_ID}
+        AND type = 'dialog.preferences_updated'`).toHaveLength(1);
+  });
+
+  await withDisposableDatabase(
+    { migrated: true },
+    async ({ sql, runFile }) => {
+      await seedTriggerMember(sql);
+      await runFile(expand);
+      await installTriggerShadowRelations(sql);
+      await sql.begin(async (tx) => {
+        await tx`SET LOCAL search_path = trigger_shadow, public, pg_catalog`;
+        await tx`
+          UPDATE public.dialog_members
+          SET notification_mode = 'muted'
+          WHERE dialog_id = ${TRIGGER_DIALOG_ID}
+            AND account_id = ${TRIGGER_ACCOUNT_ID}`;
+      });
+      expect(Boolean((await sql`
+        SELECT is_muted
+        FROM public.dialog_preferences
+        WHERE dialog_id = ${TRIGGER_DIALOG_ID}
+          AND account_id = ${TRIGGER_ACCOUNT_ID}`)[0]?.is_muted)).toBe(true);
+      expect(await sql`
+        SELECT account_id
+        FROM public.dialog_preference_legacy_reconciliation
+        WHERE dialog_id = ${TRIGGER_DIALOG_ID}
+          AND account_id = ${TRIGGER_ACCOUNT_ID}`).toHaveLength(1);
+      expect(await sql`
+        SELECT account_id
+        FROM trigger_shadow.dialog_preferences`).toHaveLength(0);
+      expect(await sql`
+        SELECT account_id
+        FROM trigger_shadow.dialog_preference_legacy_reconciliation`).toHaveLength(0);
+    },
+  );
 }, 120_000);
 
 test("readiness requires the enabled compatibility trigger bound to the final function", async () => {
@@ -207,7 +358,7 @@ test("readiness rejects every malformed compatibility trigger topology", async (
   }
 }, 240_000);
 
-test("readiness rejects additional compatibility triggers in any schema", async () => {
+test("duplicate topology is scoped to dialog_members and intended function OIDs", async () => {
   await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
     await sql`
       CREATE TRIGGER dialog_members_notification_mode_staging_duplicate
@@ -221,6 +372,18 @@ test("readiness rejects additional compatibility triggers in any schema", async 
   });
   await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
     await sql`CREATE SCHEMA readiness_shadow`;
+    await sql`
+      CREATE TABLE public.unrelated_trigger_host (
+        dialog_id UUID,
+        account_id UUID,
+        notification_mode TEXT
+      )`;
+    await sql`
+      CREATE TRIGGER unrelated_intended_function_trigger
+      AFTER UPDATE OF notification_mode ON public.unrelated_trigger_host
+      FOR EACH ROW
+      EXECUTE FUNCTION
+        public.mirror_dialog_notification_mode_to_preferences_v1_staging()`;
     await sql.unsafe(`
       CREATE FUNCTION
         readiness_shadow.mirror_dialog_notification_mode_to_preferences_v1_staging()
@@ -239,8 +402,8 @@ test("readiness rejects additional compatibility triggers in any schema", async 
       EXECUTE FUNCTION
         readiness_shadow.mirror_dialog_notification_mode_to_preferences_v1_staging()`;
     const state = await dialogPreferenceSchemaState(sql, { bypassCache: true });
-    expect(state.compatibilityTriggerReady).toBe(false);
-    expect(state.ready).toBe(false);
+    expect(state.compatibilityTriggerReady).toBe(true);
+    expect(state.ready).toBe(true);
   });
 }, 120_000);
 
@@ -419,6 +582,50 @@ test("readiness rejects wrong preference column type, default, and nullability",
       ALTER COLUMN result_json DROP NOT NULL`;
 
     expect((await dialogPreferenceSchemaState(sql, { bypassCache: true })).ready).toBe(true);
+  });
+}, 120_000);
+
+test("pending-request metrics use the concurrent partial index", async () => {
+  await withDisposableDatabase({ migrated: true }, async ({ sql }) => {
+    await seedTriggerMember(sql);
+    await sql`
+      INSERT INTO public.dialog_preference_requests (
+        account_id, client_mutation_id, dialog_id, fingerprint, status, created_at
+      )
+      SELECT
+        ${TRIGGER_ACCOUNT_ID},
+        gen_random_uuid(),
+        ${TRIGGER_DIALOG_ID},
+        decode('00', 'hex'),
+        CASE WHEN series <= 5 THEN 'pending' ELSE 'completed' END,
+        now() - series * interval '1 second'
+      FROM generate_series(1, 20_000) AS series`;
+    await sql`ANALYZE public.dialog_preference_requests`;
+
+    const index = (await sql`
+      SELECT index_row.indisvalid, index_row.indisready,
+             pg_catalog.pg_get_expr(
+               index_row.indpred,
+               index_row.indrelid,
+               TRUE
+             ) AS predicate
+      FROM pg_catalog.pg_index index_row
+      WHERE index_row.indexrelid =
+        'public.dialog_preference_requests_pending_idx'::pg_catalog.regclass`)[0];
+    expect(index).toMatchObject({
+      indisvalid: true,
+      indisready: true,
+      predicate: "status = 'pending'::text",
+    });
+
+    const plan = await sql`
+      EXPLAIN (FORMAT JSON, COSTS OFF)
+      SELECT pg_catalog.count(*)
+      FROM public.dialog_preference_requests
+      WHERE status = 'pending'`;
+    const serializedPlan = JSON.stringify(plan);
+    expect(serializedPlan).toContain("dialog_preference_requests_pending_idx");
+    expect(serializedPlan).toContain("Index Only Scan");
   });
 }, 120_000);
 

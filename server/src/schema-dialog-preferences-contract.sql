@@ -27,6 +27,7 @@ $$;
 CREATE OR REPLACE FUNCTION mirror_dialog_notification_mode_to_preferences_v1_final()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
   next_pts BIGINT;
