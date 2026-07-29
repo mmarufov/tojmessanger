@@ -1657,6 +1657,7 @@ private struct InlineVideoPlayerView: View {
     @State private var player: AVQueuePlayer?
     @State private var looper: AVPlayerLooper?
     @State private var owner: StreamingMediaAsset?
+    @State private var startTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -1671,17 +1672,27 @@ private struct InlineVideoPlayerView: View {
     }
 
     private func start() {
-        guard player == nil, let owner = model.streamingVideoAsset(for: media) else { return }
-        self.owner = owner
-        let queue = AVQueuePlayer()
-        queue.isMuted = true
-        queue.actionAtItemEnd = .none
-        looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: owner.asset))
-        player = queue
-        queue.play()
+        guard player == nil else { return }
+        startTask?.cancel()
+        startTask = Task { @MainActor in
+            guard let owner = await model.streamingVideoAsset(for: media),
+                  !Task.isCancelled,
+                  isActive,
+                  player == nil
+            else { return }
+            self.owner = owner
+            let queue = AVQueuePlayer()
+            queue.isMuted = true
+            queue.actionAtItemEnd = .none
+            looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: owner.asset))
+            player = queue
+            queue.play()
+        }
     }
 
     private func stop() {
+        startTask?.cancel()
+        startTask = nil
         player?.pause()
         looper = nil
         player = nil
@@ -2586,7 +2597,7 @@ private struct ProductionMediaViewer: View {
     /// header + first chunk arrive instead of after a full download. Share/Save get the whole file in
     /// the background (reusing the streaming chunk cache).
     private func loadStreamingVideo() async throws {
-        guard let owner = model.streamingVideoAsset(for: media) else {
+        guard let owner = await model.streamingVideoAsset(for: media) else {
             throw MediaPresentationError.unreadable
         }
         let asset = owner.asset

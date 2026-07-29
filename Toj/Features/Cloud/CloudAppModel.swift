@@ -254,9 +254,6 @@ final class CloudAppModel {
                 savedMessagesSessionGeneration &+= 1
                 savedMessagesCapabilityState = .unknown
             }
-            if storedSession != nil {
-                sessionTeardownActive = false
-            }
         }
     }
     private(set) var launchPhase: LaunchPhase = .restoringLocal
@@ -384,6 +381,8 @@ final class CloudAppModel {
     private var composerMediaOperationId: UUID?
     private var composerMediaDialogId: String?
     private var activeComposerTransferId: String?
+    private var temporaryPreviewURLsByDialog: [String: Set<URL>] = [:]
+    private var dialogPresentationGenerations: [String: UInt64] = [:]
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
     private var mediaTransferDialogIds: [String: String] = [:]
     private var syncInFlight = false
@@ -430,6 +429,7 @@ final class CloudAppModel {
     private var readReceiptDrainRequested = false
     #if DEBUG
     private var demoLinesByDialog: [String: [Line]] = [:]
+    private var temporaryPreviewAuthorizationGate: (@Sendable (URL) async -> Void)?
     #endif
 
     let callCoordinator: CallCoordinator
@@ -445,6 +445,14 @@ final class CloudAppModel {
         return WebRTCEngineFactory.supportsCameraVideoProfile
             ? negotiatedCapabilities
             : negotiatedCapabilities.subtracting(.videoCalls)
+    }
+
+    private func installAuthenticatedSession(_ session: StoredCloudSession) {
+        // Only explicit authentication/restore entry points may lower the teardown fence.
+        // Profile and other generic refreshes cannot resurrect a session during erasure.
+        guard sessionClearBarrier == nil else { return }
+        sessionTeardownActive = false
+        storedSession = session
     }
 
     var replicaSyncSnapshot: ReplicaSyncSnapshot {
@@ -592,7 +600,7 @@ final class CloudAppModel {
                 return
             }
             if let saved = savedSession {
-                storedSession = saved
+                installAuthenticatedSession(saved)
                 phone = saved.phone
                 displayName = saved.displayName
                 await loadProfileDetails()
@@ -676,7 +684,7 @@ final class CloudAppModel {
             )
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
-            storedSession = stored
+            installAuthenticatedSession(stored)
             profileDetails = Self.profileDetails(from: name)
             try? await tokenStore.saveProfile(profileDetails, accountId: session.accountId)
             resendTask?.cancel()
@@ -800,7 +808,11 @@ final class CloudAppModel {
     }
 
     private func acceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
-        guard let saved = storedSession, saved.session.token == token else { return }
+        guard !sessionTeardownActive,
+              let saved = storedSession,
+              saved.session.token == token
+        else { return }
+        let generation = savedMessagesSessionGeneration
         let details = Self.profileDetails(from: profile, pendingSync: false)
         let updatedSession = StoredCloudSession(
             session: saved.session,
@@ -809,11 +821,16 @@ final class CloudAppModel {
         )
         do {
             try await tokenStore.saveProfile(details, accountId: saved.session.accountId)
-            try await tokenStore.save(updatedSession)
         } catch {
             status = "Profile updated, but local storage could not be refreshed"
             return
         }
+        guard !sessionTeardownActive,
+              savedMessagesSessionGeneration == generation,
+              storedSession?.session.accountId == saved.session.accountId,
+              storedSession?.session.token == token,
+              !Task.isCancelled
+        else { return }
         profileDetails = details
         storedSession = updatedSession
         displayName = details.displayName
@@ -1054,6 +1071,8 @@ final class CloudAppModel {
         mediaTransferTasks.removeAll()
         mediaTransferDialogIds.removeAll()
         mediaTransfersInFlight.removeAll()
+        temporaryPreviewURLsByDialog.removeAll()
+        dialogPresentationGenerations.removeAll()
         messageMutationsInFlight.removeAll()
         mutationTargetsBeingQueued.removeAll()
         syncInFlight = false
@@ -2895,7 +2914,9 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return demoMediaBytes(for: media, thumbnail: true) }
         #endif
-        guard let token = storedSession?.session.token else { return nil }
+        guard let token = storedSession?.session.token,
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil
+        else { return nil }
         let state = await mediaEngine.mediaDownloadState(mediaId: media.id, expectedSize: media.byteSize)
         LocalFirstMetrics.cacheResult(hit: state?.hasThumbnail == true, thumbnail: true)
         return try? await mediaEngine.thumbnail(
@@ -2903,6 +2924,29 @@ final class CloudAppModel {
             token: token,
             localStore: localStore
         )
+    }
+
+    private func restoreMediaAccessIfAuthorized(
+        mediaId: String,
+        dialogId: String? = nil
+    ) async -> MediaPresentationAuthorization? {
+        guard !sessionTeardownActive, let localStore else { return nil }
+        guard let authorization = try? await localStore.mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        ) else { return nil }
+        do {
+            try await mediaEngine.restoreAuthorizedAccess(mediaId: mediaId)
+        } catch {
+            return nil
+        }
+        guard !sessionTeardownActive,
+              (try? await localStore.validatesMediaPresentationAuthorization(
+                authorization
+              )) == true
+        else { return nil }
+        MediaPresentationCache.shared.restore(mediaIds: [mediaId])
+        return authorization
     }
 
     func presentationImage(
@@ -2926,6 +2970,9 @@ final class CloudAppModel {
         }
         #endif
 
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return nil
+        }
         let engine = mediaEngine
         let store = localStore
         let token = storedSession?.session.token
@@ -2997,6 +3044,9 @@ final class CloudAppModel {
         for media: CloudMedia,
         variant: MediaPresentationVariant
     ) async -> MediaAvailability {
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return .failed
+        }
         let key = MediaPresentationKey(mediaId: media.id, variant: variant)
         if MediaPresentationCache.shared.contains(key) { return .decoded }
         if await mediaEngine.representation(media: media, variant: variant, localStore: localStore) != nil {
@@ -3029,7 +3079,9 @@ final class CloudAppModel {
             return demoMediaBytes(for: media, thumbnail: false) ?? Data()
         }
         #endif
-        guard let token = storedSession?.session.token else {
+        guard let token = storedSession?.session.token,
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil
+        else {
             throw CloudAPIError(status: 401, message: "Sign in required", retryAfter: nil)
         }
         let state = await mediaEngine.mediaDownloadState(mediaId: media.id, expectedSize: media.byteSize)
@@ -3045,7 +3097,10 @@ final class CloudAppModel {
 
     /// A streaming asset that plays this media progressively (chunk-by-chunk) instead of requiring a
     /// full download first. Returns `nil` until there is a session token. Retain the owner while playing.
-    func streamingVideoAsset(for media: CloudMedia) -> StreamingMediaAsset? {
+    func streamingVideoAsset(for media: CloudMedia) async -> StreamingMediaAsset? {
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return nil
+        }
         if let prepared = MediaPresentationCache.shared.takePreparedVideoAsset(mediaId: media.id) {
             return prepared
         }
@@ -3059,6 +3114,7 @@ final class CloudAppModel {
 
     private func prewarmStreamingVideoAssetIfLocal(for media: CloudMedia) async {
         guard media.kind == "video",
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil,
               !MediaPresentationCache.shared.hasPreparedVideoAsset(mediaId: media.id),
               let token = storedSession?.session.token,
               await mediaEngine.mediaDownloadState(
@@ -3086,6 +3142,7 @@ final class CloudAppModel {
         let token = storedSession?.session.token
         let generation = savedMessagesSessionGeneration
         let store = localStore
+        let presentationGeneration = dialogPresentationGenerations[dialogId, default: 0]
         #if DEBUG
         let permitsDemoMedia = isDemoMode
         #else
@@ -3096,15 +3153,37 @@ final class CloudAppModel {
         else {
             throw CloudLocalStoreAccessError.revoked
         }
+        let authorization: MediaPresentationAuthorization?
+        #if DEBUG
+        if permitsDemoMedia {
+            authorization = nil
+        } else {
+            authorization = try await store?.mediaPresentationAuthorization(
+                mediaId: mediaId,
+                dialogId: dialogId
+            )
+        }
+        #else
+        authorization = try await store?.mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        )
+        #endif
+        guard permitsDemoMedia || authorization != nil else {
+            throw CloudLocalStoreAccessError.revoked
+        }
         return try await mediaEngine.temporaryPreview(
             data: data,
             fileExtension: fileExtension
         ) { [weak self, store] url in
             guard !Task.isCancelled else { return false }
+            #if DEBUG
+            await self?.temporaryPreviewAuthorizationGate?(url)
+            #endif
             if !permitsDemoMedia {
-                guard let store,
-                      (try? await store.isMediaPresentable(
-                        mediaId: mediaId, dialogId: dialogId
+                guard let store, let authorization,
+                      (try? await store.validatesMediaPresentationAuthorization(
+                        authorization
                       )) == true
                 else { return false }
             }
@@ -3115,14 +3194,30 @@ final class CloudAppModel {
                       self.savedMessagesSessionGeneration == generation,
                       self.storedSession?.session.accountId == accountId,
                       self.storedSession?.session.token == token,
-                      self.localStore === store || permitsDemoMedia
+                      self.localStore === store || permitsDemoMedia,
+                      self.dialogPresentationGenerations[dialogId, default: 0]
+                        == presentationGeneration
                 else { return false }
-                return transferOwnership(url)
+                self.temporaryPreviewURLsByDialog[dialogId, default: []].insert(url)
+                let transferred = transferOwnership(url)
+                if !transferred {
+                    self.temporaryPreviewURLsByDialog[dialogId]?.remove(url)
+                    if self.temporaryPreviewURLsByDialog[dialogId]?.isEmpty == true {
+                        self.temporaryPreviewURLsByDialog[dialogId] = nil
+                    }
+                }
+                return transferred
             }
         }
     }
 
     func removeTemporaryMediaURL(_ url: URL) async {
+        for dialogId in Array(temporaryPreviewURLsByDialog.keys) {
+            temporaryPreviewURLsByDialog[dialogId]?.remove(url)
+            if temporaryPreviewURLsByDialog[dialogId]?.isEmpty == true {
+                temporaryPreviewURLsByDialog[dialogId] = nil
+            }
+        }
         await mediaEngine.removeTemporaryPreview(url)
     }
 
@@ -3219,6 +3314,11 @@ final class CloudAppModel {
 
     private func invalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
         let dialogId = job.dialogId
+        dialogPresentationGenerations[dialogId, default: 0] &+= 1
+        let temporaryURLs = temporaryPreviewURLsByDialog.removeValue(forKey: dialogId) ?? []
+        for url in temporaryURLs {
+            await mediaEngine.removeTemporaryPreview(url)
+        }
         // Shared media remains valid in a forwarded copy. Only globally orphaned media receives a
         // process-wide presentation tombstone.
         MediaPresentationCache.shared.revoke(mediaIds: job.purgeMediaIds)
@@ -3314,6 +3414,34 @@ final class CloudAppModel {
 
     func testHasSessionClearBarrier() -> Bool {
         sessionClearBarrier != nil
+    }
+
+    func testInstallAuthenticatedSession(_ session: StoredCloudSession) {
+        installAuthenticatedSession(session)
+    }
+
+    func testAcceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
+        await acceptCanonicalProfile(profile, token: token)
+    }
+
+    func testHandleRevokedSessionHint(deviceId: String? = nil) async {
+        await scheduleSessionClearFromRevokedHint(deviceId: deviceId)?.value
+    }
+
+    func testHandleRevokedSessionHintFromHintTask(deviceId: String? = nil) async {
+        var teardownTask: Task<Void, Never>?
+        let task = Task { @MainActor [weak self] in
+            teardownTask = self?.scheduleSessionClearFromRevokedHint(deviceId: deviceId)
+        }
+        hintTask = task
+        await task.value
+        await teardownTask?.value
+    }
+
+    func testSetTemporaryPreviewAuthorizationGate(
+        _ gate: (@Sendable (URL) async -> Void)?
+    ) {
+        temporaryPreviewAuthorizationGate = gate
     }
     #endif
 
@@ -3425,7 +3553,7 @@ final class CloudAppModel {
         }
         let fixtureSession = TelegramFastUITestFixture.session
         try await tokenStore.save(fixtureSession)
-        storedSession = fixtureSession
+        installAuthenticatedSession(fixtureSession)
         phone = fixtureSession.phone
         displayName = fixtureSession.displayName
         profileDetails = StoredProfileDetails(
@@ -4037,11 +4165,12 @@ final class CloudAppModel {
                         case .call(let hint):
                             await self.callCoordinator.handle(hint)
                         case .sessionRevoked(let hint):
-                            if let revokedDeviceId = hint.deviceId {
-                                let currentDeviceId = await self.storedSession?.session.deviceId
-                                guard revokedDeviceId == currentDeviceId else { continue }
-                            }
-                            await self.clearLocalSession(finalStatus: "Session ended")
+                            guard await self.scheduleSessionClearFromRevokedHint(
+                                deviceId: hint.deviceId
+                            ) != nil else { continue }
+                            // Teardown runs outside this exact hintTask so it can cancel and await
+                            // both socket loops without ever awaiting itself.
+                            return
                         }
                     }
                 }
@@ -4058,6 +4187,17 @@ final class CloudAppModel {
                 }
                 await group.waitForAll()
             }
+        }
+    }
+
+    @discardableResult
+    private func scheduleSessionClearFromRevokedHint(
+        deviceId: String?
+    ) -> Task<Void, Never>? {
+        let applies = deviceId == nil || deviceId == storedSession?.session.deviceId
+        guard applies else { return nil }
+        return Task { [weak self] in
+            await self?.clearLocalSession(finalStatus: "Session ended")
         }
     }
 
@@ -5968,11 +6108,11 @@ final class CloudAppModel {
     #if DEBUG
     func enterDemoMode() {
         isDemoMode = true
-        storedSession = StoredCloudSession(
+        installAuthenticatedSession(StoredCloudSession(
             session: CloudSession(accountId: "debug-demo-account", deviceId: "debug-demo-device", token: "debug-demo-token"),
             phone: "+992 00 000 00 00",
             displayName: "Меҳмон"
-        )
+        ))
         status = "Demo mode"
         launchPhase = .localReady
         profileDetails = Self.profileDetails(from: "Меҳмон")

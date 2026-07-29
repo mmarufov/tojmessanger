@@ -18,6 +18,7 @@ WHERE namespace.nspname = 'public'
     'messages_forward_marker_backfill_idx',
     'message_mentions_account_idx',
     'account_events_retention_idx',
+    'account_events_lifecycle_lookup_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx'
   )
@@ -57,6 +58,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mentions_account_idx
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_retention_idx
   ON account_events(created_at, account_id, pts);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_lifecycle_lookup_idx
+  ON account_events(account_id, dialog_id, pts DESC)
+  WHERE type IN ('dialog.created', 'dialog.access_revoked');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_account_idx
   ON group_action_budgets(account_id, action, created_at DESC);

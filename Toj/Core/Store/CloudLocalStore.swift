@@ -86,6 +86,12 @@ nonisolated struct LocalLaunchSnapshot: Equatable, Sendable {
     let dialogs: [LocalDialog]
 }
 
+nonisolated struct MediaPresentationAuthorization: Equatable, Sendable {
+    let dialogId: String
+    let mediaId: String
+    let accessGeneration: Int64
+}
+
 nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let clientMsgId: String
     var id: String { clientMsgId }
@@ -791,6 +797,16 @@ actor CloudLocalStore {
                 try upsertProfile(db, profile: profile)
             }
             for dialog in snapshot.dialogs {
+                if let revoked = try Self.revokedDialog(db, dialogId: dialog.dialogId) {
+                    let isAuthoritativeGroupGrant = dialog.type == "group"
+                        && revoked.dialogType == "group"
+                        && dialog.selfRole != nil
+                        && pts > revoked.pts
+                    guard isAuthoritativeGroupGrant else { continue }
+                    // Replacement bootstrap remains invisible and fully purge-fenced until this
+                    // transaction publishes the complete authoritative snapshot.
+                    try restoreGroupAccess(db, dialogId: dialog.dialogId, grantedPts: pts)
+                }
                 try mergeBootstrapDialog(
                     db,
                     accountId: accountId,
@@ -2314,7 +2330,9 @@ actor CloudLocalStore {
                             // dialog. Saved tombstones never satisfy the group-only grant predicate.
                             continue
                         }
-                        try restoreGroupAccess(db, dialogId: dialogId)
+                        try restoreGroupAccess(
+                            db, dialogId: dialogId, grantedPts: update.pts
+                        )
                     }
                     switch update.type {
                     case "message.new", "message.edited", "message.deleted", "reaction.updated":
@@ -3356,19 +3374,55 @@ actor CloudLocalStore {
     }
 
     func isMediaPresentable(mediaId: String, dialogId: String) throws -> Bool {
+        try mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        ) != nil
+    }
+
+    func mediaPresentationAuthorization(
+        mediaId: String,
+        dialogId: String? = nil
+    ) throws -> MediaPresentationAuthorization? {
         try dbQueue.read { db in
-            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else { return false }
-            return try Bool.fetchOne(
+            try Row.fetchOne(
                 db,
                 sql: """
-                SELECT EXISTS (
-                  SELECT 1 FROM message_media
-                  WHERE dialog_id = ? AND media_id = ?
-                )
+                SELECT media.dialog_id, media.media_id,
+                       COALESCE(access.generation, 0) AS access_generation
+                FROM message_media AS media
+                JOIN dialogs AS dialog ON dialog.dialog_id = media.dialog_id
+                LEFT JOIN dialog_access_generations AS access
+                  ON access.dialog_id = media.dialog_id
+                WHERE media.media_id = ?
+                  AND (? IS NULL OR media.dialog_id = ?)
+                  AND dialog.access_state = 'active'
+                  AND COALESCE(access.authorized, 1) = 1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM revoked_dialogs revoked
+                    WHERE revoked.dialog_id = media.dialog_id
+                  )
+                ORDER BY media.dialog_id
+                LIMIT 1
                 """,
-                arguments: [dialogId, mediaId]
-            ) ?? false
+                arguments: [mediaId, dialogId, dialogId]
+            ).map {
+                MediaPresentationAuthorization(
+                    dialogId: $0["dialog_id"],
+                    mediaId: $0["media_id"],
+                    accessGeneration: $0["access_generation"]
+                )
+            }
         }
+    }
+
+    func validatesMediaPresentationAuthorization(
+        _ authorization: MediaPresentationAuthorization
+    ) throws -> Bool {
+        try mediaPresentationAuthorization(
+            mediaId: authorization.mediaId,
+            dialogId: authorization.dialogId
+        ) == authorization
     }
 
     func containsProfile(accountId: String) throws -> Bool {
@@ -4241,6 +4295,24 @@ actor CloudLocalStore {
             """)
         }
 
+        migrator.registerMigration("v12-dialog-access-generations") { db in
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS dialog_access_generations (
+              dialog_id TEXT PRIMARY KEY,
+              generation INTEGER NOT NULL,
+              authorized INTEGER NOT NULL CHECK (authorized IN (0, 1)),
+              dialog_type TEXT,
+              last_pts INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            )
+            SELECT dialog_id, 1, 0, dialog_type, revoked_pts
+            FROM revoked_dialogs;
+            """)
+        }
+
         try migrator.migrate(dbPool)
     }
 
@@ -4679,7 +4751,8 @@ actor CloudLocalStore {
                     && dialog.selfRole != nil
                     && page.state.pts > revoked.pts
                 guard isAuthoritativeGroupGrant else { continue }
-                try restoreGroupAccess(db, dialogId: dialog.dialogId)
+                // Stage the grant, but preserve the tombstone and purge job. finishBootstrap owns
+                // the only atomic transition from the old published replica to this snapshot.
             }
             let photoJSON = dialog.photo
                 .flatMap { try? encoder.encode($0) }
@@ -5577,6 +5650,12 @@ actor CloudLocalStore {
             arguments: [dialogId]
         )
         let dialogType = explicitDialogType ?? storedDialogType
+        try recordDialogRevocation(
+            db,
+            dialogId: dialogId,
+            dialogType: dialogType,
+            revokedPts: revokedPts
+        )
         try db.execute(
             sql: """
             INSERT INTO revoked_dialogs (dialog_id, dialog_type, revoked_pts, created_at)
@@ -5717,9 +5796,52 @@ actor CloudLocalStore {
         return (row["dialog_type"], row["revoked_pts"])
     }
 
-    private func restoreGroupAccess(_ db: Database, dialogId: String) throws {
+    private func recordDialogRevocation(
+        _ db: Database,
+        dialogId: String,
+        dialogType: String?,
+        revokedPts: Int64
+    ) throws {
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            ) VALUES (?, 1, 0, ?, ?)
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              generation = CASE
+                WHEN dialog_access_generations.authorized = 1
+                  OR excluded.last_pts > dialog_access_generations.last_pts
+                THEN dialog_access_generations.generation + 1
+                ELSE dialog_access_generations.generation
+              END,
+              authorized = 0,
+              dialog_type = COALESCE(excluded.dialog_type, dialog_access_generations.dialog_type),
+              last_pts = MAX(dialog_access_generations.last_pts, excluded.last_pts)
+            """,
+            arguments: [dialogId, dialogType, revokedPts]
+        )
+    }
+
+    private func restoreGroupAccess(
+        _ db: Database,
+        dialogId: String,
+        grantedPts: Int64
+    ) throws {
         // A server-authored grant newer than the durable revoke PTS is the only transition that
         // removes a group tombstone. Saved tombstones never call this path.
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            ) VALUES (?, 1, 1, 'group', ?)
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              generation = dialog_access_generations.generation + 1,
+              authorized = 1,
+              dialog_type = 'group',
+              last_pts = excluded.last_pts
+            """,
+            arguments: [dialogId, grantedPts]
+        )
         try db.execute(
             sql: "DELETE FROM pending_access_purges WHERE dialog_id = ?",
             arguments: [dialogId]
@@ -6248,6 +6370,7 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM pending_purges")
         try db.execute(sql: "DELETE FROM pending_access_purges")
         try db.execute(sql: "DELETE FROM revoked_dialogs")
+        try db.execute(sql: "DELETE FROM dialog_access_generations")
         try db.execute(sql: "DELETE FROM bootstrap_baseline_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_staged_messages")
         try db.execute(sql: "DELETE FROM bootstrap_staged_members")

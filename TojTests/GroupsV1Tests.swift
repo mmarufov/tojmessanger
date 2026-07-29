@@ -442,45 +442,70 @@ final class GroupsV1Tests: XCTestCase {
     }
 
     func testAuthoritativeBootstrapRegrantsOnlyNewerGroupSnapshot() async throws {
-        let store = try makeStore()
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "bootstrap-regrant.sqlite").path
+        let key = Data("bootstrap-regrant-key".utf8)
         let groupId = UUID().uuidString.lowercased()
-        try await store.applyGroupEnvelope(groupEnvelope(groupId: groupId, revision: 1))
-        try await applyRevocation(store: store, dialogId: groupId, pts: 30)
-        try await store.beginBootstrap(
-            accountId: "account-me",
-            token: "bootstrap-token",
-            snapshotPts: 31,
-            mode: .replacement
-        )
-        try await store.applyBootstrapPage(BootstrapDialogsPage(
-            token: "bootstrap-token",
-            state: .init(pts: 31),
-            dialogs: [BootstrapDialog(
-                dialogId: groupId,
-                type: "group",
-                title: "Regranted",
-                lastMsgId: 0,
-                updatedAt: "2026-07-28T00:00:00.000Z",
-                revision: 2,
-                memberCount: 2,
-                selfRole: "member",
-                members: [
-                    BootstrapDialogMember(
-                        accountId: "account-me", role: "member", lastReadMsgId: 0,
-                        isActive: true
-                    ),
-                ],
-                messages: []
-            )],
-            nextCursor: nil,
-            hasMore: false
-        ))
-        try await store.finishBootstrap(accountId: "account-me", pts: 31)
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            try await store.applyGroupEnvelope(groupEnvelope(groupId: groupId, revision: 1))
+            try await applyRevocation(store: store, dialogId: groupId, pts: 30)
+            try await store.beginBootstrap(
+                accountId: "account-me",
+                token: "bootstrap-token",
+                snapshotPts: 31,
+                mode: .replacement
+            )
+            try await store.applyBootstrapPage(BootstrapDialogsPage(
+                token: "bootstrap-token",
+                state: .init(pts: 31),
+                dialogs: [BootstrapDialog(
+                    dialogId: groupId,
+                    type: "group",
+                    title: "Regranted",
+                    lastMsgId: 0,
+                    updatedAt: "2026-07-28T00:00:00.000Z",
+                    revision: 2,
+                    memberCount: 2,
+                    selfRole: "member",
+                    members: [
+                        BootstrapDialogMember(
+                            accountId: "account-me", role: "member", lastReadMsgId: 0,
+                            isActive: true
+                        ),
+                    ],
+                    messages: []
+                )],
+                nextCursor: nil,
+                hasMore: false
+            ))
+            let stagedRevoked = try await store.isDialogAccessRevoked(dialogId: groupId)
+            let stagedPurgeCount = try await store.pendingAccessPurgeCount()
+            let stagedDialogs = try await store.dialogs(accountId: "account-me")
+            XCTAssertTrue(stagedRevoked)
+            XCTAssertEqual(stagedPurgeCount, 1)
+            XCTAssertTrue(stagedDialogs.isEmpty)
+        }
 
-        let revokedAfterBootstrap = try await store.isDialogAccessRevoked(dialogId: groupId)
-        let dialogsAfterBootstrap = try await store.dialogs(accountId: "account-me")
+        // A process death after page commit must not publish the staged grant or discard cleanup.
+        let relaunched = try CloudLocalStore(path: path, key: key)
+        let relaunchedRevoked = try await relaunched.isDialogAccessRevoked(dialogId: groupId)
+        let relaunchedPurgeCount = try await relaunched.pendingAccessPurgeCount()
+        let relaunchedDialogs = try await relaunched.dialogs(accountId: "account-me")
+        XCTAssertTrue(relaunchedRevoked)
+        XCTAssertEqual(relaunchedPurgeCount, 1)
+        XCTAssertTrue(relaunchedDialogs.isEmpty)
+        try await relaunched.finishBootstrap(accountId: "account-me", pts: 31)
+
+        let revokedAfterBootstrap = try await relaunched.isDialogAccessRevoked(dialogId: groupId)
+        let dialogsAfterBootstrap = try await relaunched.dialogs(accountId: "account-me")
         XCTAssertFalse(revokedAfterBootstrap)
         XCTAssertEqual(dialogsAfterBootstrap.first?.title, "Regranted")
+        let finalPurgeCount = try await relaunched.pendingAccessPurgeCount()
+        XCTAssertEqual(finalPurgeCount, 0)
     }
 
     private func makeStore() throws -> CloudLocalStore {

@@ -34,8 +34,15 @@ enum AccessPurgeCoordinatorError: Error {
 /// phase is idempotent, so process death can resume without making a revoked archive visible.
 actor AccessPurgeCoordinator {
     private struct InFlight {
+        let id: UUID
         let scope: AccessPurgeScope
         let task: Task<AccessPurgeDrainResult, Error>
+    }
+
+    private struct ScopeTransition {
+        let id: UUID
+        let target: AccessPurgeScope
+        let task: Task<Void, Never>
     }
 
     private struct ResetBarrier {
@@ -45,6 +52,7 @@ actor AccessPurgeCoordinator {
 
     private var activeScope: AccessPurgeScope?
     private var inFlight: InFlight?
+    private var scopeTransition: ScopeTransition?
     private var resetBarrier: ResetBarrier?
 
     func drain(
@@ -55,15 +63,43 @@ actor AccessPurgeCoordinator {
         invalidatePresentation: @escaping @MainActor @Sendable (AccessPurgeJob) async -> Void,
         purgeFilesOverride: (@Sendable (AccessPurgeJob) async throws -> Void)? = nil
     ) async throws -> AccessPurgeDrainResult {
-        guard resetBarrier == nil else { throw AccessPurgeCoordinatorError.staleSession }
-        if activeScope != scope {
-            activeScope = scope
-            await cancelAndAwait()
+        while true {
+            guard resetBarrier == nil else {
+                throw AccessPurgeCoordinatorError.staleSession
+            }
+            if let transition = scopeTransition {
+                await transition.task.value
+                if scopeTransition?.id == transition.id {
+                    activeScope = transition.target
+                    scopeTransition = nil
+                }
+                continue
+            }
+            guard activeScope != scope else { break }
+
+            let old = inFlight
+            inFlight = nil
+            old?.task.cancel()
+            let id = UUID()
+            let transitionTask = Task {
+                _ = await old?.task.result
+            }
+            scopeTransition = ScopeTransition(
+                id: id,
+                target: scope,
+                task: transitionTask
+            )
+            await transitionTask.value
+            if scopeTransition?.id == id {
+                activeScope = scope
+                scopeTransition = nil
+            }
         }
         if let inFlight, inFlight.scope == scope {
             return try await inFlight.task.value
         }
 
+        let operationId = UUID()
         let task = Task {
             var finalized = 0
             var batches = 0
@@ -143,9 +179,9 @@ actor AccessPurgeCoordinator {
                 failed: failedJobIds.count
             )
         }
-        inFlight = InFlight(scope: scope, task: task)
+        inFlight = InFlight(id: operationId, scope: scope, task: task)
         defer {
-            if inFlight?.scope == scope {
+            if inFlight?.id == operationId {
                 inFlight = nil
             }
         }
@@ -159,12 +195,16 @@ actor AccessPurgeCoordinator {
         }
 
         activeScope = nil
+        let transition = scopeTransition
+        scopeTransition = nil
         let old = inFlight
         inFlight = nil
+        transition?.task.cancel()
         old?.task.cancel()
 
         let id = UUID()
         let task = Task {
+            await transition?.task.value
             _ = await old?.task.result
         }
         resetBarrier = ResetBarrier(id: id, task: task)
@@ -174,16 +214,13 @@ actor AccessPurgeCoordinator {
         }
     }
 
-    private func cancelAndAwait() async {
-        let old = inFlight
-        inFlight = nil
-        old?.task.cancel()
-        _ = await old?.task.result
-    }
-
     #if DEBUG
     func testHasResetBarrier() -> Bool {
         resetBarrier != nil
+    }
+
+    func testHasScopeTransition() -> Bool {
+        scopeTransition != nil
     }
     #endif
 }

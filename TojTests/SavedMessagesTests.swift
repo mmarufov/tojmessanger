@@ -1337,6 +1337,106 @@ final class SavedMessagesTests: XCTestCase {
     }
 
     @MainActor
+    func testTwoNewScopeCallersAwaitOneOldUncooperativePurgeTransition() async throws {
+        let oldFixture = try makeStoreFixture()
+        let newFixture = try makeStoreFixture()
+        let oldStore = try CloudLocalStore(path: oldFixture.path, key: oldFixture.key)
+        let newStore = try CloudLocalStore(path: newFixture.path, key: newFixture.key)
+        try await oldStore.upsertDialog(dialogId: "old-transition", type: "group", title: "Old")
+        try await oldStore.revokeGroupAccess(
+            dialogId: "old-transition", reason: "dialog.access_revoked"
+        )
+        try await newStore.upsertDialog(dialogId: "new-transition", type: "group", title: "New")
+        try await newStore.revokeGroupAccess(
+            dialogId: "new-transition", reason: "dialog.access_revoked"
+        )
+        let oldCache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: oldFixture.path).deletingLastPathComponent()
+                .appending(path: "old-transition-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x79, count: 32), limitBytes: 1_000_000
+        )
+        let newCache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: newFixture.path).deletingLastPathComponent()
+                .appending(path: "new-transition-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x7a, count: 32), limitBytes: 1_000_000
+        )
+        let coordinator = AccessPurgeCoordinator()
+        let oldGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
+        let oldDrain = Task {
+            try await coordinator.drain(
+                scope: AccessPurgeScope(
+                    accountId: "old", token: "old-token", generation: 1, store: oldStore
+                ),
+                store: oldStore,
+                mediaEngine: CloudMediaTransferEngine(cache: oldCache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in
+                    await withTaskCancellationHandler {
+                        await oldGate.wait()
+                    } onCancel: {
+                        Task { await cancellationObserved.open() }
+                    }
+                }
+            )
+        }
+        await oldGate.waitUntilBlocked()
+
+        let newScope = AccessPurgeScope(
+            accountId: "new", token: "new-token", generation: 2, store: newStore
+        )
+        let firstCompleted = SavedMessagesCompletionProbe()
+        let secondCompleted = SavedMessagesCompletionProbe()
+        let first = Task {
+            let result = try await coordinator.drain(
+                scope: newScope,
+                store: newStore,
+                mediaEngine: CloudMediaTransferEngine(cache: newCache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in }
+            )
+            await firstCompleted.markCompleted()
+            return result
+        }
+        await cancellationObserved.wait()
+        while !(await coordinator.testHasScopeTransition()) { await Task.yield() }
+        let second = Task {
+            let result = try await coordinator.drain(
+                scope: newScope,
+                store: newStore,
+                mediaEngine: CloudMediaTransferEngine(cache: newCache),
+                isCurrent: { true },
+                invalidatePresentation: { _ in }
+            )
+            await secondCompleted.markCompleted()
+            return result
+        }
+        await Task.yield()
+        let firstBlocked = await firstCompleted.value
+        let secondBlocked = await secondCompleted.value
+        XCTAssertFalse(firstBlocked)
+        XCTAssertFalse(secondBlocked)
+
+        await oldGate.open()
+        let firstResult = try await first.value
+        let secondResult = try await second.value
+        XCTAssertEqual(firstResult, AccessPurgeDrainResult(finalized: 1, batches: 1))
+        XCTAssertEqual(secondResult, firstResult)
+        let firstFinished = await firstCompleted.value
+        let secondFinished = await secondCompleted.value
+        XCTAssertTrue(firstFinished)
+        XCTAssertTrue(secondFinished)
+        guard case .failure(let oldError) = await oldDrain.result else {
+            return XCTFail("old scope survived transition")
+        }
+        XCTAssertTrue(oldError is CancellationError)
+        let oldPurgeCount = try await oldStore.pendingAccessPurgeCount()
+        let newPurgeCount = try await newStore.pendingAccessPurgeCount()
+        XCTAssertEqual(oldPurgeCount, 1)
+        XCTAssertEqual(newPurgeCount, 0)
+    }
+
+    @MainActor
     func testComposerPreparationIsAwaitedBeforePurgeFinalization() async throws {
         let fixture = try makeStoreFixture()
         let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
@@ -1573,6 +1673,92 @@ final class SavedMessagesTests: XCTestCase {
         XCTAssertFalse(model.testHasSessionClearBarrier())
     }
 
+    @MainActor
+    func testRevokedHintTeardownNeverAwaitsItsOwnHintTask() async throws {
+        let tokenStore = TokenStore(service: "com.toj.revoked-hint.\(UUID().uuidString)")
+        let session = StoredCloudSession(
+            session: CloudSession(
+                accountId: "hint-account", deviceId: "hint-device", token: "hint-token"
+            ),
+            phone: "+992900000201",
+            displayName: "Hint Account"
+        )
+        try await tokenStore.save(session)
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://hint.invalid"))),
+            tokenStore: tokenStore,
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(session)
+
+        await model.testHandleRevokedSessionHintFromHintTask(deviceId: "hint-device")
+
+        XCTAssertNil(model.storedSession)
+        XCTAssertTrue(model.sessionTeardownActive)
+        let persistedSession = try await tokenStore.load()
+        XCTAssertNil(persistedSession)
+    }
+
+    @MainActor
+    func testStaleProfileResponseCannotLowerTeardownFenceOrRepublishSession() async throws {
+        let tokenStore = TokenStore(service: "com.toj.stale-profile.\(UUID().uuidString)")
+        let session = StoredCloudSession(
+            session: CloudSession(
+                accountId: "profile-account",
+                deviceId: "profile-device",
+                token: "profile-token"
+            ),
+            phone: "+992900000202",
+            displayName: "Original Name"
+        )
+        try await tokenStore.save(session)
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://profile.invalid"))),
+            tokenStore: tokenStore,
+            useDefaultLocalStore: false,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(session)
+        let composerGate = SavedMessagesAsyncGate()
+        let cancellationObserved = SavedMessagesAsyncGate()
+        let composer = Task {
+            await withTaskCancellationHandler {
+                await composerGate.wait()
+            } onCancel: {
+                Task { await cancellationObserved.open() }
+            }
+        }
+        await composerGate.waitUntilBlocked()
+        model.testTrackComposerPreparation(dialogId: "profile-dialog", task: composer)
+        let clear = Task { @MainActor in await model.testClearLocalSession() }
+        await cancellationObserved.wait()
+        XCTAssertTrue(model.sessionTeardownActive)
+
+        await model.testAcceptCanonicalProfile(
+            CloudProfile(
+                accountId: "profile-account",
+                firstName: "Stale",
+                lastName: "Response",
+                displayName: "Stale Response",
+                bio: "must not publish",
+                birthday: nil,
+                colorIndex: 5,
+                updatedAt: "2026-07-29T00:00:00Z"
+            ),
+            token: "profile-token"
+        )
+        XCTAssertTrue(model.sessionTeardownActive)
+        XCTAssertEqual(model.storedSession?.displayName, "Original Name")
+
+        await composerGate.open()
+        await clear.value
+        XCTAssertTrue(model.sessionTeardownActive)
+        XCTAssertNil(model.storedSession)
+        let persistedSession = try await tokenStore.load()
+        XCTAssertNil(persistedSession)
+    }
+
     func testCancelledTemporaryPreviewDeletesPlaintextBeforeOwnershipTransfer() async throws {
         let fixture = try makeStoreFixture()
         let cache = try EncryptedMediaCache(
@@ -1600,6 +1786,259 @@ final class SavedMessagesTests: XCTestCase {
         let transferred = try await previewTask.value
         XCTAssertFalse(transferred)
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @MainActor
+    func testRevocationBetweenPreviewAuthorizationAndOwnershipDeletesPlaintext() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "preview-account"
+        let dialogId = "preview-group"
+        let media = CloudMedia(
+            id: "preview-media", kind: "file", contentType: "application/octet-stream",
+            fileName: "preview.bin", byteSize: 17, durationMs: nil,
+            width: nil, height: nil, hasThumbnail: false
+        )
+        try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Preview")
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            dialogType: "group",
+            media: media,
+            pts: 1,
+            msgId: 1
+        )
+        let cache = try EncryptedMediaCache(
+            root: URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+                .appending(path: "preview-revoke-cache", directoryHint: .isDirectory),
+            keyData: Data(repeating: 0x7b, count: 32), limitBytes: 1_000_000
+        )
+        let model = CloudAppModel(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://preview.invalid"))),
+            localStore: store,
+            useDefaultLocalStore: false,
+            mediaEngine: CloudMediaTransferEngine(cache: cache),
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId, deviceId: "preview-device", token: "preview-token"
+            ),
+            phone: "+992900000203",
+            displayName: "Preview Account"
+        ))
+        let authorizationGate = SavedMessagesAsyncGate()
+        let urlRecorder = SavedMessagesURLRecorder()
+        model.testSetTemporaryPreviewAuthorizationGate { url in
+            await urlRecorder.record(url)
+            await authorizationGate.wait()
+        }
+        let ownership = SavedMessagesCompletionProbe()
+        let preview = Task { @MainActor in
+            try await model.transferTemporaryMediaURL(
+                data: Data("preview plaintext".utf8),
+                fileExtension: "bin",
+                mediaId: media.id,
+                dialogId: dialogId
+            ) { _ in
+                Task { await ownership.markCompleted() }
+                return true
+            }
+        }
+        let url = await urlRecorder.waitForURL()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        try await store.revokeGroupAccess(
+            dialogId: dialogId, reason: "dialog.access_revoked"
+        )
+        let jobs = try await store.pendingAccessPurgeJobs()
+        let job = try XCTUnwrap(jobs.first)
+        await model.testInvalidatePresentationForAccessPurge(job)
+        await authorizationGate.open()
+
+        let transferred = try await preview.value
+        let ownershipTransferred = await ownership.value
+        XCTAssertFalse(transferred)
+        XCTAssertFalse(ownershipTransferred)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        model.testSetTemporaryPreviewAuthorizationGate(nil)
+    }
+
+    @MainActor
+    func testFullyPurgedGroupMediaCanRedownloadAfterNewerGrantInSameProcess() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "regrant-media-account"
+        let dialogId = "regrant-media-group"
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8))
+        let payload = try XCTUnwrap(renderer.pngData { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        } as Data?)
+        let media = CloudMedia(
+            id: "regrant-media-id",
+            kind: "photo",
+            contentType: "image/png",
+            fileName: "regrant.png",
+            byteSize: Int64(payload.count),
+            durationMs: nil,
+            width: 8,
+            height: 8,
+            hasThumbnail: false
+        )
+        try await store.upsertDialog(dialogId: dialogId, type: "group", title: "Media Group")
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            dialogType: "group",
+            media: media,
+            pts: 1,
+            msgId: 1
+        )
+        let cacheRoot = URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+            .appending(path: "regrant-media-cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot,
+            keyData: Data(repeating: 0x7c, count: 32),
+            limitBytes: 1_000_000
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SavedMessagesMockURLProtocol.self]
+        SavedMessagesMockURLProtocol.handler = { request in
+            let offset = Int(URLComponents(
+                url: try XCTUnwrap(request.url),
+                resolvingAgainstBaseURL: false
+            )?.queryItems?.first(where: { $0.name == "offset" })?.value ?? "0") ?? 0
+            let chunk = offset < payload.count ? Data(payload[offset...]) : Data()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [
+                        "content-type": "application/octet-stream",
+                        "x-media-next-offset": String(payload.count),
+                        "x-media-total-size": String(payload.count),
+                    ]
+                )),
+                chunk
+            )
+        }
+        defer { SavedMessagesMockURLProtocol.handler = nil }
+        let config = CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://regrant-media.invalid"))
+        )
+        let engine = CloudMediaTransferEngine(
+            config: config,
+            cache: cache,
+            session: URLSession(configuration: configuration)
+        )
+        let model = CloudAppModel(
+            config: config,
+            localStore: store,
+            useDefaultLocalStore: false,
+            mediaEngine: engine,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId,
+                deviceId: "regrant-media-device",
+                token: "regrant-media-token"
+            ),
+            phone: "+992900000204",
+            displayName: "Media Account"
+        ))
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 2),
+                updates: [CloudUpdate(
+                    pts: 2,
+                    ptsCount: 1,
+                    type: "dialog.access_revoked",
+                    dialogId: dialogId,
+                    dialogTitle: nil,
+                    dialogType: "group",
+                    message: nil,
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let purgeResult = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: accountId,
+                token: "regrant-media-token",
+                generation: 1,
+                store: store
+            ),
+            store: store,
+            mediaEngine: engine,
+            isCurrent: { true },
+            invalidatePresentation: { job in
+                await model.testInvalidatePresentationForAccessPurge(job)
+            }
+        )
+        XCTAssertEqual(purgeResult.finalized, 1)
+        let authorizationAfterPurge = try await store.mediaPresentationAuthorization(
+            mediaId: media.id,
+            dialogId: dialogId
+        )
+        XCTAssertNil(authorizationAfterPurge)
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 3),
+                updates: [CloudUpdate(
+                    pts: 3,
+                    ptsCount: 1,
+                    type: "dialog.created",
+                    dialogId: dialogId,
+                    dialogTitle: "Media Group",
+                    dialogType: "group",
+                    message: nil,
+                    group: CloudUpdateGroup(
+                        id: dialogId,
+                        title: "Media Group",
+                        revision: 3,
+                        memberCount: 2
+                    ),
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            dialogType: "group",
+            media: media,
+            pts: 4,
+            msgId: 2
+        )
+        let authorization = try await store.mediaPresentationAuthorization(
+            mediaId: media.id,
+            dialogId: dialogId
+        )
+        XCTAssertNotNil(authorization)
+
+        let image = await model.presentationImage(for: media, variant: .screen2048)
+        XCTAssertNotNil(image)
+        let redownloaded = try await cache.downloadedData(
+            mediaId: media.id,
+            expectedSize: Int64(payload.count)
+        )
+        XCTAssertEqual(redownloaded, payload)
     }
 
     func testSavedMessagesStringsHaveRussianAndTajikTranslations() throws {

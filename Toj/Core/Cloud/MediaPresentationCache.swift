@@ -109,6 +109,10 @@ final class MediaPresentationCache {
         invalidate(mediaIds: mediaIds)
     }
 
+    func restore(mediaIds: Set<String>) {
+        revokedMediaIds.subtract(mediaIds)
+    }
+
     func resetForSession() {
         removeAll()
         revokedMediaIds.removeAll()

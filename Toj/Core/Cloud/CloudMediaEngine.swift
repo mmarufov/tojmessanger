@@ -1402,6 +1402,10 @@ actor EncryptedMediaCache {
         }
     }
 
+    func restoreAuthorizedMedia(mediaId: String) {
+        revokedMediaIds.remove(mediaId)
+    }
+
     func createTemporaryPreview(_ data: Data, fileExtension: String?) throws -> URL {
         guard !data.isEmpty, data.count <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
         let candidate = (fileExtension ?? "").lowercased()
@@ -2978,6 +2982,13 @@ actor CloudMediaTransferEngine {
             mediaIds: allMediaIds,
             excluding: []
         )
+    }
+
+    /// The caller must first prove a live SQLCipher message_media reference in an authorized
+    /// dialog. This only removes the process-local fence; it never creates authorization.
+    func restoreAuthorizedAccess(mediaId: String) async throws {
+        let cache = try resolvedCache()
+        await cache.restoreAuthorizedMedia(mediaId: mediaId)
     }
 
     func cacheUsageBytes() async -> Int64 {
