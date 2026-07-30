@@ -42,12 +42,14 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let cloudDrafts = Self(rawValue: 1 << 15)
     static let dialogPreferences = Self(rawValue: 1 << 16)
     static let localSearch = Self(rawValue: 1 << 17)
+    static let mediaGroups = Self(rawValue: 1 << 18)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
         .chatOrganization, .replies, .editing, .deletion, .forwarding,
         .reactions, .media, .voiceNotes, .groups, .calls, .profiles, .richSearch, .multipartMedia,
         .videoCalls,
+        .cloudDrafts, .mediaGroups,
     ]
 }
 

@@ -22,6 +22,10 @@ enum TelegramFastUITestFixture {
         ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE_RESET"] == "1"
     }
 
+    static var usesSingleAttachmentDraft: Bool {
+        ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] == "1"
+    }
+
     static var session: StoredCloudSession {
         StoredCloudSession(
             session: CloudSession(
@@ -52,6 +56,7 @@ enum TelegramFastUITestFixture {
         let existing = try await store.messages(dialogId: primaryDialogId)
         if existing.contains(where: { $0.clientMsgId == "ui-fixture-video" }) {
             try await ensureDialogMetadata(in: store)
+            try await applyRemoteClearIfRequested(to: store)
             return
         }
 
@@ -85,6 +90,8 @@ enum TelegramFastUITestFixture {
             "2026-07-18T20:01:00Z",
             "2026-07-18T20:02:00Z",
             "2026-07-18T20:03:00Z",
+            "2026-07-18T20:04:00Z",
+            "2026-07-18T20:04:01Z",
         ]
         try await ensureDialogMetadata(in: store)
         try await store.applyHistoryPage(HistoryPageResponse(
@@ -136,6 +143,36 @@ enum TelegramFastUITestFixture {
                     state: "visible",
                     serverTs: timestamps[3]
                 ),
+                CloudMessage(
+                    dialogId: primaryDialogId,
+                    msgId: 5,
+                    senderAccountId: peerAccountId,
+                    clientMsgId: "ui-fixture-partial-album-0",
+                    kind: "photo",
+                    text: "Partially delivered album",
+                    media: photo,
+                    mediaGroupId: "00000000-0000-4000-8000-000000000601",
+                    mediaGroupIndex: 0,
+                    mediaGroupCount: 3,
+                    editVersion: 0,
+                    state: "visible",
+                    serverTs: timestamps[4]
+                ),
+                CloudMessage(
+                    dialogId: primaryDialogId,
+                    msgId: 6,
+                    senderAccountId: peerAccountId,
+                    clientMsgId: "ui-fixture-partial-album-2",
+                    kind: "video",
+                    text: "",
+                    media: video,
+                    mediaGroupId: "00000000-0000-4000-8000-000000000601",
+                    mediaGroupIndex: 2,
+                    mediaGroupCount: 3,
+                    editVersion: 0,
+                    state: "visible",
+                    serverTs: timestamps[5]
+                ),
             ],
             nextBeforeMsgId: nil,
             hasMore: false
@@ -172,6 +209,126 @@ enum TelegramFastUITestFixture {
                 try await store.upsertMediaCacheEntry(entry)
             }
         }
+        try await seedPersistentDraft(in: store, photo: photo, video: video)
+        try await seedFailedAlbum(in: store)
+        try await applyRemoteClearIfRequested(to: store)
+    }
+
+    private static func seedPersistentDraft(
+        in store: CloudLocalStore,
+        photo: CloudMedia,
+        video: CloudMedia
+    ) async throws {
+        let file = CloudMedia(
+            id: "00000000-0000-4000-8000-000000000303",
+            kind: "file",
+            contentType: "application/pdf",
+            fileName: "offline-notes.pdf",
+            byteSize: 512,
+            durationMs: nil,
+            width: nil,
+            height: nil,
+            hasThumbnail: false
+        )
+        try await store.applyCloudDraft(
+            CloudDraft(
+                dialogId: primaryDialogId,
+                revision: 100,
+                state: "active",
+                text: "Persistent exact draft  ",
+                replyToMsgId: 1,
+                replyPreview: CloudDraftReplyPreview(
+                    msgId: 1,
+                    senderAccountId: peerAccountId,
+                    text: "This conversation opened entirely from SQLCipher.",
+                    unavailable: false
+                ),
+                mentions: [],
+                attachments: (usesSingleAttachmentDraft ? [photo] : [photo, video, file])
+                    .enumerated().map { index, media in
+                    CloudDraftAttachment(
+                        attachmentId: "ui-draft-\(index)",
+                        mediaId: media.id,
+                        position: index,
+                        media: media
+                    )
+                },
+                operationId: "00000000-0000-4000-8000-000000000501",
+                updatedAt: "2026-07-18T20:04:00Z"
+            ),
+            accountId: accountId
+        )
+    }
+
+    private static func seedFailedAlbum(in store: CloudLocalStore) async throws {
+        let media = (0..<2).map { index in
+            CloudMedia(
+                id: "00000000-0000-4000-8000-00000000030\(index + 4)",
+                kind: "file",
+                contentType: "application/pdf",
+                fileName: "failed-\(index + 1).pdf",
+                byteSize: 512,
+                durationMs: nil,
+                width: nil,
+                height: nil,
+                hasThumbnail: false
+            )
+        }
+        let operationId = "00000000-0000-4000-8000-000000000503"
+        try await store.applyCloudDraft(
+            CloudDraft(
+                dialogId: secondDialogId,
+                revision: 200,
+                state: "active",
+                text: "Recoverable failed album",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: [],
+                attachments: media.enumerated().map { index, item in
+                    CloudDraftAttachment(
+                        attachmentId: "ui-failed-\(index)",
+                        mediaId: item.id,
+                        position: index,
+                        media: item
+                    )
+                },
+                operationId: operationId,
+                updatedAt: "2026-07-18T20:06:00Z"
+            ),
+            accountId: accountId
+        )
+        let group = try await store.consumeDraftAsMediaGroup(
+            accountId: accountId,
+            dialogId: secondDialogId,
+            operationId: operationId
+        )
+        try await store.markMediaGroupSendFailed(
+            clientGroupId: group.clientGroupId,
+            error: "fixture network failure",
+            retryAfter: nil,
+            terminal: false
+        )
+    }
+
+    private static func applyRemoteClearIfRequested(to store: CloudLocalStore) async throws {
+        guard ProcessInfo.processInfo.environment["TOJ_UI_FIXTURE_REMOTE_CLEAR"] == "1" else {
+            return
+        }
+        try await store.applyCloudDraft(
+            CloudDraft(
+                dialogId: primaryDialogId,
+                revision: 101,
+                state: "cleared",
+                text: "",
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: [],
+                attachments: [],
+                operationId: "00000000-0000-4000-8000-000000000502",
+                updatedAt: "2026-07-18T20:05:00Z"
+            ),
+            accountId: accountId
+        )
     }
 
     private static func ensureDialogMetadata(in store: CloudLocalStore) async throws {

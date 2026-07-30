@@ -1901,6 +1901,9 @@ actor CloudMediaTransferEngine {
     private var inFlightFullDownloads: [String: SharedFullDownload] = [:]
     private var inFlightThumbnailDownloads: [String: SharedThumbnailDownload] = [:]
     private let volumeCapacityProvider: (@Sendable () throws -> MediaVolumeCapacity)?
+    #if DEBUG
+    private var rollbackHandoffGate: (@Sendable () async -> Void)?
+    #endif
 
     init(
         config: CloudConfig = .current,
@@ -3046,10 +3049,21 @@ actor CloudMediaTransferEngine {
     func rollbackUnauthorizedAccess(_ lease: MediaAccessRestoreLease) async throws -> Bool {
         // Never lazily create or address a replacement session cache for an old lease.
         guard let cache, cache === lease.cache else { return false }
-        return try await cache.rollbackUnauthorizedMedia(lease)
+        #if DEBUG
+        await rollbackHandoffGate?()
+        #endif
+        let rolledBack = try await cache.rollbackUnauthorizedMedia(lease)
+        // The engine is reentrant across the cache-actor hop. A logout may have installed a new
+        // cache while the old one was rolling back, so never hand that old success to presentation.
+        guard self.cache === cache else { return false }
+        return rolledBack
     }
 
     #if DEBUG
+    func testSetRollbackHandoffGate(_ gate: (@Sendable () async -> Void)?) {
+        rollbackHandoffGate = gate
+    }
+
     func testInstallReplacementCache(_ replacement: EncryptedMediaCache) {
         precondition(cache == nil, "replacement cache requires completed teardown")
         cache = replacement

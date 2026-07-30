@@ -11,6 +11,8 @@ import {
 import { appendAccessRevokedEvent, fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { loadMediaDTO, type MediaDTO } from "./media";
 import { loadProfiles, type ProfileDTO } from "./sync";
+import { purgeRevokedDialogDraftState } from "./drafts";
+import { updateDialogPreferences } from "./dialog-preferences";
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -701,6 +703,7 @@ export async function removeGroupMember(sql: SQL, input: {
     await tx`
       UPDATE dialog_members SET left_at = now()
       WHERE dialog_id = ${input.dialogId} AND account_id = ${targetId}`;
+    await purgeRevokedDialogDraftState(tx, targetId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = await emitLifecycle(
       tx, input.actorAccountId, input.dialogId, "member.removed", "member.removed",
@@ -892,6 +895,7 @@ export async function leaveGroup(sql: SQL, input: {
     await tx`
       UPDATE dialog_members SET left_at = now()
       WHERE dialog_id = ${input.dialogId} AND account_id = ${input.actorAccountId}`;
+    await purgeRevokedDialogDraftState(tx, input.actorAccountId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = closed
       ? []
@@ -913,28 +917,79 @@ export async function leaveGroup(sql: SQL, input: {
 
 export async function updateGroupNotifications(sql: SQL, input: {
   actorAccountId: string;
+  actorDeviceId: string;
   dialogId: string;
   mode: unknown;
   clientMutationId: unknown;
-}): Promise<GroupEnvelope> {
+  usePreferenceService?: boolean;
+}): Promise<{ envelope: GroupEnvelope; pushes: FanoutPush[] }> {
   const mode = String(input.mode ?? "");
   if (mode !== "all" && mode !== "muted") {
     throw new GroupError("notification mode must be all or muted", "invalid_request");
   }
-  return sql.begin(async (tx) => {
-    const claim = await claimMutation(
-      tx, input.actorAccountId, input.clientMutationId, input.dialogId, "notifications", mode,
-    );
-    if (claim.duplicate) return envelope(tx, input.actorAccountId, input.dialogId, { duplicate: true });
-    const access = await mutationAccess(
-      tx, input.actorAccountId, input.dialogId, ["owner", "admin", "member"],
-    );
-    await tx`
-      UPDATE dialog_members SET notification_mode = ${mode}
-      WHERE dialog_id = ${input.dialogId} AND account_id = ${input.actorAccountId}`;
-    await completeMutation(tx, input.actorAccountId, claim.mutationId, access.revision);
-    return envelope(tx, input.actorAccountId, input.dialogId);
+  if (input.usePreferenceService === false) {
+    return sql.begin(async (tx) => {
+      const claim = await claimMutation(
+        tx,
+        input.actorAccountId,
+        input.clientMutationId,
+        input.dialogId,
+        "notifications",
+        mode,
+      );
+      if (claim.duplicate) {
+        return {
+          envelope: await envelope(tx, input.actorAccountId, input.dialogId, {
+            duplicate: true,
+          }),
+          pushes: [],
+        };
+      }
+      const access = await mutationAccess(
+        tx,
+        input.actorAccountId,
+        input.dialogId,
+        ["owner", "admin", "member"],
+      );
+      await tx`
+        UPDATE dialog_members
+        SET notification_mode = ${mode}
+        WHERE dialog_id = ${input.dialogId}
+          AND account_id = ${input.actorAccountId}`;
+      await completeMutation(tx, input.actorAccountId, claim.mutationId, access.revision);
+      return {
+        envelope: await envelope(tx, input.actorAccountId, input.dialogId),
+        pushes: [],
+      };
+    }).catch((error: any) => {
+      if (error?.message?.includes("dialog_preference_rate_limited")) {
+        throw new GroupError(
+          "dialog preference rate limit reached",
+          "rate_limited",
+          429,
+          {},
+          3600,
+        );
+      }
+      if (error?.message?.includes("dialog_preference_account_unavailable")) {
+        throw new GroupError("account unavailable", "account_unavailable", 403);
+      }
+      throw error;
+    });
+  }
+  const result = await updateDialogPreferences(sql, {
+    accountId: input.actorAccountId,
+    deviceId: input.actorDeviceId,
+    dialogId: input.dialogId,
+    clientMutationId: input.clientMutationId,
+    patch: { muted: mode === "muted" },
   });
+  return {
+    envelope: await envelope(sql, input.actorAccountId, input.dialogId, {
+      duplicate: result.duplicate,
+    }),
+    pushes: result.pushes,
+  };
 }
 
 /** Called inside account deletion after devices are revoked and before commit. */

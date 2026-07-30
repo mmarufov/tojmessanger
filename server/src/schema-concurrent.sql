@@ -17,8 +17,15 @@ WHERE namespace.nspname = 'public'
     'messages_reply_target_idx',
     'messages_forward_marker_backfill_idx',
     'message_mentions_account_idx',
+    'messages_media_group_idx',
     'account_events_retention_idx',
     'account_events_lifecycle_lookup_idx',
+    'media_objects_expiry_idx',
+    'media_objects_orphan_expiry_idx',
+    'draft_mutation_requests_expiry_idx',
+    'draft_mutation_tombstones_dialog_idx',
+    'media_group_send_requests_expiry_idx',
+    'media_group_send_tombstones_dialog_idx',
     'group_action_budgets_account_idx',
     'group_action_budgets_target_idx'
   )
@@ -56,12 +63,34 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_reply_target_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mentions_account_idx
   ON message_mentions(account_id, dialog_id, msg_id);
 
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS messages_media_group_idx
+  ON messages(dialog_id, media_group_id, media_group_index)
+  WHERE media_group_id IS NOT NULL;
+
 CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_retention_idx
   ON account_events(created_at, account_id, pts);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_lifecycle_lookup_idx
   ON account_events(account_id, dialog_id, pts DESC)
   WHERE type IN ('dialog.created', 'dialog.access_revoked');
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_expiry_idx
+  ON media_objects(expires_at, id)
+  WHERE status IN ('uploading','rejected');
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_orphan_expiry_idx
+  ON media_objects(GREATEST(completed_at, last_accessed_at), id)
+  WHERE status = 'ready';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_mutation_requests_expiry_idx
+  ON draft_mutation_requests(created_at, account_id, operation_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS draft_mutation_tombstones_dialog_idx
+  ON draft_mutation_tombstones(account_id, dialog_id, resulting_revision DESC);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_group_send_requests_expiry_idx
+  ON media_group_send_requests(created_at, sender_account_id, client_group_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS media_group_send_tombstones_dialog_idx
+  ON media_group_send_tombstones(sender_account_id, dialog_id, sender_pts DESC);
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_account_idx
   ON group_action_budgets(account_id, action, created_at DESC);

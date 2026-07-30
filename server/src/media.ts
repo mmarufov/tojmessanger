@@ -507,6 +507,20 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
             OR (d.created_by = ${accountId} AND dm.role = 'owner')
           )
       )
+      OR EXISTS (
+        SELECT 1 FROM draft_attachments attachment
+        JOIN account_dialog_drafts draft
+          ON draft.account_id = attachment.account_id
+         AND draft.dialog_id = attachment.dialog_id
+        JOIN dialogs dialog ON dialog.id = draft.dialog_id
+        JOIN dialog_members dm ON dm.dialog_id = draft.dialog_id
+        WHERE attachment.media_id = mo.id
+          AND draft.state = 'active'
+          AND dialog.closed_at IS NULL
+          AND draft.account_id = ${accountId}
+          AND dm.account_id = ${accountId}
+          AND dm.left_at IS NULL
+      )
     )
     FOR KEY SHARE OF mo`)[0];
   if (!row || row.status !== "ready") throw new MediaError("media not found", 404);
@@ -562,6 +576,18 @@ export async function cancelMediaUpload(sql: SQL, accountId: string, deviceId: s
       SELECT 1 FROM messages WHERE media_id = ${mediaId} AND state = 'visible'
       UNION ALL
       SELECT 1 FROM dialogs WHERE photo_media_id = ${mediaId}
+      UNION ALL
+      SELECT 1
+      FROM draft_attachments attachment
+      JOIN account_dialog_drafts draft
+        ON draft.account_id = attachment.account_id
+       AND draft.dialog_id = attachment.dialog_id
+      JOIN dialogs dialog ON dialog.id = draft.dialog_id AND dialog.closed_at IS NULL
+      JOIN dialog_members member
+        ON member.dialog_id = draft.dialog_id
+       AND member.account_id = draft.account_id
+       AND member.left_at IS NULL
+      WHERE attachment.media_id = ${mediaId} AND draft.state = 'active'
       LIMIT 1`;
     if (referenced.length) throw new MediaError("media is already attached to a message", 409);
     await tx`DELETE FROM media_objects WHERE id = ${mediaId}`;

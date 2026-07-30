@@ -18,6 +18,7 @@
 		7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */; };
 		7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
+		ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
 		DAE6D5DFCCA9A3125DC90412 /* TelegramFastLocalFirstUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */; };
 		DAF0BE9F58109F5B51592FC6 /* BackgroundMediaTransferSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */; };
@@ -48,6 +49,7 @@
 		4F8DF8F3E80AB4C80C4C67B0 /* Pods-Toj.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.debug.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.debug.xcconfig"; sourceTree = "<group>"; };
 		5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TelegramFastLocalFirstUITests.swift; sourceTree = "<group>"; };
 		51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EnvelopeTests.swift; sourceTree = "<group>"; };
+		55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudDraftsV1Tests.swift; sourceTree = "<group>"; };
 		65F781742FF68D07000D35EE /* Toj.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Toj.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		6A1C38E90F4D4F298C027102 /* GroupsV1Tests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = GroupsV1Tests.swift; sourceTree = "<group>"; };
 		7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackgroundMediaTransferSessionTests.swift; sourceTree = "<group>"; };
@@ -120,6 +122,7 @@
 				E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */,
 				E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */,
 				A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */,
+				55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */,
 			);
 			path = TojTests;
 			sourceTree = "<group>";
@@ -396,6 +399,7 @@
 				E4A8C89C215B4C37BF5246E1 /* EncryptedProfilePhotoStoreTests.swift in Sources */,
 				7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */,
 				7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */,
+				ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

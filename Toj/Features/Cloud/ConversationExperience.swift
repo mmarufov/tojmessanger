@@ -98,9 +98,14 @@ struct TojConversationExperience: View {
     private var isSavedMessages: Bool { dialog?.type == "saved" }
 
     private var canSend: Bool {
-        model.activeDialogId == dialogId
-            && !model.composerMode.isRecording
-            && !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard model.activeDialogId == dialogId, !model.composerMode.isRecording else {
+            return false
+        }
+        let attachments = model.currentDraft?.attachments ?? []
+        if !attachments.isEmpty {
+            return attachments.allSatisfy { $0.state == "ready" && $0.mediaId != nil }
+        }
+        return !model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
@@ -483,6 +488,7 @@ struct TojConversationExperience: View {
                                 TojMessageBubble(
                                     model: model,
                                     line: item.line,
+                                    albumLines: item.albumLines,
                                     isLastInGroup: item.isLastInGroup,
                                     actions: model.actions(for: item.line),
                                     onAction: { perform($0, on: item.line) },
@@ -668,15 +674,35 @@ struct TojConversationExperience: View {
     }
 
     private var timelineItems: [TimelinePresentationItem] {
-        model.lines.map { line in
-            return TimelinePresentationItem(
-                line: line,
-                dayLabel: line.presentationDayLabel,
-                showsUnreadDivider: line.msgId == openingUnreadMsgId,
-                isFirstInGroup: line.presentationIsFirstInGroup,
-                isLastInGroup: line.presentationIsLastInGroup
-            )
+        let grouped = Dictionary(grouping: model.lines.compactMap { line in
+            line.mediaGroupId.map { ($0, line) }
+        }, by: { $0.0 })
+        var emittedGroups = Set<String>()
+        var items: [TimelinePresentationItem] = []
+        for line in model.lines {
+            let albumLines: [CloudAppModel.Line]
+            if let groupId = line.mediaGroupId {
+                guard emittedGroups.insert(groupId).inserted else { continue }
+                albumLines = (grouped[groupId] ?? [])
+                    .map { $0.1 }
+                    .sorted {
+                        ($0.mediaGroupIndex ?? Int.max) < ($1.mediaGroupIndex ?? Int.max)
+                    }
+            } else {
+                albumLines = []
+            }
+            let representative = albumLines.first ?? line
+            items.append(TimelinePresentationItem(
+                line: representative,
+                albumLines: albumLines,
+                dayLabel: representative.presentationDayLabel,
+                showsUnreadDivider: (albumLines.isEmpty ? [representative] : albumLines)
+                    .contains(where: { $0.msgId == openingUnreadMsgId }),
+                isFirstInGroup: representative.presentationIsFirstInGroup,
+                isLastInGroup: (albumLines.last ?? representative).presentationIsLastInGroup
+            ))
         }
+        return items
     }
 
     /// Telegram's bottom bar grammar: three floating Liquid Glass elements — attach circle,
@@ -763,6 +789,10 @@ struct TojConversationExperience: View {
                 }
             }
 
+            if let attachments = model.currentDraft?.attachments, !attachments.isEmpty {
+                draftAttachmentStrip(attachments)
+            }
+
             TextField("Message", text: $model.draft, axis: .vertical)
                 .focused($composerFocused)
                 .lineLimit(1...8)
@@ -777,6 +807,37 @@ struct TojConversationExperience: View {
                 .disabled(model.composerMode.isRecording)
         }
         .tojGlass(in: RoundedRectangle(cornerRadius: 23, style: .continuous), interactive: true)
+    }
+
+    private func draftAttachmentStrip(_ attachments: [LocalDraftAttachment]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments.sorted(by: { $0.position < $1.position })) { attachment in
+                    DraftAttachmentChip(
+                        model: model,
+                        attachment: attachment,
+                        total: attachments.count,
+                        onRetry: { model.retryDraftAttachment(attachment) },
+                        onRemove: { model.removeDraftAttachment(attachment) },
+                        onMoveEarlier: {
+                            model.moveDraftAttachment(attachment.attachmentId, by: -1)
+                        },
+                        onMoveLater: {
+                            model.moveDraftAttachment(attachment.attachmentId, by: 1)
+                        },
+                        onDrop: { movingId in
+                            model.moveDraftAttachment(
+                                movingId,
+                                before: attachment.attachmentId
+                            )
+                        }
+                    )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 9)
+        }
+        .accessibilityLabel("\(attachments.count) draft attachments")
     }
 
     private var composerContext: some View {
@@ -972,7 +1033,7 @@ struct TojConversationExperience: View {
     }
 
     private var timelineLineIDs: [String] {
-        model.lines.map(\.id)
+        timelineItems.map(\.line.id)
     }
 
     private var visibleTimelineLineIDs: [String] {
@@ -1132,12 +1193,119 @@ nonisolated private enum TimelineTargetID: Hashable, Sendable {
 
 private struct TimelinePresentationItem: Identifiable {
     let line: CloudAppModel.Line
+    let albumLines: [CloudAppModel.Line]
     let dayLabel: String?
     let showsUnreadDivider: Bool
     let isFirstInGroup: Bool
     let isLastInGroup: Bool
 
     var id: TimelineTargetID { .message(line.id) }
+}
+
+private struct DraftAttachmentChip: View {
+    let model: CloudAppModel
+    let attachment: LocalDraftAttachment
+    let total: Int
+    let onRetry: () -> Void
+    let onRemove: () -> Void
+    let onMoveEarlier: () -> Void
+    let onMoveLater: () -> Void
+    let onDrop: (String) -> Void
+    @State private var thumbnail: UIImage?
+
+    private var icon: String {
+        switch attachment.media?.kind {
+        case "photo": "photo.fill"
+        case "video": "video.fill"
+        default: "doc.fill"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(TojTheme.raised)
+                    .frame(width: 38, height: 38)
+                if let thumbnail {
+                    Image(uiImage: thumbnail)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 38, height: 38)
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(TojTheme.gold)
+                }
+                Text("\(attachment.position + 1)")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(TojTheme.onAccent)
+                    .frame(width: 16, height: 16)
+                    .background(TojTheme.accent, in: Circle())
+                    .offset(x: 15, y: -15)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(attachment.media?.displayName ?? String(localized: "Preparing"))
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                if attachment.state == "ready" {
+                    Label("Ready", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(TojTheme.secure)
+                } else if attachment.state == "failed" || attachment.state == "terminal" {
+                    Button("Retry", action: onRetry)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(TojTheme.danger)
+                } else {
+                    ProgressView(value: attachment.progress)
+                        .tint(TojTheme.gold)
+                        .frame(width: 58)
+                }
+            }
+            .font(.caption2)
+
+            Menu {
+                Button("Move earlier", systemImage: "arrow.left", action: onMoveEarlier)
+                    .disabled(attachment.position == 0)
+                Button("Move later", systemImage: "arrow.right", action: onMoveLater)
+                    .disabled(attachment.position >= total - 1)
+                Button("Remove", systemImage: "trash", role: .destructive, action: onRemove)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.caption.weight(.bold))
+                    .frame(width: 28, height: 32)
+            }
+            .foregroundStyle(TojTheme.secondaryText)
+            .accessibilityIdentifier("draft-attachment-menu-\(attachment.attachmentId)")
+        }
+        .padding(.leading, 7)
+        .padding(.trailing, 4)
+        .padding(.vertical, 5)
+        .background(TojTheme.strong, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(TojTheme.hairlineStrong, lineWidth: 0.5)
+        )
+        .draggable(attachment.attachmentId)
+        .dropDestination(for: String.self) { values, _ in
+            guard let movingId = values.first else { return false }
+            onDrop(movingId)
+            return true
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Attachment \(attachment.position + 1) of \(total), \(attachment.state)"
+        )
+        .accessibilityIdentifier("draft-attachment-\(attachment.attachmentId)")
+        .task(id: attachment.media?.id) {
+            guard let media = attachment.media,
+                  media.kind == "photo" || media.kind == "video" else {
+                thumbnail = nil
+                return
+            }
+            thumbnail = await model.presentationImage(for: media, variant: .bubble720)
+        }
+    }
 }
 
 private struct VoiceCallServiceRow: View {
@@ -1170,6 +1338,7 @@ private struct VoiceCallServiceRow: View {
 private struct TojMessageBubble: View {
     let model: CloudAppModel
     let line: CloudAppModel.Line
+    let albumLines: [CloudAppModel.Line]
     let isLastInGroup: Bool
     let actions: [MessageAction]
     let onAction: (MessageAction) -> Void
@@ -1212,7 +1381,25 @@ private struct TojMessageBubble: View {
                     replyQuote
                 }
 
-                if let media = line.media {
+                if !albumLines.isEmpty {
+                    AlbumMediaBubble(
+                        model: model,
+                        lines: albumLines,
+                        expectedCount: line.mediaGroupCount ?? albumLines.count,
+                        onRetry: {
+                            model.retryFailedMessage(
+                                albumLines.first(where: {
+                                    if case .failed = $0.delivery { return true }
+                                    return false
+                                }) ?? line
+                            )
+                        },
+                        onRemove: { model.removeFailedMedia(line) }
+                    )
+                    .contentShape(Rectangle())
+                    .matchedTransitionSource(id: line.id, in: mediaZoom)
+                    .onTapGesture { showingMedia = true }
+                } else if let media = line.media {
                     ProductionMediaBubble(
                         model: model, line: line, media: media,
                         onRetry: { model.retryFailedMessage(line) },
@@ -1293,7 +1480,11 @@ private struct TojMessageBubble: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(
-            line.media.map { "media-bubble-\($0.id)" } ?? "message-\(line.clientMsgId)"
+            line.mediaGroupId.map {
+                "media-group-\($0)\(line.msgId == nil ? "-pending" : "")"
+            }
+                ?? line.media.map { "media-bubble-\($0.id)" }
+                ?? "message-\(line.clientMsgId)"
         )
         .accessibilityLabel(accessibilityDescription)
         .accessibilityHint("Swipe to reply or use message actions")
@@ -1304,7 +1495,25 @@ private struct TojMessageBubble: View {
         }
         .fullScreenCover(isPresented: $showingMedia) {
             Group {
-                if let media = line.media {
+                if albumLines.count > 1 {
+                    TabView {
+                        ForEach(albumLines) { albumLine in
+                            if let media = albumLine.media {
+                                ProductionMediaViewer(
+                                    model: model,
+                                    media: media,
+                                    line: albumLine,
+                                    title: model.dialogTitle(albumLine.dialogId ?? ""),
+                                    subtitle: albumLine.presentationMediaTimestampLabel ?? "",
+                                    onReply: { model.beginReply(to: albumLine) }
+                                )
+                                .tag(albumLine.id)
+                            }
+                        }
+                    }
+                    .tabViewStyle(.page(indexDisplayMode: .always))
+                    .background(Color.black)
+                } else if let media = line.media {
                     ProductionMediaViewer(
                         model: model, media: media, line: line,
                         title: model.dialogTitle(line.dialogId ?? ""),
@@ -1349,7 +1558,12 @@ private struct TojMessageBubble: View {
     }
 
     private var isVisualMedia: Bool {
-        line.media.map { $0.kind == "photo" || $0.kind == "video" } ?? false
+        if !albumLines.isEmpty {
+            return albumLines.allSatisfy {
+                $0.media?.kind == "photo" || $0.media?.kind == "video"
+            }
+        }
+        return line.media.map { $0.kind == "photo" || $0.kind == "video" } ?? false
     }
 
     private var showsSenderName: Bool {
@@ -1520,7 +1734,10 @@ private struct TojMessageBubble: View {
         case .seen: state = String(localized: "seen")
         case .failed: state = String(localized: "failed")
         }
-        return "\(sender): \(line.text), \(state)"
+        let content = albumLines.isEmpty
+            ? line.text
+            : "Media group, \(albumLines.count) of \(line.mediaGroupCount ?? albumLines.count) items, \(line.text)"
+        return "\(sender): \(content), \(state)"
     }
 }
 
@@ -1768,6 +1985,171 @@ private struct ProductionMediaBubble: View {
         guard isFinishedVideo else { return AnyView(EmptyView()) }
         // Pin identity so wrapping in AnyView can't reset the player's state across re-renders.
         return AnyView(InlineVideoPlayerView(model: model, media: media, isActive: isAutoplaying).id(media.id))
+    }
+}
+
+enum AlbumSlotAssignment {
+    static func linesBySlot(
+        _ lines: [CloudAppModel.Line]
+    ) -> [Int: CloudAppModel.Line] {
+        Dictionary(
+            lines.compactMap { line in
+                line.mediaGroupIndex.map { ($0, line) }
+            },
+            uniquingKeysWith: { current, _ in current }
+        )
+    }
+
+    static func slotCount(
+        lines: [CloudAppModel.Line],
+        expectedCount: Int
+    ) -> Int {
+        min(10, max(lines.count, expectedCount))
+    }
+}
+
+private struct AlbumMediaBubble: View {
+    let model: CloudAppModel
+    let lines: [CloudAppModel.Line]
+    let expectedCount: Int
+    let onRetry: () -> Void
+    let onRemove: () -> Void
+
+    private var visual: Bool {
+        lines.allSatisfy { $0.media?.kind == "photo" || $0.media?.kind == "video" }
+    }
+
+    private var slotCount: Int {
+        AlbumSlotAssignment.slotCount(lines: lines, expectedCount: expectedCount)
+    }
+
+    private var linesBySlot: [Int: CloudAppModel.Line] {
+        AlbumSlotAssignment.linesBySlot(lines)
+    }
+
+    var body: some View {
+        Group {
+            if visual {
+                LazyVGrid(
+                    columns: [
+                        GridItem(.fixed(126), spacing: 3),
+                        GridItem(.fixed(126), spacing: 3),
+                    ],
+                    spacing: 3
+                ) {
+                    ForEach(0..<slotCount, id: \.self) { index in
+                        if let line = linesBySlot[index], let media = line.media {
+                            AlbumVisualCell(model: model, line: line, media: media)
+                        } else {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(TojTheme.raised)
+                                .overlay {
+                                    Image(systemName: "ellipsis")
+                                        .foregroundStyle(TojTheme.tertiaryText)
+                                }
+                                .frame(width: 126, height: 104)
+                                .accessibilityLabel("Album item unavailable")
+                        }
+                    }
+                }
+            } else {
+                VStack(spacing: 2) {
+                    ForEach(0..<slotCount, id: \.self) { index in
+                        if let item = linesBySlot[index], let media = item.media {
+                            HStack(spacing: 10) {
+                                Image(systemName: "doc.fill")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(TojTheme.gold)
+                                    .frame(width: 36, height: 36)
+                                    .background(TojTheme.raised, in: Circle())
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(media.displayName)
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(media.formattedSize)
+                                        .font(.caption)
+                                        .foregroundStyle(TojTheme.secondaryText)
+                                }
+                                Spacer(minLength: 6)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 5)
+                        } else {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Waiting for album item")
+                                    .font(.caption)
+                                    .foregroundStyle(TojTheme.secondaryText)
+                                Spacer()
+                            }
+                            .padding(8)
+                        }
+                    }
+                }
+                .frame(width: 252)
+            }
+        }
+        .overlay {
+            if lines.contains(where: {
+                if case .failed = $0.delivery { return true }
+                return false
+            }) {
+                HStack(spacing: 8) {
+                    Button("Retry", action: onRetry)
+                    Button("Remove", role: .destructive, action: onRemove)
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
+                .padding(8)
+                .background(.ultraThinMaterial, in: Capsule())
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Media group, \(lines.count) of \(slotCount) items")
+    }
+}
+
+private struct AlbumVisualCell: View {
+    let model: CloudAppModel
+    let line: CloudAppModel.Line
+    let media: CloudMedia
+    @State private var thumbnail: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let thumbnail {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                LinearGradient(
+                    colors: [Color(hex: 0x27333A), Color(hex: 0x101C22)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                ProgressView().tint(TojTheme.text)
+            }
+            if media.kind == "video" {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(.black.opacity(0.45), in: Circle())
+            }
+            if line.delivery == .sending {
+                ProgressView()
+                    .tint(.white)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(.black.opacity(0.2))
+            }
+        }
+        .frame(width: 126, height: 104)
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .task(id: media.id) {
+            thumbnail = await model.presentationImage(for: media, variant: .bubble720)
+        }
+        .accessibilityLabel("\(media.displayName), album item \(line.mediaGroupIndex.map { $0 + 1 } ?? 1)")
     }
 }
 
@@ -2791,14 +3173,19 @@ private struct ProductionAttachmentPicker: View {
     let onDone: () -> Void
     let onSent: () -> Void
     @StateObject private var library = RecentMediaLibrary()
-    @State private var mediaItem: PhotosPickerItem?
-    @State private var photoItem: PhotosPickerItem?
-    @State private var videoItem: PhotosPickerItem?
+    @State private var mediaItems: [PhotosPickerItem] = []
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var videoItems: [PhotosPickerItem] = []
     @State private var selectedAsset: PHAsset?
     @State private var selectedFile: PreparedFileSelection?
     @State private var importingFile = false
     @State private var working = false
     @State private var error: String?
+
+    private var maximumSelectionCount: Int {
+        guard model.capabilities.contains(.mediaGroups) else { return 1 }
+        return max(1, 10 - (model.currentDraft?.attachments.count ?? 0))
+    }
     @State private var selectionTask: Task<Void, Never>?
 
     var body: some View {
@@ -2810,23 +3197,23 @@ private struct ProductionAttachmentPicker: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(TojTheme.base)
         .task { await library.load() }
-        .onChange(of: mediaItem) { _, item in
-            guard let item else { return }
+        .onChange(of: mediaItems) { _, items in
+            guard !items.isEmpty else { return }
             selectedFile = nil
             selectionTask?.cancel()
-            selectionTask = Task { await loadMedia(item) }
+            selectionTask = Task { await loadMediaItems(items) }
         }
-        .onChange(of: photoItem) { _, item in
-            guard let item else { return }
+        .onChange(of: photoItems) { _, items in
+            guard !items.isEmpty else { return }
             selectedFile = nil
             selectionTask?.cancel()
-            selectionTask = Task { await loadPhoto(item) }
+            selectionTask = Task { await loadMediaItems(items) }
         }
-        .onChange(of: videoItem) { _, item in
-            guard let item else { return }
+        .onChange(of: videoItems) { _, items in
+            guard !items.isEmpty else { return }
             selectedFile = nil
             selectionTask?.cancel()
-            selectionTask = Task { await loadVideo(item) }
+            selectionTask = Task { await loadMediaItems(items) }
         }
         .fileImporter(isPresented: $importingFile, allowedContentTypes: [.data, .item]) { result in
             selectionTask?.cancel()
@@ -2862,7 +3249,12 @@ private struct ProductionAttachmentPicker: View {
                 if selectedFile != nil {
                     AttachmentFileTitle()
                 } else {
-                    PhotosPicker(selection: $mediaItem, matching: .any(of: [.images, .videos])) {
+                    PhotosPicker(
+                        selection: $mediaItems,
+                        maxSelectionCount: maximumSelectionCount,
+                        selectionBehavior: .ordered,
+                        matching: .any(of: [.images, .videos])
+                    ) {
                         AttachmentLibraryTitle()
                     }
                     .buttonStyle(.plain)
@@ -3006,7 +3398,7 @@ private struct ProductionAttachmentPicker: View {
                 Button {
                     sendFile(selectedFile)
                 } label: {
-                    Label("Send file", systemImage: "arrow.up")
+                    Label("Add file", systemImage: "plus")
                         .font(.headline.weight(.bold))
                         .foregroundStyle(TojTheme.onAccent)
                         .frame(maxWidth: .infinity)
@@ -3028,8 +3420,8 @@ private struct ProductionAttachmentPicker: View {
                     }
                 } label: {
                     Label(
-                        selectedAsset?.mediaType == .video ? "Send video" : "Send photo",
-                        systemImage: "arrow.up"
+                        selectedAsset?.mediaType == .video ? "Add video" : "Add photo",
+                        systemImage: "plus"
                     )
                         .font(.headline.weight(.bold))
                         .foregroundStyle(TojTheme.onAccent)
@@ -3058,12 +3450,22 @@ private struct ProductionAttachmentPicker: View {
                 }
                 .buttonStyle(.tojPressable)
 
-                PhotosPicker(selection: $photoItem, matching: .images) {
+                PhotosPicker(
+                    selection: $photoItems,
+                    maxSelectionCount: maximumSelectionCount,
+                    selectionBehavior: .ordered,
+                    matching: .images
+                ) {
                     AttachmentActionLabel(title: "Photo", icon: "photo.fill")
                 }
                 .buttonStyle(.tojPressable)
 
-                PhotosPicker(selection: $videoItem, matching: .videos) {
+                PhotosPicker(
+                    selection: $videoItems,
+                    maxSelectionCount: maximumSelectionCount,
+                    selectionBehavior: .ordered,
+                    matching: .videos
+                ) {
                     AttachmentActionLabel(title: "Video", icon: "video.fill")
                 }
                 .buttonStyle(.tojPressable)
@@ -3095,6 +3497,39 @@ private struct ProductionAttachmentPicker: View {
         }
     }
 
+    /// Imports in picker order and releases each source buffer before requesting the next item, so
+    /// a 10-item selection never retains all PhotosPicker payloads at once.
+    private func loadMediaItems(_ items: [PhotosPickerItem]) async {
+        working = true
+        defer {
+            working = false
+            mediaItems = []
+            photoItems = []
+            videoItems = []
+        }
+        do {
+            for item in items {
+                try Task.checkCancellation()
+                guard let source = try await item.loadTransferable(type: Data.self) else {
+                    throw PickerError.unreadable
+                }
+                if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
+                    let fitted = try await MediaAssetDataLoader.fittedVideoData(source)
+                    try await prepareAndStageVideo(fitted, finishSelection: false)
+                } else {
+                    try await prepareAndStagePhoto(source, finishSelection: false)
+                }
+            }
+            selectionTask = nil
+            onSent()
+            onDone()
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
     private func loadPhoto(_ item: PhotosPickerItem) async {
         working = true
         defer { working = false }
@@ -3103,7 +3538,7 @@ private struct ProductionAttachmentPicker: View {
                 throw PickerError.unreadable
             }
             try Task.checkCancellation()
-            try await prepareAndSendPhoto(data)
+            try await prepareAndStagePhoto(data)
         } catch is CancellationError {
             return
         } catch {
@@ -3117,7 +3552,7 @@ private struct ProductionAttachmentPicker: View {
         do {
             let data = try await MediaAssetDataLoader.imageData(for: asset)
             try Task.checkCancellation()
-            try await prepareAndSendPhoto(data)
+            try await prepareAndStagePhoto(data)
         } catch is CancellationError {
             return
         } catch {
@@ -3125,23 +3560,29 @@ private struct ProductionAttachmentPicker: View {
         }
     }
 
-    private func prepareAndSendPhoto(_ data: Data) async throws {
+    private func prepareAndStagePhoto(
+        _ data: Data,
+        finishSelection: Bool = true
+    ) async throws {
         guard let prepared = await Task.detached(priority: .userInitiated, operation: {
             SafeMediaImageDecoder.preparePhotoUpload(data)
         }).value else { throw PickerError.unreadable }
         try Task.checkCancellation()
-        working = false
-        selectionTask = nil
-        Task {
-            await model.sendMedia(
-                data: prepared.data, kind: "photo", contentType: prepared.contentType,
-                fileName: "Photo.\(prepared.filenameExtension)",
-                width: prepared.pixelWidth, height: prepared.pixelHeight,
-                thumbnail: prepared.thumbnail
-            )
+        try await model.stageDraftMedia(
+            data: prepared.data,
+            kind: "photo",
+            contentType: prepared.contentType,
+            fileName: "Photo.\(prepared.filenameExtension)",
+            width: prepared.pixelWidth,
+            height: prepared.pixelHeight,
+            thumbnail: prepared.thumbnail
+        )
+        if finishSelection {
+            working = false
+            selectionTask = nil
+            onSent()
+            onDone()
         }
-        onSent()
-        onDone()
     }
 
     private func loadVideo(_ item: PhotosPickerItem) async {
@@ -3152,7 +3593,7 @@ private struct ProductionAttachmentPicker: View {
             try Task.checkCancellation()
             let data = try await MediaAssetDataLoader.fittedVideoData(source)
             try Task.checkCancellation()
-            try await prepareAndSendVideo(data)
+            try await prepareAndStageVideo(data)
         } catch is CancellationError {
             return
         } catch {
@@ -3166,7 +3607,7 @@ private struct ProductionAttachmentPicker: View {
         do {
             let data = try await MediaAssetDataLoader.videoData(for: asset)
             try Task.checkCancellation()
-            try await prepareAndSendVideo(data)
+            try await prepareAndStageVideo(data)
         } catch is CancellationError {
             return
         } catch {
@@ -3174,7 +3615,10 @@ private struct ProductionAttachmentPicker: View {
         }
     }
 
-    private func prepareAndSendVideo(_ data: Data) async throws {
+    private func prepareAndStageVideo(
+        _ data: Data,
+        finishSelection: Bool = true
+    ) async throws {
         guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
         guard let container = SafeMediaVideoInspector.container(for: data) else {
             throw PickerError.unsupportedVideo
@@ -3216,18 +3660,22 @@ private struct ProductionAttachmentPicker: View {
             SafeMediaImageDecoder.thumbnailData(UIImage(cgImage: image))
         }.value
         try Task.checkCancellation()
-        working = false
-        selectionTask = nil
-        Task {
-            await model.sendMedia(
-                data: data, kind: "video", contentType: container.contentType,
-                fileName: "Video.\(container.filenameExtension)",
-                durationMs: Int64(duration.seconds * 1_000),
-                width: dimensions.0, height: dimensions.1, thumbnail: thumbnail
-            )
+        try await model.stageDraftMedia(
+            data: data,
+            kind: "video",
+            contentType: container.contentType,
+            fileName: "Video.\(container.filenameExtension)",
+            durationMs: Int64(duration.seconds * 1_000),
+            width: dimensions.0,
+            height: dimensions.1,
+            thumbnail: thumbnail
+        )
+        if finishSelection {
+            working = false
+            selectionTask = nil
+            onSent()
+            onDone()
         }
-        onSent()
-        onDone()
     }
 
     private func loadFile(_ result: Result<URL, Error>) async {
@@ -3275,14 +3723,19 @@ private struct ProductionAttachmentPicker: View {
         selectedFile = nil
         selectionTask = nil
         Task {
-            await model.sendMedia(
-                data: file.data, kind: "file",
-                contentType: file.contentType,
-                fileName: file.fileName
-            )
+            do {
+                try await model.stageDraftMedia(
+                    data: file.data,
+                    kind: "file",
+                    contentType: file.contentType,
+                    fileName: file.fileName
+                )
+                onSent()
+                onDone()
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
-        onSent()
-        onDone()
     }
 
     private func cancelSelection() {

@@ -693,8 +693,29 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(model.draft, outgoing.text)
 
         model.cancelComposerMode()
-        XCTAssertEqual(model.composerMode, .text)
+        XCTAssertEqual(
+            model.composerMode,
+            .replying(messageId: incoming.id, preview: incoming.text)
+        )
         XCTAssertTrue(model.draft.isEmpty)
+    }
+
+    @MainActor
+    func testReplyTargetWithoutTextRemainsADraftInsteadOfSendingAnEmptyMessage() async throws {
+        let model = CloudAppModel(useDefaultLocalStore: false)
+        model.enterDemoMode()
+        await model.selectDialog("demo-mehrona")
+        let incoming = try XCTUnwrap(model.lines.first(where: { !$0.mine }))
+        let before = model.lines
+
+        model.beginReply(to: incoming)
+        await model.sendDraft()
+
+        XCTAssertEqual(model.lines, before)
+        XCTAssertEqual(
+            model.composerMode,
+            .replying(messageId: incoming.id, preview: incoming.text)
+        )
     }
 
     @MainActor
@@ -707,8 +728,34 @@ final class MessagingPresentationTests: XCTestCase {
         model.archive("demo-aziz")
 
         XCTAssertEqual(model.dialogs.first(where: { $0.id == "demo-mehrona" })?.isMuted, true)
-        XCTAssertEqual(model.dialogs.first?.id, "demo-mehrona", "Existing pinned chat remains first")
+        XCTAssertEqual(model.dialogs.first?.id, "demo-firooz", "The most recently pinned chat is first")
         XCTAssertFalse(model.dialogs(matching: "", scope: .chats).contains(where: { $0.id == "demo-aziz" }))
+        XCTAssertEqual(
+            model.dialogs(matching: "Азиз", scope: .chats).first?.isArchived,
+            true,
+            "Main search can discover archived chats"
+        )
+        model.unarchive("demo-aziz")
+        XCTAssertTrue(model.dialogs(matching: "", scope: .chats).contains(where: { $0.id == "demo-aziz" }))
+        await Task.yield()
+    }
+
+    @MainActor
+    func testPreferenceActionsAreBlockedAsSoonAsSessionTeardownBegins() async {
+        let model = CloudAppModel(useDefaultLocalStore: false)
+        model.enterDemoMode()
+        let dialogId = "demo-mehrona"
+        let before = model.dialogs.first(where: { $0.id == dialogId })
+
+        model.beginSessionTeardownForTesting()
+        model.toggleMuted(dialogId)
+        model.togglePinned(dialogId)
+        model.archive(dialogId)
+
+        let after = model.dialogs.first(where: { $0.id == dialogId })
+        XCTAssertEqual(after?.isMuted, before?.isMuted)
+        XCTAssertEqual(after?.isPinned, before?.isPinned)
+        XCTAssertEqual(after?.isArchived, before?.isArchived)
         await Task.yield()
     }
 

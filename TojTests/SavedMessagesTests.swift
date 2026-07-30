@@ -1112,13 +1112,26 @@ final class SavedMessagesTests: XCTestCase {
             limitBytes: 1_000_000
         )
         let engine = CloudMediaTransferEngine(cache: oldCache)
+        let model = CloudAppModel(
+            config: CloudConfig(
+                baseURL: try XCTUnwrap(URL(string: "https://rollback-handoff.invalid"))
+            ),
+            useDefaultLocalStore: false,
+            mediaEngine: engine,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
         let mediaId = "replacement-cache-generation-collision"
 
         let oldLease = try await engine.restoreAuthorizedAccess(mediaId: mediaId)
         let rollbackGate = SavedMessagesAsyncGate()
-        let oldRollback = Task {
+        await engine.testSetRollbackHandoffGate {
             await rollbackGate.wait()
-            return try await engine.rollbackUnauthorizedAccess(oldLease)
+        }
+        let oldRollback = Task { @MainActor in
+            await model.testRollbackUnauthorizedMediaPresentation(
+                oldLease,
+                mediaId: mediaId
+            )
         }
         await rollbackGate.waitUntilBlocked()
 
@@ -1151,8 +1164,9 @@ final class SavedMessagesTests: XCTestCase {
         XCTAssertTrue(presentation.contains(presentationKey))
 
         await rollbackGate.open()
-        let oldRollbackResult = try await oldRollback.value
+        let oldRollbackResult = await oldRollback.value
         XCTAssertFalse(oldRollbackResult)
+        await engine.testSetRollbackHandoffGate(nil)
         let retainedChunk = try await newCache.cachedByteRange(
             mediaId: mediaId, offset: 0, length: Int64(newChunk.count)
         )
