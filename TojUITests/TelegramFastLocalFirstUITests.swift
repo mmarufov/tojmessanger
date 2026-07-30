@@ -152,7 +152,7 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
 
     func testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking() {
         openChat(Fixture.primaryDialog)
-        XCTAssertTrue(element("draft-attachment-ui-draft-0").exists)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").waitForExistence(timeout: 15))
         XCTAssertFalse(element("draft-attachment-ui-draft-1").exists)
         let send = app.buttons["Send"]
         XCTAssertTrue(send.waitForExistence(timeout: 15))

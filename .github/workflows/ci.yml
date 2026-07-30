@@ -56,7 +56,7 @@ jobs:
           bun run migrate
           DATABASE_URL="${TEST_DATABASE_URL}" bun run migrate
           bun run verify:dialog-preferences-migration
-          bun test
+          bun test --max-concurrency=4
 
   ios-debug-tests:
     name: ios-debug-tests
