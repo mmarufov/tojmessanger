@@ -537,7 +537,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
   return value.otp + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
-    + value.messageMutations + value.groupCreates + value.groupMutations
+    + value.messageMutations + value.draftMutations + value.draftBudgets
+    + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
     + Object.values(value.callData).reduce((sum, count) => sum + count, 0);
 }
