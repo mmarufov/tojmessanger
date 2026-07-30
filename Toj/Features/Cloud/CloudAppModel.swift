@@ -430,6 +430,7 @@ final class CloudAppModel {
     #if DEBUG
     private var demoLinesByDialog: [String: [Line]] = [:]
     private var temporaryPreviewAuthorizationGate: (@Sendable (URL) async -> Void)?
+    private var mediaAccessRestoreAuthorizationGate: (@Sendable () async -> Void)?
     #endif
 
     let callCoordinator: CallCoordinator
@@ -2935,18 +2936,41 @@ final class CloudAppModel {
             mediaId: mediaId,
             dialogId: dialogId
         ) else { return nil }
+        #if DEBUG
+        await mediaAccessRestoreAuthorizationGate?()
+        #endif
+        let lease: MediaAccessRestoreLease
         do {
-            try await mediaEngine.restoreAuthorizedAccess(mediaId: mediaId)
+            lease = try await mediaEngine.restoreAuthorizedAccess(mediaId: mediaId)
         } catch {
             return nil
         }
-        guard !sessionTeardownActive,
-              (try? await localStore.validatesMediaPresentationAuthorization(
-                authorization
-              )) == true
-        else { return nil }
-        MediaPresentationCache.shared.restore(mediaIds: [mediaId])
-        return authorization
+        if !sessionTeardownActive,
+           (try? await localStore.validatesMediaPresentationAuthorization(
+            authorization
+           )) == true {
+            MediaPresentationCache.shared.restore(mediaIds: [mediaId])
+            return authorization
+        }
+
+        // The exact dialog authorization was stale. Keep the global fence open only when a
+        // separately revalidated SQLCipher reference proves that another dialog (or a newer group
+        // grant) currently owns this media. Otherwise roll back this exact unfencing generation;
+        // rollback fences first and removes any bytes written during the brief unfenced window.
+        if !sessionTeardownActive,
+           let currentAuthorization = try? await localStore.mediaPresentationAuthorization(
+            mediaId: mediaId
+           ),
+           (try? await localStore.validatesMediaPresentationAuthorization(
+            currentAuthorization
+           )) == true {
+            MediaPresentationCache.shared.restore(mediaIds: [mediaId])
+            return nil
+        }
+        if (try? await mediaEngine.rollbackUnauthorizedAccess(lease)) == true {
+            MediaPresentationCache.shared.revoke(mediaIds: [mediaId])
+        }
+        return nil
     }
 
     func presentationImage(
@@ -3442,6 +3466,19 @@ final class CloudAppModel {
         _ gate: (@Sendable (URL) async -> Void)?
     ) {
         temporaryPreviewAuthorizationGate = gate
+    }
+
+    func testSetMediaAccessRestoreAuthorizationGate(
+        _ gate: (@Sendable () async -> Void)?
+    ) {
+        mediaAccessRestoreAuthorizationGate = gate
+    }
+
+    func testRestoreMediaAccessIfAuthorized(
+        mediaId: String,
+        dialogId: String? = nil
+    ) async -> MediaPresentationAuthorization? {
+        await restoreMediaAccessIfAuthorized(mediaId: mediaId, dialogId: dialogId)
     }
     #endif
 

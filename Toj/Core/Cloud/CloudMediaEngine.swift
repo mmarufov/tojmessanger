@@ -626,6 +626,11 @@ nonisolated enum MediaDownloadComponent: String, Codable, Sendable {
     case fullMedia = "full"
 }
 
+nonisolated struct MediaAccessRestoreLease: Equatable, Sendable {
+    let mediaId: String
+    let generation: UInt64
+}
+
 /// Token-free and Codable so the local replica can persist queue items without ever persisting an
 /// account credential. Callers provide the current session token only when executing a dequeued item.
 nonisolated struct MediaDownloadQueueItem: Codable, Equatable, Identifiable, Sendable {
@@ -709,6 +714,7 @@ actor EncryptedMediaCache {
     private var activeAccessCounts: [String: Int] = [:]
     private var removedLedgerKeys: Set<MediaCacheLedgerKey> = []
     private var revokedMediaIds: Set<String> = []
+    private var mediaAccessGenerations: [String: UInt64] = [:]
     private var lastRetentionSweep: Date?
 
     init(
@@ -1334,6 +1340,8 @@ actor EncryptedMediaCache {
         representations.removeAll()
         activeAccessCounts.removeAll()
         removedLedgerKeys.removeAll()
+        revokedMediaIds.removeAll()
+        mediaAccessGenerations.removeAll()
     }
 
     @discardableResult
@@ -1380,6 +1388,7 @@ actor EncryptedMediaCache {
         // presentation-representation continuations that arrive after this point are rejected.
         revokedMediaIds.formUnion(mediaIds)
         for mediaId in mediaIds {
+            _ = advanceMediaAccessGeneration(mediaId: mediaId)
             activeAccessCounts[mediaId] = nil
             removeCachedMedia(mediaId: mediaId)
             let paths = [
@@ -1402,8 +1411,38 @@ actor EncryptedMediaCache {
         }
     }
 
-    func restoreAuthorizedMedia(mediaId: String) {
+    func restoreAuthorizedMedia(mediaId: String) -> MediaAccessRestoreLease {
+        let generation = advanceMediaAccessGeneration(mediaId: mediaId)
         revokedMediaIds.remove(mediaId)
+        return MediaAccessRestoreLease(mediaId: mediaId, generation: generation)
+    }
+
+    /// Reinstalls the fence only if no later purge or authorized restore superseded this lease.
+    /// Deleting again closes the brief unfenced window for late chunk/thumbnail/representation
+    /// writers before the caller learned that its SQLCipher authorization was stale.
+    func rollbackUnauthorizedMedia(_ lease: MediaAccessRestoreLease) throws -> Bool {
+        guard mediaAccessGenerations[lease.mediaId] == lease.generation else {
+            return false
+        }
+        _ = advanceMediaAccessGeneration(mediaId: lease.mediaId)
+        revokedMediaIds.insert(lease.mediaId)
+        activeAccessCounts[lease.mediaId] = nil
+        removeCachedMedia(mediaId: lease.mediaId)
+        let paths = [
+            downloadDirectory(lease.mediaId),
+            thumbnailURL(lease.mediaId),
+            representationDirectory(lease.mediaId),
+        ]
+        for path in paths where fileManager.fileExists(atPath: path.path) {
+            try fileManager.removeItem(at: path)
+        }
+        return true
+    }
+
+    private func advanceMediaAccessGeneration(mediaId: String) -> UInt64 {
+        let generation = (mediaAccessGenerations[mediaId] ?? 0) &+ 1
+        mediaAccessGenerations[mediaId] = generation
+        return generation
     }
 
     func createTemporaryPreview(_ data: Data, fileExtension: String?) throws -> URL {
@@ -2986,9 +3025,14 @@ actor CloudMediaTransferEngine {
 
     /// The caller must first prove a live SQLCipher message_media reference in an authorized
     /// dialog. This only removes the process-local fence; it never creates authorization.
-    func restoreAuthorizedAccess(mediaId: String) async throws {
+    func restoreAuthorizedAccess(mediaId: String) async throws -> MediaAccessRestoreLease {
         let cache = try resolvedCache()
-        await cache.restoreAuthorizedMedia(mediaId: mediaId)
+        return await cache.restoreAuthorizedMedia(mediaId: mediaId)
+    }
+
+    func rollbackUnauthorizedAccess(_ lease: MediaAccessRestoreLease) async throws -> Bool {
+        let cache = try resolvedCache()
+        return try await cache.rollbackUnauthorizedMedia(lease)
     }
 
     func cacheUsageBytes() async -> Int64 {

@@ -824,6 +824,252 @@ final class SavedMessagesTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleMediaRestoreRollsBackFenceAfterFullRevocationPurge() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let accountId = "stale-restore-account"
+        let revokedDialogId = "stale-restore-group"
+        let sharedDialogId = "stale-restore-direct"
+        let staleMedia = CloudMedia(
+            id: "stale-restore-orphan",
+            kind: "file",
+            contentType: "application/octet-stream",
+            fileName: "orphan.bin",
+            byteSize: 3,
+            durationMs: nil,
+            width: nil,
+            height: nil,
+            hasThumbnail: true
+        )
+        let sharedMedia = CloudMedia(
+            id: "stale-restore-shared",
+            kind: "file",
+            contentType: "application/octet-stream",
+            fileName: "shared.bin",
+            byteSize: 3,
+            durationMs: nil,
+            width: nil,
+            height: nil,
+            hasThumbnail: true
+        )
+        try await store.upsertDialog(
+            dialogId: revokedDialogId, type: "group", title: "Revoked Group"
+        )
+        try await store.upsertDialog(
+            dialogId: sharedDialogId, type: "direct", title: "Shared Chat"
+        )
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: revokedDialogId,
+            dialogType: "group",
+            media: staleMedia,
+            pts: 1,
+            msgId: 1
+        )
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: revokedDialogId,
+            dialogType: "group",
+            media: sharedMedia,
+            pts: 2,
+            msgId: 2
+        )
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: sharedDialogId,
+            dialogType: "direct",
+            media: sharedMedia,
+            pts: 3,
+            msgId: 1
+        )
+
+        let cacheRoot = URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+            .appending(path: "stale-restore-cache", directoryHint: .isDirectory)
+        let cache = try EncryptedMediaCache(
+            root: cacheRoot,
+            keyData: Data(repeating: 0x7d, count: 32),
+            limitBytes: 1_000_000
+        )
+        for mediaId in [staleMedia.id, sharedMedia.id] {
+            try await cache.storeDownloadChunk(Data([1, 2, 3]), mediaId: mediaId, offset: 0)
+            try await cache.storeThumbnail(Data([4]), mediaId: mediaId)
+            try await cache.storeRepresentation(
+                Data([5]), mediaId: mediaId, variant: .bubble720
+            )
+        }
+        let engine = CloudMediaTransferEngine(cache: cache)
+        let model = CloudAppModel(
+            config: CloudConfig(
+                baseURL: try XCTUnwrap(URL(string: "https://stale-restore.invalid"))
+            ),
+            localStore: store,
+            useDefaultLocalStore: false,
+            mediaEngine: engine,
+            capabilityDefaults: UserDefaults(suiteName: UUID().uuidString)!
+        )
+        model.testInstallAuthenticatedSession(StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId,
+                deviceId: "stale-restore-device",
+                token: "stale-restore-token"
+            ),
+            phone: "+992900000205",
+            displayName: "Stale Restore"
+        ))
+
+        let restoreGate = SavedMessagesAsyncGate()
+        model.testSetMediaAccessRestoreAuthorizationGate {
+            await restoreGate.wait()
+        }
+        let staleRestore = Task { @MainActor in
+            await model.testRestoreMediaAccessIfAuthorized(
+                mediaId: staleMedia.id,
+                dialogId: revokedDialogId
+            )
+        }
+        await restoreGate.waitUntilBlocked()
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 4),
+                updates: [CloudUpdate(
+                    pts: 4,
+                    ptsCount: 1,
+                    type: "dialog.access_revoked",
+                    dialogId: revokedDialogId,
+                    dialogTitle: nil,
+                    dialogType: "group",
+                    message: nil,
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let purgeResult = try await AccessPurgeCoordinator().drain(
+            scope: AccessPurgeScope(
+                accountId: accountId,
+                token: "stale-restore-token",
+                generation: 1,
+                store: store
+            ),
+            store: store,
+            mediaEngine: engine,
+            isCurrent: { true },
+            invalidatePresentation: { job in
+                await model.testInvalidatePresentationForAccessPurge(job)
+            }
+        )
+        XCTAssertEqual(purgeResult.finalized, 1)
+        let remainingPurgeCount = try await store.pendingAccessPurgeCount()
+        XCTAssertEqual(remainingPurgeCount, 0)
+
+        await restoreGate.open()
+        let staleResult = await staleRestore.value
+        XCTAssertNil(staleResult)
+        model.testSetMediaAccessRestoreAuthorizationGate(nil)
+
+        do {
+            try await cache.storeDownloadChunk(
+                Data([6]), mediaId: staleMedia.id, offset: 0
+            )
+            XCTFail("late chunk write must remain fenced")
+        } catch MediaCacheError.accessRevoked {
+            // Expected.
+        }
+        do {
+            try await cache.storeThumbnail(Data([7]), mediaId: staleMedia.id)
+            XCTFail("late thumbnail write must remain fenced")
+        } catch MediaCacheError.accessRevoked {
+            // Expected.
+        }
+        do {
+            try await cache.storeRepresentation(
+                Data([8]), mediaId: staleMedia.id, variant: .bubble720
+            )
+            XCTFail("late representation write must remain fenced")
+        } catch MediaCacheError.accessRevoked {
+            // Expected.
+        }
+        let stalePaths = [
+            cacheRoot.appending(
+                path: "downloads/\(staleMedia.id)", directoryHint: .isDirectory
+            ),
+            cacheRoot.appending(path: "thumbnails/\(staleMedia.id).tojthumb"),
+            cacheRoot.appending(
+                path: "representations/\(staleMedia.id)", directoryHint: .isDirectory
+            ),
+        ]
+        for path in stalePaths {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: path.path),
+                "stale restore recreated \(path.lastPathComponent)"
+            )
+        }
+
+        let sharedAuthorization = try await store.mediaPresentationAuthorization(
+            mediaId: sharedMedia.id,
+            dialogId: sharedDialogId
+        )
+        XCTAssertNotNil(sharedAuthorization)
+        try await cache.storeDownloadChunk(Data([9, 9, 9]), mediaId: sharedMedia.id, offset: 0)
+        try await cache.storeThumbnail(Data([9]), mediaId: sharedMedia.id)
+        try await cache.storeRepresentation(
+            Data([9]), mediaId: sharedMedia.id, variant: .bubble720
+        )
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 5),
+                updates: [CloudUpdate(
+                    pts: 5,
+                    ptsCount: 1,
+                    type: "dialog.created",
+                    dialogId: revokedDialogId,
+                    dialogTitle: "Regranted Group",
+                    dialogType: "group",
+                    message: nil,
+                    group: CloudUpdateGroup(
+                        id: revokedDialogId,
+                        title: "Regranted Group",
+                        revision: 2,
+                        memberCount: 2
+                    ),
+                    readerAccountId: nil,
+                    maxReadMsgId: nil
+                )],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        try await Self.applyCanonicalMedia(
+            store: store,
+            accountId: accountId,
+            dialogId: revokedDialogId,
+            dialogType: "group",
+            media: staleMedia,
+            pts: 6,
+            msgId: 3
+        )
+        let regrantedAuthorization = await model.testRestoreMediaAccessIfAuthorized(
+            mediaId: staleMedia.id,
+            dialogId: revokedDialogId
+        )
+        XCTAssertNotNil(regrantedAuthorization)
+        try await cache.storeDownloadChunk(Data([10, 10, 10]), mediaId: staleMedia.id, offset: 0)
+        try await cache.storeThumbnail(Data([10]), mediaId: staleMedia.id)
+        try await cache.storeRepresentation(
+            Data([10]), mediaId: staleMedia.id, variant: .bubble720
+        )
+    }
+
+    @MainActor
     func testRevokingChatADoesNotCancelChatBUploadTask() async throws {
         let model = CloudAppModel(
             config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://task-scope.invalid"))),
