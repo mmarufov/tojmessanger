@@ -15,6 +15,9 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
         app = XCUIApplication()
+        if name.contains("testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking") {
+            app.launchEnvironment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] = "1"
+        }
         launch(reset: true)
     }
 
@@ -148,9 +151,6 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
     }
 
     func testAcknowledgedSingleAttachmentCreatesOptimisticMessageBeforeNetworking() {
-        app.terminate()
-        app.launchEnvironment["TOJ_UI_FIXTURE_SINGLE_DRAFT"] = "1"
-        launch(reset: true)
         openChat(Fixture.primaryDialog)
         XCTAssertTrue(element("draft-attachment-ui-draft-0").exists)
         XCTAssertFalse(element("draft-attachment-ui-draft-1").exists)
