@@ -108,7 +108,46 @@ PY
 expect_failure "digest change without version bump" \
   bash -c "cd '$WORK/nobump' && ./scripts/verify-search-tables.sh HEAD~1"
 
-# 5. The same change *with* a bump must pass, or the gate is useless noise.
+# 5. A downgrade must fail. Equality was the only rejected case before, so 3 -> 2 sailed through
+#    while leaving installs on an index built under rules the code no longer applies.
+setup_repo "$WORK/downgrade"
+(
+  cd "$WORK/downgrade"
+  python3 - <<'JSON_EOF'
+import json
+p = "Toj/Core/Search/search-tokenizer-manifest.json"
+d = json.load(open(p))
+d["digests"]["behavior"] = "changed"
+d["normalizerVersion"] = 2                # base is 3
+json.dump(d, open(p, "w"), indent=2)
+JSON_EOF
+  git commit -qam "downgrade version alongside a token-affecting change"
+)
+expect_failure "version downgrade 3 -> 2" \
+  bash -c "cd '$WORK/downgrade' && ./scripts/verify-search-tables.sh HEAD~1"
+
+# 6. A non-integer version cannot be ordered, so it must be rejected rather than compared as a
+#    string — "10" < "9" lexically, and a float or word would silently satisfy any inequality test.
+for bad in '"3.1"' '"three"' 'null'; do
+  slug="$(printf '%s' "$bad" | tr -cd '[:alnum:]')"
+  setup_repo "$WORK/nonnumeric$slug"
+  (
+    cd "$WORK/nonnumeric$slug"
+    python3 - "$bad" <<'JSON_EOF'
+import json, sys
+p = "Toj/Core/Search/search-tokenizer-manifest.json"
+d = json.load(open(p))
+d["digests"]["behavior"] = "changed"
+d["normalizerVersion"] = json.loads(sys.argv[1])
+json.dump(d, open(p, "w"), indent=2)
+JSON_EOF
+    git commit -qam "non-integer version"
+  )
+  expect_failure "non-integer version $bad" \
+    bash -c "cd '$WORK/nonnumeric$slug' && ./scripts/verify-search-tables.sh HEAD~1"
+done
+
+# 7. The same change *with* a forward bump must pass, or the gate is useless noise.
 setup_repo "$WORK/bumped"
 (
   cd "$WORK/bumped"
@@ -123,7 +162,7 @@ PY
   git commit -qam "change digest and bump version"
 )
 if (cd "$WORK/bumped" && ./scripts/verify-search-tables.sh HEAD~1 > /dev/null 2>&1); then
-  echo "  ok  digest change with version bump passes"
+  echo "  ok  digest change with version bump 3 -> 4 passes"
 else
   echo "FAIL: a properly bumped change was rejected" >&2
   (cd "$WORK/bumped" && ./scripts/verify-search-tables.sh HEAD~1 2>&1 | sed 's/^/      /') >&2

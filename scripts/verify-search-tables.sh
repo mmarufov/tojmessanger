@@ -110,12 +110,7 @@ head_digests="$(digests_of "")"
 base_version="$(version_of "$merge_base")"
 head_version="$(version_of "")"
 
-if [[ "$base_digests" == "ABSENT" ]]; then
-  echo "  --  manifest is new at this base; nothing to compare"
-elif [[ "$base_digests" == "$head_digests" ]]; then
-  echo "  ok  no token-affecting change since $(git rev-parse --short "$merge_base")"
-elif [[ "$base_version" == "$head_version" ]]; then
-  echo "FAIL: token-affecting inputs changed but normalizerVersion is still $head_version." >&2
+report_digest_changes() {
   python3 - "$base_digests" "$head_digests" >&2 <<'PY'
 import json, sys
 base, head = json.loads(sys.argv[1]), json.loads(sys.argv[2])
@@ -123,10 +118,41 @@ for key in sorted(set(base) | set(head)):
     if base.get(key) != head.get(key):
         print(f"        {key}: {str(base.get(key))[:16]} -> {str(head.get(key))[:16]}", file=sys.stderr)
 PY
-  echo "      Bump normalizerVersion in $MANIFEST and SearchTextNormalizer.version," >&2
-  echo "      regenerate the manifest, and update pinnedTableDigest in the tests." >&2
-  exit 1
+}
+
+if [[ "$base_digests" == "ABSENT" ]]; then
+  echo "  --  manifest is new at this base; nothing to compare"
+elif [[ "$base_digests" == "$head_digests" ]]; then
+  echo "  ok  no token-affecting change since $(git rev-parse --short "$merge_base")"
 else
+  # Digests moved, so the version must move forward with them. Requiring a strict increase rather
+  # than mere inequality closes two holes an equality check leaves open: a downgrade, and reusing a
+  # version that already shipped. Either leaves installs holding an index built under different
+  # rules while believing they are current — the exact failure this gate exists to prevent, and a
+  # silent one, because the number looks deliberate.
+  if [[ ! "$base_version" =~ ^[0-9]+$ ]] || [[ ! "$head_version" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: normalizerVersion must be an integer on both sides to be comparable." >&2
+    echo "      base='$base_version' head='$head_version'" >&2
+    report_digest_changes
+    echo "      Set an integer normalizerVersion in $MANIFEST greater than the base, then" >&2
+    echo "      regenerate with scripts/generate-search-manifest.py." >&2
+    exit 1
+  fi
+
+  if (( head_version <= base_version )); then
+    if (( head_version == base_version )); then
+      echo "FAIL: token-affecting inputs changed but normalizerVersion is still $head_version." >&2
+    else
+      echo "FAIL: normalizerVersion went backwards, $base_version -> $head_version, while" >&2
+      echo "      token-affecting inputs changed." >&2
+    fi
+    report_digest_changes
+    echo "      Bump normalizerVersion in $MANIFEST above $base_version, keep" >&2
+    echo "      SearchTextNormalizer.version in step, then regenerate with" >&2
+    echo "      scripts/generate-search-manifest.py." >&2
+    exit 1
+  fi
+
   echo "  ok  token-affecting change with normalizerVersion $base_version -> $head_version"
 fi
 
