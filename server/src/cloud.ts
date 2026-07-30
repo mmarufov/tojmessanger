@@ -43,6 +43,7 @@ import {
 } from "./sync";
 import { DraftError, getDraft, putDraft } from "./drafts";
 import {
+  dialogPreferenceBacklogMetrics,
   OperationalMetrics,
   logRequest,
   readiness,
@@ -105,6 +106,12 @@ import {
   updateGroupProfile,
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
+import {
+  dialogPreferencesCapabilityEnabled,
+  DialogPreferenceError,
+  updateDialogPreferences,
+} from "./dialog-preferences";
+import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -133,6 +140,7 @@ function cloudCapabilities(
   groups: boolean,
   cloudDrafts: boolean,
   mediaGroups: boolean,
+  dialogPreferences: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -140,6 +148,7 @@ function cloudCapabilities(
   if (groups) capabilities.push("groups_v1");
   if (cloudDrafts) capabilities.push("cloud_drafts_v1");
   if (mediaGroups) capabilities.push("media_groups_v1");
+  if (dialogPreferences) capabilities.push("dialog_preferences_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -264,6 +273,7 @@ export function startCloudServer(
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
+  const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db, undefined, metrics);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -293,10 +303,11 @@ export function startCloudServer(
         if (url.pathname === "/health") response = new Response("ok");
 
         else if (url.pathname === "/ready") {
-          response = json(await readiness(db, {
+          const state = await readiness(db, {
             sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
             push: pushSender ? "configured" : "disabled",
-          }));
+          });
+          response = json(state, state.status === "ready" ? 200 : 503);
         }
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
@@ -310,6 +321,7 @@ export function startCloudServer(
             groupsAvailable,
             cloudDraftsAvailable,
             mediaGroupsAvailable,
+            dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
           ));
         }
 
@@ -317,7 +329,10 @@ export function startCloudServer(
           const metricsToken = process.env.TOJ_METRICS_TOKEN;
           if (!metricsToken) response = new Response("not found", { status: 404 });
           else if (bearer(req) !== metricsToken) response = new Response("unauthorized", { status: 401 });
-          else response = new Response(metrics.render(), { headers: { "content-type": "text/plain; version=0.0.4" } });
+          else response = new Response(
+            metrics.render() + await dialogPreferenceBacklogMetrics(db),
+            { headers: { "content-type": "text/plain; version=0.0.4" } },
+          );
         }
 
         else if (url.pathname === "/v1/ws") {
@@ -354,6 +369,19 @@ export function startCloudServer(
           // Hard-close the complete route family during dark deploys. Advertisement alone is not
           // sufficient because stale or modified clients could otherwise create live group events.
           response = new Response("not found", { status: 404 });
+        }
+
+        else if (
+          /^\/v1\/dialogs\/[0-9a-f-]+\/preferences$/i.test(url.pathname)
+          && (
+            !dialogPreferencesConfigured
+            || !await dialogPreferenceBehaviorAvailable(db)
+          )
+        ) {
+          response = json({
+            error: "dialog preferences capability unavailable",
+            code: "capability_unavailable",
+          }, 404);
         }
 
         else {
@@ -423,6 +451,9 @@ export function startCloudServer(
           const groupLeaveMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/leave$/i);
           const groupNotificationsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/notifications$/i);
           const groupMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)$/i);
+          const dialogPreferencesMatch = url.pathname.match(
+            /^\/v1\/dialogs\/([0-9a-f-]+)\/preferences$/i,
+          );
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
           const result = await createGroup(db, {
@@ -528,13 +559,34 @@ export function startCloudServer(
         }
 
         if (groupNotificationsMatch && req.method === "PUT") {
+          const dialogPreferencesAvailable = dialogPreferencesConfigured
+            && await dialogPreferenceBehaviorAvailable(db);
           const result = await updateGroupNotifications(db, {
             actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
             dialogId: groupNotificationsMatch[1],
             mode: body.mode,
             clientMutationId: body.clientMutationId,
+            usePreferenceService: dialogPreferencesAvailable,
           });
-          response = json(result);
+          pushHints(sockets, result.pushes);
+          response = json(result.envelope);
+        }
+
+        if (dialogPreferencesMatch && req.method === "PUT") {
+          const result = await updateDialogPreferences(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            dialogId: dialogPreferencesMatch[1],
+            clientMutationId: body.clientMutationId,
+            patch: body,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({
+            preferences: result.preferences,
+            pts: result.pts,
+            duplicate: result.duplicate,
+          });
         }
 
         if (url.pathname === "/v1/devices/push" && req.method === "POST") {
@@ -936,6 +988,7 @@ export function startCloudServer(
           : err instanceof MediaError ? err.status
           : err instanceof CallError ? err.status
           : err instanceof GroupError ? err.status
+          : err instanceof DialogPreferenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof DraftError ? err.status
           : err instanceof SyncError ? err.status
@@ -955,12 +1008,16 @@ export function startCloudServer(
         if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof GroupError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof DraftError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof DialogPreferenceError && err.retryAfter) {
+          headers["retry-after"] = String(err.retryAfter);
+        }
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
           ...(err instanceof DraftError ? { code: err.code } : {}),
           ...(err instanceof SyncError ? { code: err.code, ...err.details } : {}),

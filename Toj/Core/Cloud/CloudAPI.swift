@@ -219,6 +219,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let profileUpdatedAt: String?
     let peerAccountId: String?
     let sharedDialogIds: [String]?
+    let preferences: CloudDialogPreferences?
+    let clientMutationId: String?
+    let changedFields: [String]?
 
     init(
         pts: Int64,
@@ -243,7 +246,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         colorIndex: Int? = nil,
         profileUpdatedAt: String? = nil,
         peerAccountId: String? = nil,
-        sharedDialogIds: [String]? = nil
+        sharedDialogIds: [String]? = nil,
+        preferences: CloudDialogPreferences? = nil,
+        clientMutationId: String? = nil,
+        changedFields: [String]? = nil
     ) {
         self.pts = pts
         self.ptsCount = ptsCount
@@ -268,6 +274,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.profileUpdatedAt = profileUpdatedAt
         self.peerAccountId = peerAccountId
         self.sharedDialogIds = sharedDialogIds
+        self.preferences = preferences
+        self.clientMutationId = clientMutationId
+        self.changedFields = changedFields
     }
 
     enum CodingKeys: String, CodingKey {
@@ -294,6 +303,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case profileUpdatedAt = "updated_at"
         case peerAccountId = "peer_account_id"
         case sharedDialogIds = "shared_dialog_ids"
+        case preferences
+        case clientMutationId = "client_mutation_id"
+        case changedFields = "changed_fields"
     }
 }
 
@@ -368,6 +380,15 @@ nonisolated struct CloudUpdateGroup: Codable, Equatable, Sendable {
     let memberCount: Int
 }
 
+nonisolated struct CloudDialogPreferences: Codable, Equatable, Sendable {
+    let dialogId: String
+    let pinned: Bool
+    let pinnedAt: String?
+    let muted: Bool
+    let archived: Bool
+    let updatedAt: String
+}
+
 nonisolated struct CloudGroup: Codable, Equatable, Sendable {
     let id: String
     let title: String
@@ -419,6 +440,12 @@ private struct ProfileUpdateRequest: Codable, Sendable {
 nonisolated struct DirectDialogResponse: Codable, Sendable {
     let dialogId: String
     let created: Bool
+}
+
+nonisolated struct DialogPreferencesResponse: Codable, Sendable {
+    let preferences: CloudDialogPreferences
+    let pts: Int64
+    let duplicate: Bool
 }
 
 nonisolated struct SendMessageResponse: Codable, Sendable {
@@ -563,6 +590,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
     let memberCount: Int?
     let selfRole: String?
     let notificationMode: String?
+    let preferences: CloudDialogPreferences?
     let photo: CloudMedia?
     let draft: CloudDraft?
     let members: [BootstrapDialogMember]
@@ -580,6 +608,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         memberCount: Int? = nil,
         selfRole: String? = nil,
         notificationMode: String? = nil,
+        preferences: CloudDialogPreferences? = nil,
         photo: CloudMedia? = nil,
         draft: CloudDraft? = nil,
         members: [BootstrapDialogMember],
@@ -596,6 +625,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         self.memberCount = memberCount
         self.selfRole = selfRole
         self.notificationMode = notificationMode
+        self.preferences = preferences
         self.photo = photo
         self.draft = draft
         self.members = members
@@ -614,6 +644,7 @@ nonisolated struct BootstrapDialog: Codable, Equatable, Sendable {
         case memberCount = "member_count"
         case selfRole = "self_role"
         case notificationMode = "notification_mode"
+        case preferences
         case photo
         case draft
         case members
@@ -961,6 +992,26 @@ struct CloudAPI: Sendable {
         try await put(
             "v1/groups/\(id)/notifications",
             body: GroupNotificationsRequest(mode: mode, clientMutationId: clientMutationId),
+            token: token
+        )
+    }
+
+    func updateDialogPreferences(
+        dialogId: String,
+        clientMutationId: String,
+        pinned: Bool? = nil,
+        muted: Bool? = nil,
+        archived: Bool? = nil,
+        token: String
+    ) async throws -> DialogPreferencesResponse {
+        try await put(
+            "v1/dialogs/\(dialogId)/preferences",
+            body: DialogPreferencesRequest(
+                clientMutationId: clientMutationId,
+                pinned: pinned,
+                muted: muted,
+                archived: archived
+            ),
             token: token
         )
     }
@@ -1538,6 +1589,13 @@ private struct LeaveGroupRequest: Encodable {
 private struct GroupNotificationsRequest: Encodable {
     let mode: String
     let clientMutationId: String
+}
+
+private struct DialogPreferencesRequest: Encodable {
+    let clientMutationId: String
+    let pinned: Bool?
+    let muted: Bool?
+    let archived: Bool?
 }
 
 private struct BootstrapDialogsRequest: Encodable {

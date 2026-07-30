@@ -390,7 +390,8 @@ CREATE TABLE IF NOT EXISTS account_events (
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
                        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-                        'dialog.created','member.added','member.removed','profile.updated')),
+                        'dialog.created','member.added','member.removed','member.role_changed','member.left',
+                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -404,8 +405,8 @@ DO $$ BEGIN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v2 CHECK (type IN
       ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
        'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
-       'draft.updated')) NOT VALID;
+       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
+       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
   END IF;
 END $$;
 DO $$ BEGIN

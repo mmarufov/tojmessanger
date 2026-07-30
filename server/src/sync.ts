@@ -63,6 +63,7 @@ export type Push = SyncPush;
 export type SyncWakeup = Push;
 const ACCOUNT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export { notifySyncWakeups };
 const n = (v: unknown) => Number(v as any);
 const buf = (v: unknown) => Buffer.from(v as Uint8Array);
 const iso = (v: unknown) => v instanceof Date ? v.toISOString() : String(v);
@@ -272,7 +273,28 @@ export async function getOrCreateDirectDialog(
     await tx`INSERT INTO dialog_members (dialog_id, account_id, role) VALUES (${dialogId}, ${low}, 'member'), (${dialogId}, ${high}, 'member')`;
     for (const acc of [low, high]) { // already ascending
       const upd = await tx`UPDATE account_sync_states SET pts = pts + 1, updated_at = now() WHERE account_id = ${acc} RETURNING pts`;
-      await tx`INSERT INTO account_events (account_id, pts, type, dialog_id, actor_account_id) VALUES (${acc}, ${n(upd[0].pts)}, 'dialog.created', ${dialogId}, ${aId})`;
+      await tx`
+        INSERT INTO account_events (
+          account_id, pts, type, dialog_id, actor_account_id, data
+        )
+        SELECT ${acc}, ${n(upd[0].pts)}, 'dialog.created', ${dialogId}, ${aId},
+               jsonb_build_object(
+                 'preferences',
+                 jsonb_build_object(
+                   'dialogId', ${dialogId}::uuid,
+                   'pinned', COALESCE(preference.is_pinned, FALSE),
+                   'pinnedAt', preference.pinned_at,
+                   'muted', COALESCE(preference.is_muted, member.notification_mode = 'muted'),
+                   'archived', COALESCE(preference.is_archived, FALSE),
+                   'updatedAt', COALESCE(preference.updated_at, member.joined_at)
+                 )
+               )
+        FROM dialog_members member
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = member.dialog_id
+         AND preference.account_id = member.account_id
+        WHERE member.dialog_id = ${dialogId}
+          AND member.account_id = ${acc}`;
     }
     return { dialogId, created: true };
   });
@@ -510,6 +532,7 @@ export async function sendMessage(sql: SQL, p: {
       msgId,
       actorAccountId: p.senderAccountId,
       sourceDeviceId: p.senderDeviceId,
+      unarchiveOnIncomingMessage: true,
     });
     let senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
     const consumed = await consumeDraftInTransaction(tx, {
@@ -1436,6 +1459,7 @@ export async function getDifference(
           dialog_type: ev.dialog_type,
           dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
           msg_id: n(ev.msg_id),
+          ...eventData(ev.data),
         };
       } else {
         update = {
@@ -1443,6 +1467,7 @@ export async function getDifference(
           dialog_type: ev.dialog_type,
           dialog_title: ev.dialog_title ?? undefined, peer_account_id: ev.peer_account_id ?? undefined,
           message,
+          ...eventData(ev.data),
         };
       }
     } else if (ev.type === "draft.updated" && opts.cloudDraftsEnabled === false) {
@@ -1504,25 +1529,50 @@ export type BootstrapStart = { token: string; state: { pts: number }; expiresAt:
  */
 export async function startBootstrap(sql: SQL, accountId: string): Promise<BootstrapStart> {
   return await sql.begin(async (tx) => {
-    const state = (await tx`SELECT pts FROM account_sync_states WHERE account_id = ${accountId}`)[0];
-    if (!state) throw new SyncError("unknown account");
-
+    // The cursor and every captured dialog/preference value must come from one PostgreSQL statement
+    // snapshot. Separate SELECT/INSERT statements under READ COMMITTED could otherwise pair an old
+    // pts with a preference that committed a moment later.
     const snap = (await tx`
-      INSERT INTO bootstrap_snapshots (account_id, snapshot_pts)
-      VALUES (${accountId}, ${n(state.pts)})
-      RETURNING id, expires_at`)[0];
-
-    await tx`
-      INSERT INTO bootstrap_snapshot_dialogs (snapshot_id, dialog_id, ceiling_msg_id, sort_updated_at)
-      SELECT ${snap.id}, d.id, d.last_msg_id, d.updated_at
-      FROM dialog_members dm
-      JOIN dialogs d ON d.id = dm.dialog_id
-      WHERE dm.account_id = ${accountId} AND dm.left_at IS NULL
-      ORDER BY d.updated_at DESC, d.id DESC`;
-
-    const count = (await tx`
-      SELECT count(*)::int AS count FROM bootstrap_snapshot_dialogs WHERE snapshot_id = ${snap.id}`)[0];
-    return { token: snap.id, state: { pts: n(state.pts) }, expiresAt: iso(snap.expires_at), dialogCount: n(count.count) };
+      WITH captured_state AS MATERIALIZED (
+        SELECT pts
+        FROM account_sync_states
+        WHERE account_id = ${accountId}
+      ), created AS (
+        INSERT INTO bootstrap_snapshots (account_id, snapshot_pts)
+        SELECT ${accountId}, pts FROM captured_state
+        RETURNING id, snapshot_pts, expires_at
+      ), captured_dialogs AS (
+        INSERT INTO bootstrap_snapshot_dialogs (
+          snapshot_id, dialog_id, ceiling_msg_id, sort_updated_at,
+          preferences_captured, preference_is_pinned, preference_pinned_at,
+          preference_is_muted, preference_is_archived, preference_updated_at
+        )
+        SELECT
+          created.id, d.id, d.last_msg_id, d.updated_at,
+          TRUE,
+          COALESCE(preference.is_pinned, FALSE),
+          preference.pinned_at,
+          COALESCE(preference.is_muted, dm.notification_mode = 'muted'),
+          COALESCE(preference.is_archived, FALSE),
+          COALESCE(preference.updated_at, d.updated_at)
+        FROM created
+        JOIN dialog_members dm ON dm.account_id = ${accountId} AND dm.left_at IS NULL
+        JOIN dialogs d ON d.id = dm.dialog_id
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
+        ORDER BY d.updated_at DESC, d.id DESC
+        RETURNING snapshot_id
+      )
+      SELECT created.id, created.snapshot_pts, created.expires_at,
+             (SELECT count(*)::int FROM captured_dialogs) AS dialog_count
+      FROM created`)[0];
+    if (!snap) throw new SyncError("unknown account");
+    return {
+      token: snap.id,
+      state: { pts: n(snap.snapshot_pts) },
+      expiresAt: iso(snap.expires_at),
+      dialogCount: n(snap.dialog_count),
+    };
   });
 }
 
@@ -1531,6 +1581,10 @@ export type BootstrapDialog = {
   updated_at: string; unread_count: number; revision: number; member_count: number;
   self_role: string; notification_mode: string; photo: MediaDTO | null;
   draft: DraftDTO | null;
+  preferences: {
+    dialogId: string; pinned: boolean; pinnedAt: string | null;
+    muted: boolean; archived: boolean; updatedAt: string;
+  };
   members: {
     account_id: string; role: string; last_read_msg_id: number;
     joined_at: string; is_active: boolean;
@@ -1573,12 +1627,30 @@ export async function getBootstrapDialogsPage(
                CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_pinned ELSE COALESCE(preference.is_pinned, FALSE)
+               END AS preference_is_pinned,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_pinned_at ELSE preference.pinned_at
+               END AS preference_pinned_at,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_muted
+                 ELSE COALESCE(preference.is_muted, self.notification_mode = 'muted')
+               END AS preference_is_muted,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_archived ELSE COALESCE(preference.is_archived, FALSE)
+               END AS preference_is_archived,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_updated_at ELSE COALESCE(preference.updated_at, d.updated_at)
+               END AS preference_updated_at,
                (SELECT count(*)::int FROM dialog_members active
                 WHERE active.dialog_id = d.id AND active.left_at IS NULL) AS member_count
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = d.id AND preference.account_id = ${accountId}
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high
@@ -1594,12 +1666,30 @@ export async function getBootstrapDialogsPage(
                CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_pinned ELSE COALESCE(preference.is_pinned, FALSE)
+               END AS preference_is_pinned,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_pinned_at ELSE preference.pinned_at
+               END AS preference_pinned_at,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_muted
+                 ELSE COALESCE(preference.is_muted, self.notification_mode = 'muted')
+               END AS preference_is_muted,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_is_archived ELSE COALESCE(preference.is_archived, FALSE)
+               END AS preference_is_archived,
+               CASE WHEN bsd.preferences_captured
+                 THEN bsd.preference_updated_at ELSE COALESCE(preference.updated_at, d.updated_at)
+               END AS preference_updated_at,
                (SELECT count(*)::int FROM dialog_members active
                 WHERE active.dialog_id = d.id AND active.left_at IS NULL) AS member_count
         FROM bootstrap_snapshot_dialogs bsd
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = d.id AND preference.account_id = ${accountId}
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
         LEFT JOIN accounts peer ON peer.id = CASE
           WHEN pair.account_low = ${accountId} THEN pair.account_high
@@ -1674,7 +1764,15 @@ export async function getBootstrapDialogsPage(
       revision: n(row.revision),
       member_count: n(row.member_count),
       self_role: row.self_role,
-      notification_mode: row.notification_mode,
+      notification_mode: row.preference_is_muted ? "muted" : "all",
+      preferences: {
+        dialogId: row.dialog_id,
+        pinned: Boolean(row.preference_is_pinned),
+        pinnedAt: row.preference_pinned_at == null ? null : iso(row.preference_pinned_at),
+        muted: Boolean(row.preference_is_muted),
+        archived: Boolean(row.preference_is_archived),
+        updatedAt: iso(row.preference_updated_at),
+      },
       photo: await loadMediaDTO(sql, row.photo_media_id),
       draft: pageDrafts.get(String(row.dialog_id)) ?? null,
       members: members.map((m) => ({
