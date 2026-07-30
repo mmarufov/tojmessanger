@@ -431,6 +431,7 @@ final class CloudAppModel {
     private var demoLinesByDialog: [String: [Line]] = [:]
     private var temporaryPreviewAuthorizationGate: (@Sendable (URL) async -> Void)?
     private var mediaAccessRestoreAuthorizationGate: (@Sendable () async -> Void)?
+    private var mediaAccessPostRestoreValidationGate: (@Sendable () async -> Void)?
     #endif
 
     let callCoordinator: CallCoordinator
@@ -2945,6 +2946,9 @@ final class CloudAppModel {
         } catch {
             return nil
         }
+        #if DEBUG
+        await mediaAccessPostRestoreValidationGate?()
+        #endif
         if !sessionTeardownActive,
            (try? await localStore.validatesMediaPresentationAuthorization(
             authorization
@@ -3472,6 +3476,12 @@ final class CloudAppModel {
         _ gate: (@Sendable () async -> Void)?
     ) {
         mediaAccessRestoreAuthorizationGate = gate
+    }
+
+    func testSetMediaAccessPostRestoreValidationGate(
+        _ gate: (@Sendable () async -> Void)?
+    ) {
+        mediaAccessPostRestoreValidationGate = gate
     }
 
     func testRestoreMediaAccessIfAuthorized(

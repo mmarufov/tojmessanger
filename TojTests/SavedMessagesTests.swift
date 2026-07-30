@@ -921,8 +921,12 @@ final class SavedMessagesTests: XCTestCase {
         ))
 
         let restoreGate = SavedMessagesAsyncGate()
+        let postRestoreGate = SavedMessagesAsyncGate()
         model.testSetMediaAccessRestoreAuthorizationGate {
             await restoreGate.wait()
+        }
+        model.testSetMediaAccessPostRestoreValidationGate {
+            await postRestoreGate.wait()
         }
         let staleRestore = Task { @MainActor in
             await model.testRestoreMediaAccessIfAuthorized(
@@ -970,9 +974,31 @@ final class SavedMessagesTests: XCTestCase {
         XCTAssertEqual(remainingPurgeCount, 0)
 
         await restoreGate.open()
+        await postRestoreGate.waitUntilBlocked()
+        let lateChunk = Data([6, 6, 6])
+        let lateThumbnail = Data([7])
+        let lateRepresentation = Data([8])
+        try await cache.storeDownloadChunk(lateChunk, mediaId: staleMedia.id, offset: 0)
+        try await cache.storeThumbnail(lateThumbnail, mediaId: staleMedia.id)
+        try await cache.storeRepresentation(
+            lateRepresentation, mediaId: staleMedia.id, variant: .bubble720
+        )
+        let storedLateChunk = try await cache.cachedByteRange(
+            mediaId: staleMedia.id, offset: 0, length: Int64(lateChunk.count)
+        )
+        let storedLateThumbnail = try await cache.thumbnail(mediaId: staleMedia.id)
+        let storedLateRepresentation = try await cache.representation(
+            mediaId: staleMedia.id, variant: .bubble720
+        )
+        XCTAssertEqual(storedLateChunk, lateChunk)
+        XCTAssertEqual(storedLateThumbnail, lateThumbnail)
+        XCTAssertEqual(storedLateRepresentation, lateRepresentation)
+
+        await postRestoreGate.open()
         let staleResult = await staleRestore.value
         XCTAssertNil(staleResult)
         model.testSetMediaAccessRestoreAuthorizationGate(nil)
+        model.testSetMediaAccessPostRestoreValidationGate(nil)
 
         do {
             try await cache.storeDownloadChunk(
@@ -1067,6 +1093,83 @@ final class SavedMessagesTests: XCTestCase {
         try await cache.storeRepresentation(
             Data([10]), mediaId: staleMedia.id, variant: .bubble720
         )
+    }
+
+    @MainActor
+    func testOldSessionRestoreLeaseCannotRollbackReplacementCache() async throws {
+        let fixture = try makeStoreFixture()
+        let cacheRoot = URL(fileURLWithPath: fixture.path).deletingLastPathComponent()
+        let oldRoot = cacheRoot.appending(path: "lease-old-cache", directoryHint: .isDirectory)
+        let newRoot = cacheRoot.appending(path: "lease-new-cache", directoryHint: .isDirectory)
+        let oldCache = try EncryptedMediaCache(
+            root: oldRoot,
+            keyData: Data(repeating: 0x7e, count: 32),
+            limitBytes: 1_000_000
+        )
+        let newCache = try EncryptedMediaCache(
+            root: newRoot,
+            keyData: Data(repeating: 0x7f, count: 32),
+            limitBytes: 1_000_000
+        )
+        let engine = CloudMediaTransferEngine(cache: oldCache)
+        let mediaId = "replacement-cache-generation-collision"
+
+        let oldLease = try await engine.restoreAuthorizedAccess(mediaId: mediaId)
+        let rollbackGate = SavedMessagesAsyncGate()
+        let oldRollback = Task {
+            await rollbackGate.wait()
+            return try await engine.rollbackUnauthorizedAccess(oldLease)
+        }
+        await rollbackGate.waitUntilBlocked()
+
+        await engine.destroyLocalStateForLogout()
+        await engine.testInstallReplacementCache(newCache)
+        let newLease = try await engine.restoreAuthorizedAccess(mediaId: mediaId)
+        XCTAssertEqual(
+            oldLease.generation,
+            newLease.generation,
+            "the regression must exercise a colliding numeric generation"
+        )
+
+        let newChunk = Data([11, 12, 13])
+        let newThumbnail = Data([14])
+        let newRepresentation = Data([15])
+        try await newCache.storeDownloadChunk(newChunk, mediaId: mediaId, offset: 0)
+        try await newCache.storeThumbnail(newThumbnail, mediaId: mediaId)
+        try await newCache.storeRepresentation(
+            newRepresentation, mediaId: mediaId, variant: .bubble720
+        )
+
+        let presentation = MediaPresentationCache.shared
+        presentation.resetForSession()
+        presentation.restore(mediaIds: [mediaId])
+        let presentationKey = MediaPresentationKey(mediaId: mediaId, variant: .bubble720)
+        let presented = await presentation.image(for: presentationKey) {
+            SafeDecodedImage(image: UIImage(), pixelWidth: 1, pixelHeight: 1)
+        }
+        XCTAssertNotNil(presented)
+        XCTAssertTrue(presentation.contains(presentationKey))
+
+        await rollbackGate.open()
+        let oldRollbackResult = try await oldRollback.value
+        XCTAssertFalse(oldRollbackResult)
+        let retainedChunk = try await newCache.cachedByteRange(
+            mediaId: mediaId, offset: 0, length: Int64(newChunk.count)
+        )
+        let retainedThumbnail = try await newCache.thumbnail(mediaId: mediaId)
+        let retainedRepresentation = try await newCache.representation(
+            mediaId: mediaId, variant: .bubble720
+        )
+        XCTAssertEqual(retainedChunk, newChunk)
+        XCTAssertEqual(retainedThumbnail, newThumbnail)
+        XCTAssertEqual(retainedRepresentation, newRepresentation)
+        XCTAssertTrue(presentation.contains(presentationKey))
+        let retainedPresentation = await presentation.image(for: presentationKey) {
+            XCTFail("replacement cache presentation should remain warm")
+            return nil
+        }
+        XCTAssertNotNil(retainedPresentation)
+        presentation.resetForSession()
     }
 
     @MainActor

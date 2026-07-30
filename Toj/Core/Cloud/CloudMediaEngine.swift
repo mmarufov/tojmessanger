@@ -629,6 +629,13 @@ nonisolated enum MediaDownloadComponent: String, Codable, Sendable {
 nonisolated struct MediaAccessRestoreLease: Equatable, Sendable {
     let mediaId: String
     let generation: UInt64
+    fileprivate let cache: EncryptedMediaCache
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.mediaId == rhs.mediaId
+            && lhs.generation == rhs.generation
+            && lhs.cache === rhs.cache
+    }
 }
 
 /// Token-free and Codable so the local replica can persist queue items without ever persisting an
@@ -1414,14 +1421,20 @@ actor EncryptedMediaCache {
     func restoreAuthorizedMedia(mediaId: String) -> MediaAccessRestoreLease {
         let generation = advanceMediaAccessGeneration(mediaId: mediaId)
         revokedMediaIds.remove(mediaId)
-        return MediaAccessRestoreLease(mediaId: mediaId, generation: generation)
+        return MediaAccessRestoreLease(
+            mediaId: mediaId,
+            generation: generation,
+            cache: self
+        )
     }
 
     /// Reinstalls the fence only if no later purge or authorized restore superseded this lease.
     /// Deleting again closes the brief unfenced window for late chunk/thumbnail/representation
     /// writers before the caller learned that its SQLCipher authorization was stale.
     func rollbackUnauthorizedMedia(_ lease: MediaAccessRestoreLease) throws -> Bool {
-        guard mediaAccessGenerations[lease.mediaId] == lease.generation else {
+        guard lease.cache === self,
+              mediaAccessGenerations[lease.mediaId] == lease.generation
+        else {
             return false
         }
         _ = advanceMediaAccessGeneration(mediaId: lease.mediaId)
@@ -3031,9 +3044,17 @@ actor CloudMediaTransferEngine {
     }
 
     func rollbackUnauthorizedAccess(_ lease: MediaAccessRestoreLease) async throws -> Bool {
-        let cache = try resolvedCache()
+        // Never lazily create or address a replacement session cache for an old lease.
+        guard let cache, cache === lease.cache else { return false }
         return try await cache.rollbackUnauthorizedMedia(lease)
     }
+
+    #if DEBUG
+    func testInstallReplacementCache(_ replacement: EncryptedMediaCache) {
+        precondition(cache == nil, "replacement cache requires completed teardown")
+        cache = replacement
+    }
+    #endif
 
     func cacheUsageBytes() async -> Int64 {
         guard let cache else { return 0 }
