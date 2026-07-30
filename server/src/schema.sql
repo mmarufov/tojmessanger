@@ -357,7 +357,8 @@ CREATE TABLE IF NOT EXISTS account_events (
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
                        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-                        'dialog.created','member.added','member.removed','profile.updated')),
+                        'dialog.created','member.added','member.removed','member.role_changed','member.left',
+                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -365,12 +366,6 @@ CREATE TABLE IF NOT EXISTS account_events (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, pts)                            -- serves get_difference: WHERE account_id=? AND pts>? ORDER BY pts
 );
-ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
-ALTER TABLE account_events ADD CONSTRAINT account_events_type_check CHECK (type IN
-  ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-   'dialog.created','member.added','member.removed','member.role_changed','member.left',
-   'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated'));
-
 -- ============ idempotency (B2): claimed BEFORE any msg_id is allocated ============
 CREATE TABLE IF NOT EXISTS send_requests (
   sender_account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

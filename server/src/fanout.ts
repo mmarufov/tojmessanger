@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
 
 export type FanoutPush = { accountId: string; pts: number; ptsCount: number };
 
@@ -11,6 +12,8 @@ type FanoutOptions = {
   data?: Record<string, unknown>;
   alertRecipients?: boolean;
   recipientAccountIds?: string[];
+  unarchiveOnIncomingMessage?: boolean;
+  useDialogPreferences?: boolean;
 };
 
 const n = (value: unknown) => Number(value as any);
@@ -20,19 +23,49 @@ const n = (value: unknown) => Number(value as any);
  * account_sync_states are acquired in account UUID order before the set-based update.
  */
 export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promise<FanoutPush[]> {
+  const useDialogPreferences = options.useDialogPreferences
+    ?? await dialogPreferenceBehaviorAvailable(sql);
+  const unarchived = options.unarchiveOnIncomingMessage && useDialogPreferences
+    ? await sql`
+        UPDATE dialog_preferences
+        SET is_archived = FALSE, updated_at = statement_timestamp()
+        WHERE dialog_id = ${options.dialogId}
+          AND account_id <> ${options.actorAccountId}
+          AND is_archived = TRUE
+          AND is_muted = FALSE
+          AND EXISTS (
+            SELECT 1
+            FROM dialog_members active_member
+            WHERE active_member.dialog_id = dialog_preferences.dialog_id
+              AND active_member.account_id = dialog_preferences.account_id
+              AND active_member.left_at IS NULL
+          )
+        RETURNING account_id`
+    : [];
+  const unarchivedAccountIds = unarchived.map((row: any) => String(row.account_id));
   const selected = options.recipientAccountIds
     ? await sql`
         SELECT dm.account_id,
-               (dm.notification_mode <> 'muted') AS alert
+               CASE WHEN ${useDialogPreferences}
+                 THEN COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted')
+                 ELSE dm.notification_mode <> 'muted'
+               END AS alert
         FROM dialog_members dm
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
         WHERE dm.dialog_id = ${options.dialogId}
           AND dm.left_at IS NULL
           AND dm.account_id = ANY(${sql.array(options.recipientAccountIds, "uuid")}::uuid[])
         ORDER BY dm.account_id`
     : await sql`
         SELECT dm.account_id,
-               (dm.notification_mode <> 'muted') AS alert
+               CASE WHEN ${useDialogPreferences}
+                 THEN COALESCE(NOT preference.is_muted, dm.notification_mode <> 'muted')
+                 ELSE dm.notification_mode <> 'muted'
+               END AS alert
         FROM dialog_members dm
+        LEFT JOIN dialog_preferences preference
+          ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
         WHERE dm.dialog_id = ${options.dialogId} AND dm.left_at IS NULL
         ORDER BY dm.account_id`;
   if (selected.length === 0) return [];
@@ -55,11 +88,47 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     INSERT INTO account_events (
       account_id, pts, type, dialog_id, msg_id, actor_account_id, data
     )
-    SELECT account_id, pts, ${options.type}, ${options.dialogId},
+    SELECT bumped.account_id, bumped.pts, ${options.type}, ${options.dialogId},
            ${options.msgId ?? null}, ${options.actorAccountId},
-           ${JSON.stringify(options.data ?? {})}::jsonb
+           ${JSON.stringify(options.data ?? {})}::text::jsonb ||
+           CASE
+             WHEN ${options.type === "dialog.created"} THEN jsonb_build_object(
+               'preferences',
+               jsonb_build_object(
+                 'dialogId', ${options.dialogId}::uuid,
+                 'pinned', COALESCE(preference.is_pinned, FALSE),
+                 'pinnedAt', preference.pinned_at,
+                 'muted', COALESCE(
+                   preference.is_muted,
+                   member.notification_mode = 'muted'
+                 ),
+                 'archived', COALESCE(preference.is_archived, FALSE),
+                 'updatedAt', COALESCE(preference.updated_at, member.joined_at)
+               )
+             )
+             WHEN bumped.account_id = ANY(
+               ${sql.array(unarchivedAccountIds, "uuid")}::uuid[]
+             ) THEN jsonb_build_object(
+               'preferences',
+               jsonb_build_object(
+                 'dialogId', ${options.dialogId}::uuid,
+                 'pinned', preference.is_pinned,
+                 'pinnedAt', preference.pinned_at,
+                 'muted', preference.is_muted,
+                 'archived', preference.is_archived,
+                 'updatedAt', preference.updated_at
+               )
+             )
+             ELSE '{}'::jsonb
+           END
     FROM bumped
-    ORDER BY account_id
+    LEFT JOIN dialog_preferences preference
+      ON preference.dialog_id = ${options.dialogId}
+     AND preference.account_id = bumped.account_id
+    LEFT JOIN dialog_members member
+      ON member.dialog_id = ${options.dialogId}
+     AND member.account_id = bumped.account_id
+    ORDER BY bumped.account_id
     RETURNING account_id, pts`;
 
   const eventByAccount = new Map(events.map((row: any) => [String(row.account_id), n(row.pts)]));

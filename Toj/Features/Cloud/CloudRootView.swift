@@ -513,12 +513,17 @@ private struct CloudChatsView: View {
     @State private var isSearchDrawerOpen = false
     @State private var searchScrollOffset = ChatSearchDrawerBehavior.height
     @State private var searchRevealWasArmed = true
+    @State private var showingArchivedChats = false
     @FocusState private var searchFocused: Bool
 
     private var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     private var filteredDialogs: [CloudAppModel.Dialog] {
         model.dialogs(matching: query, scope: searchScope)
+    }
+
+    private var archivedDialogs: [CloudAppModel.Dialog] {
+        model.dialogs.filter(\.isArchived)
     }
 
     var body: some View {
@@ -538,7 +543,11 @@ private struct CloudChatsView: View {
                                 .accessibilityLabel("Search filters")
                         }
 
-                        if filteredDialogs.isEmpty {
+                        if !isSearching, !archivedDialogs.isEmpty {
+                            archivedChatsEntry
+                        }
+
+                        if filteredDialogs.isEmpty, archivedDialogs.isEmpty || isSearching {
                             emptyState
                                 .padding(.top, 92)
                         } else {
@@ -549,18 +558,40 @@ private struct CloudChatsView: View {
                                         Button(dialog.isPinned ? "Unpin" : "Pin", systemImage: dialog.isPinned ? "pin.slash" : "pin") {
                                             model.togglePinned(dialog.id)
                                         }
+                                    }
+                                    if model.capabilities.contains(.chatOrganization)
+                                        || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
                                             model.toggleMuted(dialog.id)
                                         }
-                                        Button("Archive", systemImage: "archivebox") { model.archive(dialog.id) }
+                                    }
+                                    if model.capabilities.contains(.chatOrganization) {
+                                        Button(
+                                            dialog.isArchived ? "Unarchive" : "Archive",
+                                            systemImage: dialog.isArchived ? "tray.and.arrow.up" : "archivebox"
+                                        ) {
+                                            dialog.isArchived
+                                                ? model.unarchive(dialog.id)
+                                                : model.archive(dialog.id)
+                                        }
                                     }
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                                     if model.capabilities.contains(.chatOrganization) {
-                                        Button { model.archive(dialog.id) } label: {
-                                            Label("Archive", systemImage: "archivebox")
+                                        Button {
+                                            dialog.isArchived
+                                                ? model.unarchive(dialog.id)
+                                                : model.archive(dialog.id)
+                                        } label: {
+                                            Label(
+                                                dialog.isArchived ? "Unarchive" : "Archive",
+                                                systemImage: dialog.isArchived ? "tray.and.arrow.up" : "archivebox"
+                                            )
                                         }
                                         .tint(TojTheme.strong)
+                                    }
+                                    if model.capabilities.contains(.chatOrganization)
+                                        || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button { model.toggleMuted(dialog.id) } label: {
                                             Label(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash")
                                         }
@@ -666,6 +697,50 @@ private struct CloudChatsView: View {
             reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation,
             value: model.replicaSyncState
         )
+        .sheet(isPresented: $showingArchivedChats) {
+            NavigationStack {
+                ArchivedChatsView(model: model) { dialogId in
+                    onOpen?(dialogId)
+                    showingArchivedChats = false
+                }
+            }
+        }
+    }
+
+    private var archivedChatsEntry: some View {
+        Button {
+            showingArchivedChats = true
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "archivebox.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(TojTheme.gold)
+                    .frame(width: 44, height: 44)
+                    .background(TojTheme.raised, in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Archived Chats")
+                        .font(TojTheme.heading(.headline, weight: .semibold))
+                        .foregroundStyle(TojTheme.text)
+                    Text("\(archivedDialogs.count) archived chats")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(TojTheme.secondaryText)
+            }
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(TojTheme.hairline)
+                    .frame(height: 0.5)
+                    .padding(.leading, 56)
+            }
+        }
+        .buttonStyle(.tojPressable)
+        .accessibilityIdentifier("archived-chats-entry")
     }
 
     private var searchDrawer: some View {
@@ -746,17 +821,19 @@ private struct CloudChatsView: View {
                     CloudDialogRow(dialog: dialog)
                     Button {
                         withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
-                            model.archive(dialog.id)
+                            dialog.isArchived
+                                ? model.unarchive(dialog.id)
+                                : model.archive(dialog.id)
                         }
                     } label: {
-                        Image(systemName: "archivebox.fill")
+                        Image(systemName: dialog.isArchived ? "tray.and.arrow.up.fill" : "archivebox.fill")
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(TojTheme.gold)
                             .frame(width: 44, height: 44)
                             .background(TojTheme.raised, in: Circle())
                     }
                     .buttonStyle(.tojPressable)
-                    .accessibilityLabel("Archive")
+                    .accessibilityLabel(dialog.isArchived ? "Unarchive" : "Archive")
                 }
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             } else if let onOpen {
@@ -820,6 +897,101 @@ private struct ReplicaSyncBanner: View {
     }
 }
 
+private struct ArchivedChatsView: View {
+    @Bindable var model: CloudAppModel
+    let onOpen: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var dialogs: [CloudAppModel.Dialog] {
+        model.dialogs.filter(\.isArchived)
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                if dialogs.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "archivebox")
+                            .font(.system(size: 38, weight: .medium))
+                            .foregroundStyle(TojTheme.secondaryText)
+                        Text("No archived chats")
+                            .font(TojTheme.heading(.title3))
+                            .foregroundStyle(TojTheme.text)
+                        Text("Chats you archive will stay available here.")
+                            .font(.subheadline)
+                            .foregroundStyle(TojTheme.secondaryText)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 100)
+                } else {
+                    ForEach(dialogs) { dialog in
+                        Button {
+                            onOpen(dialog.id)
+                        } label: {
+                            CloudDialogRow(dialog: dialog)
+                        }
+                        .buttonStyle(.tojPressable)
+                        .contextMenu {
+                            preferenceActions(for: dialog)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            if model.capabilities.contains(.chatOrganization) {
+                                Button {
+                                    model.unarchive(dialog.id)
+                                } label: {
+                                    Label("Unarchive", systemImage: "tray.and.arrow.up")
+                                }
+                                .tint(TojTheme.strong)
+                                Button {
+                                    model.toggleMuted(dialog.id)
+                                } label: {
+                                    Label(
+                                        dialog.isMuted ? "Unmute" : "Mute",
+                                        systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash"
+                                    )
+                                }
+                                .tint(.gray)
+                            }
+                        }
+                        .accessibilityIdentifier("archived-chat-row-\(dialog.id)")
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 26)
+        }
+        .background(TojTheme.canvas)
+        .navigationTitle("Archived Chats")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Close") { dismiss() }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func preferenceActions(for dialog: CloudAppModel.Dialog) -> some View {
+        if model.capabilities.contains(.chatOrganization) {
+            Button("Unarchive", systemImage: "tray.and.arrow.up") {
+                model.unarchive(dialog.id)
+            }
+            Button(
+                dialog.isPinned ? "Unpin" : "Pin",
+                systemImage: dialog.isPinned ? "pin.slash" : "pin"
+            ) {
+                model.togglePinned(dialog.id)
+            }
+            Button(
+                dialog.isMuted ? "Unmute" : "Mute",
+                systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash"
+            ) {
+                model.toggleMuted(dialog.id)
+            }
+        }
+    }
+}
+
 private struct CloudDialogRow: View {
     let dialog: CloudAppModel.Dialog
 
@@ -847,6 +1019,12 @@ private struct CloudDialogRow: View {
                         Image(systemName: "speaker.slash.fill")
                             .font(.caption2)
                             .foregroundStyle(TojTheme.secondaryText)
+                    }
+                    if dialog.isArchived {
+                        Image(systemName: "archivebox.fill")
+                            .font(.caption2)
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .accessibilityLabel("Archived")
                     }
                 }
 
@@ -1343,7 +1521,7 @@ private struct CloudSettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 if pendingLogoutItemCount > 0 {
-                    Text("Pending messages, edits, or uploads have not reached the cloud and will be permanently removed from this device.")
+                    Text("Pending messages, edits, chat settings, or uploads have not reached the cloud and will be permanently removed from this device.")
                 } else {
                     Text("Your encrypted local replica and downloaded media will be removed from this device.")
                 }

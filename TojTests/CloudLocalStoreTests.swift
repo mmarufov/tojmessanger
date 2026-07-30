@@ -30,6 +30,1065 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(response.capabilities, ["media_uploads", "voice_notes"])
     }
 
+    func testDialogPreferencesRequestIsAPatchAndDecodesCanonicalResponse() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        let dialogId = "11111111-1111-4111-8111-111111111111"
+        let mutationId = "22222222-2222-4222-8222-222222222222"
+        CloudAPIMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PUT")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/dialogs/\(dialogId)/preferences")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+            let body = try XCTUnwrap(CloudAPIMockURLProtocol.bodyData(from: request))
+            let json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: Any]
+            )
+            XCTAssertEqual(json["clientMutationId"] as? String, mutationId)
+            XCTAssertEqual(json["muted"] as? Bool, true)
+            XCTAssertNil(json["pinned"])
+            XCTAssertNil(json["archived"])
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"preferences":{"dialogId":"\(dialogId)","pinned":true,
+                "pinnedAt":"2026-07-25T10:00:00.000Z","muted":true,"archived":false,
+                "updatedAt":"2026-07-25T10:00:01.000Z"},"pts":17,"duplicate":false}
+                """.utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let response = try await api.updateDialogPreferences(
+            dialogId: dialogId,
+            clientMutationId: mutationId,
+            muted: true,
+            token: "token"
+        )
+        XCTAssertEqual(response.pts, 17)
+        XCTAssertTrue(response.preferences.pinned)
+        XCTAssertTrue(response.preferences.muted)
+        XCTAssertFalse(response.preferences.archived)
+    }
+
+    func testDialogPreferenceOutboxSurvivesReopenAndProtectsNewerIntentFromStaleEvent() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("dialog-preference-outbox-key".utf8)
+        let accountId = "account-preferences"
+        let dialogId = "dialog-preferences"
+
+        let firstMutation: PendingDialogPreferenceMutation
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            try await store.upsertDialog(
+                dialogId: dialogId,
+                title: "Preferences",
+                updatedAt: "2026-07-25T09:00:00.000Z"
+            )
+            let queued = try await store.queueDialogPreference(
+                accountId: accountId,
+                dialogId: dialogId,
+                field: .pinned,
+                desiredValue: true
+            )
+            firstMutation = try XCTUnwrap(queued)
+            let optimisticDialog = try await store.dialogs(accountId: accountId).first
+            XCTAssertTrue(try XCTUnwrap(optimisticDialog).isPinned)
+        }
+
+        let reopened = try CloudLocalStore(path: path, key: key)
+        let reopenedPending = try await reopened.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            reopenedPending.map(\.clientMutationId),
+            [firstMutation.clientMutationId]
+        )
+        let accepted = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: true,
+            pinnedAt: "2026-07-25T10:00:00.000Z",
+            muted: false,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        try await reopened.acknowledgeDialogPreference(
+            clientMutationId: firstMutation.clientMutationId,
+            pts: 7,
+            preferences: accepted,
+            accountId: accountId
+        )
+        let newerQueued = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned
+        )
+        let newerMutation = try XCTUnwrap(newerQueued)
+        XCTAssertFalse(newerMutation.desiredValue)
+
+        try await reopened.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 7),
+                updates: [
+                    CloudUpdate(
+                        pts: 7,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: accepted,
+                        clientMutationId: firstMutation.clientMutationId,
+                        changedFields: ["pinned"]
+                    )
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let afterStaleEvent = try await reopened.dialogs(accountId: accountId).first
+        XCTAssertFalse(try XCTUnwrap(afterStaleEvent).isPinned)
+        let pendingAfterStaleEvent = try await reopened.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertEqual(
+            pendingAfterStaleEvent.map(\.clientMutationId),
+            [newerMutation.clientMutationId]
+        )
+
+        let final = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: false,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:01.000Z"
+        )
+        try await reopened.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 8),
+                updates: [
+                    CloudUpdate(
+                        pts: 8,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: final,
+                        clientMutationId: newerMutation.clientMutationId,
+                        changedFields: ["pinned"]
+                    )
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let pendingAfterMatchingEvent = try await reopened.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(pendingAfterMatchingEvent.isEmpty)
+        let redundantUnpin = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: false
+        )
+        XCTAssertNil(redundantUnpin)
+
+        let archived = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: false,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        let archivedQueued = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
+        let archivedMutation = try XCTUnwrap(archivedQueued)
+        try await reopened.acknowledgeDialogPreference(
+            clientMutationId: archivedMutation.clientMutationId,
+            pts: 10,
+            preferences: archived,
+            accountId: accountId
+        )
+        try await reopened.beginBootstrap(
+            accountId: accountId,
+            token: "preferences-bootstrap-10",
+            snapshotPts: 10,
+            mode: .replacement
+        )
+        try await reopened.applyBootstrapPage(
+            BootstrapDialogsPage(
+                token: "preferences-bootstrap-10",
+                state: .init(pts: 10),
+                dialogs: [
+                    BootstrapDialog(
+                        dialogId: dialogId,
+                        type: "direct",
+                        title: "Preferences",
+                        lastMsgId: 0,
+                        updatedAt: archived.updatedAt,
+                        preferences: archived,
+                        members: [],
+                        messages: []
+                    )
+                ],
+                nextCursor: nil,
+                hasMore: false
+            )
+        )
+        try await reopened.finishBootstrap(accountId: accountId, pts: 10)
+        let redundantArchive = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
+        XCTAssertNil(
+            redundantArchive,
+            "A covering bootstrap cursor should clear its acknowledged mutation"
+        )
+
+        let unarchiveQueued = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: false
+        )
+        let unarchiveMutation = try XCTUnwrap(unarchiveQueued)
+        let unarchived = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: false,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:04.000Z"
+        )
+        try await reopened.acknowledgeDialogPreference(
+            clientMutationId: unarchiveMutation.clientMutationId,
+            pts: 12,
+            preferences: unarchived,
+            accountId: accountId
+        )
+        try await reopened.beginBootstrap(
+            accountId: accountId,
+            token: "preferences-bootstrap-11",
+            snapshotPts: 11,
+            mode: .replacement
+        )
+        try await reopened.applyBootstrapPage(
+            BootstrapDialogsPage(
+                token: "preferences-bootstrap-11",
+                state: .init(pts: 11),
+                dialogs: [
+                    BootstrapDialog(
+                        dialogId: dialogId,
+                        type: "direct",
+                        title: "Preferences",
+                        lastMsgId: 0,
+                        updatedAt: archived.updatedAt,
+                        preferences: archived,
+                        members: [],
+                        messages: []
+                    )
+                ],
+                nextCursor: nil,
+                hasMore: false
+            )
+        )
+        try await reopened.finishBootstrap(accountId: accountId, pts: 11)
+        let effectiveAfterOlderBootstrap = try await reopened.dialogs(
+            accountId: accountId
+        ).first
+        XCTAssertFalse(try XCTUnwrap(effectiveAfterOlderBootstrap).isArchived)
+        let retainedUnarchive = try await reopened.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: false
+        )
+        XCTAssertEqual(
+            retainedUnarchive?.clientMutationId,
+            unarchiveMutation.clientMutationId,
+            "A snapshot before acknowledged pts must preserve the newer optimistic intent"
+        )
+    }
+
+    func testRecentOptimisticPinsSortFirstAndArchiveDoesNotDiscardPin() async throws {
+        let store = try makeStore()
+        let accountId = "account-order"
+        try await store.upsertDialog(
+            dialogId: "dialog-a",
+            title: "A",
+            updatedAt: "2026-07-25T10:00:03.000Z"
+        )
+        try await store.upsertDialog(
+            dialogId: "dialog-b",
+            title: "B",
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        _ = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: "dialog-a",
+            field: .pinned,
+            desiredValue: true
+        )
+        try await Task.sleep(for: .milliseconds(2))
+        _ = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: "dialog-b",
+            field: .pinned,
+            desiredValue: true
+        )
+        _ = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: "dialog-b",
+            field: .archived,
+            desiredValue: true
+        )
+
+        let dialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertEqual(dialogs.map(\.dialogId), ["dialog-b", "dialog-a"])
+        XCTAssertEqual(dialogs.map(\.isPinned), [true, true])
+        XCTAssertTrue(try XCTUnwrap(
+            dialogs.first(where: { $0.dialogId == "dialog-b" })
+        ).isArchived)
+    }
+
+    func testDelayedPreferenceResponseCannotRegressANewerDifferenceSnapshot() async throws {
+        let store = try makeStore()
+        let accountId = "account-delayed-response"
+        let dialogId = "dialog-delayed-response"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Delayed response",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let mutation = try XCTUnwrap(queuedMutation)
+        let accepted = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: true,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:01.000Z"
+        )
+        let newer = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: true,
+            pinnedAt: "2026-07-25T10:00:02.000Z",
+            muted: true,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 12),
+                updates: [
+                    CloudUpdate(
+                        pts: 11,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: accepted,
+                        clientMutationId: mutation.clientMutationId,
+                        changedFields: ["muted"]
+                    ),
+                    CloudUpdate(
+                        pts: 12,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: newer,
+                        clientMutationId: UUID().uuidString.lowercased(),
+                        changedFields: ["pinned"]
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        // Simulate the pts=11 HTTP response arriving after both ordered events were committed.
+        try await store.acknowledgeDialogPreference(
+            clientMutationId: mutation.clientMutationId,
+            pts: 11,
+            preferences: accepted,
+            accountId: accountId
+        )
+        let storedDialog = try await store.dialogs(accountId: accountId).first
+        let dialog = try XCTUnwrap(storedDialog)
+        XCTAssertTrue(dialog.isPinned)
+        XCTAssertTrue(dialog.isMuted)
+        let pending = try await store.pendingDialogPreferencesReady(accountId: accountId)
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    func testBootstrapCursorCoversDelayedPreferenceAcknowledgementBeforeRemoteUpdate() async throws {
+        let store = try makeStore()
+        let accountId = "account-bootstrap-before-ack"
+        let dialogId = "dialog-bootstrap-before-ack"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Bootstrap ordering",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
+        let mutation = try XCTUnwrap(queuedMutation)
+        let accepted = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: false,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:01.000Z"
+        )
+
+        try await store.beginBootstrap(
+            accountId: accountId,
+            token: "bootstrap-before-ack",
+            snapshotPts: 20,
+            mode: .replacement
+        )
+        try await store.applyBootstrapPage(BootstrapDialogsPage(
+            token: "bootstrap-before-ack",
+            state: .init(pts: 20),
+            dialogs: [
+                BootstrapDialog(
+                    dialogId: dialogId,
+                    type: "direct",
+                    title: "Bootstrap ordering",
+                    lastMsgId: 0,
+                    updatedAt: accepted.updatedAt,
+                    preferences: accepted,
+                    members: [],
+                    messages: []
+                ),
+            ],
+            nextCursor: nil,
+            hasMore: false
+        ))
+        try await store.finishBootstrap(accountId: accountId, pts: 20)
+
+        try await store.acknowledgeDialogPreference(
+            clientMutationId: mutation.clientMutationId,
+            pts: 20,
+            preferences: accepted,
+            accountId: accountId
+        )
+        let pendingAfterAcknowledgement = try await store.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(
+            pendingAfterAcknowledgement.isEmpty,
+            "A delayed response covered by the current cursor must be removed immediately"
+        )
+
+        let remote = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: true,
+            pinnedAt: "2026-07-25T10:00:02.000Z",
+            muted: true,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 21),
+                updates: [
+                    CloudUpdate(
+                        pts: 21,
+                        ptsCount: 1,
+                        type: "dialog.preferences_updated",
+                        dialogId: dialogId,
+                        dialogTitle: nil,
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: remote,
+                        clientMutationId: UUID().uuidString.lowercased(),
+                        changedFields: ["pinned", "muted"]
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let storedDialog = try await store.dialogs(accountId: accountId).first
+        let dialog = try XCTUnwrap(storedDialog)
+        XCTAssertTrue(dialog.isPinned)
+        XCTAssertTrue(dialog.isMuted)
+        XCTAssertTrue(dialog.isArchived)
+        let currentPts = try await store.loadPts(accountId: accountId)
+        XCTAssertEqual(currentPts, 21)
+    }
+
+    func testIncomingMessagePreferencePayloadAppliesAutoUnarchiveWithTheMessageCursor() async throws {
+        let store = try makeStore()
+        let accountId = "account-auto-unarchive"
+        let dialogId = "dialog-auto-unarchive"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Auto unarchive",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        try await store.applyDialogPreferences(
+            CloudDialogPreferences(
+                dialogId: dialogId,
+                pinned: true,
+                pinnedAt: "2026-07-25T09:00:00.000Z",
+                muted: true,
+                archived: true,
+                updatedAt: "2026-07-25T10:00:00.000Z"
+            ),
+            accountId: accountId
+        )
+        let mutedMessage = CloudMessage(
+            dialogId: dialogId,
+            msgId: 1,
+            senderAccountId: "account-peer",
+            clientMsgId: UUID().uuidString.lowercased(),
+            kind: "text",
+            text: "silent",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-25T10:00:01.000Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 1),
+                updates: [
+                    CloudUpdate(
+                        pts: 1,
+                        ptsCount: 1,
+                        type: "message.new",
+                        dialogId: dialogId,
+                        dialogTitle: "Auto unarchive",
+                        message: mutedMessage,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let stillArchived = try await store.dialogs(accountId: accountId).first
+        XCTAssertTrue(try XCTUnwrap(stillArchived).isArchived)
+
+        let autoUnarchived = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: true,
+            pinnedAt: "2026-07-25T09:00:00.000Z",
+            muted: false,
+            archived: false,
+            updatedAt: "2026-07-25T10:00:02.000Z"
+        )
+        let alertingMessage = CloudMessage(
+            dialogId: dialogId,
+            msgId: 2,
+            senderAccountId: "account-peer",
+            clientMsgId: UUID().uuidString.lowercased(),
+            kind: "text",
+            text: "returns to chats",
+            editVersion: 0,
+            state: "visible",
+            serverTs: "2026-07-25T10:00:02.000Z"
+        )
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 2),
+                updates: [
+                    CloudUpdate(
+                        pts: 2,
+                        ptsCount: 1,
+                        type: "message.new",
+                        dialogId: dialogId,
+                        dialogTitle: "Auto unarchive",
+                        message: alertingMessage,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: autoUnarchived
+                    ),
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+        let returnedDialog = try await store.dialogs(accountId: accountId).first
+        let returned = try XCTUnwrap(returnedDialog)
+        XCTAssertFalse(returned.isArchived)
+        XCTAssertFalse(returned.isMuted)
+        XCTAssertTrue(returned.isPinned, "Auto-unarchive must preserve the independent pin field")
+        let pts = try await store.loadPts(accountId: accountId)
+        XCTAssertEqual(pts, 2)
+    }
+
+    func testDialogPreferenceCoordinatorRollsBackPermanentAccessErrorsAndRetainsAuthenticationFailures() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = DialogPreferencesCoordinator(api: api)
+        let store = try makeStore()
+        let accountId = "account-coordinator"
+        let dialogId = "dialog-coordinator"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Coordinator",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+
+        CloudAPIMockURLProtocol.handler = { request in
+            (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 403, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"error":"not a member","code":"forbidden"}"#.utf8)
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+        _ = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
+        let optimisticArchive = try await store.dialogs(accountId: accountId).first
+        XCTAssertTrue(try XCTUnwrap(optimisticArchive).isArchived)
+
+        let forbidden = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true
+        )
+        XCTAssertEqual(forbidden.permanentErrors, ["not a member"])
+        XCTAssertFalse(forbidden.authenticationRequired)
+        let rolledBackArchive = try await store.dialogs(accountId: accountId).first
+        XCTAssertFalse(try XCTUnwrap(rolledBackArchive).isArchived)
+
+        CloudAPIMockURLProtocol.handler = { request in
+            (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 404, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"error":"dialog not found","code":"group_not_found"}"#.utf8)
+            )
+        }
+        _ = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        let missingDialog = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true
+        )
+        XCTAssertEqual(missingDialog.permanentErrors, ["dialog not found"])
+        let dialogsAfterMissing = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(try XCTUnwrap(dialogsAfterMissing.first).isPinned)
+
+        CloudAPIMockURLProtocol.handler = { request in
+            (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 401, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"error":"session expired","code":"unauthorized"}"#.utf8)
+            )
+        }
+        _ = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let unauthorized = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "expired-session",
+            serverAdvertisesFeature: true
+        )
+        XCTAssertTrue(unauthorized.authenticationRequired)
+        XCTAssertTrue(unauthorized.permanentErrors.isEmpty)
+        let authenticationRetry = try await store.nextDialogPreferenceRetryDelay(
+            accountId: accountId
+        )
+        XCTAssertNotNil(authenticationRetry)
+        let retainedMute = try await store.dialogs(accountId: accountId).first
+        XCTAssertTrue(try XCTUnwrap(retainedMute).isMuted)
+    }
+
+    func testDialogPreferenceDrainStopsAfterFirstOfflineRateLimitOrAuthenticationFailure() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        for status in [0, 429, 401] {
+            let store = try makeStore()
+            let accountId = "account-stop-\(status)"
+            for index in 0..<200 {
+                let dialogId = "dialog-stop-\(status)-\(index)"
+                try await store.upsertDialog(
+                    dialogId: dialogId,
+                    title: "Queued \(index)",
+                    updatedAt: "2026-07-25T10:00:00.000Z"
+                )
+                _ = try await store.queueDialogPreference(
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    field: .pinned,
+                    desiredValue: true
+                )
+            }
+            let requests = LockedCounter()
+            CloudAPIMockURLProtocol.handler = { request in
+                requests.increment()
+                if status == 0 { throw URLError(.notConnectedToInternet) }
+                let headers = status == 429
+                    ? ["content-type": "application/json", "retry-after": "11"]
+                    : ["content-type": "application/json"]
+                return (
+                    try XCTUnwrap(HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: status,
+                        httpVersion: "HTTP/1.1",
+                        headerFields: headers
+                    )),
+                    Data(#"{"error":"paused"}"#.utf8)
+                )
+            }
+
+            let result = try await DialogPreferencesCoordinator(api: api).drain(
+                store: store,
+                accountId: accountId,
+                token: "token-\(status)",
+                serverAdvertisesFeature: true,
+                sessionGeneration: 7
+            )
+            XCTAssertEqual(requests.value, 1, "status \(status) must stop the whole drain")
+            let pendingCount = try await store.pendingDestructiveLogoutItemCount()
+            XCTAssertEqual(pendingCount, 200)
+            if status == 401 {
+                XCTAssertTrue(result.authenticationRequired)
+            } else {
+                XCTAssertNotNil(result.retryAfter)
+            }
+        }
+    }
+
+    func testCommittedUnknownOutcomeStaysDormantWhenCapabilityIsWithdrawn() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = DialogPreferencesCoordinator(api: api)
+        let store = try makeStore()
+        let accountId = "account-capability-withdrawn"
+        let dialogId = "dialog-capability-withdrawn"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Capability withdrawn",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let queued = try XCTUnwrap(queuedMutation)
+        let requests = LockedCounter()
+        CloudAPIMockURLProtocol.handler = { request in
+            requests.increment()
+            throw URLError(.networkConnectionLost)
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let lostResponse = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true,
+            sessionGeneration: 12
+        )
+        XCTAssertNotNil(lostResponse.retryAfter)
+        try await store.failDialogPreference(
+            accountId: accountId,
+            clientMutationId: queued.clientMutationId,
+            retryAfter: nil,
+            error: "Retry after capability refresh",
+            terminal: false
+        )
+        CloudAPIMockURLProtocol.handler = { request in
+            requests.increment()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(
+                    #"{"error":"dialog preferences capability unavailable","code":"capability_unavailable"}"#
+                        .utf8
+                )
+            )
+        }
+
+        let result = try await coordinator.drain(
+            store: store,
+            accountId: accountId,
+            token: "session-token",
+            serverAdvertisesFeature: true,
+            sessionGeneration: 12
+        )
+        XCTAssertEqual(requests.value, 2)
+        XCTAssertTrue(result.capabilityRefreshRequired)
+        let pendingCount = try await store.pendingDestructiveLogoutItemCount()
+        XCTAssertEqual(pendingCount, 1)
+
+        let moved = try await store.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 0)
+        let remainingPreferences = try await store.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(remainingPreferences.isEmpty, "Unknown-outcome requests stay dormant")
+        let fallback = try await store.pendingGroupMutationsReady()
+        XCTAssertTrue(fallback.isEmpty, "The mutation must not cross idempotency domains")
+        let reactivatedCount = try await store.reactivateDormantDialogPreferences(
+            accountId: accountId
+        )
+        XCTAssertEqual(reactivatedCount, 1)
+        let reactivated = try await store.pendingDialogPreferencesReady(accountId: accountId)
+        XCTAssertEqual(reactivated.map(\.clientMutationId), [queued.clientMutationId])
+    }
+
+    func testConvertedMuteIsCoalescedByANewerLegacyUnmute() async throws {
+        let store = try makeStore()
+        let accountId = "account-converted-order"
+        let dialogId = "dialog-converted-order"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Ordered fallback",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMute = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .muted,
+            desiredValue: true
+        )
+        let mute = try XCTUnwrap(queuedMute)
+        let moved = try await store.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 1)
+        let convertedMutations = try await store.pendingGroupMutationsReady()
+        let converted = try XCTUnwrap(convertedMutations.first)
+        XCTAssertEqual(converted.clientMutationId, mute.clientMutationId)
+        XCTAssertEqual(converted.payloadJSON, #"{"mode":"muted"}"#)
+
+        try await store.enqueueGroupMutation(
+            dialogId: dialogId,
+            operation: "notifications",
+            payloadJSON: #"{"mode":"all"}"#,
+            clientMutationId: "newer-unmute",
+            accountId: accountId
+        )
+        let ready = try await store.pendingGroupMutationsReady()
+        XCTAssertEqual(ready.map(\.clientMutationId), ["newer-unmute"])
+        XCTAssertEqual(ready.first?.payloadJSON, #"{"mode":"all"}"#)
+        XCTAssertGreaterThan(try XCTUnwrap(ready.first?.localOrder), converted.localOrder)
+        let dialogsAfterUnmute = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(try XCTUnwrap(dialogsAfterUnmute.first).isMuted)
+    }
+
+    func testTerminalLegacyNotificationFailureRestoresCanonicalMute() async throws {
+        let store = try makeStore()
+        let accountId = "account-legacy-rollback"
+        let dialogId = "dialog-legacy-rollback"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            type: "group",
+            title: "Rollback",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        try await store.savePts(1, accountId: accountId)
+        try await store.enqueueGroupMutation(
+            dialogId: dialogId,
+            operation: "notifications",
+            payloadJSON: #"{"mode":"muted"}"#,
+            clientMutationId: "terminal-legacy-mute",
+            accountId: accountId
+        )
+        let optimisticDialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertTrue(try XCTUnwrap(optimisticDialogs.first).isMuted)
+        try await store.markGroupMutationAttempted(
+            clientMutationId: "terminal-legacy-mute"
+        )
+        try await store.failGroupMutation(
+            clientMutationId: "terminal-legacy-mute",
+            retryAfter: nil,
+            error: "not a member",
+            terminal: true
+        )
+        let rolledBackDialogs = try await store.dialogs(accountId: accountId)
+        XCTAssertFalse(
+            try XCTUnwrap(rolledBackDialogs.first).isMuted,
+            "A terminal 4xx must remove the optimistic overlay"
+        )
+    }
+
+    func testPreferenceDrainCancellationWaitsForSuspendedRequestAndPreservesAccountIntent() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(
+                URL(string: "https://cloud.example.test/cloud")
+            )),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = DialogPreferencesCoordinator(api: api)
+        let store = try makeStore()
+        let accountId = "account-logout-suspended"
+        let dialogId = "dialog-logout-suspended"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Suspended logout",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+        let queuedMutation = try await coordinator.queue(
+            store: store,
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        let mutation = try XCTUnwrap(queuedMutation)
+        let gate = LockedGate()
+        CloudAPIMockURLProtocol.deferHandlerExecution = true
+        CloudAPIMockURLProtocol.handler = { request in
+            gate.signalStarted()
+            gate.waitForRelease()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"preferences":{"dialogId":"\(dialogId)","pinned":true,
+                "pinnedAt":"2026-07-25T10:00:00.000Z","muted":false,"archived":false,
+                "updatedAt":"2026-07-25T10:00:00.000Z"},"pts":5,"duplicate":false}
+                """.utf8)
+            )
+        }
+        defer {
+            gate.release()
+            CloudAPIMockURLProtocol.deferHandlerExecution = false
+            CloudAPIMockURLProtocol.handler = nil
+        }
+
+        let drain = Task {
+            try await coordinator.drain(
+                store: store,
+                accountId: accountId,
+                token: "old-session-token",
+                serverAdvertisesFeature: true,
+                sessionGeneration: 40
+            )
+        }
+        XCTAssertTrue(gate.waitUntilStarted())
+        drain.cancel()
+        let delayedRelease = Task {
+            try? await Task.sleep(for: .milliseconds(20))
+            gate.release()
+        }
+        await coordinator.cancelAndWait()
+        await delayedRelease.value
+        _ = try? await drain.value
+
+        let hasActiveDrain = await coordinator.hasActiveDrain
+        XCTAssertFalse(hasActiveDrain)
+        let retained = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .pinned,
+            desiredValue: true
+        )
+        XCTAssertEqual(retained?.clientMutationId, mutation.clientMutationId)
+        XCTAssertNil(retained?.acknowledgedPts)
+    }
+
     func testCloudFailureClassificationRetriesOnlyRecoverableFailures() {
         XCTAssertEqual(cloudFailureDisposition(URLError(.notConnectedToInternet)), .transient(retryAfter: nil))
         XCTAssertEqual(
@@ -674,6 +1733,53 @@ final class CloudLocalStoreTests: XCTestCase {
     }
 
     @MainActor
+    func testDialogCreatedAppliesRecipientPreferencesAtomically() async throws {
+        let store = try makeStore()
+        let accountId = "account-stranger-invite"
+        let dialogId = "dialog-stranger-invite"
+        let preferences = CloudDialogPreferences(
+            dialogId: dialogId,
+            pinned: false,
+            pinnedAt: nil,
+            muted: true,
+            archived: true,
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
+
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference",
+                state: .init(pts: 1),
+                updates: [
+                    CloudUpdate(
+                        pts: 1,
+                        ptsCount: 1,
+                        type: "dialog.created",
+                        dialogId: dialogId,
+                        dialogTitle: "Stranger invitation",
+                        dialogType: "group",
+                        message: nil,
+                        readerAccountId: nil,
+                        maxReadMsgId: nil,
+                        preferences: preferences
+                    )
+                ],
+                hasMore: false
+            ),
+            accountId: accountId
+        )
+
+        let dialogs = try await store.dialogs(accountId: accountId)
+        let dialog = try XCTUnwrap(dialogs.first)
+        XCTAssertEqual(dialog.dialogId, dialogId)
+        XCTAssertTrue(dialog.isMuted)
+        XCTAssertTrue(dialog.isArchived)
+        XCTAssertEqual(dialog.notificationMode, "muted")
+        let pts = try await store.loadPts(accountId: accountId)
+        XCTAssertEqual(pts, 1)
+    }
+
+    @MainActor
     func testBootstrapPageDoesNotAdvancePtsUntilFinished() async throws {
         let store = try makeStore()
         let accountId = "account-a"
@@ -1189,6 +2295,119 @@ final class CloudLocalStoreTests: XCTestCase {
         )
         let outbox = try await store.pendingOutboxReady()
         XCTAssertEqual(outbox.first?.replyToMsgId, 1)
+    }
+
+    func testDialogPreferenceMigrationSeedsLegacyMuteAndConvertsQueuedGroupMutation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "cloud.sqlite").path
+        let key = Data("legacy-dialog-preferences-key".utf8)
+        let accountId = "account-legacy-preferences"
+        let dialogId = "dialog-legacy-preferences"
+        let mutationId = "33333333-3333-4333-8333-333333333333"
+
+        do {
+            let latest = try CloudLocalStore(path: path, key: key)
+            try await latest.savePts(9, accountId: accountId)
+            try await latest.upsertDialog(
+                dialogId: dialogId,
+                type: "group",
+                title: "Legacy group",
+                updatedAt: "2026-07-25T08:00:00.000Z"
+            )
+            try await latest.enqueueGroupMutation(
+                dialogId: dialogId,
+                operation: "notifications",
+                payloadJSON: "{\"mode\":\"muted\"}",
+                clientMutationId: mutationId
+            )
+        }
+
+        var configuration = Configuration()
+        configuration.prepareDatabase { db in
+            try db.usePassphrase(key)
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        do {
+            let v9 = try DatabaseQueue(path: path, configuration: configuration)
+            try await v9.write { db in
+                try db.execute(sql: """
+                UPDATE dialogs
+                SET notification_mode = 'muted'
+                WHERE dialog_id = '\(dialogId)';
+                CREATE TABLE pending_group_mutations_v9 (
+                  client_mutation_id TEXT PRIMARY KEY,
+                  dialog_id TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  retry_count INTEGER NOT NULL DEFAULT 0,
+                  next_retry_at TEXT,
+                  last_error TEXT,
+                  terminal INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO pending_group_mutations_v9 (
+                  client_mutation_id, dialog_id, operation, payload_json,
+                  retry_count, next_retry_at, last_error, terminal, created_at
+                )
+                SELECT client_mutation_id, dialog_id, operation, payload_json,
+                       retry_count, next_retry_at, last_error, terminal, created_at
+                FROM pending_group_mutations;
+                DROP TABLE pending_group_mutations;
+                ALTER TABLE pending_group_mutations_v9 RENAME TO pending_group_mutations;
+                CREATE INDEX pending_group_mutations_ready_idx
+                  ON pending_group_mutations(terminal, next_retry_at, created_at);
+                DROP TABLE pending_dialog_preference_mutations;
+                DROP TABLE dialog_preferences;
+                DROP TABLE local_mutation_sequence;
+                DELETE FROM grdb_migrations
+                WHERE identifier IN (
+                  'v10-dialog-preferences',
+                  'v11-ordered-preference-outbox'
+                );
+                """)
+            }
+        }
+
+        let upgraded = try CloudLocalStore(path: path, key: key)
+        let migratedDialog = try await upgraded.dialogs(accountId: accountId).first
+        let dialog = try XCTUnwrap(migratedDialog)
+        XCTAssertTrue(dialog.isMuted)
+        XCTAssertEqual(dialog.notificationMode, "muted")
+        let converted = try await upgraded.pendingDialogPreferencesReady(accountId: accountId)
+        XCTAssertEqual(converted.map(\.clientMutationId), [mutationId])
+        XCTAssertEqual(converted.first?.field, .muted)
+        XCTAssertEqual(converted.first?.desiredValue, true)
+        let legacyGroupMutations = try await upgraded.pendingGroupMutationsReady()
+        XCTAssertTrue(legacyGroupMutations.isEmpty)
+        let destructiveLogoutCount = try await upgraded.pendingDestructiveLogoutItemCount()
+        XCTAssertEqual(destructiveLogoutCount, 1)
+
+        let moved = try await upgraded.movePendingGroupMutesToLegacy(accountId: accountId)
+        XCTAssertEqual(moved, 1)
+        let pendingPreferences = try await upgraded.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(
+            pendingPreferences.isEmpty,
+            "With the capability off, the preference lane must not remain immediately due"
+        )
+        let legacyFallback = try await upgraded.pendingGroupMutationsReady()
+        XCTAssertEqual(legacyFallback.map(\.clientMutationId), [mutationId])
+        XCTAssertEqual(legacyFallback.first?.operation, "notifications")
+        XCTAssertEqual(legacyFallback.first?.payloadJSON, #"{"mode":"muted"}"#)
+        let fallbackDialog = try await upgraded.dialogs(accountId: accountId).first
+        XCTAssertTrue(try XCTUnwrap(fallbackDialog).isMuted)
+
+        try await upgraded.clearAccount(accountId: accountId)
+        let dialogsAfterClear = try await upgraded.dialogs(accountId: accountId)
+        let preferencesAfterClear = try await upgraded.pendingDialogPreferencesReady(
+            accountId: accountId
+        )
+        XCTAssertTrue(dialogsAfterClear.isEmpty)
+        XCTAssertTrue(preferencesAfterClear.isEmpty)
     }
 
     func testMediaCacheEncryptsPendingFilesAndSurvivesCacheReset() async throws {
@@ -2568,9 +3787,15 @@ final class CloudLocalStoreTests: XCTestCase {
         )
     }
 
-    func testDestructiveLogoutCountIncludesTextMutationsAndMediaUploads() async throws {
+    func testDestructiveLogoutCountIncludesOfflineDialogPreferences() async throws {
         let store = try makeStore()
         let dialogId = "dialog-pending-logout"
+        let accountId = "account-me"
+        try await store.upsertDialog(
+            dialogId: dialogId,
+            title: "Pending logout",
+            updatedAt: "2026-07-25T10:00:00.000Z"
+        )
         _ = try await store.insertSending(
             dialogId: dialogId,
             clientMsgId: "pending-text",
@@ -2604,9 +3829,15 @@ final class CloudLocalStoreTests: XCTestCase {
             caption: "",
             replyToMsgId: nil
         )
+        _ = try await store.queueDialogPreference(
+            accountId: accountId,
+            dialogId: dialogId,
+            field: .archived,
+            desiredValue: true
+        )
 
         let destructiveLogoutCount = try await store.pendingDestructiveLogoutItemCount()
-        XCTAssertEqual(destructiveLogoutCount, 3)
+        XCTAssertEqual(destructiveLogoutCount, 4)
     }
 
     func testBootstrapAndDifferenceTooLongPreserveReplicaAndEveryDurableOutbox() async throws {
@@ -3290,6 +4521,9 @@ final class CloudLocalStoreTests: XCTestCase {
 
 private final class CloudAPIMockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    nonisolated(unsafe) static var deferHandlerExecution = false
+    private let stateLock = NSLock()
+    private var stopped = false
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -3311,9 +4545,24 @@ private final class CloudAPIMockURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
+        if Self.deferHandlerExecution {
+            let work = DispatchWorkItem { [weak self] in
+                self?.runHandler()
+            }
+            DispatchQueue.global(qos: .userInitiated).async(execute: work)
+            return
+        }
+        runHandler()
+    }
+
+    private func runHandler() {
         do {
             let handler = try XCTUnwrap(Self.handler)
             let (response, data) = try handler(request)
+            stateLock.lock()
+            let shouldDeliver = !stopped
+            stateLock.unlock()
+            guard shouldDeliver else { return }
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
@@ -3322,7 +4571,58 @@ private final class CloudAPIMockURLProtocol: URLProtocol {
         }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        stateLock.lock()
+        stopped = true
+        stateLock.unlock()
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+private final class LockedGate: @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didRelease = false
+
+    func signalStarted() {
+        started.signal()
+    }
+
+    func waitUntilStarted() -> Bool {
+        started.wait(timeout: .now() + 2) == .success
+    }
+
+    func waitForRelease() {
+        released.wait()
+    }
+
+    func release() {
+        lock.lock()
+        guard !didRelease else {
+            lock.unlock()
+            return
+        }
+        didRelease = true
+        lock.unlock()
+        released.signal()
+    }
 }
 
 private final class LockedMediaRequests: @unchecked Sendable {
