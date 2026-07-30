@@ -103,7 +103,7 @@ BEGIN
       AND conname = 'account_events_type_check'
       AND contype = 'c'
       AND convalidated
-      AND pg_get_expr(conbin, conrelid, TRUE) = $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text])$constraint$
+      AND pg_get_expr(conbin, conrelid, TRUE) = $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text])$constraint$
   ) THEN
     RETURN;
   END IF;
@@ -118,7 +118,7 @@ BEGIN
         ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
          'dialog.created','member.added','member.removed','member.role_changed','member.left',
          'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-         'dialog.preferences_updated','profile.updated'))
+         'dialog.preferences_updated','profile.updated','draft.updated'))
       NOT VALID;
   END IF;
 END;

@@ -1,17 +1,43 @@
 import type { SQL } from "bun";
 import { Client } from "pg";
-import { seal, open, bodyAAD } from "./crypto";
+import { timingSafeEqual } from "node:crypto";
+import { seal, open, bodyAAD, requestFingerprintHMAC } from "./crypto";
 import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
 import { requireActiveDevice } from "./auth";
-import { lockAccountMutations } from "./locks";
+import {
+  lockAccountMutations,
+  lockMutationKeys,
+  mediaGroupReceiptKey,
+} from "./locks";
 import { fanoutDialogEvent } from "./fanout";
+import {
+  consumeDraftInTransaction,
+  loadDrafts,
+  type DraftDTO,
+} from "./drafts";
 import {
   DialogAccessError,
   lockDialogForMutation,
   requireDialogReadAccess,
 } from "./dialog-access";
+import {
+  SYNC_NOTIFY_CHANNEL,
+  isSyncWakeupChannel,
+  notifySyncWakeups,
+  type SyncPush,
+} from "./sync-wakeup";
 
-export class SyncError extends Error {}
+export class SyncError extends Error {
+  constructor(
+    message: string,
+    readonly status = 400,
+    readonly code = "invalid_sync_request",
+    readonly details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = "SyncError";
+  }
+}
 
 // Global lock order for EVERY mutation (review B4), to stay deadlock-free:
 //   1 idempotency row (send_requests / message_mutation_requests / group_*_requests)
@@ -27,22 +53,17 @@ export type MessageDTO = {
   forwarded: boolean; reactions: { account_id: string; emoji: string }[];
   mentions: { account_id: string; offset: number; length: number }[];
   media: MediaDTO | null;
+  media_group_id: string | null;
+  media_group_index: number | null;
+  media_group_count: number | null;
   service_type: string | null; service_data: Record<string, unknown> | null;
   state: string; server_ts: string;
 };
-export type Push = { accountId: string; pts: number; ptsCount: number };
+export type Push = SyncPush;
 export type SyncWakeup = Push;
-
-const SYNC_NOTIFY_CHANNEL = "toj_sync_events";
 const ACCOUNT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function notifySyncWakeups(sql: SQL, pushes: Push[]): Promise<void> {
-  for (const push of pushes) {
-    const payload = JSON.stringify(push);
-    await sql`SELECT pg_notify(${SYNC_NOTIFY_CHANNEL}, ${payload})`;
-  }
-}
-
+export { notifySyncWakeups };
 const n = (v: unknown) => Number(v as any);
 const buf = (v: unknown) => Buffer.from(v as Uint8Array);
 const iso = (v: unknown) => v instanceof Date ? v.toISOString() : String(v);
@@ -103,6 +124,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
            m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
            m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
            m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
+           m.media_group_id, m.media_group_index, m.media_group_count,
            media.id AS media_object_id, media.kind AS media_object_kind,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
            media.file_name_key_id AS media_file_name_key_id,
@@ -193,6 +215,9 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       reactions: reactions.get(key) ?? [],
       mentions: mentions.get(key) ?? [],
       media: row.state === "deleted_for_all" ? null : media,
+      media_group_id: row.media_group_id ?? null,
+      media_group_index: row.media_group_index == null ? null : n(row.media_group_index),
+      media_group_count: row.media_group_count == null ? null : n(row.media_group_count),
       service_type: row.service_type ?? null,
       service_data: row.service_data == null ? null : eventData(row.service_data),
       state: row.state, server_ts: iso(row.server_ts),
@@ -202,6 +227,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
 }
 
 const MAX_TEXT_BYTES = 16 * 1024;
+const MAX_MEDIA_GROUP_ITEMS_PER_MINUTE = 600;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function requireTextBody(body: unknown): string {
@@ -276,6 +302,7 @@ export async function getOrCreateDirectDialog(
 
 export type SendResult = {
   dialogId: string; clientMsgId: string; msgId: number; senderPts: number;
+  clearedDraftRevision: number | null;
   duplicate: boolean; serverTs?: string; text?: string; senderAccountId?: string; pushes: Push[];
 };
 
@@ -314,10 +341,21 @@ export async function sendMessage(sql: SQL, p: {
   mediaId?: string | null;
   forwardedFrom?: { dialogId: string; msgId: number } | null;
   mentions?: unknown;
+  draftConsumeOperationId?: string | null;
+  allowDraftConsumption?: boolean;
   /** Server-only escape hatch for generated lifecycle rows such as call history. */
   internalService?: boolean;
 }): Promise<SendResult> {
+  if (p.draftConsumeOperationId != null && p.allowDraftConsumption === false) {
+    throw new SyncError("cloud drafts are unavailable", 404, "capability_unavailable");
+  }
   return await sql.begin(async (tx) => {
+    const draftConsumeOperationId = p.draftConsumeOperationId == null
+      ? null
+      : String(p.draftConsumeOperationId).toLowerCase();
+    if (draftConsumeOperationId != null && !UUID_PATTERN.test(draftConsumeOperationId)) {
+      throw new SyncError("invalid draft consume operation id");
+    }
     let body = p.forwardedFrom || p.mediaId ? String(p.body ?? "") : requireTextBody(p.body);
     if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
     let kind = p.kind ?? "text";
@@ -327,16 +365,29 @@ export async function sendMessage(sql: SQL, p: {
     let mentions = normalizeMentions(p.mentions, body);
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
-      INSERT INTO send_requests (sender_account_id, client_msg_id, dialog_id, status)
-      VALUES (${p.senderAccountId}, ${p.clientMsgId}, ${p.dialogId}, 'pending')
+      INSERT INTO send_requests (
+        sender_account_id, client_msg_id, dialog_id, status, draft_consume_operation_id
+      )
+      VALUES (
+        ${p.senderAccountId}, ${p.clientMsgId}, ${p.dialogId}, 'pending',
+        ${draftConsumeOperationId}
+      )
       ON CONFLICT (sender_account_id, client_msg_id) DO NOTHING RETURNING status`;
     if (claim.length === 0) {
       const row = (await tx`
-        SELECT status, dialog_id, msg_id, sender_pts
+        SELECT status, dialog_id, msg_id, sender_pts, draft_consume_operation_id,
+               cleared_draft_revision
         FROM send_requests
         WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}
         FOR UPDATE`)[0];
       if (row.status !== "completed") throw new SyncError("send already in progress");
+      if ((row.draft_consume_operation_id ?? null) !== draftConsumeOperationId) {
+        throw new SyncError(
+          "client message id already used with a different draft",
+          409,
+          "send_idempotency_conflict",
+        );
+      }
       const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id));
       if (p.internalService === true && (
         row.dialog_id !== p.dialogId
@@ -348,7 +399,10 @@ export async function sendMessage(sql: SQL, p: {
       }
       return {
         dialogId: row.dialog_id, clientMsgId: p.clientMsgId, msgId: n(row.msg_id),
-        senderPts: n(row.sender_pts), duplicate: true, pushes: [],
+        senderPts: n(row.sender_pts),
+        clearedDraftRevision: row.cleared_draft_revision == null
+          ? null : n(row.cleared_draft_revision),
+        duplicate: true, pushes: [],
         serverTs: msg?.server_ts, text: msg?.text, senderAccountId: msg?.sender_account_id,
       };
     }
@@ -368,6 +422,8 @@ export async function sendMessage(sql: SQL, p: {
       FROM direct_dialog_pairs WHERE dialog_id = ${p.dialogId}`)[0];
     if (directPair) {
       await lockAccountMutations(tx, [directPair.account_low, directPair.account_high]);
+    } else {
+      await lockAccountMutations(tx, [p.senderAccountId]);
     }
     if (p.forwardedFrom) {
       if (mentions.length) throw new SyncError("forwarded messages cannot add mentions");
@@ -395,6 +451,7 @@ export async function sendMessage(sql: SQL, p: {
       if (media.status !== "ready") throw new SyncError("media upload is incomplete");
       if (media.purpose !== "message") throw new SyncError("media purpose does not allow messages");
       kind = media.kind;
+      await tx`UPDATE media_objects SET last_accessed_at = now() WHERE id = ${mediaId}`;
     } else if (!mediaId && !p.forwardedFrom && kind !== "text"
       && !(kind === "service" && p.internalService === true)) {
       throw new SyncError("media upload required");
@@ -415,8 +472,17 @@ export async function sendMessage(sql: SQL, p: {
       const target = await tx`
         SELECT state FROM messages
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${replyToMsgId}`;
-      if (target.length === 0) throw new SyncError("reply target not found");
-      if (target[0].state !== "visible") throw new SyncError("cannot reply to a deleted message");
+      if (target.length === 0) {
+        throw new SyncError("reply target not found", 409, "invalid_reply_target");
+      }
+      if (target[0].state !== "visible") {
+        throw new SyncError(
+          "original message is unavailable",
+          409,
+          "invalid_reply_target",
+          { reply_to_msg_id: replyToMsgId },
+        );
+      }
     }
     if (mentions.length) {
       const activeTargets = await tx`
@@ -468,10 +534,26 @@ export async function sendMessage(sql: SQL, p: {
       sourceDeviceId: p.senderDeviceId,
       unarchiveOnIncomingMessage: true,
     });
-    const senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
+    let senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
+    const consumed = await consumeDraftInTransaction(tx, {
+      accountId: p.senderAccountId,
+      deviceId: p.senderDeviceId,
+      dialogId: p.dialogId,
+      operationId: draftConsumeOperationId,
+    });
+    if (consumed) {
+      pushes.push(...consumed.pushes);
+      senderPts = consumed.revision;
+    }
 
     // complete the idempotency row so retries return this exact result
-    await tx`UPDATE send_requests SET status = 'completed', msg_id = ${msgId}, sender_pts = ${senderPts} WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}`;
+    await tx`
+      UPDATE send_requests SET
+        status = 'completed',
+        msg_id = ${msgId},
+        sender_pts = ${senderPts},
+        cleared_draft_revision = ${consumed?.revision ?? null}
+      WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}`;
     // A bounded PostgreSQL wake-up keeps connected clients on every server process current. The
     // account_events rows remain authoritative, so local immediate and cross-process hints may
     // safely be delivered more than once.
@@ -479,7 +561,461 @@ export async function sendMessage(sql: SQL, p: {
 
     return {
       dialogId: p.dialogId, clientMsgId: p.clientMsgId, msgId, senderPts, duplicate: false,
+      clearedDraftRevision: consumed?.revision ?? null,
       serverTs: iso(inserted[0].server_ts), text: body, senderAccountId: p.senderAccountId, pushes,
+    };
+  });
+}
+
+export type MediaGroupSendResult = {
+  dialogId: string;
+  clientGroupId: string;
+  messages: MessageDTO[];
+  senderPts: number;
+  clearedDraftRevision: number | null;
+  duplicate: boolean;
+  pushes: Push[];
+};
+
+type NormalizedGroupItem = {
+  mediaId: string;
+  clientMsgId: string;
+};
+
+function deterministicGroupClientMessageId(clientGroupId: string, index: number): string {
+  const bytes = Buffer.from(requestFingerprintHMAC(
+    "media-group-client-message-id",
+    `${clientGroupId}:${index}`,
+  ).subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function normalizeMediaGroupItems(value: unknown, clientGroupId: string): NormalizedGroupItem[] {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 10) {
+    throw new SyncError("media groups require 2 to 10 items");
+  }
+  const mediaIds = new Set<string>();
+  const clientMessageIds = new Set<string>();
+  return value.map((raw: any, index: number) => {
+    const mediaId = String(raw?.media_id ?? raw?.mediaId ?? "").toLowerCase();
+    if (!UUID_PATTERN.test(mediaId) || mediaIds.has(mediaId)) {
+      throw new SyncError("invalid or duplicate group media id");
+    }
+    mediaIds.add(mediaId);
+    const supplied = raw?.client_msg_id ?? raw?.clientMsgId;
+    const fingerprintClientMsgId = supplied == null ? null : String(supplied).toLowerCase();
+    if (fingerprintClientMsgId != null && !UUID_PATTERN.test(fingerprintClientMsgId)) {
+      throw new SyncError("invalid group client message id");
+    }
+    const clientMsgId = fingerprintClientMsgId
+      ?? deterministicGroupClientMessageId(clientGroupId, index);
+    if (clientMessageIds.has(clientMsgId)) throw new SyncError("duplicate group client message id");
+    clientMessageIds.add(clientMsgId);
+    return { mediaId, clientMsgId };
+  });
+}
+
+function mediaGroupFingerprint(input: {
+  dialogId: string;
+  body: string;
+  replyToMsgId: number | null;
+  mentions: MessageMention[];
+  draftConsumeOperationId: string | null;
+  items: NormalizedGroupItem[];
+}): Buffer {
+  return requestFingerprintHMAC("media-group-send", JSON.stringify({
+    dialog_id: input.dialogId,
+    body: input.body,
+    reply_to_msg_id: input.replyToMsgId,
+    mentions: input.mentions.map((mention) => ({
+      account_id: mention.accountId,
+      offset: mention.offset,
+      length: mention.length,
+    })),
+    draft_consume_operation_id: input.draftConsumeOperationId,
+    items: input.items.map((item) => ({
+      media_id: item.mediaId,
+      client_msg_id: item.clientMsgId,
+    })),
+  }));
+}
+
+/**
+ * Validates every media object before allocating one consecutive message-id range. All album rows,
+ * their ordinary message.new events, and exact-operation draft consumption commit together.
+ */
+export async function sendMediaGroup(sql: SQL, p: {
+  senderAccountId: string;
+  senderDeviceId: string;
+  dialogId: string;
+  clientGroupId: string;
+  items: unknown;
+  body?: unknown;
+  replyToMsgId?: unknown;
+  mentions?: unknown;
+  draftConsumeOperationId?: string | null;
+  allowDraftConsumption?: boolean;
+}): Promise<MediaGroupSendResult> {
+  const dialogId = String(p.dialogId ?? "").toLowerCase();
+  const clientGroupId = String(p.clientGroupId ?? "").toLowerCase();
+  if (!UUID_PATTERN.test(dialogId)) throw new SyncError("invalid dialog id");
+  if (!UUID_PATTERN.test(clientGroupId)) throw new SyncError("invalid client group id");
+  if (p.body != null && typeof p.body !== "string") throw new SyncError("caption must be a string");
+  const body = String(p.body ?? "");
+  if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
+  const replyToMsgId = optionalMessageId(p.replyToMsgId);
+  const mentions = normalizeMentions(p.mentions, body);
+  const items = normalizeMediaGroupItems(p.items, clientGroupId);
+  const draftConsumeOperationId = p.draftConsumeOperationId == null
+    ? null
+    : String(p.draftConsumeOperationId).toLowerCase();
+  if (draftConsumeOperationId != null && !UUID_PATTERN.test(draftConsumeOperationId)) {
+    throw new SyncError("invalid draft consume operation id");
+  }
+  if (draftConsumeOperationId != null && p.allowDraftConsumption === false) {
+    throw new SyncError("cloud drafts are unavailable", 404, "capability_unavailable");
+  }
+  const fingerprint = mediaGroupFingerprint({
+    dialogId,
+    body,
+    replyToMsgId,
+    mentions,
+    draftConsumeOperationId,
+    items,
+  });
+
+  return await sql.begin(async (tx) => {
+    // Serialize the live receipt and compact tombstone with maintenance cleanup. Without this
+    // exact-operation lock, cleanup could delete the request after our tombstone read and allow
+    // the retry's claim to succeed as a new group send.
+    await lockMutationKeys(tx, [
+      mediaGroupReceiptKey(p.senderAccountId, clientGroupId),
+    ]);
+    await requireActiveAccount(tx, p.senderAccountId);
+    await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
+    try {
+      await requireDialogReadAccess(tx, p.senderAccountId, dialogId);
+    } catch (error) {
+      if (error instanceof DialogAccessError) {
+        throw new SyncError("dialog access denied", 403, "dialog_access_denied");
+      }
+      throw error;
+    }
+
+    const requestStillPresent = (await tx`
+      SELECT 1 FROM media_group_send_requests
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}`)[0] != null;
+    const durableGroup = requestStillPresent ? [] : await tx`
+      SELECT dialog_id, msg_id, client_msg_id, media_id, media_group_index, media_group_count,
+             draft_consume_operation_id, draft_cleared_revision
+      FROM messages
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND media_group_id = ${clientGroupId}
+      ORDER BY media_group_index`;
+    if (durableGroup.length) {
+      const shapeMatches = durableGroup.length === items.length
+        && durableGroup.every((row: any, index: number) =>
+          row.dialog_id === dialogId
+          && n(row.media_group_index) === index
+          && n(row.media_group_count) === items.length
+          && row.media_id === items[index].mediaId
+          && row.client_msg_id === items[index].clientMsgId
+          && (row.draft_consume_operation_id ?? null) === draftConsumeOperationId
+        );
+      const keys = durableGroup.map((row: any) => ({
+        dialogId: String(row.dialog_id),
+        msgId: n(row.msg_id),
+      }));
+      const loaded = await loadMessages(tx, keys);
+      const messages = keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`))
+        .filter((message): message is MessageDTO => message != null);
+      const first = messages[0];
+      const contentMatches = first?.text === body
+        && first?.reply_to_msg_id === replyToMsgId
+        && JSON.stringify(first?.mentions ?? []) === JSON.stringify(
+          mentions.map((mention) => ({
+            account_id: mention.accountId,
+            offset: mention.offset,
+            length: mention.length,
+          })),
+        );
+      if (!shapeMatches || !contentMatches || messages.length !== items.length) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+      const firstMsgId = n(durableGroup[0].msg_id);
+      const lastMsgId = n(durableGroup[durableGroup.length - 1].msg_id);
+      const clearedRevision = durableGroup[0].draft_cleared_revision == null
+        ? null : n(durableGroup[0].draft_cleared_revision);
+      const messagePts = (await tx`
+        SELECT COALESCE(max(pts), 0)::bigint AS pts
+        FROM account_events
+        WHERE account_id = ${p.senderAccountId}
+          AND dialog_id = ${dialogId}
+          AND type = 'message.new'
+          AND msg_id BETWEEN ${firstMsgId} AND ${lastMsgId}`)[0];
+      const senderPts = Math.max(n(messagePts.pts), clearedRevision ?? 0);
+      await tx`
+        INSERT INTO media_group_send_requests (
+          sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+          first_msg_id, last_msg_id, sender_pts, draft_consume_operation_id,
+          cleared_draft_revision
+        ) VALUES (
+          ${p.senderAccountId}, ${clientGroupId}, ${dialogId}, ${fingerprint}, 'completed',
+          ${firstMsgId}, ${lastMsgId}, ${senderPts}, ${draftConsumeOperationId},
+          ${clearedRevision}
+        )
+        ON CONFLICT (sender_account_id, client_group_id) DO NOTHING`;
+      return {
+        dialogId,
+        clientGroupId,
+        messages,
+        senderPts,
+        clearedDraftRevision: clearedRevision,
+        duplicate: true,
+        pushes: [],
+      };
+    }
+    const tombstone = requestStillPresent ? null : (await tx`
+      SELECT dialog_id, payload_fingerprint
+      FROM media_group_send_tombstones
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}
+      FOR SHARE`)[0];
+    if (tombstone) {
+      const existingFingerprint = buf(tombstone.payload_fingerprint);
+      if (tombstone.dialog_id !== dialogId
+        || existingFingerprint.length !== fingerprint.length
+        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+      throw new SyncError(
+        "media group result is no longer available",
+        409,
+        "media_group_result_expired",
+      );
+    }
+    const claim = await tx`
+      INSERT INTO media_group_send_requests (
+        sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+        draft_consume_operation_id
+      )
+      VALUES (
+        ${p.senderAccountId}, ${clientGroupId}, ${dialogId}, ${fingerprint}, 'pending',
+        ${draftConsumeOperationId}
+      )
+      ON CONFLICT (sender_account_id, client_group_id) DO NOTHING
+      RETURNING client_group_id`;
+    if (claim.length === 0) {
+      const existing = (await tx`
+        SELECT dialog_id, payload_fingerprint, status, first_msg_id, last_msg_id,
+               sender_pts, cleared_draft_revision
+        FROM media_group_send_requests
+        WHERE sender_account_id = ${p.senderAccountId}
+          AND client_group_id = ${clientGroupId}
+        FOR UPDATE`)[0];
+      const existingFingerprint = buf(existing.payload_fingerprint);
+      if (existing.dialog_id !== dialogId
+        || existingFingerprint.length !== fingerprint.length
+        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+      if (existing.status !== "completed") {
+        throw new SyncError("media group send already in progress", 409);
+      }
+      const keys: MessageKey[] = [];
+      for (let msgId = n(existing.first_msg_id); msgId <= n(existing.last_msg_id); msgId += 1) {
+        keys.push({ dialogId, msgId });
+      }
+      const loaded = await loadMessages(tx, keys);
+      const messages = keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`))
+        .filter((message): message is MessageDTO => message != null);
+      return {
+        dialogId,
+        clientGroupId,
+        messages,
+        senderPts: n(existing.sender_pts),
+        clearedDraftRevision: existing.cleared_draft_revision == null
+          ? null : n(existing.cleared_draft_revision),
+        duplicate: true,
+        pushes: [],
+      };
+    }
+
+    const directPair = (await tx`
+      SELECT account_low, account_high
+      FROM direct_dialog_pairs WHERE dialog_id = ${dialogId}`)[0];
+    await lockAccountMutations(tx, directPair
+      ? [directPair.account_low, directPair.account_high]
+      : [p.senderAccountId]);
+    const itemBudget = (await tx`
+      SELECT COALESCE(sum(item_count), 0)::int AS count
+      FROM media_group_send_budgets
+      WHERE account_id = ${p.senderAccountId}
+        AND accepted_at > now() - interval '1 minute'`)[0];
+    if (n(itemBudget.count) + items.length > MAX_MEDIA_GROUP_ITEMS_PER_MINUTE) {
+      throw new SyncError("media group item budget exceeded", 429, "media_group_rate_limited");
+    }
+    await tx`
+      INSERT INTO media_group_send_budgets(account_id, device_id, item_count)
+      VALUES (${p.senderAccountId}, ${p.senderDeviceId}, ${items.length})`;
+
+    const sortedMediaIds = items.map((item) => item.mediaId).sort();
+    const mediaRows = await tx`
+      SELECT id, owner_account_id, kind, status, purpose
+      FROM media_objects
+      WHERE id = ANY(${tx.array(sortedMediaIds, "uuid")}::uuid[])
+      ORDER BY id
+      FOR UPDATE`;
+    if (mediaRows.length !== items.length
+      || mediaRows.some((row: any) =>
+        row.owner_account_id !== p.senderAccountId
+        || row.status !== "ready"
+        || row.purpose !== "message"
+        || row.kind === "voice"
+      )) {
+      throw new SyncError("group media is unavailable", 409, "media_group_item_unavailable");
+    }
+    await tx`
+      UPDATE media_objects SET last_accessed_at = now()
+      WHERE id = ANY(${tx.array(sortedMediaIds, "uuid")}::uuid[])`;
+    const mediaById = new Map(mediaRows.map((row: any) => [String(row.id), row]));
+
+    await lockDialogForMutation(tx, p.senderAccountId, dialogId);
+    const blocked = await tx`
+      SELECT 1
+      FROM direct_dialog_pairs pair
+      JOIN account_blocks block ON
+        (block.blocker_account_id = pair.account_low AND block.blocked_account_id = pair.account_high)
+        OR (block.blocker_account_id = pair.account_high AND block.blocked_account_id = pair.account_low)
+      WHERE pair.dialog_id = ${dialogId}
+      LIMIT 1`;
+    if (blocked.length) throw new SyncError("conversation is blocked");
+    if (replyToMsgId != null) {
+      const target = (await tx`
+        SELECT state FROM messages
+        WHERE dialog_id = ${dialogId} AND msg_id = ${replyToMsgId}`)[0];
+      if (!target || target.state !== "visible") {
+        throw new SyncError(
+          "original message is unavailable",
+          409,
+          "invalid_reply_target",
+          { reply_to_msg_id: replyToMsgId },
+        );
+      }
+    }
+    if (mentions.length) {
+      const mentionIds = mentions.map((mention) => mention.accountId);
+      const active = await tx`
+        SELECT account_id FROM dialog_members
+        WHERE dialog_id = ${dialogId} AND left_at IS NULL
+          AND account_id = ANY(${tx.array(mentionIds, "uuid")}::uuid[])`;
+      if (active.length !== mentionIds.length) {
+        throw new SyncError("mention target is not an active member");
+      }
+    }
+
+    const allocation = (await tx`
+      UPDATE dialogs
+      SET last_msg_id = last_msg_id + ${items.length}, updated_at = now()
+      WHERE id = ${dialogId}
+      RETURNING last_msg_id`)[0];
+    const lastMsgId = n(allocation.last_msg_id);
+    const firstMsgId = lastMsgId - items.length + 1;
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      const msgId = firstMsgId + index;
+      const caption = index === 0 ? body : "";
+      const sealed = seal(caption, bodyAAD(dialogId, msgId, p.senderAccountId));
+      const media = mediaById.get(item.mediaId)!;
+      await tx`
+        INSERT INTO messages (
+          dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
+          body_key_id, body_nonce, body_ciphertext, reply_to_msg_id, media_id,
+          media_group_id, media_group_index, media_group_count
+        )
+        VALUES (
+          ${dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId},
+          ${item.clientMsgId}, ${media.kind}, ${sealed.keyId}, ${sealed.nonce},
+          ${sealed.ciphertext}, ${index === 0 ? replyToMsgId : null}, ${item.mediaId},
+          ${clientGroupId}, ${index}, ${items.length}
+        )`;
+    }
+    if (mentions.length) {
+      await tx`
+        INSERT INTO message_mentions (dialog_id, msg_id, account_id, entity_offset, length)
+        SELECT ${dialogId}, ${firstMsgId}, account_id, entity_offset, entity_length
+        FROM unnest(
+          ${tx.array(mentions.map((mention) => mention.accountId), "uuid")}::uuid[],
+          ${tx.array(mentions.map((mention) => mention.offset), "int4")}::int[],
+          ${tx.array(mentions.map((mention) => mention.length), "int4")}::int[]
+        ) AS mention(account_id, entity_offset, entity_length)`;
+    }
+
+    const pushes: Push[] = [];
+    let senderPts = 0;
+    for (let index = 0; index < items.length; index += 1) {
+      const eventPushes = await fanoutDialogEvent(tx, {
+        dialogId,
+        type: "message.new",
+        msgId: firstMsgId + index,
+        actorAccountId: p.senderAccountId,
+        sourceDeviceId: p.senderDeviceId,
+        alertRecipients: index === 0,
+      });
+      pushes.push(...eventPushes);
+      senderPts = eventPushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? senderPts;
+    }
+    const consumed = await consumeDraftInTransaction(tx, {
+      accountId: p.senderAccountId,
+      deviceId: p.senderDeviceId,
+      dialogId,
+      operationId: draftConsumeOperationId,
+    });
+    if (consumed) {
+      pushes.push(...consumed.pushes);
+      senderPts = consumed.revision;
+    }
+    await tx`
+      UPDATE messages SET
+        draft_consume_operation_id = ${draftConsumeOperationId},
+        draft_cleared_revision = ${consumed?.revision ?? null}
+      WHERE dialog_id = ${dialogId} AND msg_id = ${firstMsgId}`;
+    await tx`
+      UPDATE media_group_send_requests SET
+        status = 'completed',
+        first_msg_id = ${firstMsgId},
+        last_msg_id = ${lastMsgId},
+        sender_pts = ${senderPts},
+        cleared_draft_revision = ${consumed?.revision ?? null}
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}`;
+    await notifySyncWakeups(tx, pushes);
+    const keys = items.map((_, index) => ({ dialogId, msgId: firstMsgId + index }));
+    const loaded = await loadMessages(tx, keys);
+    return {
+      dialogId,
+      clientGroupId,
+      messages: keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`)!),
+      senderPts,
+      clearedDraftRevision: consumed?.revision ?? null,
+      duplicate: false,
+      pushes,
     };
   });
 }
@@ -507,7 +1043,7 @@ export function startSyncNotificationListener(
     const next = new Client({ connectionString: databaseUrl, application_name: "toj-sync-notify" });
     client = next;
     next.on("notification", (notification) => {
-      if (notification.channel !== SYNC_NOTIFY_CHANNEL || !notification.payload) return;
+      if (!isSyncWakeupChannel(notification.channel) || !notification.payload) return;
       try {
         const value = JSON.parse(notification.payload) as SyncWakeup;
         if (!ACCOUNT_UUID_PATTERN.test(value.accountId) || !Number.isSafeInteger(value.pts)
@@ -802,7 +1338,7 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
 /** review B3 (pruned floor → too_long) + I3 (byte + count budget, slicing). */
 export async function getDifference(
   sql: SQL, accountId: string, sincePts: number,
-  opts: { maxEvents?: number; maxBytes?: number } = {},
+  opts: { maxEvents?: number; maxBytes?: number; cloudDraftsEnabled?: boolean } = {},
 ): Promise<Difference> {
   const maxEvents = boundedInteger(opts.maxEvents, 200, 1, 200);
   const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
@@ -895,6 +1431,12 @@ export async function getDifference(
       : []
   );
   const messages = await loadMessages(sql, messageKeys);
+  const draftDialogIds = rows
+    .filter((event: any) => event.type === "draft.updated" && !revokedDialogs.has(event.dialog_id))
+    .map((event: any) => String(event.dialog_id));
+  const drafts = opts.cloudDraftsEnabled === false
+    ? new Map<string, DraftDTO>()
+    : await loadDrafts(sql, accountId, draftDialogIds);
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
@@ -928,6 +1470,21 @@ export async function getDifference(
           ...eventData(ev.data),
         };
       }
+    } else if (ev.type === "draft.updated" && opts.cloudDraftsEnabled === false) {
+      // Preserve the contiguous account pts stream while the lane is killed. No draft payload
+      // leaks through the disabled capability; re-enable is recovered by replacement bootstrap.
+      update = { pts, ptsCount: 1, type: "capability.skipped" };
+    } else if (ev.type === "draft.updated") {
+      update = {
+        pts,
+        ptsCount: 1,
+        type: "draft.updated",
+        dialog_id: ev.dialog_id,
+        dialog_type: ev.dialog_type,
+        dialog_title: ev.dialog_title ?? undefined,
+        peer_account_id: ev.peer_account_id ?? undefined,
+        draft: drafts.get(String(ev.dialog_id)) ?? null,
+      };
     } else {
       update = {
         pts, ptsCount: 1, type: ev.type, dialog_id: ev.dialog_id,
@@ -945,14 +1502,20 @@ export async function getDifference(
     lastPts = pts;
   }
   const hasMore = truncated || (rows.length === maxEvents && lastPts < statePts);
-  const profiles: ProfileDTO[] = rows.length
+  const eventProfiles: ProfileDTO[] = rows.length
     ? (typeof rows[0].profiles === "string" ? JSON.parse(rows[0].profiles) : rows[0].profiles)
     : [];
+  const draftProfileIds = new Set<string>();
+  collectAccountIds([...drafts.values()], draftProfileIds);
+  const profileById = new Map(eventProfiles.map((profile) => [profile.accountId, profile]));
+  for (const profile of await loadProfiles(sql, draftProfileIds)) {
+    profileById.set(profile.accountId, profile);
+  }
   return {
     kind: hasMore ? "difference_slice" : "difference",
     state: { pts: hasMore ? lastPts : statePts },
     updates,
-    profiles,
+    profiles: [...profileById.values()].sort((left, right) => left.accountId.localeCompare(right.accountId)),
     hasMore,
   };
 }
@@ -1017,6 +1580,7 @@ export type BootstrapDialog = {
   dialog_id: string; type: string; title: string | null; last_msg_id: number;
   updated_at: string; unread_count: number; revision: number; member_count: number;
   self_role: string; notification_mode: string; photo: MediaDTO | null;
+  draft: DraftDTO | null;
   preferences: {
     dialogId: string; pinned: boolean; pinnedAt: string | null;
     muted: boolean; archived: boolean; updatedAt: string;
@@ -1039,7 +1603,12 @@ export async function getBootstrapDialogsPage(
   sql: SQL,
   accountId: string,
   token: string,
-  opts: { cursor?: string; limit?: number; previewMessages?: number } = {},
+  opts: {
+    cursor?: string;
+    limit?: number;
+    previewMessages?: number;
+    cloudDraftsEnabled?: boolean;
+  } = {},
 ): Promise<BootstrapPage> {
   // Keep worst-case hydration bounded. The client pages dialogs and history separately, so a
   // bootstrap response never needs thousands of per-message lookups in one request.
@@ -1132,6 +1701,13 @@ export async function getBootstrapDialogsPage(
         LIMIT ${limit + 1}`;
 
   const pageRows = rows.slice(0, limit);
+  const pageDrafts = opts.cloudDraftsEnabled === false
+    ? new Map<string, DraftDTO>()
+    : await loadDrafts(
+      sql,
+      accountId,
+      pageRows.map((row: any) => String(row.dialog_id)),
+    );
   const dialogs: BootstrapDialog[] = [];
   for (const row of pageRows) {
     const members = await sql`
@@ -1198,6 +1774,7 @@ export async function getBootstrapDialogsPage(
         updatedAt: iso(row.preference_updated_at),
       },
       photo: await loadMediaDTO(sql, row.photo_media_id),
+      draft: pageDrafts.get(String(row.dialog_id)) ?? null,
       members: members.map((m) => ({
         account_id: m.account_id,
         role: m.role,

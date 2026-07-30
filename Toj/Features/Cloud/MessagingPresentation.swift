@@ -24,12 +24,15 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let richSearch = Self(rawValue: 1 << 11)
     static let multipartMedia = Self(rawValue: 1 << 12)
     static let videoCalls = Self(rawValue: 1 << 13)
+    static let cloudDrafts = Self(rawValue: 1 << 14)
+    static let mediaGroups = Self(rawValue: 1 << 15)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
         .chatOrganization, .replies, .editing, .deletion, .forwarding,
         .reactions, .media, .voiceNotes, .groups, .calls, .profiles, .richSearch, .multipartMedia,
         .videoCalls,
+        .cloudDrafts, .mediaGroups,
     ]
 }
 

@@ -21,6 +21,9 @@ nonisolated struct LocalMessage: Identifiable, Equatable, Sendable {
     let reactions: [CloudReaction]
     let mentions: [CloudMention]
     let media: CloudMedia?
+    var mediaGroupId: String? = nil
+    var mediaGroupIndex: Int? = nil
+    var mediaGroupCount: Int? = nil
     let serviceType: String?
     let serviceData: CloudServiceData?
     let editVersion: Int
@@ -54,10 +57,101 @@ nonisolated struct LocalDialog: Identifiable, Equatable, Sendable {
     let selfRole: String?
     let notificationMode: String
     let accessState: String
+    var draftText: String? = nil
+    var draftAttachmentCount: Int = 0
+    var hasDraftReply: Bool = false
     let isPinned: Bool
     let pinnedAt: String?
     let isMuted: Bool
     let isArchived: Bool
+}
+
+nonisolated struct LocalDraftAttachment: Identifiable, Equatable, Sendable {
+    let attachmentId: String
+    var id: String { attachmentId }
+    let mediaId: String?
+    let position: Int
+    let media: CloudMedia?
+    let transferId: String?
+    let state: String
+    let progress: Double
+    let lastError: String?
+}
+
+nonisolated struct LocalDraft: Identifiable, Equatable, Sendable {
+    var id: String { "\(accountId)|\(dialogId)" }
+    let accountId: String
+    let dialogId: String
+    let state: String
+    let text: String
+    let replyToMsgId: Int64?
+    let replyPreview: CloudDraftReplyPreview?
+    let mentions: [CloudMention]
+    let attachments: [LocalDraftAttachment]
+    let localGeneration: Int64
+    let operationId: String
+    let serverRevision: Int64
+    let terminal: Bool
+    let lastError: String?
+    let updatedAt: String
+}
+
+nonisolated struct PendingDraftMutation: Identifiable, Equatable, Sendable {
+    var id: String { "\(accountId)|\(dialogId)" }
+    let accountId: String
+    let dialogId: String
+    let operationId: String
+    let localGeneration: Int64
+    let state: String
+    let text: String
+    let replyToMsgId: Int64?
+    let mentions: [CloudMention]
+    let attachments: [DraftAttachmentRequest]
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+    let terminal: Bool
+}
+
+nonisolated struct PendingMediaGroupSend: Identifiable, Equatable, Sendable {
+    let clientGroupId: String
+    var id: String { clientGroupId }
+    let accountId: String
+    let dialogId: String
+    let payload: PendingMediaGroupPayload
+    var draftConsumeOperationId: String? = nil
+    let retryCount: Int
+    let nextRetryAt: String?
+    let lastError: String?
+    let terminal: Bool
+}
+
+nonisolated struct PendingMediaGroupItem: Codable, Equatable, Sendable {
+    let clientMsgId: String
+    let mediaId: String
+    let transferId: String
+    let media: CloudMedia
+}
+
+nonisolated struct PendingMediaGroupPayload: Codable, Equatable, Sendable {
+    let items: [PendingMediaGroupItem]
+    let caption: String
+    let replyToMsgId: Int64?
+    let mentions: [CloudMention]
+}
+
+nonisolated struct PendingMediaGroupCleanup: Identifiable, Equatable, Sendable {
+    let clientGroupId: String
+    var id: String { clientGroupId }
+    let transferIds: [String]
+}
+
+nonisolated private struct StoredDraftMutationPayload: Codable {
+    let state: String
+    let text: String
+    let replyToMsgId: Int64?
+    let mentions: [CloudMention]
+    let attachments: [DraftAttachmentRequest]
 }
 
 nonisolated struct PendingGroupCreation: Identifiable, Equatable, Sendable {
@@ -123,8 +217,14 @@ nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let forwardedFromDialogId: String?
     let forwardedFromMsgId: Int64?
     var mentions: [CloudMention] = []
+    var draftConsumeOperationId: String? = nil
     let retryCount: Int
     let nextRetryAt: String?
+}
+
+nonisolated enum InvalidReplyTextRecovery: Equatable, Sendable {
+    case restoredDraft(dialogId: String)
+    case keptFailedMessage(dialogId: String)
 }
 
 nonisolated struct PendingReadReceipt: Identifiable, Equatable, Sendable {
@@ -158,6 +258,8 @@ nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
     let caption: String
     let replyToMsgId: Int64?
     var purpose: String = "message"
+    var draftOperationId: String? = nil
+    var mentions: [CloudMention] = []
     let kind: String
     let contentType: String
     let fileName: String?
@@ -854,6 +956,483 @@ actor CloudLocalStore {
         }
     }
 
+    func loadDraft(accountId: String, dialogId: String) throws -> LocalDraft? {
+        try dbQueue.read { db in
+            try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId)
+        }
+    }
+
+    func observeDraft(
+        accountId: String,
+        dialogId: String
+    ) -> AsyncThrowingStream<LocalDraft?, Error> {
+        let values = ValueObservation
+            .tracking {
+                try Self.fetchDraft($0, accountId: accountId, dialogId: dialogId)
+            }
+            .removeDuplicates()
+            .values(
+                in: dbQueue,
+                scheduling: .async(onQueue: .global(qos: .userInitiated)),
+                bufferingPolicy: .bufferingNewest(1)
+            )
+        return Self.stream(values)
+    }
+
+    /// Commits the visible draft and replaces the dialog's queued network mutation in one WAL
+    /// transaction. Raw text is never normalized; trim is used only to decide an empty clear.
+    func saveLocalDraft(
+        accountId: String,
+        dialogId: String,
+        text: String,
+        replyToMsgId: Int64?,
+        replyPreview: CloudDraftReplyPreview?,
+        mentions: [CloudMention]
+    ) throws -> LocalDraft {
+        try dbQueue.write { db in
+            let attachmentCount = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, dialogId]
+            ) ?? 0
+            let active = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || replyToMsgId != nil
+                || attachmentCount > 0
+            let state = active ? "active" : "cleared"
+            let storedText = active ? text : ""
+            let storedReply = active ? replyToMsgId : nil
+            let storedMentions = active ? mentions : []
+            if !active {
+                try db.execute(
+                    sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+                    arguments: [accountId, dialogId]
+                )
+            }
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                state: state,
+                text: storedText,
+                replyToMsgId: storedReply,
+                replyPreview: active ? replyPreview : nil,
+                mentions: storedMentions
+            )
+            guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            return draft
+        }
+    }
+
+    /// Adds a protected, encrypted staging file and its draft chip atomically with the coalesced
+    /// mutation. The picker may release its source bytes as soon as this returns.
+    func stageDraftAttachment(
+        prepared: PreparedMediaUpload,
+        accountId: String,
+        dialogId: String,
+        attachmentId: String,
+        position: Int
+    ) throws -> LocalDraft {
+        try dbQueue.write { db in
+            let count = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, dialogId]
+            ) ?? 0
+            guard count < 10 else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            // The database write queue serializes staging for a dialog. Allocating the next
+            // position inside this transaction prevents two concurrent picker callbacks from
+            // claiming the same slot; the caller's position is only a stale UI hint.
+            let allocatedPosition = count
+            try db.execute(
+                sql: """
+                INSERT INTO media_transfers (
+                  transfer_id, dialog_id, client_msg_id, caption, reply_to_msg_id,
+                  purpose, draft_attachment_id, kind, content_type, file_name, byte_size,
+                  sha256, duration_ms, width, height, encrypted_source_path,
+                  encrypted_thumbnail_path, state, created_at
+                ) VALUES (
+                  ?, ?, ?, '', NULL, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                  datetime('now')
+                )
+                """,
+                arguments: [
+                    prepared.transferId, dialogId, attachmentId, attachmentId,
+                    prepared.kind, prepared.contentType, prepared.fileName, prepared.byteSize,
+                    prepared.sha256, prepared.durationMs, prepared.width, prepared.height,
+                    prepared.encryptedSourcePath, prepared.encryptedThumbnailPath,
+                ]
+            )
+            try db.execute(
+                sql: """
+                INSERT INTO draft_attachments (
+                  account_id, dialog_id, attachment_id, position, transfer_id, state, progress
+                ) VALUES (?, ?, ?, ?, ?, 'staging', 0)
+                """,
+                arguments: [accountId, dialogId, attachmentId, allocatedPosition, prepared.transferId]
+            )
+            let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                state: "active",
+                text: current?.text ?? "",
+                replyToMsgId: current?.replyToMsgId,
+                replyPreview: current?.replyPreview,
+                mentions: current?.mentions ?? []
+            )
+            guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            return draft
+        }
+    }
+
+    func updateDraftAttachment(
+        transferId: String,
+        mediaId: String?,
+        state: String,
+        progress: Double,
+        error: String?,
+        retryAfter: TimeInterval? = nil
+    ) throws {
+        let nextRetryAt = retryAfter.map {
+            Self.sqliteTimestamp(Date().addingTimeInterval($0))
+        }
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT attachment.account_id, attachment.dialog_id, transfer.kind,
+                       transfer.content_type, transfer.file_name, transfer.byte_size,
+                       transfer.duration_ms, transfer.width, transfer.height,
+                       transfer.encrypted_thumbnail_path, transfer.state AS transfer_state
+                FROM draft_attachments attachment
+                JOIN media_transfers transfer ON transfer.transfer_id = attachment.transfer_id
+                WHERE attachment.transfer_id = ?
+                """,
+                arguments: [transferId]
+            ) else { return }
+            let accountId: String = row["account_id"]
+            let dialogId: String = row["dialog_id"]
+            let media = mediaId.map {
+                CloudMedia(
+                    id: $0,
+                    kind: row["kind"],
+                    contentType: row["content_type"],
+                    fileName: row["file_name"],
+                    byteSize: row["byte_size"],
+                    durationMs: row["duration_ms"],
+                    width: row["width"],
+                    height: row["height"],
+                    hasThumbnail: (row["encrypted_thumbnail_path"] as String?) != nil
+                )
+            }
+            let mediaJSON = media
+                .flatMap { try? JSONEncoder().encode($0) }
+                .flatMap { String(data: $0, encoding: .utf8) }
+            try db.execute(
+                sql: """
+                UPDATE draft_attachments SET
+                  media_id = COALESCE(?, media_id),
+                  media_json = COALESCE(?, media_json),
+                  state = ?,
+                  progress = ?,
+                  last_error = ?
+                WHERE transfer_id = ?
+                """,
+                arguments: [
+                    mediaId, mediaJSON, state, max(0, min(1, progress)), error, transferId,
+                ]
+            )
+            let currentTransferState: String = row["transfer_state"]
+            let transferState: String
+            switch state {
+            case "ready":
+                transferState = "ready_to_send"
+            case "uploading":
+                transferState = "uploading"
+            default:
+                // `failed` and `terminal` describe the draft chip, not the transport. Preserve
+                // its valid pending/uploading/ready_to_send state instead of violating the table
+                // domain or making retry scans depend on UI state names.
+                transferState = currentTransferState
+            }
+            let terminal = state == "terminal"
+            let transientFailure = state == "failed"
+            try db.execute(
+                sql: """
+                UPDATE media_transfers SET
+                  media_id = COALESCE(?, media_id),
+                  upload_offset = CASE WHEN ? = 'ready' THEN byte_size ELSE upload_offset END,
+                  state = ?,
+                  last_error = ?,
+                  terminal = CASE
+                    WHEN ? THEN 1
+                    WHEN ? THEN 0
+                    ELSE terminal
+                  END,
+                  next_retry_at = CASE
+                    WHEN ? THEN NULL
+                    WHEN ? THEN ?
+                    ELSE next_retry_at
+                  END,
+                  retry_count = retry_count + CASE WHEN ? THEN 1 ELSE 0 END
+                WHERE transfer_id = ?
+                """,
+                arguments: [
+                    mediaId, state, transferState, error,
+                    terminal, transientFailure,
+                    terminal, transientFailure, nextRetryAt,
+                    transientFailure,
+                    transferId,
+                ]
+            )
+            let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                state: "active",
+                text: current?.text ?? "",
+                replyToMsgId: current?.replyToMsgId,
+                replyPreview: current?.replyPreview,
+                mentions: current?.mentions ?? []
+            )
+        }
+    }
+
+    func retryDraftAttachment(transferId: String) throws -> MediaTransferRecord? {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE media_transfers SET
+                  terminal = 0,
+                  next_retry_at = NULL,
+                  last_error = NULL,
+                  state = CASE WHEN media_id IS NULL THEN 'pending' ELSE 'uploading' END
+                WHERE transfer_id = ? AND purpose = 'draft'
+                """,
+                arguments: [transferId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE draft_attachments SET
+                  state = 'staging',
+                  last_error = NULL
+                WHERE transfer_id = ?
+                """,
+                arguments: [transferId]
+            )
+            return try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM media_transfers WHERE transfer_id = ?",
+                arguments: [transferId]
+            ).map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func removeDraftAttachment(
+        accountId: String,
+        dialogId: String,
+        attachmentId: String
+    ) throws -> String? {
+        try dbQueue.write { db in
+            let transferId = try String.fetchOne(
+                db,
+                sql: """
+                SELECT transfer_id FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ? AND attachment_id = ?
+                """,
+                arguments: [accountId, dialogId, attachmentId]
+            )
+            try db.execute(
+                sql: """
+                DELETE FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ? AND attachment_id = ?
+                """,
+                arguments: [accountId, dialogId, attachmentId]
+            )
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                SELECT attachment_id FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ?
+                ORDER BY position
+                """,
+                arguments: [accountId, dialogId]
+            )
+            try rewriteDraftAttachmentOrder(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentIds: rows.map { $0["attachment_id"] as String }
+            )
+            let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)
+            let active = !(current?.text ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || current?.replyToMsgId != nil
+                || !rows.isEmpty
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                state: active ? "active" : "cleared",
+                text: active ? current?.text ?? "" : "",
+                replyToMsgId: active ? current?.replyToMsgId : nil,
+                replyPreview: active ? current?.replyPreview : nil,
+                mentions: active ? current?.mentions ?? [] : []
+            )
+            if let transferId {
+                try db.execute(sql: "DELETE FROM media_transfers WHERE transfer_id = ?", arguments: [transferId])
+            }
+            return transferId
+        }
+    }
+
+    func reorderDraftAttachments(
+        accountId: String,
+        dialogId: String,
+        attachmentIds: [String]
+    ) throws {
+        try dbQueue.write { db in
+            let existing = try String.fetchAll(
+                db,
+                sql: """
+                SELECT attachment_id FROM draft_attachments
+                WHERE account_id = ? AND dialog_id = ?
+                ORDER BY position
+                """,
+                arguments: [accountId, dialogId]
+            )
+            guard Set(existing) == Set(attachmentIds), existing.count == attachmentIds.count else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            try rewriteDraftAttachmentOrder(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentIds: attachmentIds
+            )
+            let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                state: "active",
+                text: current?.text ?? "",
+                replyToMsgId: current?.replyToMsgId,
+                replyPreview: current?.replyPreview,
+                mentions: current?.mentions ?? []
+            )
+        }
+    }
+
+    func pendingDraftMutationsReady(
+        now: Date = Date(),
+        limit: Int = 20
+    ) throws -> [PendingDraftMutation] {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM pending_draft_mutations
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM draft_attachments attachment
+                    WHERE attachment.account_id = pending_draft_mutations.account_id
+                      AND attachment.dialog_id = pending_draft_mutations.dialog_id
+                      AND attachment.state != 'ready'
+                  )
+                ORDER BY updated_at, dialog_id
+                LIMIT ?
+                """,
+                arguments: [nowText, max(1, min(limit, 100))]
+            ).compactMap(Self.pendingDraftMutation(from:))
+        }
+    }
+
+    /// Returns the durable dependency for one dialog even while it is backed off or terminal.
+    /// Explicit send/navigation flushes use this to avoid mistaking "not due yet" for "synced."
+    func pendingDraftMutation(
+        accountId: String,
+        dialogId: String
+    ) throws -> PendingDraftMutation? {
+        try dbQueue.read { db in
+            try Row.fetchOne(
+                db,
+                sql: """
+                SELECT * FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, dialogId]
+            ).flatMap(Self.pendingDraftMutation(from:))
+        }
+    }
+
+    func pendingDraftDialogIds(accountId: String) throws -> [String] {
+        try dbQueue.read { db in
+            try String.fetchAll(
+                db,
+                sql: """
+                SELECT dialog_id FROM pending_draft_mutations
+                WHERE account_id = ? AND terminal = 0
+                ORDER BY updated_at, dialog_id
+                LIMIT 100
+                """,
+                arguments: [accountId]
+            )
+        }
+    }
+
+    func acknowledgeDraftMutation(
+        _ response: DraftMutationResponse,
+        accountId: String,
+        attemptedOperationId: String
+    ) throws {
+        try dbQueue.write { db in
+            let currentOperation = try String.fetchOne(
+                db,
+                sql: """
+                SELECT operation_id FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, response.draft.dialogId]
+            )
+            try applyCloudDraft(
+                db,
+                draft: response.draft,
+                accountId: accountId,
+                preserveLocalOverlay: currentOperation != nil
+            )
+            if currentOperation == attemptedOperationId {
+                try db.execute(
+                    sql: """
+                    DELETE FROM pending_draft_mutations
+                    WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                    """,
+                    arguments: [accountId, response.draft.dialogId, attemptedOperationId]
+                )
+                try materializeServerShadowIfUnblocked(
+                    db,
+                    accountId: accountId,
+                    dialogId: response.draft.dialogId
+                )
+            }
+        }
+    }
+
     @discardableResult
     func queueDialogPreference(
         accountId: String,
@@ -1043,6 +1622,119 @@ actor CloudLocalStore {
         }
     }
 
+    func applyCloudDraft(_ draft: CloudDraft, accountId: String) throws {
+        try dbQueue.write { db in
+            let pending = try String.fetchOne(
+                db,
+                sql: """
+                SELECT operation_id FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, draft.dialogId]
+            )
+            try applyCloudDraft(
+                db,
+                draft: draft,
+                accountId: accountId,
+                preserveLocalOverlay: pending != nil
+            )
+        }
+    }
+
+    func markDraftMutationFailed(
+        accountId: String,
+        dialogId: String,
+        operationId: String,
+        error: String,
+        retryAfter: TimeInterval?,
+        terminal: Bool
+    ) throws {
+        let nextRetryAt = retryAfter.map {
+            Self.sqliteTimestamp(Date().addingTimeInterval($0))
+        }
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_draft_mutations SET
+                  retry_count = retry_count + 1,
+                  next_retry_at = ?,
+                  last_error = ?,
+                  terminal = ?
+                WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                """,
+                arguments: [
+                    nextRetryAt, error, terminal, accountId, dialogId, operationId,
+                ]
+            )
+            if terminal {
+                let hasShadow = try String.fetchOne(
+                    db,
+                    sql: """
+                    SELECT server_shadow_json FROM drafts
+                    WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                    """,
+                    arguments: [accountId, dialogId, operationId]
+                ) != nil
+                if hasShadow {
+                    try db.execute(
+                        sql: """
+                        DELETE FROM pending_draft_mutations
+                        WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                        """,
+                        arguments: [accountId, dialogId, operationId]
+                    )
+                    try materializeServerShadowIfUnblocked(
+                        db,
+                        accountId: accountId,
+                        dialogId: dialogId
+                    )
+                } else {
+                    try db.execute(
+                        sql: """
+                        UPDATE drafts SET terminal = 1, last_error = ?
+                        WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                        """,
+                        arguments: [error, accountId, dialogId, operationId]
+                    )
+                }
+            }
+        }
+    }
+
+    func pendingDraftDependency(operationId: String) throws -> PendingDraftMutation? {
+        try dbQueue.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM pending_draft_dependencies WHERE operation_id = ?",
+                arguments: [operationId]
+            ).flatMap(Self.pendingDraftMutation(from:))
+        }
+    }
+
+    func acknowledgeDraftDependency(
+        _ response: DraftMutationResponse,
+        accountId: String,
+        attemptedOperationId: String
+    ) throws {
+        try dbQueue.write { db in
+            guard try String.fetchOne(
+                db,
+                sql: "SELECT operation_id FROM pending_draft_dependencies WHERE operation_id = ?",
+                arguments: [attemptedOperationId]
+            ) != nil else { return }
+            try applyCloudDraft(
+                db,
+                draft: response.draft,
+                accountId: accountId,
+                preserveLocalOverlay: true
+            )
+            try db.execute(
+                sql: "DELETE FROM pending_draft_dependencies WHERE operation_id = ?",
+                arguments: [attemptedOperationId]
+            )
+        }
+    }
+
     func nextDialogPreferenceRetryDelay(
         accountId: String,
         now: Date = Date()
@@ -1122,6 +1814,821 @@ actor CloudLocalStore {
                 accountId: accountId,
                 clientMutationId: clientMutationId
             )
+        }
+    }
+
+    func markDraftDependencyFailed(
+        operationId: String,
+        error: String,
+        retryAfter: TimeInterval?,
+        terminal: Bool = false
+    ) throws {
+        try dbQueue.write { db in
+            let dialogIds = try String.fetchAll(
+                db,
+                sql: """
+                SELECT DISTINCT dialog_id FROM (
+                  SELECT dialog_id FROM pending_outbox
+                  WHERE draft_consume_operation_id = ?
+                  UNION ALL
+                  SELECT dialog_id FROM pending_media_group_sends
+                  WHERE draft_consume_operation_id = ?
+                  UNION ALL
+                  SELECT dialog_id FROM media_transfers
+                  WHERE draft_operation_id = ?
+                )
+                """,
+                arguments: [operationId, operationId, operationId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE pending_draft_dependencies SET
+                  retry_count = retry_count + 1,
+                  next_retry_at = ?,
+                  last_error = ?,
+                  terminal = ?
+                WHERE operation_id = ?
+                """,
+                arguments: [
+                    retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) },
+                    error,
+                    terminal,
+                    operationId,
+                ]
+            )
+            if terminal {
+                try db.execute(
+                    sql: """
+                    UPDATE messages SET local_state = 'failed'
+                    WHERE client_msg_id IN (
+                      SELECT client_msg_id FROM pending_outbox
+                      WHERE draft_consume_operation_id = ?
+                      UNION
+                      SELECT client_msg_id FROM media_transfers
+                      WHERE draft_operation_id = ?
+                    )
+                    OR media_group_id IN (
+                      SELECT client_group_id FROM pending_media_group_sends
+                      WHERE draft_consume_operation_id = ?
+                    )
+                    """,
+                    arguments: [operationId, operationId, operationId]
+                )
+                try db.execute(
+                    sql: """
+                    UPDATE pending_outbox
+                    SET terminal = 1, next_retry_at = NULL
+                    WHERE draft_consume_operation_id = ?
+                    """,
+                    arguments: [operationId]
+                )
+                try db.execute(
+                    sql: """
+                    UPDATE pending_media_group_sends
+                    SET terminal = 1, next_retry_at = NULL, last_error = ?
+                    WHERE draft_consume_operation_id = ?
+                    """,
+                    arguments: [error, operationId]
+                )
+                try db.execute(
+                    sql: """
+                    UPDATE media_transfers
+                    SET terminal = 1, next_retry_at = NULL, last_error = ?
+                    WHERE draft_operation_id = ?
+                    """,
+                    arguments: [error, operationId]
+                )
+                for dialogId in dialogIds {
+                    try refreshDialogSummary(db, dialogId: dialogId)
+                }
+            }
+        }
+    }
+
+    func nextPendingDraftDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM pending_draft_mutations
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM draft_attachments attachment
+                    WHERE attachment.account_id = pending_draft_mutations.account_id
+                      AND attachment.dialog_id = pending_draft_mutations.dialog_id
+                      AND attachment.state != 'ready'
+                  )
+                """,
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: """
+                SELECT MIN(next_retry_at) FROM pending_draft_mutations
+                WHERE terminal = 0 AND next_retry_at > ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM draft_attachments attachment
+                    WHERE attachment.account_id = pending_draft_mutations.account_id
+                      AND attachment.dialog_id = pending_draft_mutations.dialog_id
+                      AND attachment.state != 'ready'
+                  )
+                """,
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
+        }
+    }
+
+    /// Atomically converts a one-item draft into the existing resumable media outbox. The draft
+    /// operation remains as a consume shield until the server confirms the matching revision.
+    func consumeDraftAsSingleMedia(
+        accountId: String,
+        dialogId: String,
+        operationId: String
+    ) throws -> MediaTransferRecord {
+        try dbQueue.write { db in
+            guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId),
+                  draft.operationId == operationId,
+                  draft.state == "active",
+                  draft.attachments.count == 1,
+                  let attachment = draft.attachments.first,
+                  attachment.state == "ready",
+                  attachment.mediaId != nil,
+                  let transferId = attachment.transferId else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let clientMsgId = UUID().uuidString.lowercased()
+            let mentionsJSON = String(
+                data: try JSONEncoder().encode(draft.mentions),
+                encoding: .utf8
+            ) ?? "[]"
+            try db.execute(
+                sql: """
+                UPDATE media_transfers SET
+                  client_msg_id = ?,
+                  caption = ?,
+                  reply_to_msg_id = ?,
+                  mentions_json = ?,
+                  purpose = 'message',
+                  draft_operation_id = ?,
+                  state = 'ready_to_send',
+                  terminal = 0,
+                  last_error = NULL,
+                  next_retry_at = NULL
+                WHERE transfer_id = ? AND media_id IS NOT NULL
+                """,
+                arguments: [
+                    clientMsgId, draft.text, draft.replyToMsgId, mentionsJSON,
+                    operationId, transferId,
+                ]
+            )
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM media_transfers WHERE transfer_id = ?",
+                arguments: [transferId]
+            ) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let transfer = Self.mediaTransfer(from: row)
+            try upsertSendingMedia(db, transfer: transfer, senderAccountId: accountId)
+            try preserveDraftDependency(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                operationId: operationId
+            )
+            try db.execute(
+                sql: """
+                DELETE FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                """,
+                arguments: [accountId, dialogId, operationId]
+            )
+            try markDraftConsumed(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                operationId: operationId
+            )
+            try db.execute(
+                sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+                arguments: [accountId, dialogId]
+            )
+            try refreshDialogSummary(db, dialogId: dialogId)
+            try refreshAllUnreadSummaries(db, dialogId: dialogId)
+            return transfer
+        }
+    }
+
+    /// Creates all optimistic album rows, the durable group request, and the consumed-draft shield
+    /// in one transaction. A failed local commit therefore leaves the original draft untouched.
+    func consumeDraftAsMediaGroup(
+        accountId: String,
+        dialogId: String,
+        operationId: String
+    ) throws -> PendingMediaGroupSend {
+        try dbQueue.write { db in
+            guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId),
+                  draft.operationId == operationId,
+                  draft.state == "active",
+                  (2...10).contains(draft.attachments.count),
+                  draft.attachments.allSatisfy({
+                      $0.state == "ready" && $0.mediaId != nil && $0.transferId != nil && $0.media != nil
+                  }) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let ordered = draft.attachments.sorted { $0.position < $1.position }
+            let clientGroupId = UUID().uuidString.lowercased()
+            let items = ordered.map { attachment in
+                PendingMediaGroupItem(
+                    clientMsgId: UUID().uuidString.lowercased(),
+                    mediaId: attachment.mediaId!,
+                    transferId: attachment.transferId!,
+                    media: attachment.media!
+                )
+            }
+            let payload = PendingMediaGroupPayload(
+                items: items,
+                caption: draft.text,
+                replyToMsgId: draft.replyToMsgId,
+                mentions: draft.mentions
+            )
+            let encoder = JSONEncoder()
+            let payloadJSON = String(data: try encoder.encode(payload), encoding: .utf8) ?? "{}"
+            let mentionsJSON = String(data: try encoder.encode(draft.mentions), encoding: .utf8) ?? "[]"
+
+            try upsertDialog(
+                db,
+                dialogId: dialogId,
+                type: "direct",
+                title: nil,
+                lastMsgId: 0,
+                updatedAt: nil
+            )
+            for (index, item) in items.enumerated() {
+                let localId = "pending:\(item.clientMsgId)"
+                let mediaJSON = String(data: try encoder.encode(item.media), encoding: .utf8)
+                try db.execute(
+                    sql: """
+                    UPDATE media_transfers SET
+                      client_msg_id = ?,
+                      caption = ?,
+                      reply_to_msg_id = ?,
+                      purpose = 'group_send',
+                      draft_operation_id = ?,
+                      state = 'ready_to_send',
+                      terminal = 0,
+                      last_error = NULL,
+                      next_retry_at = NULL
+                    WHERE transfer_id = ? AND media_id = ?
+                    """,
+                    arguments: [
+                        item.clientMsgId, index == 0 ? draft.text : "",
+                        index == 0 ? draft.replyToMsgId : nil, operationId,
+                        item.transferId, item.mediaId,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                    INSERT INTO messages (
+                      local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+                      reply_to_msg_id, is_forwarded, mentions_json, media_json,
+                      media_group_id, media_group_index, media_group_count,
+                      edit_version, state, server_ts, local_state
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
+                    ON CONFLICT(client_msg_id) DO NOTHING
+                    """,
+                    arguments: [
+                        localId, dialogId, item.clientMsgId, accountId, item.media.kind,
+                        index == 0 ? draft.text : "",
+                        index == 0 ? draft.replyToMsgId : nil,
+                        index == 0 ? mentionsJSON : "[]", mediaJSON,
+                        clientGroupId, index, items.count,
+                    ]
+                )
+                try Self.upsertMessageMedia(
+                    db,
+                    localId: localId,
+                    dialogId: dialogId,
+                    msgId: nil,
+                    media: item.media
+                )
+            }
+            try db.execute(
+                sql: """
+                INSERT INTO pending_media_group_sends (
+                  client_group_id, account_id, dialog_id, payload_json,
+                  draft_consume_operation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, datetime('now'))
+                """,
+                arguments: [clientGroupId, accountId, dialogId, payloadJSON, operationId]
+            )
+            try preserveDraftDependency(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                operationId: operationId
+            )
+            try db.execute(
+                sql: """
+                DELETE FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                """,
+                arguments: [accountId, dialogId, operationId]
+            )
+            try markDraftConsumed(
+                db,
+                accountId: accountId,
+                dialogId: dialogId,
+                operationId: operationId
+            )
+            try db.execute(
+                sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+                arguments: [accountId, dialogId]
+            )
+            try refreshDialogSummary(db, dialogId: dialogId)
+            try refreshAllUnreadSummaries(db, dialogId: dialogId)
+            return PendingMediaGroupSend(
+                clientGroupId: clientGroupId,
+                accountId: accountId,
+                dialogId: dialogId,
+                payload: payload,
+                draftConsumeOperationId: operationId,
+                retryCount: 0,
+                nextRetryAt: nil,
+                lastError: nil,
+                terminal: false
+            )
+        }
+    }
+
+    func pendingMediaGroupSendsReady(
+        now: Date = Date(),
+        limit: Int = 10
+    ) throws -> [PendingMediaGroupSend] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM pending_media_group_sends
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pending_media_group_cleanup cleanup
+                    WHERE cleanup.client_group_id = pending_media_group_sends.client_group_id
+                  )
+                ORDER BY created_at, client_group_id
+                LIMIT ?
+                """,
+                arguments: [Self.sqliteTimestamp(now), max(1, min(limit, 25))]
+            ).compactMap(Self.pendingMediaGroupSend(from:))
+        }
+    }
+
+    func markMediaGroupSendFailed(
+        clientGroupId: String,
+        error: String,
+        retryAfter: TimeInterval?,
+        terminal: Bool
+    ) throws {
+        let next = retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) }
+        try dbQueue.write { db in
+            let dialogId = try String.fetchOne(
+                db,
+                sql: "SELECT dialog_id FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [clientGroupId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE pending_media_group_sends SET
+                  retry_count = retry_count + 1,
+                  next_retry_at = ?,
+                  last_error = ?,
+                  terminal = ?
+                WHERE client_group_id = ?
+                """,
+                arguments: [next, error, terminal, clientGroupId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE messages SET local_state = 'failed'
+                WHERE media_group_id = ? AND msg_id IS NULL
+                """,
+                arguments: [clientGroupId]
+            )
+            if let dialogId { try refreshDialogSummary(db, dialogId: dialogId) }
+        }
+    }
+
+    func retryMediaGroupSend(clientGroupId: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_media_group_sends SET
+                  next_retry_at = NULL, last_error = NULL, terminal = 0
+                WHERE client_group_id = ?
+                """,
+                arguments: [clientGroupId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE messages SET local_state = 'sending'
+                WHERE media_group_id = ? AND msg_id IS NULL
+                """,
+                arguments: [clientGroupId]
+            )
+        }
+    }
+
+    func removeMediaGroupSend(clientGroupId: String) throws -> [MediaTransferRecord] {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT * FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [clientGroupId]
+            ), let group = Self.pendingMediaGroupSend(from: row) else { return [] }
+            let transfers = try group.payload.items.compactMap { item in
+                try Row.fetchOne(
+                    db,
+                    sql: "SELECT * FROM media_transfers WHERE transfer_id = ?",
+                    arguments: [item.transferId]
+                ).map(Self.mediaTransfer(from:))
+            }
+            try db.execute(
+                sql: """
+                DELETE FROM message_media WHERE local_id IN (
+                  SELECT local_id FROM messages
+                  WHERE media_group_id = ? AND msg_id IS NULL
+                )
+                """,
+                arguments: [clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM messages WHERE media_group_id = ? AND msg_id IS NULL",
+                arguments: [clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM pending_media_group_cleanup WHERE client_group_id = ?",
+                arguments: [clientGroupId]
+            )
+            for item in group.payload.items {
+                try db.execute(
+                    sql: "DELETE FROM media_transfers WHERE transfer_id = ?",
+                    arguments: [item.transferId]
+                )
+            }
+            try refreshDialogSummary(db, dialogId: group.dialogId)
+            return transfers
+        }
+    }
+
+    /// Typed invalid-reply recovery: put every uploaded item back into a fresh draft generation,
+    /// remove only the rejected reply context, and discard the failed optimistic album.
+    func restoreMediaGroupAsDraftWithoutReply(
+        _ group: PendingMediaGroupSend
+    ) throws -> LocalDraft {
+        try dbQueue.write { db in
+            guard let stored = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT client_group_id FROM pending_media_group_sends
+                WHERE client_group_id = ? AND account_id = ? AND dialog_id = ?
+                """,
+                arguments: [group.clientGroupId, group.accountId, group.dialogId]
+            ), (stored["client_group_id"] as String?) != nil else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            try db.execute(
+                sql: """
+                DELETE FROM message_media WHERE local_id IN (
+                  SELECT local_id FROM messages
+                  WHERE media_group_id = ? AND msg_id IS NULL
+                )
+                """,
+                arguments: [group.clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM messages WHERE media_group_id = ? AND msg_id IS NULL",
+                arguments: [group.clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+                arguments: [group.accountId, group.dialogId]
+            )
+            let encoder = JSONEncoder()
+            for (position, item) in group.payload.items.enumerated() {
+                let attachmentId = UUID().uuidString.lowercased()
+                let mediaJSON = String(data: try encoder.encode(item.media), encoding: .utf8)
+                try db.execute(
+                    sql: """
+                    UPDATE media_transfers SET
+                      client_msg_id = ?,
+                      caption = '',
+                      reply_to_msg_id = NULL,
+                      purpose = 'draft',
+                      draft_attachment_id = ?,
+                      draft_operation_id = NULL,
+                      state = 'ready_to_send',
+                      terminal = 0,
+                      last_error = NULL,
+                      next_retry_at = NULL
+                    WHERE transfer_id = ?
+                    """,
+                    arguments: [attachmentId, attachmentId, item.transferId]
+                )
+                try db.execute(
+                    sql: """
+                    INSERT INTO draft_attachments (
+                      account_id, dialog_id, attachment_id, media_id, position,
+                      media_json, transfer_id, state, progress
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1)
+                    """,
+                    arguments: [
+                        group.accountId, group.dialogId, attachmentId, item.mediaId,
+                        position, mediaJSON, item.transferId,
+                    ]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [group.clientGroupId]
+            )
+            try rewriteDraftMutation(
+                db,
+                accountId: group.accountId,
+                dialogId: group.dialogId,
+                state: "active",
+                text: group.payload.caption,
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: group.payload.mentions
+            )
+            guard let draft = try Self.fetchDraft(
+                db,
+                accountId: group.accountId,
+                dialogId: group.dialogId
+            ) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            try refreshDialogSummary(db, dialogId: group.dialogId)
+            return draft
+        }
+    }
+
+    /// Typed invalid-reply recovery for a one-item send. The exact consumed draft is restored
+    /// with its uploaded media and mentions, while only the now-invalid reply context is removed.
+    func restoreSingleMediaAsDraftWithoutReply(
+        _ transfer: MediaTransferRecord,
+        accountId: String
+    ) throws -> LocalDraft {
+        try dbQueue.write { db in
+            guard let attemptedOperationId = transfer.draftOperationId,
+                  let draftRow = try Row.fetchOne(
+                      db,
+                      sql: """
+                      SELECT operation_id, consumed_operation_id
+                      FROM drafts
+                      WHERE account_id = ? AND dialog_id = ?
+                      """,
+                      arguments: [accountId, transfer.dialogId]
+                  ),
+                  (draftRow["operation_id"] as String?) == attemptedOperationId,
+                  (draftRow["consumed_operation_id"] as String?) == attemptedOperationId,
+                  let storedTransfer = try Row.fetchOne(
+                      db,
+                      sql: """
+                      SELECT media_id FROM media_transfers
+                      WHERE transfer_id = ? AND draft_operation_id = ?
+                        AND purpose = 'message'
+                      """,
+                      arguments: [transfer.transferId, attemptedOperationId]
+                  ),
+                  let mediaId: String = storedTransfer["media_id"] else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+
+            try db.execute(
+                sql: """
+                DELETE FROM message_media WHERE local_id IN (
+                  SELECT local_id FROM messages
+                  WHERE client_msg_id = ? AND msg_id IS NULL
+                )
+                """,
+                arguments: [transfer.clientMsgId]
+            )
+            try db.execute(
+                sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
+                arguments: [transfer.clientMsgId]
+            )
+            try db.execute(
+                sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+                arguments: [accountId, transfer.dialogId]
+            )
+
+            let attachmentId = UUID().uuidString.lowercased()
+            try db.execute(
+                sql: """
+                UPDATE media_transfers SET
+                  client_msg_id = ?,
+                  caption = '',
+                  reply_to_msg_id = NULL,
+                  purpose = 'draft',
+                  draft_attachment_id = ?,
+                  draft_operation_id = NULL,
+                  state = 'ready_to_send',
+                  terminal = 0,
+                  last_error = NULL,
+                  next_retry_at = NULL
+                WHERE transfer_id = ?
+                """,
+                arguments: [attachmentId, attachmentId, transfer.transferId]
+            )
+            let mediaJSON = String(
+                data: try JSONEncoder().encode(transfer.media),
+                encoding: .utf8
+            )
+            try db.execute(
+                sql: """
+                INSERT INTO draft_attachments (
+                  account_id, dialog_id, attachment_id, media_id, position,
+                  media_json, transfer_id, state, progress
+                ) VALUES (?, ?, ?, ?, 0, ?, ?, 'ready', 1)
+                """,
+                arguments: [
+                    accountId, transfer.dialogId, attachmentId, mediaId,
+                    mediaJSON, transfer.transferId,
+                ]
+            )
+            try rewriteDraftMutation(
+                db,
+                accountId: accountId,
+                dialogId: transfer.dialogId,
+                state: "active",
+                text: transfer.caption,
+                replyToMsgId: nil,
+                replyPreview: nil,
+                mentions: transfer.mentions
+            )
+            guard let draft = try Self.fetchDraft(
+                db,
+                accountId: accountId,
+                dialogId: transfer.dialogId
+            ) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            try refreshDialogSummary(db, dialogId: transfer.dialogId)
+            return draft
+        }
+    }
+
+    func completeMediaGroupSend(
+        _ response: MediaGroupSendResponse,
+        senderAccountId: String,
+        attemptedOperationId: String?
+    ) throws {
+        try dbQueue.write { db in
+            for message in response.messages {
+                try upsertMessage(db, message: message, localState: "sent", refreshSummaries: false)
+            }
+            guard let group = try Row.fetchOne(
+                db,
+                sql: "SELECT payload_json FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [response.clientGroupId]
+            ), let payloadJSON: String = group["payload_json"] else { return }
+            try db.execute(
+                sql: """
+                INSERT INTO pending_media_group_cleanup (
+                  client_group_id, transfer_ids_json, created_at
+                ) VALUES (?, ?, datetime('now'))
+                ON CONFLICT(client_group_id) DO NOTHING
+                """,
+                arguments: [
+                    response.clientGroupId,
+                    String(
+                        data: try JSONEncoder().encode(
+                            try JSONDecoder().decode(
+                                PendingMediaGroupPayload.self,
+                                from: Data(payloadJSON.utf8)
+                            ).items.map(\.transferId)
+                        ),
+                        encoding: .utf8
+                    ) ?? "[]",
+                ]
+            )
+            if let attemptedOperationId, let revision = response.clearedDraftRevision {
+                try db.execute(
+                    sql: """
+                    UPDATE drafts SET
+                      server_revision = MAX(server_revision, ?),
+                      consumed_operation_id = NULL,
+                      terminal = 0,
+                      last_error = NULL,
+                      updated_at = datetime('now')
+                    WHERE account_id = ? AND dialog_id = ?
+                      AND operation_id = ?
+                      AND consumed_operation_id = ?
+                    """,
+                    arguments: [
+                        revision, senderAccountId, response.dialogId,
+                        attemptedOperationId, attemptedOperationId,
+                    ]
+                )
+                try materializeServerShadowIfUnblocked(
+                    db,
+                    accountId: senderAccountId,
+                    dialogId: response.dialogId
+                )
+                try db.execute(
+                    sql: "DELETE FROM pending_draft_dependencies WHERE operation_id = ?",
+                    arguments: [attemptedOperationId]
+                )
+            }
+            try refreshDialogSummary(db, dialogId: response.dialogId)
+            try refreshAllUnreadSummaries(db, dialogId: response.dialogId)
+        }
+    }
+
+    func pendingMediaGroupCleanups(limit: Int = 25) throws -> [PendingMediaGroupCleanup] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT client_group_id, transfer_ids_json
+                FROM pending_media_group_cleanup
+                ORDER BY created_at, client_group_id
+                LIMIT ?
+                """,
+                arguments: [max(1, min(limit, 100))]
+            ).compactMap { row in
+                guard let json: String = row["transfer_ids_json"],
+                      let ids = try? JSONDecoder().decode([String].self, from: Data(json.utf8))
+                else { return nil }
+                return PendingMediaGroupCleanup(
+                    clientGroupId: row["client_group_id"],
+                    transferIds: ids
+                )
+            }
+        }
+    }
+
+    func mediaTransfers(ids: [String]) throws -> [MediaTransferRecord] {
+        guard !ids.isEmpty else { return [] }
+        return try dbQueue.read { db in
+            try ids.compactMap { id in
+                try Row.fetchOne(
+                    db,
+                    sql: "SELECT * FROM media_transfers WHERE transfer_id = ?",
+                    arguments: [id]
+                ).map(Self.mediaTransfer(from:))
+            }
+        }
+    }
+
+    func finalizeMediaGroupCleanup(_ cleanup: PendingMediaGroupCleanup) throws {
+        try dbQueue.write { db in
+            for transferId in cleanup.transferIds {
+                try db.execute(
+                    sql: "DELETE FROM media_transfers WHERE transfer_id = ?",
+                    arguments: [transferId]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM pending_media_group_sends WHERE client_group_id = ?",
+                arguments: [cleanup.clientGroupId]
+            )
+            try db.execute(
+                sql: "DELETE FROM pending_media_group_cleanup WHERE client_group_id = ?",
+                arguments: [cleanup.clientGroupId]
+            )
+        }
+    }
+
+    func nextMediaGroupSendDelay(now: Date = Date()) throws -> TimeInterval? {
+        let nowText = Self.sqliteTimestamp(now)
+        return try dbQueue.read { db in
+            let due = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT COUNT(*) FROM pending_media_group_sends
+                WHERE terminal = 0 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                """,
+                arguments: [nowText]
+            ) ?? 0
+            if due > 0 { return 0 }
+            guard let next = try String.fetchOne(
+                db,
+                sql: """
+                SELECT MIN(next_retry_at) FROM pending_media_group_sends
+                WHERE terminal = 0 AND next_retry_at > ?
+                """,
+                arguments: [nowText]
+            ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
+            return max(0, date.timeIntervalSince(now))
         }
     }
 
@@ -1769,6 +3276,8 @@ actor CloudLocalStore {
         senderAccountId: String,
         replyToMsgId: Int64? = nil,
         mentions: [CloudMention] = [],
+        draftConsumeOperationId: String? = nil,
+        requiresCloudDraftSync: Bool = true,
         forwardedFromAccountId: String? = nil,
         forwardedFromDialogId: String? = nil,
         forwardedFromMsgId: Int64? = nil
@@ -1809,22 +3318,55 @@ actor CloudLocalStore {
                 sql: """
                 INSERT INTO pending_outbox (
                   client_msg_id, dialog_id, body, reply_to_msg_id,
-                  forwarded_from_dialog_id, forwarded_from_msg_id, mentions_json, created_at
+                  forwarded_from_dialog_id, forwarded_from_msg_id, mentions_json,
+                  draft_consume_operation_id, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   body = excluded.body,
                   reply_to_msg_id = excluded.reply_to_msg_id,
                   forwarded_from_dialog_id = excluded.forwarded_from_dialog_id,
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   mentions_json = excluded.mentions_json,
+                  draft_consume_operation_id = excluded.draft_consume_operation_id,
                   next_retry_at = NULL
                 """,
                 arguments: [
                     clientMsgId, dialogId, text, replyToMsgId,
-                    forwardedFromDialogId, forwardedFromMsgId, mentionsJSON
+                    forwardedFromDialogId, forwardedFromMsgId, mentionsJSON,
+                    draftConsumeOperationId
                 ]
             )
+            if let draftConsumeOperationId {
+                try db.execute(
+                    sql: """
+                    UPDATE drafts SET
+                      state = 'cleared',
+                      text = '',
+                      reply_to_msg_id = NULL,
+                      reply_preview_json = NULL,
+                      mentions_json = '[]',
+                      consumed_operation_id = ?,
+                      updated_at = datetime('now')
+                    WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                    """,
+                    arguments: [
+                        draftConsumeOperationId, senderAccountId, dialogId,
+                        draftConsumeOperationId,
+                    ]
+                )
+                if !requiresCloudDraftSync {
+                    try db.execute(
+                        sql: """
+                        DELETE FROM pending_draft_mutations
+                        WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+                        """,
+                        arguments: [
+                            senderAccountId, dialogId, draftConsumeOperationId,
+                        ]
+                    )
+                }
+            }
             try refreshDialogSummary(db, dialogId: dialogId)
             try refreshAllUnreadSummaries(db, dialogId: dialogId)
         }
@@ -1902,8 +3444,141 @@ actor CloudLocalStore {
         }
     }
 
+    func removeUnsentMessage(clientMsgId: String) throws {
+        try dbQueue.write { db in
+            let dialogId = try String.fetchOne(
+                db,
+                sql: "SELECT dialog_id FROM messages WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
+            try db.execute(
+                sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                arguments: [clientMsgId]
+            )
+            try db.execute(
+                sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
+                arguments: [clientMsgId]
+            )
+            if let dialogId {
+                try refreshDialogSummary(db, dialogId: dialogId)
+            }
+        }
+    }
+
+    /// Removes only an invalid reply edge after a typed server rejection. The original composer
+    /// content becomes a new draft only while the exact consumed operation is still current. If
+    /// another device/local edit already replaced it, the failed bubble is retained for explicit
+    /// retry instead of overwriting the newer draft.
+    func recoverTextSendAfterInvalidReply(
+        clientMsgId: String,
+        accountId: String
+    ) throws -> InvalidReplyTextRecovery {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT pending.dialog_id, pending.body, pending.mentions_json,
+                       pending.draft_consume_operation_id,
+                       draft.state AS draft_state,
+                       draft.operation_id AS current_operation_id,
+                       draft.consumed_operation_id
+                FROM pending_outbox pending
+                LEFT JOIN drafts draft
+                  ON draft.account_id = ?
+                 AND draft.dialog_id = pending.dialog_id
+                WHERE pending.client_msg_id = ?
+                """,
+                arguments: [accountId, clientMsgId]
+            ) else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let dialogId: String = row["dialog_id"]
+            let body: String = row["body"]
+            let attemptedOperationId: String? = row["draft_consume_operation_id"]
+            let currentOperationId: String? = row["current_operation_id"]
+            let consumedOperationId: String? = row["consumed_operation_id"]
+            let pendingDraftOperation = try String.fetchOne(
+                db,
+                sql: """
+                SELECT operation_id FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, dialogId]
+            )
+            let exactConsumedDraft = attemptedOperationId != nil
+                && currentOperationId == attemptedOperationId
+                && consumedOperationId == attemptedOperationId
+            let safeMissingShield = attemptedOperationId == nil
+                && (row["draft_state"] as String?) != "active"
+                && pendingDraftOperation == nil
+
+            if exactConsumedDraft || safeMissingShield {
+                let mentions = (row["mentions_json"] as String?)
+                    .flatMap { $0.data(using: .utf8) }
+                    .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? []
+                try db.execute(
+                    sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                    arguments: [clientMsgId]
+                )
+                try db.execute(
+                    sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
+                    arguments: [clientMsgId]
+                )
+                let active = !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                try rewriteDraftMutation(
+                    db,
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    state: active ? "active" : "cleared",
+                    text: active ? body : "",
+                    replyToMsgId: nil,
+                    replyPreview: nil,
+                    mentions: active ? mentions : []
+                )
+                try refreshDialogSummary(db, dialogId: dialogId)
+                try refreshAllUnreadSummaries(db, dialogId: dialogId)
+                return .restoredDraft(dialogId: dialogId)
+            }
+
+            try db.execute(
+                sql: """
+                UPDATE pending_outbox
+                SET reply_to_msg_id = NULL, terminal = 1, next_retry_at = NULL
+                WHERE client_msg_id = ?
+                """,
+                arguments: [clientMsgId]
+            )
+            try db.execute(
+                sql: """
+                UPDATE messages SET reply_to_msg_id = NULL, local_state = 'failed'
+                WHERE client_msg_id = ? AND msg_id IS NULL
+                """,
+                arguments: [clientMsgId]
+            )
+            try refreshDialogSummary(db, dialogId: dialogId)
+            return .keptFailedMessage(dialogId: dialogId)
+        }
+    }
+
     func markSent(_ response: SendMessageResponse, senderAccountId: String) throws {
         try dbQueue.write { db in
+            let outboxDraftOperationId = try String.fetchOne(
+                db,
+                sql: """
+                SELECT draft_consume_operation_id FROM pending_outbox
+                WHERE client_msg_id = ?
+                """,
+                arguments: [response.clientMsgId]
+            )
+            let mediaDraftOperationId = try String.fetchOne(
+                db,
+                sql: """
+                SELECT draft_operation_id FROM media_transfers
+                WHERE client_msg_id = ?
+                """,
+                arguments: [response.clientMsgId]
+            )
+            let draftConsumeOperationId = outboxDraftOperationId ?? mediaDraftOperationId
             let previousLocalId = try String.fetchOne(
                 db,
                 sql: "SELECT local_id FROM messages WHERE client_msg_id = ?",
@@ -1940,6 +3615,39 @@ actor CloudLocalStore {
                 )
             }
             try db.execute(sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?", arguments: [response.clientMsgId])
+            if let draftConsumeOperationId, let revision = response.clearedDraftRevision {
+                try db.execute(
+                    sql: """
+                    UPDATE drafts SET
+                      state = 'cleared',
+                      text = '',
+                      reply_to_msg_id = NULL,
+                      reply_preview_json = NULL,
+                      mentions_json = '[]',
+                      server_revision = MAX(server_revision, ?),
+                      consumed_operation_id = NULL,
+                      terminal = 0,
+                      last_error = NULL,
+                      updated_at = datetime('now')
+                    WHERE account_id = ? AND dialog_id = ?
+                      AND operation_id = ?
+                      AND consumed_operation_id = ?
+                    """,
+                    arguments: [
+                        revision, senderAccountId, response.dialogId,
+                        draftConsumeOperationId, draftConsumeOperationId,
+                    ]
+                )
+                try materializeServerShadowIfUnblocked(
+                    db,
+                    accountId: senderAccountId,
+                    dialogId: response.dialogId
+                )
+                try db.execute(
+                    sql: "DELETE FROM pending_draft_dependencies WHERE operation_id = ?",
+                    arguments: [draftConsumeOperationId]
+                )
+            }
             try refreshDialogSummary(db, dialogId: response.dialogId)
             try refreshAllUnreadSummaries(db, dialogId: response.dialogId)
         }
@@ -2019,7 +3727,11 @@ actor CloudLocalStore {
         }
     }
 
-    func mediaTransfersReady(now: Date = Date(), limit: Int = 10) throws -> [MediaTransferRecord] {
+    func mediaTransfersReady(
+        now: Date = Date(),
+        limit: Int = 10,
+        includeCloudDraftDependencies: Bool = true
+    ) throws -> [MediaTransferRecord] {
         try dbQueue.read { db in
             let rows = try Row.fetchAll(
                 db,
@@ -2027,17 +3739,26 @@ actor CloudLocalStore {
                 SELECT media_transfers.* FROM media_transfers
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
+                  AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
+                  AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
                 ORDER BY media_transfers.created_at, media_transfers.transfer_id LIMIT ?
                 """,
-                arguments: [Self.sqliteTimestamp(now), limit]
+                arguments: [includeCloudDraftDependencies, Self.sqliteTimestamp(now), limit]
             )
             return rows.map(Self.mediaTransfer(from:))
         }
     }
 
-    func nextMediaTransferDelay(now: Date = Date()) throws -> TimeInterval? {
+    func nextMediaTransferDelay(
+        now: Date = Date(),
+        includeCloudDraftDependencies: Bool = true
+    ) throws -> TimeInterval? {
         let nowText = Self.sqliteTimestamp(now)
         return try dbQueue.read { db in
             let due = try Int.fetchOne(
@@ -2046,10 +3767,16 @@ actor CloudLocalStore {
                 SELECT COUNT(*) FROM media_transfers
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
+                  AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
+                  AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND (media_transfers.next_retry_at IS NULL OR media_transfers.next_retry_at <= ?)
                 """,
-                arguments: [nowText]
+                arguments: [includeCloudDraftDependencies, nowText]
             ) ?? 0
             if due > 0 { return 0 }
             guard let next = try String.fetchOne(
@@ -2058,10 +3785,16 @@ actor CloudLocalStore {
                 SELECT MIN(media_transfers.next_retry_at) FROM media_transfers
                 LEFT JOIN dialogs ON dialogs.dialog_id = media_transfers.dialog_id
                 WHERE media_transfers.terminal = 0
+                  AND media_transfers.purpose <> 'group_send'
+                  AND NOT (
+                    media_transfers.purpose = 'draft'
+                    AND media_transfers.state = 'ready_to_send'
+                  )
+                  AND (? OR media_transfers.draft_operation_id IS NULL)
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
                   AND media_transfers.next_retry_at > ?
                 """,
-                arguments: [nowText]
+                arguments: [includeCloudDraftDependencies, nowText]
             ), let date = Self.makeSQLiteDateFormatter().date(from: next) else { return nil }
             return max(0, date.timeIntervalSince(now))
         }
@@ -2071,6 +3804,12 @@ actor CloudLocalStore {
         try dbQueue.read { db in
             try Row.fetchOne(db, sql: "SELECT * FROM media_transfers WHERE transfer_id = ?", arguments: [id])
                 .map(Self.mediaTransfer(from:))
+        }
+    }
+
+    func debugSQLiteTotalChanges() throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
         }
     }
 
@@ -2125,33 +3864,8 @@ actor CloudLocalStore {
     }
 
     func insertSendingMedia(_ transfer: MediaTransferRecord, senderAccountId: String) throws {
-        let mediaJSON = String(data: try JSONEncoder().encode(transfer.media), encoding: .utf8)
         try dbQueue.write { db in
-            try upsertDialog(db, dialogId: transfer.dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
-            try db.execute(
-                sql: """
-                INSERT INTO messages (
-                  local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
-                  reply_to_msg_id, is_forwarded, media_json, edit_version, state, server_ts, local_state
-                ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, 0, 'visible', NULL, 'sending')
-                ON CONFLICT(client_msg_id) DO UPDATE SET
-                  kind = excluded.kind, text = excluded.text, media_json = excluded.media_json,
-                  local_state = 'sending'
-                """,
-                arguments: [
-                    "pending:\(transfer.clientMsgId)", transfer.dialogId, transfer.clientMsgId,
-                    senderAccountId, transfer.kind, transfer.caption, transfer.replyToMsgId, mediaJSON
-                ]
-            )
-            try Self.upsertMessageMedia(
-                db,
-                localId: "pending:\(transfer.clientMsgId)",
-                dialogId: transfer.dialogId,
-                msgId: nil,
-                media: transfer.media
-            )
-            try refreshDialogSummary(db, dialogId: transfer.dialogId)
-            try refreshAllUnreadSummaries(db, dialogId: transfer.dialogId)
+            try upsertSendingMedia(db, transfer: transfer, senderAccountId: senderAccountId)
         }
     }
 
@@ -2493,6 +4207,22 @@ actor CloudLocalStore {
                             accountId: accountId,
                             maxReadMsgId: maxReadMsgId,
                             exactUnreadCount: update.unreadCount
+                        )
+                    case "draft.updated":
+                        guard let draft = update.draft else { continue }
+                        let pending = try String.fetchOne(
+                            db,
+                            sql: """
+                            SELECT operation_id FROM pending_draft_mutations
+                            WHERE account_id = ? AND dialog_id = ?
+                            """,
+                            arguments: [accountId, draft.dialogId]
+                        )
+                        try applyCloudDraft(
+                            db,
+                            draft: draft,
+                            accountId: accountId,
+                            preserveLocalOverlay: pending != nil
                         )
                     case "profile.updated":
                         guard
@@ -3286,7 +5016,11 @@ actor CloudLocalStore {
         }
     }
 
-    func pendingOutboxReady(now: Date = Date(), limit: Int = 20) throws -> [PendingOutboxItem] {
+    func pendingOutboxReady(
+        now: Date = Date(),
+        limit: Int = 20,
+        includeCloudDraftDependencies: Bool = true
+    ) throws -> [PendingOutboxItem] {
         let nowText = Self.sqliteTimestamp(now)
         return try dbQueue.read { db in
             let rows = try Row.fetchAll(
@@ -3295,17 +5029,19 @@ actor CloudLocalStore {
                 SELECT pending_outbox.client_msg_id, pending_outbox.dialog_id, pending_outbox.body,
                        pending_outbox.reply_to_msg_id, pending_outbox.forwarded_from_dialog_id,
                        pending_outbox.forwarded_from_msg_id, pending_outbox.mentions_json,
+                       pending_outbox.draft_consume_operation_id,
                        pending_outbox.retry_count,
                        pending_outbox.next_retry_at
                 FROM pending_outbox
                 LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
                 WHERE pending_outbox.terminal = 0
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (? OR pending_outbox.draft_consume_operation_id IS NULL)
                   AND (pending_outbox.next_retry_at IS NULL OR pending_outbox.next_retry_at <= ?)
                 ORDER BY pending_outbox.created_at ASC, pending_outbox.client_msg_id ASC
                 LIMIT ?
                 """,
-                arguments: [nowText, limit]
+                arguments: [includeCloudDraftDependencies, nowText, limit]
             )
             return rows.map(Self.pendingOutboxItem(from:))
         }
@@ -3333,6 +5069,14 @@ actor CloudLocalStore {
                   + (SELECT COUNT(*) FROM pending_group_mutations)
                 """
             ) ?? 0
+            let pendingDrafts = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT
+                  (SELECT COUNT(*) FROM pending_draft_mutations)
+                  + (SELECT COUNT(*) FROM pending_media_group_sends)
+                """
+            ) ?? 0
             let pendingDialogPreferences = try Int.fetchOne(
                 db,
                 sql: """
@@ -3342,11 +5086,14 @@ actor CloudLocalStore {
                 """
             ) ?? 0
             return pendingText + pendingMutations + pendingMedia + pendingGroups
-                + pendingDialogPreferences
+                + pendingDrafts + pendingDialogPreferences
         }
     }
 
-    func nextPendingOutboxDelay(now: Date = Date()) throws -> TimeInterval? {
+    func nextPendingOutboxDelay(
+        now: Date = Date(),
+        includeCloudDraftDependencies: Bool = true
+    ) throws -> TimeInterval? {
         let nowText = Self.sqliteTimestamp(now)
         return try dbQueue.read { db in
             let dueCount = try Int.fetchOne(
@@ -3357,9 +5104,10 @@ actor CloudLocalStore {
                 LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
                 WHERE pending_outbox.terminal = 0
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (? OR pending_outbox.draft_consume_operation_id IS NULL)
                   AND (pending_outbox.next_retry_at IS NULL OR pending_outbox.next_retry_at <= ?)
                 """,
-                arguments: [nowText]
+                arguments: [includeCloudDraftDependencies, nowText]
             ) ?? 0
             if dueCount > 0 {
                 return 0
@@ -3373,9 +5121,10 @@ actor CloudLocalStore {
                 LEFT JOIN dialogs ON dialogs.dialog_id = pending_outbox.dialog_id
                 WHERE pending_outbox.terminal = 0
                   AND COALESCE(dialogs.access_state, 'active') <> 'pending'
+                  AND (? OR pending_outbox.draft_consume_operation_id IS NULL)
                   AND pending_outbox.next_retry_at > ?
                 """,
-                arguments: [nowText]
+                arguments: [includeCloudDraftDependencies, nowText]
             ), let nextDate = Self.makeSQLiteDateFormatter().date(from: next) else {
                 return nil
             }
@@ -4135,6 +5884,164 @@ actor CloudLocalStore {
             """)
         }
 
+        migrator.registerMigration("v10-cloud-drafts-and-media-groups") { db in
+            let messageColumns = try db.columns(in: "messages").map(\.name)
+            if !messageColumns.contains("media_group_id") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN media_group_id TEXT")
+            }
+            if !messageColumns.contains("media_group_index") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN media_group_index INTEGER")
+            }
+            if !messageColumns.contains("media_group_count") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN media_group_count INTEGER")
+            }
+            let outboxColumns = try db.columns(in: "pending_outbox").map(\.name)
+            if !outboxColumns.contains("draft_consume_operation_id") {
+                try db.execute(sql: "ALTER TABLE pending_outbox ADD COLUMN draft_consume_operation_id TEXT")
+            }
+            let transferColumns = try db.columns(in: "media_transfers").map(\.name)
+            if !transferColumns.contains("draft_attachment_id") {
+                try db.execute(sql: "ALTER TABLE media_transfers ADD COLUMN draft_attachment_id TEXT")
+            }
+            if !transferColumns.contains("draft_operation_id") {
+                try db.execute(sql: "ALTER TABLE media_transfers ADD COLUMN draft_operation_id TEXT")
+            }
+            if !transferColumns.contains("mentions_json") {
+                try db.execute(
+                    sql: "ALTER TABLE media_transfers ADD COLUMN mentions_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            }
+            let stagedDialogColumns = try db.columns(in: "bootstrap_staged_dialogs").map(\.name)
+            if !stagedDialogColumns.contains("draft_json") {
+                try db.execute(sql: "ALTER TABLE bootstrap_staged_dialogs ADD COLUMN draft_json TEXT")
+            }
+
+            try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS messages_media_group_idx
+              ON messages(dialog_id, media_group_id, media_group_index)
+              WHERE media_group_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS drafts (
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              state TEXT NOT NULL CHECK (state IN ('active','cleared')),
+              text TEXT NOT NULL,
+              reply_to_msg_id INTEGER,
+              reply_preview_json TEXT,
+              mentions_json TEXT NOT NULL DEFAULT '[]',
+              local_generation INTEGER NOT NULL DEFAULT 0,
+              operation_id TEXT NOT NULL,
+              server_revision INTEGER NOT NULL DEFAULT 0,
+              server_shadow_json TEXT,
+              consumed_operation_id TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (account_id, dialog_id)
+            );
+            CREATE INDEX IF NOT EXISTS drafts_dialog_idx
+              ON drafts(dialog_id, account_id);
+            CREATE INDEX IF NOT EXISTS drafts_updated_idx
+              ON drafts(updated_at DESC, dialog_id);
+
+            CREATE TABLE IF NOT EXISTS draft_attachments (
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              attachment_id TEXT NOT NULL,
+              media_id TEXT,
+              position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 9),
+              media_json TEXT,
+              transfer_id TEXT,
+              state TEXT NOT NULL CHECK (
+                state IN ('staging','uploading','ready','failed','terminal')
+              ),
+              progress REAL NOT NULL DEFAULT 0,
+              last_error TEXT,
+              PRIMARY KEY (account_id, dialog_id, attachment_id)
+            );
+            CREATE INDEX IF NOT EXISTS draft_attachments_transfer_idx
+              ON draft_attachments(transfer_id);
+            CREATE INDEX IF NOT EXISTS draft_attachments_media_idx
+              ON draft_attachments(media_id);
+
+            CREATE TABLE IF NOT EXISTS pending_draft_mutations (
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              operation_id TEXT NOT NULL UNIQUE,
+              local_generation INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (account_id, dialog_id)
+            );
+            CREATE INDEX IF NOT EXISTS pending_draft_mutations_ready_idx
+              ON pending_draft_mutations(terminal, next_retry_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS pending_media_group_sends (
+              client_group_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              draft_consume_operation_id TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_media_group_sends_ready_idx
+              ON pending_media_group_sends(terminal, next_retry_at, created_at);
+            """)
+        }
+
+        migrator.registerMigration("v11-cloud-draft-launch-hardening") { db in
+            try db.execute(sql: """
+            UPDATE draft_attachments AS attachment
+            SET position = (
+              SELECT COUNT(*)
+              FROM draft_attachments AS earlier
+              WHERE earlier.account_id = attachment.account_id
+                AND earlier.dialog_id = attachment.dialog_id
+                AND (
+                  earlier.position < attachment.position
+                  OR (
+                    earlier.position = attachment.position
+                    AND earlier.attachment_id < attachment.attachment_id
+                  )
+                )
+            );
+            """)
+            try db.execute(sql: """
+            CREATE UNIQUE INDEX IF NOT EXISTS draft_attachments_position_unique_idx
+              ON draft_attachments(account_id, dialog_id, position);
+
+            CREATE TABLE IF NOT EXISTS pending_draft_dependencies (
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              operation_id TEXT PRIMARY KEY,
+              local_generation INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_draft_dependencies_ready_idx
+              ON pending_draft_dependencies(terminal, next_retry_at, updated_at);
+
+            CREATE TABLE IF NOT EXISTS pending_media_group_cleanup (
+              client_group_id TEXT PRIMARY KEY,
+              transfer_ids_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              last_error TEXT
+            );
+            """)
+        }
+
         migrator.registerMigration("v10-dialog-preferences") { db in
             try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS dialog_preferences (
@@ -4350,6 +6257,7 @@ actor CloudLocalStore {
            reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
            forwarded_from_msg_id, is_forwarded, mentions_json,
            media_json, service_type, service_data_json,
+           media_group_id, media_group_index, media_group_count,
            edit_version, state,
            server_ts, local_state,
            (SELECT display_name FROM profiles WHERE account_id = messages.sender_account_id)
@@ -4690,7 +6598,12 @@ actor CloudLocalStore {
               d.title,
               d.photo_media_json,
               d.last_msg_id,
-              d.updated_at,
+              CASE
+                WHEN draft.updated_at IS NOT NULL
+                  AND julianday(draft.updated_at) > julianday(d.updated_at)
+                THEN draft.updated_at
+                ELSE d.updated_at
+              END AS updated_at,
               d.revision,
               d.member_count,
               d.self_role,
@@ -4725,7 +6638,20 @@ actor CloudLocalStore {
               summary.last_local_state,
               summary.last_server_ts,
               COALESCE(unread.unread_count, 0) AS unread_count,
-              COALESCE(unread.mention_count, 0) AS mention_count
+              COALESCE(unread.mention_count, 0) AS mention_count,
+              CASE WHEN draft.state = 'active' THEN draft.text END AS draft_text,
+              CASE
+                WHEN draft.state = 'active' THEN (
+                  SELECT COUNT(*) FROM draft_attachments attachment
+                  WHERE attachment.account_id = draft.account_id
+                    AND attachment.dialog_id = draft.dialog_id
+                )
+                ELSE 0
+              END AS draft_attachment_count,
+              CASE
+                WHEN draft.state = 'active' AND draft.reply_to_msg_id IS NOT NULL THEN 1
+                ELSE 0
+              END AS has_draft_reply
             FROM dialogs d
             LEFT JOIN dialog_members peer ON peer.dialog_id = d.dialog_id
               AND peer.account_id != ? AND d.type = 'direct'
@@ -4785,16 +6711,21 @@ actor CloudLocalStore {
                  AND latest.field = pending_archive.field
                  AND latest.terminal = 0
              )
+            LEFT JOIN drafts draft
+              ON draft.dialog_id = d.dialog_id AND draft.account_id = ?
             WHERE d.access_state IN ('pending','active')
             ORDER BY
               is_pinned DESC,
               pinned_at DESC,
-              d.updated_at DESC,
+              MAX(
+                julianday(d.updated_at),
+                COALESCE(julianday(draft.updated_at), julianday(d.updated_at))
+              ) DESC,
               d.dialog_id DESC
             """,
             arguments: [
                 accountId, accountId,
-                accountId, accountId, accountId, accountId,
+                accountId, accountId, accountId, accountId, accountId,
             ]
         )
         return rows.map(dialog(from:))
@@ -4854,14 +6785,18 @@ actor CloudLocalStore {
             let photoJSON = dialog.photo
                 .flatMap { try? encoder.encode($0) }
                 .flatMap { String(data: $0, encoding: .utf8) }
+            let draftJSON = dialog.draft
+                .flatMap { try? encoder.encode($0) }
+                .flatMap { String(data: $0, encoding: .utf8) }
             try db.execute(
                 sql: """
                 INSERT INTO bootstrap_staged_dialogs (
                   account_id, dialog_id, type, title, last_msg_id, updated_at, unread_count,
                   revision, member_count, self_role, notification_mode, photo_media_json,
+                  draft_json,
                   preference_is_pinned, preference_pinned_at, preference_is_muted,
                   preference_is_archived, preference_updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, dialog_id) DO UPDATE SET
                   type = excluded.type,
                   title = excluded.title,
@@ -4873,6 +6808,7 @@ actor CloudLocalStore {
                   self_role = excluded.self_role,
                   notification_mode = excluded.notification_mode,
                   photo_media_json = excluded.photo_media_json,
+                  draft_json = excluded.draft_json,
                   preference_is_pinned = excluded.preference_is_pinned,
                   preference_pinned_at = excluded.preference_pinned_at,
                   preference_is_muted = excluded.preference_is_muted,
@@ -4883,7 +6819,7 @@ actor CloudLocalStore {
                     accountId, dialog.dialogId, dialog.type, dialog.title,
                     dialog.lastMsgId, dialog.updatedAt, dialog.unreadCount,
                     dialog.revision, dialog.memberCount, dialog.selfRole,
-                    dialog.notificationMode, photoJSON,
+                    dialog.notificationMode, photoJSON, draftJSON,
                     dialog.preferences?.pinned ?? false,
                     dialog.preferences?.pinnedAt,
                     dialog.preferences?.muted ?? (dialog.notificationMode == "muted"),
@@ -5033,6 +6969,7 @@ actor CloudLocalStore {
             sql: """
             SELECT dialog_id, type, title, last_msg_id, updated_at, unread_count,
                    revision, member_count, self_role, notification_mode, photo_media_json,
+                   draft_json,
                    preference_is_pinned, preference_pinned_at, preference_is_muted,
                    preference_is_archived, preference_updated_at
             FROM bootstrap_staged_dialogs
@@ -5046,6 +6983,9 @@ actor CloudLocalStore {
             let photo = (row["photo_media_json"] as String?)
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? decoder.decode(CloudMedia.self, from: $0) }
+            let draft = (row["draft_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode(CloudDraft.self, from: $0) }
             return BootstrapDialog(
                 dialogId: dialogId,
                 type: row["type"],
@@ -5066,6 +7006,7 @@ actor CloudLocalStore {
                     updatedAt: row["preference_updated_at"] ?? row["updated_at"]
                 ),
                 photo: photo,
+                draft: draft,
                 members: membersByDialog[dialogId] ?? [],
                 messages: messagesByDialog[dialogId] ?? []
             )
@@ -5144,6 +7085,23 @@ actor CloudLocalStore {
             accountId: accountId,
             clientMutationId: nil
         )
+
+        if let draft = dialog.draft {
+            let pending = try String.fetchOne(
+                db,
+                sql: """
+                SELECT operation_id FROM pending_draft_mutations
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [accountId, dialog.dialogId]
+            )
+            try applyCloudDraft(
+                db,
+                draft: draft,
+                accountId: accountId,
+                preserveLocalOverlay: pending != nil
+            )
+        }
 
         if pruneSnapshotWindow {
             try pruneSnapshotMessageWindow(db, dialog: dialog)
@@ -5344,12 +7302,16 @@ actor CloudLocalStore {
                   EXISTS(SELECT 1 FROM pending_outbox WHERE dialog_id = ?) OR
                   EXISTS(SELECT 1 FROM pending_message_mutations WHERE dialog_id = ?) OR
                   EXISTS(SELECT 1 FROM media_transfers WHERE dialog_id = ?) OR
+                  EXISTS(SELECT 1 FROM pending_draft_mutations WHERE dialog_id = ?) OR
+                  EXISTS(SELECT 1 FROM pending_media_group_sends WHERE dialog_id = ?) OR
                   EXISTS(
                     SELECT 1 FROM messages
                     WHERE dialog_id = ? AND (msg_id IS NULL OR local_state != 'sent')
                   )
                 """,
-                arguments: [dialogId, dialogId, dialogId, dialogId]
+                arguments: [
+                    dialogId, dialogId, dialogId, dialogId, dialogId, dialogId,
+                ]
             ) ?? false
             guard !hasPendingWork else { continue }
 
@@ -5609,6 +7571,49 @@ actor CloudLocalStore {
         )
     }
 
+    private func upsertSendingMedia(
+        _ db: Database,
+        transfer: MediaTransferRecord,
+        senderAccountId: String
+    ) throws {
+        let mediaJSON = String(data: try JSONEncoder().encode(transfer.media), encoding: .utf8)
+        try upsertDialog(
+            db,
+            dialogId: transfer.dialogId,
+            type: "direct",
+            title: nil,
+            lastMsgId: 0,
+            updatedAt: nil
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO messages (
+              local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
+              reply_to_msg_id, is_forwarded, media_json, edit_version, state, server_ts, local_state
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, 0, 'visible', NULL, 'sending')
+            ON CONFLICT(client_msg_id) DO UPDATE SET
+              kind = excluded.kind,
+              text = excluded.text,
+              reply_to_msg_id = excluded.reply_to_msg_id,
+              media_json = excluded.media_json,
+              local_state = 'sending'
+            """,
+            arguments: [
+                "pending:\(transfer.clientMsgId)", transfer.dialogId, transfer.clientMsgId,
+                senderAccountId, transfer.kind, transfer.caption, transfer.replyToMsgId, mediaJSON,
+            ]
+        )
+        try Self.upsertMessageMedia(
+            db,
+            localId: "pending:\(transfer.clientMsgId)",
+            dialogId: transfer.dialogId,
+            msgId: nil,
+            media: transfer.media
+        )
+        try refreshDialogSummary(db, dialogId: transfer.dialogId)
+        try refreshAllUnreadSummaries(db, dialogId: transfer.dialogId)
+    }
+
     nonisolated private static func historyState(from row: Row) -> DialogHistoryState {
         DialogHistoryState(
             dialogId: row["dialog_id"],
@@ -5817,6 +7822,37 @@ actor CloudLocalStore {
             sql: """
             UPDATE pending_group_mutations
             SET terminal = 1, last_error = ?
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE pending_draft_mutations
+            SET terminal = 1, last_error = ?, next_retry_at = NULL
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE pending_media_group_sends
+            SET terminal = 1, last_error = ?, next_retry_at = NULL
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE drafts SET terminal = 1, last_error = ?
+            WHERE dialog_id = ?
+            """,
+            arguments: [reason, dialogId]
+        )
+        try db.execute(
+            sql: """
+            UPDATE draft_attachments
+            SET state = 'terminal', last_error = ?
             WHERE dialog_id = ?
             """,
             arguments: [reason, dialogId]
@@ -6032,6 +8068,591 @@ actor CloudLocalStore {
         }
     }
 
+    private typealias DraftRowValue = (
+        text: String,
+        replyToMsgId: Int64?,
+        replyPreview: CloudDraftReplyPreview?,
+        mentions: [CloudMention]
+    )
+
+    private func markDraftConsumed(
+        _ db: Database,
+        accountId: String,
+        dialogId: String,
+        operationId: String
+    ) throws {
+        try db.execute(
+            sql: """
+            UPDATE drafts SET
+              state = 'cleared',
+              text = '',
+              reply_to_msg_id = NULL,
+              reply_preview_json = NULL,
+              mentions_json = '[]',
+              consumed_operation_id = ?,
+              terminal = 0,
+              last_error = NULL,
+              updated_at = datetime('now')
+            WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+            """,
+            arguments: [operationId, accountId, dialogId, operationId]
+        )
+    }
+
+    private static func fetchDraftRow(
+        _ db: Database,
+        accountId: String,
+        dialogId: String
+    ) throws -> DraftRowValue? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT text, reply_to_msg_id, reply_preview_json, mentions_json
+            FROM drafts WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        ) else { return nil }
+        let decoder = JSONDecoder()
+        return (
+            text: row["text"],
+            replyToMsgId: row["reply_to_msg_id"],
+            replyPreview: (row["reply_preview_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode(CloudDraftReplyPreview.self, from: $0) },
+            mentions: (row["mentions_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode([CloudMention].self, from: $0) } ?? []
+        )
+    }
+
+    private static func fetchDraft(
+        _ db: Database,
+        accountId: String,
+        dialogId: String
+    ) throws -> LocalDraft? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT * FROM drafts WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        ) else { return nil }
+        let decoder = JSONDecoder()
+        let attachmentRows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT * FROM draft_attachments
+            WHERE account_id = ? AND dialog_id = ?
+            ORDER BY position, attachment_id
+            """,
+            arguments: [accountId, dialogId]
+        )
+        let attachments = attachmentRows.map { attachment in
+            LocalDraftAttachment(
+                attachmentId: attachment["attachment_id"],
+                mediaId: attachment["media_id"],
+                position: attachment["position"],
+                media: (attachment["media_json"] as String?)
+                    .flatMap { $0.data(using: .utf8) }
+                    .flatMap { try? decoder.decode(CloudMedia.self, from: $0) },
+                transferId: attachment["transfer_id"],
+                state: attachment["state"],
+                progress: attachment["progress"],
+                lastError: attachment["last_error"]
+            )
+        }
+        return LocalDraft(
+            accountId: row["account_id"],
+            dialogId: row["dialog_id"],
+            state: row["state"],
+            text: row["text"],
+            replyToMsgId: row["reply_to_msg_id"],
+            replyPreview: (row["reply_preview_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode(CloudDraftReplyPreview.self, from: $0) },
+            mentions: (row["mentions_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? decoder.decode([CloudMention].self, from: $0) } ?? [],
+            attachments: attachments,
+            localGeneration: row["local_generation"],
+            operationId: row["operation_id"],
+            serverRevision: row["server_revision"],
+            terminal: (row["terminal"] as Int) != 0,
+            lastError: row["last_error"],
+            updatedAt: row["updated_at"]
+        )
+    }
+
+    private func rewriteDraftMutation(
+        _ db: Database,
+        accountId: String,
+        dialogId: String,
+        state: String,
+        text: String,
+        replyToMsgId: Int64?,
+        replyPreview: CloudDraftReplyPreview?,
+        mentions: [CloudMention]
+    ) throws {
+        let previous = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT local_generation, server_revision
+            FROM drafts WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        )
+        let generation = (previous?["local_generation"] as Int64? ?? 0) + 1
+        let operationId = UUID().uuidString.lowercased()
+        let encoder = JSONEncoder()
+        let mentionsJSON = String(
+            data: try encoder.encode(mentions),
+            encoding: .utf8
+        ) ?? "[]"
+        let replyJSON = replyPreview
+            .flatMap { try? encoder.encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
+        try db.execute(
+            sql: """
+            INSERT INTO drafts (
+              account_id, dialog_id, state, text, reply_to_msg_id, reply_preview_json,
+              mentions_json, local_generation, operation_id, server_revision,
+              terminal, last_error, consumed_operation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, datetime('now'))
+            ON CONFLICT(account_id, dialog_id) DO UPDATE SET
+              state = excluded.state,
+              text = excluded.text,
+              reply_to_msg_id = excluded.reply_to_msg_id,
+              reply_preview_json = excluded.reply_preview_json,
+              mentions_json = excluded.mentions_json,
+              local_generation = excluded.local_generation,
+              operation_id = excluded.operation_id,
+              terminal = 0,
+              last_error = NULL,
+              consumed_operation_id = NULL,
+              updated_at = excluded.updated_at
+            """,
+            arguments: [
+                accountId, dialogId, state, text, replyToMsgId, replyJSON,
+                mentionsJSON, generation, operationId,
+                previous?["server_revision"] as Int64? ?? 0,
+            ]
+        )
+        let readyRows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT attachment_id, media_id, position
+            FROM draft_attachments
+            WHERE account_id = ? AND dialog_id = ?
+              AND state = 'ready' AND media_id IS NOT NULL
+            ORDER BY position
+            """,
+            arguments: [accountId, dialogId]
+        )
+        let attachments = readyRows.map {
+            DraftAttachmentRequest(
+                attachmentId: $0["attachment_id"],
+                mediaId: $0["media_id"],
+                position: $0["position"]
+            )
+        }
+        let payload = StoredDraftMutationPayload(
+            state: state,
+            text: text,
+            replyToMsgId: replyToMsgId,
+            mentions: mentions,
+            attachments: attachments
+        )
+        let payloadJSON = String(
+            data: try encoder.encode(payload),
+            encoding: .utf8
+        ) ?? "{}"
+        try db.execute(
+            sql: """
+            INSERT INTO pending_draft_mutations (
+              account_id, dialog_id, operation_id, local_generation, payload_json,
+              retry_count, next_retry_at, last_error, terminal, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, 0, datetime('now'))
+            ON CONFLICT(account_id, dialog_id) DO UPDATE SET
+              operation_id = excluded.operation_id,
+              local_generation = excluded.local_generation,
+              payload_json = excluded.payload_json,
+              retry_count = 0,
+              next_retry_at = NULL,
+              last_error = NULL,
+              terminal = 0,
+              updated_at = excluded.updated_at
+            """,
+            arguments: [accountId, dialogId, operationId, generation, payloadJSON]
+        )
+    }
+
+    private func applyCloudDraft(
+        _ db: Database,
+        draft: CloudDraft,
+        accountId: String,
+        preserveLocalOverlay: Bool
+    ) throws {
+        let current = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT server_revision, consumed_operation_id
+            FROM drafts WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, draft.dialogId]
+        )
+        let currentRevision = current?["server_revision"] as Int64? ?? 0
+        guard draft.revision >= currentRevision else { return }
+        let encoder = JSONEncoder()
+        let shadow = String(
+            data: try encoder.encode(draft),
+            encoding: .utf8
+        )
+        let consumedOperation: String? = current?["consumed_operation_id"]
+        let preserveConsumed = consumedOperation == draft.operationId && draft.state == "active"
+        if preserveLocalOverlay || preserveConsumed {
+            try db.execute(
+                sql: """
+                UPDATE drafts SET
+                  server_revision = ?,
+                  server_shadow_json = ?
+                WHERE account_id = ? AND dialog_id = ?
+                """,
+                arguments: [draft.revision, shadow, accountId, draft.dialogId]
+            )
+            return
+        }
+        let mentionsJSON = String(
+            data: try encoder.encode(draft.mentions),
+            encoding: .utf8
+        ) ?? "[]"
+        let replyJSON = draft.replyPreview
+            .flatMap { try? encoder.encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
+        try db.execute(
+            sql: """
+            INSERT INTO drafts (
+              account_id, dialog_id, state, text, reply_to_msg_id, reply_preview_json,
+              mentions_json, local_generation, operation_id, server_revision,
+              server_shadow_json, consumed_operation_id, terminal, last_error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, 0, NULL, ?)
+            ON CONFLICT(account_id, dialog_id) DO UPDATE SET
+              state = excluded.state,
+              text = excluded.text,
+              reply_to_msg_id = excluded.reply_to_msg_id,
+              reply_preview_json = excluded.reply_preview_json,
+              mentions_json = excluded.mentions_json,
+              operation_id = excluded.operation_id,
+              server_revision = excluded.server_revision,
+              server_shadow_json = excluded.server_shadow_json,
+              consumed_operation_id = NULL,
+              terminal = 0,
+              last_error = NULL,
+              updated_at = excluded.updated_at
+            """,
+            arguments: [
+                accountId, draft.dialogId, draft.state, draft.text, draft.replyToMsgId,
+                replyJSON, mentionsJSON, draft.operationId, draft.revision, shadow,
+                draft.updatedAt,
+            ]
+        )
+        // A media id is not a transfer identity: the same uploaded object can be referenced by
+        // multiple dialogs, accounts, and purposes. Only an exact existing draft attachment in
+        // this account/dialog may retain its local transfer and encrypted staging files.
+        let reusableTransferRows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT attachment.attachment_id, attachment.transfer_id
+            FROM draft_attachments attachment
+            JOIN media_transfers transfer
+              ON transfer.transfer_id = attachment.transfer_id
+            WHERE attachment.account_id = ?
+              AND attachment.dialog_id = ?
+              AND transfer.dialog_id = ?
+              AND transfer.purpose = 'draft'
+              AND attachment.transfer_id IS NOT NULL
+            """,
+            arguments: [accountId, draft.dialogId, draft.dialogId]
+        )
+        let reusableTransferByAttachment = Dictionary(
+            uniqueKeysWithValues: reusableTransferRows.compactMap { row -> (String, String)? in
+                guard
+                    let attachmentId: String = row["attachment_id"],
+                    let transferId: String = row["transfer_id"]
+                else { return nil }
+                return (attachmentId, transferId)
+            }
+        )
+        try db.execute(
+            sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+            arguments: [accountId, draft.dialogId]
+        )
+        if draft.state == "active" {
+            for attachment in draft.attachments.sorted(by: { $0.position < $1.position }) {
+                // A different device has no staging file, but the server media id is already
+                // sufficient to send. Keep a stable local transfer row so both paths are uniform.
+                let reusableTransferId = reusableTransferByAttachment[attachment.attachmentId]
+                let transferId = reusableTransferId
+                    ?? "server:\(accountId):\(draft.dialogId):\(attachment.attachmentId)"
+                let clientMsgId = reusableTransferId == nil
+                    ? transferId
+                    : attachment.attachmentId
+                let mediaJSON = String(
+                    data: try encoder.encode(attachment.media),
+                    encoding: .utf8
+                )
+                try db.execute(
+                    sql: """
+                    INSERT INTO media_transfers (
+                      transfer_id, dialog_id, client_msg_id, caption, reply_to_msg_id,
+                      purpose, draft_attachment_id, kind, content_type, file_name, byte_size,
+                      sha256, duration_ms, width, height, encrypted_source_path,
+                      encrypted_thumbnail_path, media_id, upload_offset, state, created_at
+                    ) VALUES (
+                      ?, ?, ?, '', NULL, 'draft', ?, ?, ?, ?, ?, '', ?, ?, ?, '',
+                      NULL, ?, 0, 'ready_to_send', datetime('now')
+                    )
+                    ON CONFLICT(transfer_id) DO UPDATE SET
+                      dialog_id = excluded.dialog_id,
+                      client_msg_id = excluded.client_msg_id,
+                      media_id = excluded.media_id,
+                      purpose = 'draft',
+                      draft_attachment_id = excluded.draft_attachment_id,
+                      state = 'ready_to_send',
+                      terminal = 0,
+                      next_retry_at = NULL,
+                      last_error = NULL
+                    """,
+                    arguments: [
+                        transferId, draft.dialogId, clientMsgId,
+                        attachment.attachmentId, attachment.media.kind,
+                        attachment.media.contentType, attachment.media.fileName,
+                        attachment.media.byteSize, attachment.media.durationMs,
+                        attachment.media.width, attachment.media.height, attachment.mediaId,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                    INSERT INTO draft_attachments (
+                      account_id, dialog_id, attachment_id, media_id, position,
+                      media_json, transfer_id, state, progress
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1)
+                    """,
+                    arguments: [
+                        accountId, draft.dialogId, attachment.attachmentId,
+                        attachment.mediaId, attachment.position, mediaJSON, transferId,
+                    ]
+                )
+            }
+        }
+    }
+
+    private func preserveDraftDependency(
+        _ db: Database,
+        accountId: String,
+        dialogId: String,
+        operationId: String
+    ) throws {
+        try db.execute(
+            sql: """
+            INSERT INTO pending_draft_dependencies (
+              account_id, dialog_id, operation_id, local_generation, payload_json,
+              retry_count, next_retry_at, last_error, terminal, updated_at
+            )
+            SELECT account_id, dialog_id, operation_id, local_generation, payload_json,
+                   retry_count, next_retry_at, last_error, terminal, updated_at
+            FROM pending_draft_mutations
+            WHERE account_id = ? AND dialog_id = ? AND operation_id = ?
+            ON CONFLICT(operation_id) DO NOTHING
+            """,
+            arguments: [accountId, dialogId, operationId]
+        )
+        if try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM pending_draft_dependencies WHERE operation_id = ?",
+            arguments: [operationId]
+        ) != 1 {
+            // A draft restored on another device has already been acknowledged by the server and
+            // therefore has no local mutation row. Reconstruct the exact immutable operation so
+            // the send worker can idempotently re-ack it before consuming the draft.
+            guard let draft = try Self.fetchDraft(
+                db,
+                accountId: accountId,
+                dialogId: dialogId
+            ), draft.operationId == operationId else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            let payload = StoredDraftMutationPayload(
+                state: draft.state,
+                text: draft.text,
+                replyToMsgId: draft.replyToMsgId,
+                mentions: draft.mentions,
+                attachments: draft.attachments.compactMap { attachment in
+                    guard let mediaId = attachment.mediaId else { return nil }
+                    return DraftAttachmentRequest(
+                        attachmentId: attachment.attachmentId,
+                        mediaId: mediaId,
+                        position: attachment.position
+                    )
+                }
+            )
+            let payloadJSON = String(
+                data: try JSONEncoder().encode(payload),
+                encoding: .utf8
+            ) ?? "{}"
+            try db.execute(
+                sql: """
+                INSERT INTO pending_draft_dependencies (
+                  account_id, dialog_id, operation_id, local_generation, payload_json,
+                  retry_count, next_retry_at, last_error, terminal, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, 0, datetime('now'))
+                ON CONFLICT(operation_id) DO NOTHING
+                """,
+                arguments: [
+                    accountId, dialogId, operationId, draft.localGeneration, payloadJSON,
+                ]
+            )
+        }
+    }
+
+    private func materializeServerShadowIfUnblocked(
+        _ db: Database,
+        accountId: String,
+        dialogId: String
+    ) throws {
+        let consumedCount = try Int.fetchOne(
+            db,
+            sql: """
+            SELECT COUNT(*) FROM drafts
+            WHERE account_id = ? AND dialog_id = ? AND consumed_operation_id IS NOT NULL
+            """,
+            arguments: [accountId, dialogId]
+        ) ?? 0
+        let pendingCount = try Int.fetchOne(
+            db,
+            sql: """
+            SELECT COUNT(*) FROM pending_draft_mutations
+            WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        ) ?? 0
+        let isBlocked = consumedCount != 0 || pendingCount != 0
+        guard !isBlocked, let shadowJSON = try String.fetchOne(
+            db,
+            sql: """
+            SELECT server_shadow_json FROM drafts
+            WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        ), let shadow = try? JSONDecoder().decode(CloudDraft.self, from: Data(shadowJSON.utf8))
+        else { return }
+        try applyCloudDraft(
+            db,
+            draft: shadow,
+            accountId: accountId,
+            preserveLocalOverlay: false
+        )
+        try db.execute(
+            sql: """
+            UPDATE drafts SET server_shadow_json = NULL
+            WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        )
+    }
+
+    private func rewriteDraftAttachmentOrder(
+        _ db: Database,
+        accountId: String,
+        dialogId: String,
+        attachmentIds: [String]
+    ) throws {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+            SELECT * FROM draft_attachments
+            WHERE account_id = ? AND dialog_id = ?
+            """,
+            arguments: [accountId, dialogId]
+        )
+        let byId = Dictionary(uniqueKeysWithValues: rows.map {
+            ($0["attachment_id"] as String, $0)
+        })
+        guard Set(byId.keys) == Set(attachmentIds), byId.count == attachmentIds.count else {
+            throw CloudLocalStoreBootstrapError.invalidStagedMessage
+        }
+        try db.execute(
+            sql: "DELETE FROM draft_attachments WHERE account_id = ? AND dialog_id = ?",
+            arguments: [accountId, dialogId]
+        )
+        for (position, attachmentId) in attachmentIds.enumerated() {
+            guard let row = byId[attachmentId] else {
+                throw CloudLocalStoreBootstrapError.invalidStagedMessage
+            }
+            try db.execute(
+                sql: """
+                INSERT INTO draft_attachments (
+                  account_id, dialog_id, attachment_id, media_id, position, media_json,
+                  transfer_id, state, progress, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: [
+                    accountId,
+                    dialogId,
+                    attachmentId,
+                    row["media_id"] as String?,
+                    position,
+                    row["media_json"] as String?,
+                    row["transfer_id"] as String?,
+                    row["state"] as String,
+                    row["progress"] as Double,
+                    row["last_error"] as String?,
+                ]
+            )
+        }
+    }
+
+    private static func pendingDraftMutation(from row: Row) -> PendingDraftMutation? {
+        guard
+            let json: String = row["payload_json"],
+            let data = json.data(using: .utf8),
+            let payload = try? JSONDecoder().decode(StoredDraftMutationPayload.self, from: data)
+        else { return nil }
+        return PendingDraftMutation(
+            accountId: row["account_id"],
+            dialogId: row["dialog_id"],
+            operationId: row["operation_id"],
+            localGeneration: row["local_generation"],
+            state: payload.state,
+            text: payload.text,
+            replyToMsgId: payload.replyToMsgId,
+            mentions: payload.mentions,
+            attachments: payload.attachments,
+            retryCount: row["retry_count"],
+            nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"],
+            terminal: (row["terminal"] as Int) != 0
+        )
+    }
+
+    private static func pendingMediaGroupSend(from row: Row) -> PendingMediaGroupSend? {
+        guard
+            let json: String = row["payload_json"],
+            let data = json.data(using: .utf8),
+            let payload = try? JSONDecoder().decode(PendingMediaGroupPayload.self, from: data)
+        else { return nil }
+        return PendingMediaGroupSend(
+            clientGroupId: row["client_group_id"],
+            accountId: row["account_id"],
+            dialogId: row["dialog_id"],
+            payload: payload,
+            draftConsumeOperationId: row["draft_consume_operation_id"],
+            retryCount: row["retry_count"],
+            nextRetryAt: row["next_retry_at"],
+            lastError: row["last_error"],
+            terminal: (row["terminal"] as Int) != 0
+        )
+    }
+
     private func upsertMessage(
         _ db: Database,
         message: CloudMessage,
@@ -6049,9 +8670,10 @@ actor CloudLocalStore {
               local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
               reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
               forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state,
-              mentions_json, media_json, service_type, service_data_json
+              mentions_json, media_json, service_type, service_data_json,
+              media_group_id, media_group_index, media_group_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -6068,6 +8690,9 @@ actor CloudLocalStore {
               media_json = excluded.media_json,
               service_type = excluded.service_type,
               service_data_json = excluded.service_data_json,
+              media_group_id = excluded.media_group_id,
+              media_group_index = excluded.media_group_index,
+              media_group_count = excluded.media_group_count,
               edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
@@ -6095,7 +8720,10 @@ actor CloudLocalStore {
                     : String(data: try JSONEncoder().encode(message.mentions), encoding: .utf8) ?? "[]",
                 message.media.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) },
                 message.serviceType,
-                message.serviceData.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) }
+                message.serviceData.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) },
+                message.mediaGroupId,
+                message.mediaGroupIndex,
+                message.mediaGroupCount
             ]
         )
         if let previousLocalId, previousLocalId != message.id {
@@ -6166,6 +8794,9 @@ actor CloudLocalStore {
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
             media: (row["media_json"] as String?).flatMap { $0.data(using: .utf8) }.flatMap { try? JSONDecoder().decode(CloudMedia.self, from: $0) },
+            mediaGroupId: row["media_group_id"],
+            mediaGroupIndex: row["media_group_index"],
+            mediaGroupCount: row["media_group_count"],
             serviceType: row["service_type"],
             serviceData: (row["service_data_json"] as String?)
                 .flatMap { $0.data(using: .utf8) }
@@ -6182,6 +8813,10 @@ actor CloudLocalStore {
             transferId: row["transfer_id"], dialogId: row["dialog_id"],
             clientMsgId: row["client_msg_id"], caption: row["caption"],
             replyToMsgId: row["reply_to_msg_id"], purpose: row["purpose"],
+            draftOperationId: row["draft_operation_id"],
+            mentions: (row["mentions_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
             kind: row["kind"],
             contentType: row["content_type"], fileName: row["file_name"],
             byteSize: row["byte_size"], sha256: row["sha256"], durationMs: row["duration_ms"],
@@ -6284,6 +8919,9 @@ actor CloudLocalStore {
             selfRole: row["self_role"],
             notificationMode: row["notification_mode"],
             accessState: row["access_state"],
+            draftText: row["draft_text"],
+            draftAttachmentCount: row["draft_attachment_count"],
+            hasDraftReply: (row["has_draft_reply"] as Int) != 0,
             isPinned: (row["is_pinned"] as Int) != 0,
             pinnedAt: row["pinned_at"],
             isMuted: (row["is_muted"] as Int) != 0,
@@ -6302,6 +8940,7 @@ actor CloudLocalStore {
             mentions: (row["mentions_json"] as String?)
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
+            draftConsumeOperationId: row["draft_consume_operation_id"],
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"]
         )
@@ -6393,6 +9032,10 @@ actor CloudLocalStore {
     }
 
     private func deleteReplicaData(_ db: Database, includeMediaTransfers: Bool) throws {
+        try db.execute(sql: "DELETE FROM draft_attachments")
+        try db.execute(sql: "DELETE FROM pending_draft_mutations")
+        try db.execute(sql: "DELETE FROM pending_media_group_sends")
+        try db.execute(sql: "DELETE FROM drafts")
         try db.execute(sql: "DELETE FROM message_reactions")
         try db.execute(sql: "DELETE FROM message_media")
         try db.execute(sql: "DELETE FROM messages")
@@ -6410,6 +9053,7 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM message_mentions")
         try db.execute(sql: "DELETE FROM group_member_hydration")
         try db.execute(sql: "DELETE FROM pending_group_creations")
+        try db.execute(sql: "DELETE FROM pending_group_mutations")
         try db.execute(sql: "DELETE FROM pending_purges")
         try db.execute(sql: "DELETE FROM bootstrap_baseline_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_staged_messages")

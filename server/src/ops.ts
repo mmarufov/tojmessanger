@@ -1,9 +1,16 @@
 import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
+import {
+  draftMutationReceiptKey,
+  lockMutationKeys,
+  mediaGroupReceiptKey,
+} from "./locks";
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
-const CLEANUP_BATCH_SIZE = 1_000;
+export const CLEANUP_BATCH_SIZE = 1_000;
+export const MAINTENANCE_INTERVAL_MS = 60 * 1_000;
+export const ALLOWED_MUTATION_INGRESS_PER_MINUTE = 720;
 
 export type ProviderState = "configured" | "development" | "disabled";
 
@@ -53,6 +60,13 @@ export class OperationalMetrics {
   private readonly startedAt = Date.now();
   private readonly requests = new Map<string, number>();
   private readonly durations = new Map<string, { count: number; sumSeconds: number }>();
+  private cleanupDeleted = 0;
+  private cleanupBacklog = 0;
+
+  recordCleanup(deleted: number, backlog: number): void {
+    this.cleanupDeleted += deleted;
+    this.cleanupBacklog = backlog;
+  }
 
   record(method: string, route: string, status: number, durationMs: number): void {
     const key = `${method}\u0000${route}\u0000${statusClass(status)}`;
@@ -88,6 +102,20 @@ export class OperationalMetrics {
       lines.push(`toj_http_request_duration_seconds_sum{${labels}} ${value.sumSeconds.toFixed(6)}`);
       lines.push(`toj_http_request_duration_seconds_count{${labels}} ${value.count}`);
     }
+    lines.push(
+      "# HELP toj_cleanup_deleted_total Rows deleted by maintenance cleanup.",
+      "# TYPE toj_cleanup_deleted_total counter",
+      `toj_cleanup_deleted_total ${this.cleanupDeleted}`,
+      "# HELP toj_cleanup_backlog Expired rows waiting for maintenance cleanup.",
+      "# TYPE toj_cleanup_backlog gauge",
+      `toj_cleanup_backlog ${this.cleanupBacklog}`,
+      "# HELP toj_cleanup_batch_capacity Maximum rows cleaned per category per run.",
+      "# TYPE toj_cleanup_batch_capacity gauge",
+      `toj_cleanup_batch_capacity ${CLEANUP_BATCH_SIZE}`,
+      "# HELP toj_allowed_mutation_ingress_per_minute Maximum draft mutations plus album items.",
+      "# TYPE toj_allowed_mutation_ingress_per_minute gauge",
+      `toj_allowed_mutation_ingress_per_minute ${ALLOWED_MUTATION_INGRESS_PER_MINUTE}`,
+    );
     return `${lines.join("\n")}\n`;
   }
 }
@@ -202,7 +230,10 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       ORDER BY expires_at LIMIT ${batchSize}
       FOR UPDATE SKIP LOCKED
     )
-    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
+    DELETE FROM media_objects object
+    WHERE object.id IN (SELECT id FROM doomed)
+      AND object.status IN ('uploading', 'rejected')
+      AND object.expires_at < now()
     RETURNING id`;
   const mediaAttempts = await sql`
     WITH doomed AS (
@@ -216,14 +247,46 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const mediaOrphans = await sql`
     WITH doomed AS (
       SELECT mo.id FROM media_objects mo
-      WHERE mo.status = 'ready' AND mo.completed_at < now() - interval '24 hours'
+      WHERE mo.status = 'ready'
+        AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM draft_attachments attachment
+          JOIN account_dialog_drafts draft
+            ON draft.account_id = attachment.account_id
+           AND draft.dialog_id = attachment.dialog_id
+          JOIN dialogs dialog ON dialog.id = draft.dialog_id AND dialog.closed_at IS NULL
+          JOIN dialog_members member
+            ON member.dialog_id = draft.dialog_id
+           AND member.account_id = draft.account_id
+           AND member.left_at IS NULL
+          WHERE attachment.media_id = mo.id AND draft.state = 'active'
+        )
       ORDER BY mo.completed_at LIMIT ${batchSize}
       FOR UPDATE OF mo SKIP LOCKED
     )
-    DELETE FROM media_objects WHERE id IN (SELECT id FROM doomed)
-    RETURNING id`;
+    DELETE FROM media_objects mo
+    WHERE mo.id IN (SELECT id FROM doomed)
+      AND mo.status = 'ready'
+      AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
+      AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+      AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+      AND NOT EXISTS (
+        SELECT 1
+        FROM draft_attachments attachment
+        JOIN account_dialog_drafts draft
+          ON draft.account_id = attachment.account_id
+         AND draft.dialog_id = attachment.dialog_id
+        JOIN dialogs dialog ON dialog.id = draft.dialog_id AND dialog.closed_at IS NULL
+        JOIN dialog_members member
+          ON member.dialog_id = draft.dialog_id
+         AND member.account_id = draft.account_id
+         AND member.left_at IS NULL
+        WHERE attachment.media_id = mo.id AND draft.state = 'active'
+      )
+    RETURNING mo.id`;
   const sendRequests = await sql`
     WITH doomed AS (
       SELECT sender_account_id, client_msg_id FROM send_requests
@@ -246,6 +309,132 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
+  const draftMutations = await sql.begin(async (tx) => {
+    const candidates = await tx`
+      SELECT account_id, operation_id
+      FROM draft_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}`;
+    await lockMutationKeys(
+      tx,
+      candidates.map((row: any) =>
+        draftMutationReceiptKey(String(row.account_id), String(row.operation_id))
+      ),
+    );
+    const doomed = candidates.length ? await tx`
+      SELECT account_id, operation_id, dialog_id, payload_fingerprint,
+             status, resulting_revision
+      FROM draft_mutation_requests
+      WHERE created_at < now() - interval '24 hours'
+        AND (account_id, operation_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(candidates.map((row: any) => row.account_id), "uuid")}::uuid[],
+            ${tx.array(candidates.map((row: any) => row.operation_id), "uuid")}::uuid[]
+          )
+        )
+      ORDER BY created_at
+      FOR UPDATE SKIP LOCKED` : [];
+    const completed = doomed.filter((row: any) => row.status === "completed");
+    if (completed.length) {
+      await tx`
+        INSERT INTO draft_mutation_tombstones (
+          account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+        )
+        SELECT request.account_id, request.operation_id, request.dialog_id,
+               request.payload_fingerprint, request.resulting_revision
+        FROM draft_mutation_requests request
+        WHERE (request.account_id, request.operation_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(completed.map((row: any) => row.account_id), "uuid")}::uuid[],
+            ${tx.array(completed.map((row: any) => row.operation_id), "uuid")}::uuid[]
+          )
+        )
+        ON CONFLICT (account_id, operation_id) DO NOTHING`;
+    }
+    if (!doomed.length) return [];
+    return await tx`
+      DELETE FROM draft_mutation_requests request
+      WHERE (request.account_id, request.operation_id) IN (
+        SELECT * FROM unnest(
+          ${tx.array(doomed.map((row: any) => row.account_id), "uuid")}::uuid[],
+          ${tx.array(doomed.map((row: any) => row.operation_id), "uuid")}::uuid[]
+        )
+      )
+      RETURNING request.operation_id`;
+  });
+  const draftBudgets = await sql`
+    WITH doomed AS (
+      SELECT id FROM draft_mutation_budgets
+      WHERE accepted_at < now() - interval '2 minutes'
+      ORDER BY accepted_at LIMIT ${batchSize}
+    )
+    DELETE FROM draft_mutation_budgets WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const mediaGroupSends = await sql.begin(async (tx) => {
+    const candidates = await tx`
+      SELECT sender_account_id, client_group_id
+      FROM media_group_send_requests
+      WHERE created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize}`;
+    await lockMutationKeys(
+      tx,
+      candidates.map((row: any) =>
+        mediaGroupReceiptKey(String(row.sender_account_id), String(row.client_group_id))
+      ),
+    );
+    const doomed = candidates.length ? await tx`
+      SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+             first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+      FROM media_group_send_requests
+      WHERE created_at < now() - interval '24 hours'
+        AND (sender_account_id, client_group_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(candidates.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+            ${tx.array(candidates.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+          )
+        )
+      ORDER BY created_at
+      FOR UPDATE SKIP LOCKED` : [];
+    const completed = doomed.filter((row: any) => row.status === "completed");
+    if (completed.length) {
+      await tx`
+        INSERT INTO media_group_send_tombstones (
+          sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+          first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+        )
+        SELECT request.sender_account_id, request.client_group_id, request.dialog_id,
+               request.payload_fingerprint, request.first_msg_id, request.last_msg_id,
+               request.sender_pts, request.cleared_draft_revision
+        FROM media_group_send_requests request
+        WHERE (request.sender_account_id, request.client_group_id) IN (
+          SELECT * FROM unnest(
+            ${tx.array(completed.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+            ${tx.array(completed.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+          )
+        )
+        ON CONFLICT (sender_account_id, client_group_id) DO NOTHING`;
+    }
+    if (!doomed.length) return [];
+    return await tx`
+      DELETE FROM media_group_send_requests request
+      WHERE (request.sender_account_id, request.client_group_id) IN (
+        SELECT * FROM unnest(
+          ${tx.array(doomed.map((row: any) => row.sender_account_id), "uuid")}::uuid[],
+          ${tx.array(doomed.map((row: any) => row.client_group_id), "uuid")}::uuid[]
+        )
+      )
+      RETURNING request.client_group_id`;
+  });
+  const mediaGroupBudgets = await sql`
+    WITH doomed AS (
+      SELECT id FROM media_group_send_budgets
+      WHERE accepted_at < now() - interval '2 minutes'
+      ORDER BY accepted_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM media_group_send_budgets budget USING doomed
+    WHERE budget.id = doomed.id
+    RETURNING budget.id`;
   const groupCreates = await sql`
     WITH doomed AS (
       SELECT creator_account_id, client_group_id FROM group_create_requests
@@ -332,6 +521,10 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     mediaOrphans: mediaOrphans.length,
     sendRequests: sendRequests.length,
     messageMutations: messageMutations.length,
+    draftMutations: draftMutations.length,
+    draftBudgets: draftBudgets.length,
+    mediaGroupSends: mediaGroupSends.length,
+    mediaGroupBudgets: mediaGroupBudgets.length,
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
@@ -344,7 +537,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
   return value.otp + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
-    + value.messageMutations + value.groupCreates + value.groupMutations
+    + value.messageMutations + value.draftMutations + value.draftBudgets
+    + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
     + Object.values(value.callData).reduce((sum, count) => sum + count, 0);
 }
@@ -389,15 +583,36 @@ function cleanError(value: unknown): string {
   return (value instanceof Error ? value.message : String(value)).replace(/[\r\n]+/g, " ").slice(0, 300);
 }
 
-export function startMaintenanceWorker(sql: SQL, intervalMs = 60 * 60 * 1_000): () => void {
+export function startMaintenanceWorker(
+  sql: SQL,
+  intervalMs = MAINTENANCE_INTERVAL_MS,
+  metrics?: OperationalMetrics,
+): () => void {
   let running = false;
   const tick = async () => {
     if (running) return;
     running = true;
     try {
       const drained = await drainExpiredData(sql);
+      const backlogRows = await sql`
+        SELECT
+          (SELECT count(*) FROM media_objects
+             WHERE expires_at < now() AND status IN ('uploading','rejected'))
+          + (SELECT count(*) FROM draft_mutation_requests
+             WHERE created_at < now() - interval '24 hours')
+          + (SELECT count(*) FROM media_group_send_requests
+             WHERE created_at < now() - interval '24 hours') AS count`;
+      const deletedCount = drained.rows;
+      const backlog = Number(backlogRows[0]?.count ?? 0);
+      metrics?.recordCleanup(deletedCount, backlog);
       if (drained.rows > 0) {
-        console.log(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.cleanup", drained }));
+        console.log(JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "maintenance.cleanup",
+          drained,
+          backlog,
+          capacity_per_category: CLEANUP_BATCH_SIZE,
+        }));
       }
     } catch (error) {
       console.error(JSON.stringify({ ts: new Date().toISOString(), event: "maintenance.error", error: cleanError(error) }));

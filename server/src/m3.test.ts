@@ -684,6 +684,55 @@ describe("M3 cloud sync", () => {
       WHERE updated_at < now() - interval '24 hours'`).toHaveLength(0);
   });
 
+  test("maintenance counts and drains draft and media-group-only backlogs across passes", async () => {
+    const { alice, dialogId } = await makePair();
+    await db`
+      INSERT INTO draft_mutation_requests (
+        account_id, operation_id, dialog_id, payload_fingerprint, status, created_at
+      )
+      SELECT ${alice.accountId}, gen_random_uuid(), ${dialogId}, gen_random_bytes(32),
+             'pending', now() - interval '25 hours'
+      FROM generate_series(1, 2)`;
+    await db`
+      INSERT INTO draft_mutation_budgets (
+        account_id, device_id, operation_id, accepted_at
+      )
+      SELECT ${alice.accountId}, ${alice.deviceId}, gen_random_uuid(),
+             now() - interval '3 minutes'
+      FROM generate_series(1, 2)`;
+    await db`
+      INSERT INTO media_group_send_requests (
+        sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+        status, created_at
+      )
+      SELECT ${alice.accountId}, gen_random_uuid(), ${dialogId}, gen_random_bytes(32),
+             'pending', now() - interval '25 hours'
+      FROM generate_series(1, 2)`;
+    await db`
+      INSERT INTO media_group_send_budgets (
+        account_id, device_id, item_count, accepted_at
+      )
+      SELECT ${alice.accountId}, ${alice.deviceId}, 2, now() - interval '3 minutes'
+      FROM generate_series(1, 2)`;
+
+    const drained = await drainExpiredData(db, {
+      batchSize: 1,
+      maxRows: 100,
+      maxRuntimeMs: 10_000,
+    });
+
+    expect(drained.rows).toBe(8);
+    expect(drained.passes).toBe(3);
+    expect(drained.exhausted).toBe(false);
+    const remaining = (await db`
+      SELECT
+        (SELECT count(*) FROM draft_mutation_requests)
+        + (SELECT count(*) FROM draft_mutation_budgets)
+        + (SELECT count(*) FROM media_group_send_requests)
+        + (SELECT count(*) FROM media_group_send_budgets) AS count`)[0];
+    expect(Number(remaining.count)).toBe(0);
+  });
+
   test("failed OTP delivery consumes the unusable challenge", async () => {
     let error: unknown;
     const originalConsoleError = console.error;

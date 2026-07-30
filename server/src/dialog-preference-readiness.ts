@@ -97,7 +97,8 @@ const EXPECTED_EVENT_CONSTRAINT =
   "'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
   "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
-  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text])";
+  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
+  "'draft.updated'::text])";
 const FINAL_TRIGGER_FUNCTION = "mirror_dialog_notification_mode_to_preferences_v1_final";
 const STAGING_TRIGGER_FUNCTION =
   "mirror_dialog_notification_mode_to_preferences_v1_staging";

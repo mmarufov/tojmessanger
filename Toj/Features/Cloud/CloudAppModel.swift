@@ -232,6 +232,9 @@ final class CloudAppModel {
         var isDeleted = false
         var attachment: DemoAttachment? = nil
         var media: CloudMedia? = nil
+        var mediaGroupId: String? = nil
+        var mediaGroupIndex: Int? = nil
+        var mediaGroupCount: Int? = nil
         var transferProgress: Double? = nil
         var transferStage: TransferStage? = nil
         var transferError: String? = nil
@@ -275,6 +278,7 @@ final class CloudAppModel {
     private(set) var mediaCachePolicy: MediaCachePolicy = .default
     private(set) var clearingMediaCache = false
     private(set) var composerMode: ComposerMode = .text
+    private(set) var currentDraft: LocalDraft?
     private(set) var profileDetails: StoredProfileDetails = .empty
     private(set) var profileSaveInFlight = false
     #if DEBUG
@@ -287,12 +291,7 @@ final class CloudAppModel {
     var peerPhone = ""
     var draft = "" {
         didSet {
-            guard let activeDialogId else { return }
-            draftsByDialog[activeDialogId] = draft
-            if let index = dialogs.firstIndex(where: { $0.id == activeDialogId }) {
-                let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                dialogs[index].draftPreview = trimmed.isEmpty ? nil : trimmed
-            }
+            scheduleActiveDraftPersistence()
         }
     }
     var accountDeletionCode = ""
@@ -334,6 +333,7 @@ final class CloudAppModel {
         guard let self else { return }
         await self.runForegroundSyncAttempt(generation: generation)
     }
+    @ObservationIgnored private lazy var draftSyncCoordinator = DraftSyncCoordinator(api: api)
     @ObservationIgnored private lazy var dialogPreferencesCoordinator =
         DialogPreferencesCoordinator(api: api)
     private let voiceRecorder = VoiceNoteRecorder()
@@ -353,6 +353,8 @@ final class CloudAppModel {
     private var historyHydrationTask: Task<Void, Never>?
     private var openingAnchorHydrationTask: Task<Void, Never>?
     private var dialogObservationTask: Task<Void, Never>?
+    private var draftObservationTask: Task<Void, Never>?
+    private var draftPersistenceTasks: [String: Task<Void, Never>] = [:]
     private var timelineObservationTask: Task<Void, Never>?
     private var viewportPersistenceTask: Task<Void, Never>?
     private var mediaDownloadTask: Task<Void, Never>?
@@ -371,13 +373,23 @@ final class CloudAppModel {
     private var syncInFlight = false
     private var syncAgain = false
     private var retryInFlight = false
+    private var outboxDrainHalted = false
     private var mediaTransfersInFlight: Set<String> = []
+    private var mediaGroupSendsInFlight: Set<String> = []
+    private var draftSendsInFlightByDialog: [String: String] = [:]
     private var messageMutationsInFlight: Set<String> = []
     private var mutationTargetsBeingQueued: Set<String> = []
     private var uploadedPushRegistration: String?
     private var uploadedVoIPPushRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
-    private var draftsByDialog: [String: String] = [:]
+    private var draftPersistenceGenerations: [String: UInt64] = [:]
+    private var minimumObservedDraftGenerations: [String: Int64] = [:]
+    private var sessionEpoch: UInt64 = 0
+    private var sessionTearingDown = false
+    private var suppressDraftPersistence = false
+    private var transientUnderlyingDraftText: String?
+    private var transientUnderlyingComposerMode: ComposerMode?
+    private var transientVoiceComposerMode: ComposerMode?
     private var cachedLinesByDialog: [String: [Line]] = [:]
     private var cachedLocalMessagesByDialog: [String: [LocalMessage]] = [:]
     private var cachedLineDialogOrder: [String] = []
@@ -473,7 +485,7 @@ final class CloudAppModel {
             guard let self else { return }
             self.recordingTask?.cancel()
             self.recordingTask = nil
-            self.composerMode = .text
+            self.restoreVoiceDraftComposer()
             self.presentNotice(
                 "Recording canceled",
                 message: "The microphone or audio route became unavailable. Nothing was sent."
@@ -644,6 +656,8 @@ final class CloudAppModel {
             )
             let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
             try await tokenStore.save(stored)
+            sessionEpoch &+= 1
+            sessionTearingDown = false
             isSessionTeardownInProgress = false
             accountSessionGeneration &+= 1
             storedSession = stored
@@ -796,6 +810,7 @@ final class CloudAppModel {
             return
         }
         #endif
+        beginSessionTeardown()
         let sessionToken = storedSession?.session.token
         if let sessionToken {
             // Save before clearing the active session. If the app is killed or offline, the next
@@ -935,11 +950,13 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
-        // This guard must be set before the first suspension. UI actions and background retry
-        // callbacks can run while Keychain/SQLCipher teardown awaits cancellation.
+        beginSessionTeardown()
+        // Both session fences are entered synchronously before the first await. Draft/media work
+        // validates the epoch; preference work validates the account generation.
         isSessionTeardownInProgress = true
-        let accountId = storedSession?.session.accountId
         accountSessionGeneration &+= 1
+        let accountId = storedSession?.session.accountId
+        await draftSyncCoordinator.suspendRetries()
         var cleanupFailures: [String] = []
         do {
             try await tokenStore.savePendingLocalErasure(accountId: accountId)
@@ -949,6 +966,7 @@ final class CloudAppModel {
 
         let composerTask = composerMediaTask
         let transferTasks = Array(mediaTransferTasks.values)
+        let pendingDraftPersistenceTasks = Array(draftPersistenceTasks.values)
         let preferenceTasks = Array(preferenceMutationTasks.values)
         let pendingRetryTask = retryTask
         let backgroundTasks: [Task<Void, Never>] = [
@@ -958,7 +976,8 @@ final class CloudAppModel {
             profilePhotoMigrationTask,
             postSignInTask, postSyncWorkTask, historyHydrationTask, dialogObservationTask,
             openingAnchorHydrationTask,
-            timelineObservationTask, viewportPersistenceTask, mediaDownloadTask,
+            timelineObservationTask, draftObservationTask,
+            viewportPersistenceTask, mediaDownloadTask,
             readReceiptRetryTask, replicaIntegrityTask,
         ].compactMap { $0 }
         backgroundTasks.forEach { $0.cancel() }
@@ -975,6 +994,10 @@ final class CloudAppModel {
         for task in backgroundTasks { await task.value }
         for task in transferTasks { await task.value }
         for task in preferenceTasks { await task.value }
+        // Draft mutations are intentionally not cancelled: every captured composer generation
+        // reaches SQLCipher before logout destroys the account replica.
+        for task in pendingDraftPersistenceTasks { await task.value }
+        await draftSyncCoordinator.cancelAndWait()
         hintTask = nil
         networkObservationTask = nil
         memoryPressureTask = nil
@@ -990,6 +1013,10 @@ final class CloudAppModel {
         openingAnchorHydrationTask = nil
         dialogObservationTask = nil
         timelineObservationTask = nil
+        draftObservationTask = nil
+        draftPersistenceTasks.removeAll()
+        draftPersistenceGenerations.removeAll()
+        minimumObservedDraftGenerations.removeAll()
         viewportPersistenceTask = nil
         mediaDownloadTask = nil
         readReceiptRetryTask = nil
@@ -999,6 +1026,8 @@ final class CloudAppModel {
         mediaTransferTasks.removeAll()
         preferenceMutationTasks.removeAll()
         mediaTransfersInFlight.removeAll()
+        mediaGroupSendsInFlight.removeAll()
+        draftSendsInFlightByDialog.removeAll()
         messageMutationsInFlight.removeAll()
         mutationTargetsBeingQueued.removeAll()
         syncInFlight = false
@@ -1070,7 +1099,11 @@ final class CloudAppModel {
         historyHasMoreByDialog = [:]
         timelineForwardCursorByDialog = [:]
         timelineHasMoreForwardByDialog = [:]
-        draftsByDialog = [:]
+        currentDraft = nil
+        draftMentionsByDialog = [:]
+        transientUnderlyingDraftText = nil
+        transientUnderlyingComposerMode = nil
+        transientVoiceComposerMode = nil
         cachedLinesByDialog = [:]
         cachedLocalMessagesByDialog = [:]
         cachedLineDialogOrder = []
@@ -1106,6 +1139,21 @@ final class CloudAppModel {
         status = cleanupFailures.isEmpty
             ? finalStatus
             : "Signed out; local cleanup needs another attempt"
+    }
+
+    /// Changes the session epoch synchronously, before logout's first suspension point. Every
+    /// subsequently resumed operation must still match this epoch before touching store or UI.
+    private func beginSessionTeardown() {
+        guard !sessionTearingDown else { return }
+        sessionTearingDown = true
+        sessionEpoch &+= 1
+        draftObservationTask?.cancel()
+        timelineObservationTask?.cancel()
+        dialogObservationTask?.cancel()
+        composerMediaTask?.cancel()
+        for task in mediaTransferTasks.values { task.cancel() }
+        retryTask?.cancel()
+        postSyncWorkTask?.cancel()
     }
 
     func refreshMediaCacheUsage() async {
@@ -1669,21 +1717,163 @@ final class CloudAppModel {
         beginConversationSelection(dialogId)
     }
 
+    private func scheduleActiveDraftPersistence(
+        reason: DraftSyncCoordinator.FlushReason = .idle
+    ) {
+        #if DEBUG
+        if isDemoMode {
+            guard
+                !suppressDraftPersistence,
+                let dialogId = activeDialogId,
+                let index = dialogs.firstIndex(where: { $0.id == dialogId })
+            else { return }
+            let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+            dialogs[index].draftPreview = trimmed.isEmpty ? nil : trimmed
+            return
+        }
+        #endif
+        guard
+            !sessionTearingDown,
+            !suppressDraftPersistence,
+            let dialogId = activeDialogId,
+            storedSession != nil
+        else { return }
+        if case .editing = composerMode { return }
+        let generation = (draftPersistenceGenerations[dialogId] ?? 0) &+ 1
+        draftPersistenceGenerations[dialogId] = generation
+        let text = draft
+        let reply = activeReplyDraftContext()
+        let mentions = resolvedMentions(in: text, dialogId: dialogId)
+        let previous = draftPersistenceTasks[dialogId]
+        draftPersistenceTasks[dialogId] = Task { [weak self] in
+            // Preserve every local generation in order. The SQL row/outbox entry is still
+            // coalesced by dialog, so this durability guarantee never creates a network backlog.
+            await previous?.value
+            guard let self else { return }
+            do {
+                let saved = try await self.draftSyncCoordinator.mutate(
+                    dialogId: dialogId,
+                    text: text,
+                    replyToMsgId: reply.0,
+                    replyPreview: reply.1,
+                    mentions: mentions,
+                    reason: reason
+                )
+                guard !self.sessionTearingDown else { return }
+                self.minimumObservedDraftGenerations[dialogId] = max(
+                    self.minimumObservedDraftGenerations[dialogId] ?? 0,
+                    saved.localGeneration
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                self.status = "Draft could not be saved locally: \(error.localizedDescription)"
+            }
+            if self.draftPersistenceGenerations[dialogId] == generation {
+                self.draftPersistenceTasks[dialogId] = nil
+            }
+        }
+    }
+
+    private func activeReplyDraftContext() -> (Int64?, CloudDraftReplyPreview?) {
+        guard case let .replying(messageId, preview) = composerMode,
+              let line = lines.first(where: { $0.id == messageId }),
+              let msgId = line.msgId
+        else { return (nil, nil) }
+        let sender = loadedLocalMessages.first(where: { $0.localId == messageId })?.senderAccountId ?? ""
+        return (
+            msgId,
+            CloudDraftReplyPreview(
+                msgId: msgId,
+                senderAccountId: sender,
+                text: preview,
+                unavailable: false
+            )
+        )
+    }
+
+    private func startDraftObservation(dialogId: String) {
+        draftObservationTask?.cancel()
+        guard let localStore, let accountId = storedSession?.session.accountId else { return }
+        draftObservationTask = Task { [weak self, localStore] in
+            do {
+                let values = await localStore.observeDraft(
+                    accountId: accountId,
+                    dialogId: dialogId
+                )
+                for try await observed in values {
+                    try Task.checkCancellation()
+                    guard let self, self.activeDialogId == dialogId else { return }
+                    self.acceptObservedDraft(observed)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, self.activeDialogId == dialogId else { return }
+                self.status = "Draft observation paused: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func acceptObservedDraft(_ observed: LocalDraft?) {
+        if let dialogId = activeDialogId,
+           draftPersistenceTasks[dialogId] != nil {
+            return
+        }
+        if let observed,
+           observed.localGeneration < (minimumObservedDraftGenerations[observed.dialogId] ?? 0) {
+            return
+        }
+        currentDraft = observed
+        guard transientUnderlyingDraftText == nil, transientVoiceComposerMode == nil else { return }
+        suppressDraftPersistence = true
+        draft = observed?.state == "active" ? observed?.text ?? "" : ""
+        if let observed, observed.state == "active",
+           let reply = observed.replyPreview, let replyId = observed.replyToMsgId {
+            composerMode = .replying(
+                messageId: "\(observed.dialogId):\(replyId)",
+                preview: reply.unavailable
+                    ? String(localized: "Original message unavailable")
+                    : reply.text
+            )
+        } else {
+            composerMode = .text
+        }
+        suppressDraftPersistence = false
+        guard let observed else { return }
+        let nsText = observed.text as NSString
+        draftMentionsByDialog[observed.dialogId] = observed.mentions.compactMap { mention in
+            let range = NSRange(location: mention.offset, length: mention.length)
+            guard NSMaxRange(range) <= nsText.length else { return nil }
+            return DraftMention(
+                accountId: mention.accountId,
+                token: nsText.substring(with: range)
+            )
+        }
+    }
+
     private func beginConversationSelection(_ dialogId: String) {
         if let previousDialogId = activeDialogId, previousDialogId != dialogId {
             conversationOpenStartedAt.removeValue(forKey: previousDialogId)
             finishConversationOpenWaiters(dialogId: previousDialogId)
+            let pendingPersistence = draftPersistenceTasks[previousDialogId]
+            Task { [draftSyncCoordinator] in
+                await pendingPersistence?.value
+                _ = await draftSyncCoordinator.flush(dialogId: previousDialogId, force: true)
+            }
         }
         openingAnchorHydrationGeneration &+= 1
         openingAnchorHydrationTask?.cancel()
         openingAnchorHydrationTask = nil
-        if let activeDialogId {
-            draftsByDialog[activeDialogId] = draft
-        }
+        draftObservationTask?.cancel()
+        draftObservationTask = nil
         activeDialogId = dialogId
         conversationOpenStartedAt[dialogId] = Date()
         dialogSelectionGeneration &+= 1
-        draft = draftsByDialog[dialogId] ?? ""
+        currentDraft = nil
+        suppressDraftPersistence = true
+        draft = ""
+        suppressDraftPersistence = false
         composerMode = .text
         timelineBeforeCount = 40
         timelineAfterCount = 79
@@ -1704,6 +1894,10 @@ final class CloudAppModel {
         conversationOpenState = hasPreparedSnapshot ? .cached : .loadingLocal
         #if DEBUG
         if isDemoMode {
+            let storedDraft = dialogs.first(where: { $0.id == dialogId })?.draftPreview ?? ""
+            suppressDraftPersistence = true
+            draft = storedDraft
+            suppressDraftPersistence = false
             openingTimelineAnchor = .bottom
             timelineIsAtBottom = true
             timelineTopVisibleMsgId = nil
@@ -1722,6 +1916,7 @@ final class CloudAppModel {
             return
         }
         #endif
+        startDraftObservation(dialogId: dialogId)
         startTimelineObservation(dialogId: dialogId)
         if dialogs.first(where: { $0.id == dialogId })?.type == "group",
            groupMembersByDialog[dialogId] == nil {
@@ -1741,8 +1936,9 @@ final class CloudAppModel {
         guard activeDialogId == dialogId else { return }
         conversationOpenStartedAt.removeValue(forKey: dialogId)
         finishConversationOpenWaiters(dialogId: dialogId)
-        draftsByDialog[dialogId] = draft
         cacheCurrentLines(for: dialogId)
+        draftObservationTask?.cancel()
+        draftObservationTask = nil
         timelineObservationTask?.cancel()
         timelineObservationTask = nil
         viewportPersistenceTask?.cancel()
@@ -1752,7 +1948,10 @@ final class CloudAppModel {
         openingAnchorHydrationTask = nil
         activeDialogId = nil
         conversationOpenState = .loadingLocal
+        currentDraft = nil
+        suppressDraftPersistence = true
         draft = ""
+        suppressDraftPersistence = false
         composerMode = .text
         canLoadEarlier = false
         loadingEarlier = false
@@ -1780,10 +1979,13 @@ final class CloudAppModel {
             )
         }
         let visibleMessages = pendingVisibleReadMessages
+        let pendingDraftPersistence = draftPersistenceTasks[dialogId]
 
         // Clear presentation state synchronously, before the first suspension point, so a quick
         // navigation into another conversation cannot be undone by this closing task.
         deselectDialog(dialogId)
+        await pendingDraftPersistence?.value
+        _ = await draftSyncCoordinator.flush(dialogId: dialogId, force: true)
         if let state, let store {
             try? await store.saveViewportState(state)
             await markReadIfNeeded(dialogId: dialogId, messages: visibleMessages)
@@ -2216,14 +2418,14 @@ final class CloudAppModel {
     }
 
     func sendDraft() async {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let rawText = draft
+        let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         if case let .editing(messageId, _) = composerMode {
+            guard !trimmedText.isEmpty else { return }
             #if DEBUG
             if isDemoMode {
-                updateDemoMessage(messageId: messageId, text: text)
-                draft = ""
-                composerMode = .text
+                updateDemoMessage(messageId: messageId, text: trimmedText)
+                restoreUnderlyingDraftComposer()
                 return
             }
             #endif
@@ -2231,35 +2433,116 @@ final class CloudAppModel {
                 status = "Message is no longer available"
                 return
             }
-            await edit(line, text: text)
+            await edit(line, text: trimmedText)
             return
         }
+        if currentDraft?.attachments.isEmpty == false {
+            await sendStagedDraft()
+            return
+        }
+        // A reply target can be saved before the user types, but it is not itself a message.
+        // Keep that draft intact instead of enqueueing a request the server must reject.
+        guard !trimmedText.isEmpty else { return }
         let replyPreview: String?
         let replyToMsgId: Int64?
         if case let .replying(messageId, preview) = composerMode {
             replyPreview = preview
             replyToMsgId = lines.first(where: { $0.id == messageId })?.msgId
-            guard replyToMsgId != nil else {
-                status = "Reply target is not available yet"
-                return
-            }
+                ?? currentDraft?.replyToMsgId
         } else {
             replyPreview = nil
             replyToMsgId = nil
         }
-        let mentions = activeDialogId.map { resolvedMentions(in: text, dialogId: $0) } ?? []
+        let mentions = activeDialogId.map {
+            resolvedMentions(in: rawText, dialogId: $0)
+        } ?? []
+        if let dialogId = activeDialogId {
+            await draftPersistenceTasks[dialogId]?.value
+        }
         if let activeDialogId {
             draftMentionsByDialog.removeValue(forKey: activeDialogId)
         }
+        suppressDraftPersistence = true
         draft = ""
+        suppressDraftPersistence = false
         composerMode = .text
         #if DEBUG
         if isDemoMode {
-            sendDemo(text, replyPreview: replyPreview)
+            sendDemo(rawText, replyPreview: replyPreview)
             return
         }
         #endif
-        await send(text, replyToMsgId: replyToMsgId, mentions: mentions)
+        await send(rawText, replyToMsgId: replyToMsgId, mentions: mentions)
+    }
+
+    private func sendStagedDraft() async {
+        guard
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        await draftPersistenceTasks[dialogId]?.value
+        guard let draft = try? await localStore.loadDraft(accountId: accountId, dialogId: dialogId),
+              draft.state == "active",
+              !draft.attachments.isEmpty else { return }
+        guard draftSendsInFlightByDialog[dialogId] == nil else { return }
+        draftSendsInFlightByDialog[dialogId] = draft.operationId
+        defer {
+            if draftSendsInFlightByDialog[dialogId] == draft.operationId {
+                draftSendsInFlightByDialog[dialogId] = nil
+            }
+        }
+        guard draft.attachments.allSatisfy({ $0.state == "ready" && $0.mediaId != nil }) else {
+            presentNotice(
+                "Attachments are still preparing",
+                message: "Wait for every attachment to finish, or remove the failed item."
+            )
+            return
+        }
+        if draft.attachments.count > 1, !capabilities.contains(.mediaGroups) {
+            presentNotice(
+                "Grouped sending is unavailable",
+                message: "Your draft is saved. It will not be split into separate messages."
+            )
+            return
+        }
+        openingTimelineAnchor = .bottom
+        timelineTopVisibleMsgId = nil
+        timelineIsAtBottom = true
+        suppressDraftPersistence = true
+        self.draft = ""
+        suppressDraftPersistence = false
+        composerMode = .text
+
+        do {
+            if draft.attachments.count == 1 {
+                let transfer = try await localStore.consumeDraftAsSingleMedia(
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    operationId: draft.operationId
+                )
+                await loadLocalLines(dialogId: dialogId)
+                await refreshDialogs()
+                Task { [weak self] in await self?.runMediaTransfer(transfer) }
+                scheduleOutboxRetry()
+            } else {
+                let group = try await localStore.consumeDraftAsMediaGroup(
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    operationId: draft.operationId
+                )
+                await loadLocalLines(dialogId: dialogId)
+                await refreshDialogs()
+                Task { [weak self] in await self?.processMediaGroupSend(group) }
+                scheduleOutboxRetry()
+            }
+        } catch {
+            suppressDraftPersistence = true
+            self.draft = draft.text
+            suppressDraftPersistence = false
+            status = "Local send failed: \(error.localizedDescription)"
+            presentNotice("Could not queue attachments", message: error.localizedDescription)
+        }
     }
 
     func insertMention(_ member: GroupMember) {
@@ -2308,12 +2591,17 @@ final class CloudAppModel {
     func beginReply(to line: Line) {
         guard capabilities.contains(.replies), !line.isDeleted, line.msgId != nil else { return }
         composerMode = .replying(messageId: line.id, preview: line.text)
+        scheduleActiveDraftPersistence(reason: .replyChanged)
     }
 
     func beginEditing(_ line: Line) {
         guard line.mine, !line.isDeleted, line.msgId != nil, capabilities.contains(.editing) else { return }
+        transientUnderlyingDraftText = currentDraft?.state == "active" ? currentDraft?.text ?? "" : ""
+        transientUnderlyingComposerMode = composerMode
         composerMode = .editing(messageId: line.id, original: line.text)
+        suppressDraftPersistence = true
         draft = line.text
+        suppressDraftPersistence = false
     }
 
     func cancelComposerMode() {
@@ -2329,10 +2617,23 @@ final class CloudAppModel {
             composerMode = .text
             return
         }
-        if case let .editing(_, original) = composerMode, draft == original {
-            draft = ""
+        if case .editing = composerMode {
+            restoreUnderlyingDraftComposer()
+            return
         }
         composerMode = .text
+        scheduleActiveDraftPersistence(reason: .replyChanged)
+    }
+
+    private func restoreUnderlyingDraftComposer() {
+        let text = transientUnderlyingDraftText ?? (currentDraft?.state == "active" ? currentDraft?.text ?? "" : "")
+        let mode = transientUnderlyingComposerMode ?? .text
+        transientUnderlyingDraftText = nil
+        transientUnderlyingComposerMode = nil
+        suppressDraftPersistence = true
+        draft = text
+        composerMode = mode
+        suppressDraftPersistence = false
     }
 
     func actions(for line: Line) -> [MessageAction] {
@@ -2354,6 +2655,14 @@ final class CloudAppModel {
         Task { [weak self] in
             guard let self else { return }
             if let localStore = self.localStore {
+                if let groupId = line.mediaGroupId {
+                    try? await localStore.retryMediaGroupSend(clientGroupId: groupId)
+                    if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                        await self.loadLocalLines(dialogId: dialogId)
+                    }
+                    self.scheduleOutboxRetry()
+                    return
+                }
                 try? await localStore.markRetrying(clientMsgId: line.clientMsgId)
                 try? await localStore.markMediaRetrying(clientMsgId: line.clientMsgId)
                 if let dialogId = line.dialogId, self.activeDialogId == dialogId {
@@ -2367,7 +2676,21 @@ final class CloudAppModel {
     func removeFailedMedia(_ line: Line) {
         guard line.media != nil else { return }
         Task { [weak self] in
-            guard let self, let localStore,
+            guard let self, let localStore else { return }
+            if let groupId = line.mediaGroupId {
+                let transfers = (try? await localStore.removeMediaGroupSend(
+                    clientGroupId: groupId
+                )) ?? []
+                for transfer in transfers {
+                    await mediaEngine.discardTransfer(transfer)
+                }
+                if let dialogId = line.dialogId, activeDialogId == dialogId {
+                    await loadLocalLines(dialogId: dialogId)
+                }
+                await refreshDialogs()
+                return
+            }
+            guard
                   let transfer = try? await localStore.mediaTransfer(clientMsgId: line.clientMsgId)
             else { return }
             if let activeTask = mediaTransferTasks[transfer.transferId] {
@@ -2667,6 +2990,11 @@ final class CloudAppModel {
         timelineTopVisibleMsgId = nil
         timelineIsAtBottom = true
         let clientMsgId = UUID().uuidString.lowercased()
+        let attemptedDraft = try? await draftSyncCoordinator.currentDraft(dialogId: dialogId)
+        let consumesCloudDraft = capabilities.contains(.cloudDrafts)
+        let draftConsumeOperationId = attemptedDraft?.state == "active"
+            ? attemptedDraft?.operationId
+            : nil
         do {
             if let localStore, let accountId = storedSession?.session.accountId {
                 _ = try await localStore.insertSending(
@@ -2675,7 +3003,9 @@ final class CloudAppModel {
                     text: text,
                     senderAccountId: accountId,
                     replyToMsgId: replyToMsgId,
-                    mentions: mentions
+                    mentions: mentions,
+                    draftConsumeOperationId: draftConsumeOperationId,
+                    requiresCloudDraftSync: consumesCloudDraft
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -2697,6 +3027,15 @@ final class CloudAppModel {
             return
         }
 
+        if consumesCloudDraft {
+            let flushResult = await draftSyncCoordinator.flush(dialogId: dialogId)
+            guard await acceptDraftFlushResult(flushResult) else {
+                status = "Queued — waiting to sync draft"
+                scheduleOutboxRetry(after: 1)
+                return
+            }
+        }
+
         do {
             try await sendOutboxItem(
                 PendingOutboxItem(
@@ -2706,12 +3045,18 @@ final class CloudAppModel {
                     replyToMsgId: replyToMsgId,
                     forwardedFromDialogId: nil,
                     forwardedFromMsgId: nil,
+                    draftConsumeOperationId: consumesCloudDraft ? draftConsumeOperationId : nil,
                     retryCount: 0,
                     nextRetryAt: nil
                 ),
                 token: token
             )
         } catch {
+            if let apiError = error as? CloudAPIError,
+               apiError.code == "invalid_reply_target",
+               await recoverTextSendAfterInvalidReply(clientMsgId: clientMsgId) {
+                return
+            }
             if let localStore {
                 let disposition = cloudOperationFailureDisposition(
                     error, serverAdvertisesFeature: capabilities.contains(.replies)
@@ -2761,6 +3106,171 @@ final class CloudAppModel {
         }
     }
 
+    /// Copies picker bytes into the protected encrypted media store before returning. Uploading is
+    /// then detached from the picker lifecycle and capped at two concurrent draft transfers.
+    func stageDraftMedia(
+        data: Data,
+        kind: String,
+        contentType: String,
+        fileName: String?,
+        durationMs: Int64? = nil,
+        width: Int? = nil,
+        height: Int? = nil,
+        thumbnail: Data? = nil
+    ) async throws {
+        guard
+            !sessionTearingDown,
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { throw CloudAppModelError.localStoreUnavailable }
+        let epoch = sessionEpoch
+        let mediaEngine = self.mediaEngine
+        let groupsEnabled = capabilities.contains(.mediaGroups)
+        let transfer = try await draftSyncCoordinator.withDialogStaging(dialogId: dialogId) {
+            let existing = try await localStore.loadDraft(accountId: accountId, dialogId: dialogId)
+            let position = existing?.attachments.count ?? 0
+            guard position < 10 else { throw CloudAppModelError.tooManyDraftAttachments }
+            guard position == 0 || groupsEnabled else {
+                throw CloudAppModelError.mediaGroupsUnavailable
+            }
+            let prepared = try await mediaEngine.prepare(
+                data: data,
+                kind: kind,
+                contentType: contentType,
+                fileName: fileName,
+                durationMs: durationMs,
+                width: width,
+                height: height,
+                thumbnail: thumbnail
+            )
+            let attachmentId = UUID().uuidString.lowercased()
+            var staged = false
+            do {
+                try Task.checkCancellation()
+                _ = try await localStore.stageDraftAttachment(
+                    prepared: prepared,
+                    accountId: accountId,
+                    dialogId: dialogId,
+                    attachmentId: attachmentId,
+                    position: position
+                )
+                staged = true
+                try Task.checkCancellation()
+                guard let transfer = try await localStore.mediaTransfer(id: prepared.transferId)
+                else { throw CloudAppModelError.localStoreUnavailable }
+                return transfer
+            } catch {
+                if staged {
+                    _ = try? await localStore.removeDraftAttachment(
+                        accountId: accountId,
+                        dialogId: dialogId,
+                        attachmentId: attachmentId
+                    )
+                }
+                await mediaEngine.discardPrepared(prepared)
+                throw error
+            }
+        }
+        guard !sessionTearingDown, sessionEpoch == epoch else {
+            throw CancellationError()
+        }
+        Task { [weak self] in
+            guard let self, !self.sessionTearingDown, self.sessionEpoch == epoch else { return }
+            await self.runMediaTransfer(transfer)
+        }
+        _ = await draftSyncCoordinator.flush(dialogId: dialogId)
+    }
+
+    func removeDraftAttachment(_ attachment: LocalDraftAttachment) {
+        guard
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let transfer: MediaTransferRecord?
+            if let transferId = attachment.transferId {
+                transfer = try? await localStore.mediaTransfer(id: transferId)
+            } else {
+                transfer = nil
+            }
+            if let transferId = try? await localStore.removeDraftAttachment(
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentId: attachment.attachmentId
+            ) {
+                mediaTransferTasks[transferId]?.cancel()
+                if let transfer, let token = storedSession?.session.token {
+                    await mediaEngine.cancelUpload(transfer, token: token)
+                    await mediaEngine.discardTransfer(transfer)
+                } else if let transfer {
+                    await mediaEngine.discardTransfer(transfer)
+                }
+            }
+            _ = await draftSyncCoordinator.flush(dialogId: dialogId)
+        }
+    }
+
+    func moveDraftAttachment(_ attachmentId: String, by offset: Int) {
+        guard
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore,
+            let draft = currentDraft
+        else { return }
+        var ids = draft.attachments.sorted { $0.position < $1.position }.map(\.attachmentId)
+        guard let oldIndex = ids.firstIndex(of: attachmentId) else { return }
+        let newIndex = max(0, min(ids.count - 1, oldIndex + offset))
+        guard newIndex != oldIndex else { return }
+        let moving = ids.remove(at: oldIndex)
+        ids.insert(moving, at: newIndex)
+        Task { [weak self] in
+            guard let self else { return }
+            try? await localStore.reorderDraftAttachments(
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentIds: ids
+            )
+            _ = await draftSyncCoordinator.flush(dialogId: dialogId)
+        }
+    }
+
+    func moveDraftAttachment(_ attachmentId: String, before targetId: String) {
+        guard
+            attachmentId != targetId,
+            let dialogId = activeDialogId,
+            let accountId = storedSession?.session.accountId,
+            let localStore,
+            let draft = currentDraft
+        else { return }
+        var ids = draft.attachments.sorted { $0.position < $1.position }.map(\.attachmentId)
+        guard let movingIndex = ids.firstIndex(of: attachmentId) else { return }
+        let moving = ids.remove(at: movingIndex)
+        guard let targetIndex = ids.firstIndex(of: targetId) else { return }
+        ids.insert(moving, at: targetIndex)
+        Task { [weak self] in
+            guard let self else { return }
+            try? await localStore.reorderDraftAttachments(
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentIds: ids
+            )
+            _ = await draftSyncCoordinator.flush(dialogId: dialogId)
+        }
+    }
+
+    func retryDraftAttachment(_ attachment: LocalDraftAttachment) {
+        guard let transferId = attachment.transferId, let localStore else { return }
+        Task { [weak self] in
+            guard let self,
+                  let transfer = try? await localStore.retryDraftAttachment(transferId: transferId)
+            else { return }
+            await runMediaTransfer(transfer)
+        }
+    }
+
     private func performMediaSend(
         data: Data, kind: String, contentType: String, fileName: String?,
         durationMs: Int64?, width: Int?, height: Int?, thumbnail: Data?
@@ -2773,7 +3283,11 @@ final class CloudAppModel {
         openingTimelineAnchor = .bottom
         timelineTopVisibleMsgId = nil
         timelineIsAtBottom = true
-        let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Voice recording is a transient buffer layered over the cloud draft. It never consumes
+        // or reuses the draft text as a caption.
+        let caption = kind == "voice"
+            ? ""
+            : draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let replyToMsgId: Int64?
         if case let .replying(messageId, _) = composerMode {
             replyToMsgId = lines.first(where: { $0.id == messageId })?.msgId
@@ -2810,7 +3324,6 @@ final class CloudAppModel {
                 mine: true, delivery: .sending, timestamp: nil,
                 media: transfer.media, transferProgress: 0, transferStage: .preparing
             ))
-            draft = ""
             await runMediaTransfer(transfer)
         } catch is CancellationError {
             if let unpersistedPreparation { await mediaEngine.discardPrepared(unpersistedPreparation) }
@@ -2832,6 +3345,7 @@ final class CloudAppModel {
         if isDemoMode { beginDemoRecording(); return }
         #endif
         do {
+            transientVoiceComposerMode = composerMode
             try await voiceRecorder.start()
             composerMode = .recording(elapsedSeconds: 0)
             recordingTask?.cancel()
@@ -2843,7 +3357,7 @@ final class CloudAppModel {
             }
         } catch {
             status = error.localizedDescription
-            composerMode = .text
+            restoreVoiceDraftComposer()
             let denied = (error as? VoiceRecorderError) == .permissionDenied
             presentNotice(
                 denied ? "Microphone access is off" : "Could not record",
@@ -2861,17 +3375,18 @@ final class CloudAppModel {
         recordingTask = nil
         do {
             let result = try await voiceRecorder.finish()
-            composerMode = .text
+            composerMode = transientVoiceComposerMode ?? .text
             await sendMedia(
                 data: result.data, kind: "voice", contentType: "audio/mp4",
                 fileName: "Voice message.m4a", durationMs: result.durationMs
             )
+            restoreVoiceDraftComposer()
         } catch VoiceRecorderError.tooShort {
             status = "Recording canceled"
-            composerMode = .text
+            restoreVoiceDraftComposer()
         } catch {
             status = error.localizedDescription
-            composerMode = .text
+            restoreVoiceDraftComposer()
             presentNotice("Voice message was not sent", message: error.localizedDescription)
         }
     }
@@ -2880,7 +3395,12 @@ final class CloudAppModel {
         recordingTask?.cancel()
         recordingTask = nil
         voiceRecorder.cancel()
-        composerMode = .text
+        restoreVoiceDraftComposer()
+    }
+
+    private func restoreVoiceDraftComposer() {
+        composerMode = transientVoiceComposerMode ?? .text
+        transientVoiceComposerMode = nil
     }
 
     func thumbnailData(for media: CloudMedia) async -> Data? {
@@ -3081,6 +3601,11 @@ final class CloudAppModel {
                 throw CloudAppModelError.localStoreUnavailable
             }
             let launchSnapshot = try await restoredStore.loadLaunchSnapshot(accountId: accountId)
+            await draftSyncCoordinator.configure(
+                store: restoredStore,
+                session: storedSession?.session,
+                cloudEnabled: negotiatedCapabilities.contains(.cloudDrafts)
+            )
 
             // Publish the complete cached launch state in one main-actor turn.
             pts = launchSnapshot.pts
@@ -3115,7 +3640,7 @@ final class CloudAppModel {
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
-            try? await localStore.drainPendingPurges()
+            _ = try? await localStore.drainPendingPurges()
         }
         scheduleOutboxRetry()
     }
@@ -3175,7 +3700,15 @@ final class CloudAppModel {
             networkClass: ReplicaNetworkMonitor.shared.snapshot().networkClass,
             foregrounded: isActive
         )
-        if isActive { scheduleMediaDownloadProcessing() }
+        if isActive {
+            await draftSyncCoordinator.resumeRetries()
+            scheduleMediaDownloadProcessing()
+        } else {
+            for task in Array(draftPersistenceTasks.values) {
+                await task.value
+            }
+            await draftSyncCoordinator.flushAll(reason: .background)
+        }
     }
 
     private func prepareBackgroundMediaRuntime() async {
@@ -3239,6 +3772,7 @@ final class CloudAppModel {
             birthday: nil,
             colorIndex: 3
         )
+        negotiatedCapabilities = .demo
         guard let store = try await ensureLocalStore() else {
             throw CloudAppModelError.localStoreUnavailable
         }
@@ -3365,11 +3899,18 @@ final class CloudAppModel {
         let previous = Dictionary(uniqueKeysWithValues: dialogs.map { ($0.id, $0) })
         dialogs = localDialogs.map { local in
             var resolved = dialog(from: local)
+            let trimmedDraft = local.draftText?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmedDraft.isEmpty {
+                resolved.draftPreview = trimmedDraft
+            } else if local.draftAttachmentCount > 0 {
+                resolved.draftPreview = String(
+                    localized: "\(local.draftAttachmentCount) attachments"
+                )
+            } else if local.hasDraftReply {
+                resolved.draftPreview = String(localized: "Reply draft")
+            }
             if let existing = previous[resolved.id] {
-                resolved.draftPreview = draftsByDialog[resolved.id].flatMap { draft in
-                    let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return trimmed.isEmpty ? nil : trimmed
-                }
                 resolved.isTyping = existing.isTyping
             }
             return resolved
@@ -3542,6 +4083,7 @@ final class CloudAppModel {
         let generation = accountSessionGeneration
         let expectedAccountId = storedSession?.session.accountId
         do {
+            let previouslyHadCloudDrafts = negotiatedCapabilities.contains(.cloudDrafts)
             let response = try await api.capabilities(token: storedSession?.session.token)
             guard
                 !Task.isCancelled,
@@ -3567,6 +4109,10 @@ final class CloudAppModel {
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
             if advertised.contains("groups_v1") { resolved.insert(.groups) }
+            if advertised.contains("cloud_drafts_v1") { resolved.insert(.cloudDrafts) }
+            if advertised.contains("media_groups_v1"), resolved.contains(.media) {
+                resolved.insert(.mediaGroups)
+            }
             if advertised.contains("dialog_preferences_v1") {
                 resolved.insert(.chatOrganization)
             }
@@ -3577,6 +4123,22 @@ final class CloudAppModel {
                 resolved.insert(.videoCalls)
             }
             negotiatedCapabilities = resolved
+            await draftSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                cloudEnabled: resolved.contains(.cloudDrafts)
+            )
+            if !previouslyHadCloudDrafts,
+               resolved.contains(.cloudDrafts),
+               let token = storedSession?.session.token {
+                // Difference deliberately advances across killed draft events without payloads.
+                // A replacement bootstrap is therefore required to recover the current shadows.
+                Task { [weak self] in
+                    guard let self else { return }
+                    try? await self.rebuildLocalReplica(token: token)
+                    self.scheduleOutboxRetry()
+                }
+            }
             // Video rollout is account-scoped. Never let one signed-in account's bucket leak into
             // another account through the server-wide capability cache.
             capabilityDefaults.set(
@@ -3618,9 +4180,38 @@ final class CloudAppModel {
                 expectedAccountId == storedSession?.session.accountId
             else { return }
             negotiatedCapabilities = [.replies]
+            await draftSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                cloudEnabled: false
+            )
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
             // Keep the last successfully negotiated set when the server cannot be reached.
+        }
+    }
+
+    private func acceptDraftFlushResult(
+        _ result: DraftSyncCoordinator.FlushResult
+    ) async -> Bool {
+        switch result {
+        case .synced:
+            return true
+        case .unsupported:
+            // Withdraw the lane in the same main-actor turn. Durable dependencies remain queued
+            // and excluded from retry timing until a later capability refresh re-enables them.
+            negotiatedCapabilities.remove(.cloudDrafts)
+            await draftSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                cloudEnabled: false
+            )
+            Task { [weak self] in await self?.refreshServerCapabilities() }
+            return false
+        case .retryable, .suspended:
+            return false
+        case .terminal:
+            return false
         }
     }
 
@@ -4152,6 +4743,14 @@ final class CloudAppModel {
 
         if let localStore, let accountId = storedSession?.session.accountId {
             try await localStore.applyDifference(difference, accountId: accountId)
+            let revokedDialogIds = Set(
+                (difference.updates ?? []).compactMap { update in
+                    update.type == "dialog.access_revoked" ? update.dialogId : nil
+                }
+            )
+            if !revokedDialogIds.isEmpty {
+                await cancelMediaTransfers(forRevokedDialogs: revokedDialogIds)
+            }
             if !profileDetails.needsServerSync,
                let token = storedSession?.session.token,
                let ownProfile = (difference.updates ?? []).reversed().compactMap({ update in
@@ -4544,6 +5143,9 @@ final class CloudAppModel {
             isEdited: (message.editVersion > 0 || mutation?.operation == "edit") && message.state == "visible",
             isDeleted: message.state == "deleted_for_all",
             media: message.media,
+            mediaGroupId: message.mediaGroupId,
+            mediaGroupIndex: message.mediaGroupIndex,
+            mediaGroupCount: message.mediaGroupCount,
             transferProgress: mediaTransfer.map {
                 $0.state == "ready_to_send" ? 1 : Double($0.uploadOffset) / Double(max(1, $0.byteSize))
             },
@@ -4816,15 +5418,30 @@ final class CloudAppModel {
         guard let token = storedSession?.session.token, let localStore else { return }
 
         retryInFlight = true
+        outboxDrainHalted = false
         defer { retryInFlight = false }
 
         do {
             await retryPendingGroupCreations(token: token, localStore: localStore)
+            guard !outboxDrainHalted else { return }
             await retryPendingGroupMutations()
+            guard !outboxDrainHalted else { return }
             await retryPendingDialogPreferences()
-            let items = try await localStore.pendingOutboxReady()
+            guard !outboxDrainHalted else { return }
+            let items = try await localStore.pendingOutboxReady(
+                includeCloudDraftDependencies: capabilities.contains(.cloudDrafts)
+            )
             for item in items {
                 try Task.checkCancellation()
+                if item.draftConsumeOperationId != nil {
+                    let result = await draftSyncCoordinator.flush(
+                        dialogId: item.dialogId,
+                        force: true
+                    )
+                    guard await acceptDraftFlushResult(result) else {
+                        return
+                    }
+                }
                 try await localStore.markRetrying(clientMsgId: item.clientMsgId)
                 if activeDialogId == item.dialogId {
                     await loadLocalLines(dialogId: item.dialogId)
@@ -4834,6 +5451,11 @@ final class CloudAppModel {
                 do {
                     try await sendOutboxItem(item, token: token)
                 } catch {
+                    if let apiError = error as? CloudAPIError,
+                       apiError.code == "invalid_reply_target",
+                       await recoverTextSendAfterInvalidReply(clientMsgId: item.clientMsgId) {
+                        continue
+                    }
                     let disposition = cloudOperationFailureDisposition(
                         error, serverAdvertisesFeature: capabilities.contains(.replies)
                     )
@@ -4841,6 +5463,13 @@ final class CloudAppModel {
                         let delay = retryAfter ?? retryDelay(forRetryCount: item.retryCount + 1)
                         try? await localStore.markFailed(clientMsgId: item.clientMsgId, retryAfter: delay)
                         publishTransportFailure(error)
+                        return
+                    } else if case .authenticationRequired = disposition {
+                        try? await localStore.markFailed(
+                            clientMsgId: item.clientMsgId,
+                            retryAfter: 30
+                        )
+                        return
                     } else {
                         try? await localStore.markFailed(clientMsgId: item.clientMsgId, terminal: true)
                         presentNotice("Message was not sent", message: error.localizedDescription)
@@ -4853,8 +5482,11 @@ final class CloudAppModel {
             }
         } catch {
             status = "Outbox retry failed: \(error.localizedDescription)"
+            return
         }
         await retryMediaTransfers()
+        guard !outboxDrainHalted else { return }
+        await retryPendingMediaGroups()
     }
 
     private func retryPendingGroupCreations(token: String, localStore: CloudLocalStore) async {
@@ -4892,6 +5524,7 @@ final class CloudAppModel {
                 )
                 switch disposition {
                 case let .transient(retryAfter):
+                    outboxDrainHalted = true
                     let delay = retryAfter ?? retryDelay(forRetryCount: creation.retryCount + 1)
                     try? await localStore.retryGroupCreation(
                         groupId: creation.groupId,
@@ -4900,6 +5533,7 @@ final class CloudAppModel {
                     )
                     publishTransportFailure(error)
                 case .authenticationRequired:
+                    outboxDrainHalted = true
                     try? await localStore.retryGroupCreation(
                         groupId: creation.groupId,
                         after: 30,
@@ -4916,6 +5550,7 @@ final class CloudAppModel {
                     )
                 }
                 await refreshDialogs()
+                if outboxDrainHalted { return }
             }
         }
     }
@@ -5061,6 +5696,7 @@ final class CloudAppModel {
                         dialogId: mutation.dialogId,
                         reason: "You no longer have access to this group."
                     )
+                    await cancelMediaTransfers(forRevokedDialogs: [mutation.dialogId])
                 }
                 let disposition = cloudOperationFailureDisposition(
                     error,
@@ -5068,6 +5704,7 @@ final class CloudAppModel {
                 )
                 switch disposition {
                 case let .transient(retryAfter):
+                    outboxDrainHalted = true
                     let delay = retryAfter ?? retryDelay(forRetryCount: mutation.retryCount + 1)
                     try? await localStore.failGroupMutation(
                         clientMutationId: mutation.clientMutationId,
@@ -5079,6 +5716,7 @@ final class CloudAppModel {
                     await refreshDialogs()
                     return
                 case .authenticationRequired:
+                    outboxDrainHalted = true
                     try? await localStore.failGroupMutation(
                         clientMutationId: mutation.clientMutationId,
                         retryAfter: 30,
@@ -5097,16 +5735,155 @@ final class CloudAppModel {
                     presentNotice("Group change failed", message: error.localizedDescription)
                 }
                 await refreshDialogs()
+                if outboxDrainHalted { return }
             }
+        }
+    }
+
+    private func retryPendingMediaGroups() async {
+        guard let localStore else { return }
+        do {
+            await reconcileMediaGroupCleanups(localStore: localStore)
+            guard capabilities.contains(.mediaGroups) else { return }
+            for group in try await localStore.pendingMediaGroupSendsReady() {
+                try Task.checkCancellation()
+                guard await processMediaGroupSend(group) else { break }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            status = "Grouped send retry failed: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    private func processMediaGroupSend(_ group: PendingMediaGroupSend) async -> Bool {
+        guard !mediaGroupSendsInFlight.contains(group.clientGroupId) else { return false }
+        guard
+            capabilities.contains(.mediaGroups),
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId,
+            accountId == group.accountId,
+            let localStore
+        else { return false }
+        mediaGroupSendsInFlight.insert(group.clientGroupId)
+        defer { mediaGroupSendsInFlight.remove(group.clientGroupId) }
+        do {
+            if let operationId = group.draftConsumeOperationId {
+                guard capabilities.contains(.cloudDrafts) else {
+                    await refreshServerCapabilities()
+                    return false
+                }
+                let result = await draftSyncCoordinator.flushDependency(operationId: operationId)
+                guard await acceptDraftFlushResult(result) else {
+                    scheduleOutboxRetry(after: 2)
+                    return false
+                }
+            }
+            let response = try await api.sendMediaGroup(
+                dialogId: group.dialogId,
+                clientGroupId: group.clientGroupId,
+                items: group.payload.items.map {
+                    MediaGroupItemRequest(clientMsgId: $0.clientMsgId, mediaId: $0.mediaId)
+                },
+                caption: group.payload.caption,
+                replyToMsgId: group.payload.replyToMsgId,
+                mentions: group.payload.mentions,
+                draftConsumeOperationId: capabilities.contains(.cloudDrafts)
+                    ? group.draftConsumeOperationId
+                    : nil,
+                token: token
+            )
+            try await localStore.completeMediaGroupSend(
+                response,
+                senderAccountId: accountId,
+                attemptedOperationId: group.draftConsumeOperationId
+            )
+            await reconcileMediaGroupCleanups(localStore: localStore)
+            if activeDialogId == group.dialogId { await loadLocalLines(dialogId: group.dialogId) }
+            await refreshDialogs()
+            scheduleSync()
+            status = response.duplicate ? "Grouped send confirmed" : "Sent"
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            if let apiError = error as? CloudAPIError, apiError.code == "invalid_reply_target" {
+                if (try? await localStore.restoreMediaGroupAsDraftWithoutReply(group)) != nil {
+                    _ = await draftSyncCoordinator.flush(dialogId: group.dialogId)
+                    if activeDialogId == group.dialogId {
+                        await loadLocalLines(dialogId: group.dialogId)
+                    }
+                    await refreshDialogs()
+                    presentNotice(
+                        "Original message unavailable",
+                        message: "The reply was removed. Every attachment is still in your draft."
+                    )
+                }
+                return true
+            }
+            let disposition = cloudOperationFailureDisposition(
+                error,
+                serverAdvertisesFeature: capabilities.contains(.mediaGroups)
+            )
+            switch disposition {
+            case let .transient(retryAfter):
+                let delay = retryAfter ?? retryDelay(forRetryCount: group.retryCount + 1)
+                try? await localStore.markMediaGroupSendFailed(
+                    clientGroupId: group.clientGroupId,
+                    error: error.localizedDescription,
+                    retryAfter: delay,
+                    terminal: false
+                )
+                publishTransportFailure(error)
+                scheduleOutboxRetry(after: delay)
+            case .authenticationRequired:
+                try? await localStore.markMediaGroupSendFailed(
+                    clientGroupId: group.clientGroupId,
+                    error: "Sign in required",
+                    retryAfter: 30,
+                    terminal: false
+                )
+            case .unsupportedServer:
+                await refreshServerCapabilities()
+                return false
+            case .permanent:
+                try? await localStore.markMediaGroupSendFailed(
+                    clientGroupId: group.clientGroupId,
+                    error: error.localizedDescription,
+                    retryAfter: nil,
+                    terminal: true
+                )
+                presentNotice("Grouped message was not sent", message: error.localizedDescription)
+            }
+            if activeDialogId == group.dialogId { await loadLocalLines(dialogId: group.dialogId) }
+            await refreshDialogs()
+            return false
+        }
+    }
+
+    private func reconcileMediaGroupCleanups(localStore: CloudLocalStore) async {
+        let cleanups = (try? await localStore.pendingMediaGroupCleanups()) ?? []
+        for cleanup in cleanups {
+            if Task.isCancelled { return }
+            let transfers = (try? await localStore.mediaTransfers(ids: cleanup.transferIds)) ?? []
+            for transfer in transfers {
+                let promoted = await mediaEngine.finishUpload(transfer, localStore: localStore)
+                if !promoted { await mediaEngine.discardTransfer(transfer) }
+            }
+            try? await localStore.finalizeMediaGroupCleanup(cleanup)
         }
     }
 
     private func retryMediaTransfers() async {
         guard let localStore else { return }
         do {
-            for transfer in try await localStore.mediaTransfersReady() {
+            for transfer in try await localStore.mediaTransfersReady(
+                includeCloudDraftDependencies: capabilities.contains(.cloudDrafts)
+            ) {
                 try Task.checkCancellation()
                 await runMediaTransfer(transfer)
+                if outboxDrainHalted { return }
             }
         } catch is CancellationError {
             return
@@ -5145,37 +5922,97 @@ final class CloudAppModel {
         do {
             try Task.checkCancellation()
             let mediaId: String
+            var draftReadyCommitted = false
             if initial.state == "ready_to_send", let existing = initial.mediaId {
                 mediaId = existing
             } else {
-                mediaId = try await mediaEngine.upload(
-                    transfer: initial, token: token, localStore: localStore,
-                    useMultipartV2: capabilities.contains(.multipartMedia),
-                    progress: { [weak self] progress in
-                        await MainActor.run {
-                            guard let self else { return }
-                            if let index = self.lines.firstIndex(where: { $0.clientMsgId == initial.clientMsgId }) {
-                                self.lines[index].transferProgress = progress
-                                self.lines[index].transferStage = progress >= 0.97 ? .finalizing : .uploading
-                            }
-                            if self.activeDialogId == initial.dialogId {
-                                self.composerMode = .uploading(
-                                    Self.demoAttachment(
-                                        kind: initial.kind, fileName: initial.fileName,
-                                        byteSize: initial.byteSize, durationMs: initial.durationMs
-                                    ), progress: progress
+                let useMultipartV2 = capabilities.contains(.multipartMedia)
+                let upload: @Sendable () async throws -> String = { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    return try await self.mediaEngine.upload(
+                        transfer: initial, token: token, localStore: localStore,
+                        useMultipartV2: useMultipartV2,
+                        progress: { [weak self] progress in
+                            if initial.purpose == "draft" {
+                                try? await localStore.updateDraftAttachment(
+                                    transferId: initial.transferId,
+                                    mediaId: nil,
+                                    state: "uploading",
+                                    progress: progress,
+                                    error: nil
                                 )
+                            } else {
+                                await MainActor.run {
+                                    guard let self else { return }
+                                    if let index = self.lines.firstIndex(
+                                        where: { $0.clientMsgId == initial.clientMsgId }
+                                    ) {
+                                        self.lines[index].transferProgress = progress
+                                        self.lines[index].transferStage =
+                                            progress >= 0.97 ? .finalizing : .uploading
+                                    }
+                                    if self.activeDialogId == initial.dialogId {
+                                        self.composerMode = .uploading(
+                                            Self.demoAttachment(
+                                                kind: initial.kind,
+                                                fileName: initial.fileName,
+                                                byteSize: initial.byteSize,
+                                                durationMs: initial.durationMs
+                                            ),
+                                            progress: progress
+                                        )
+                                    }
+                                }
                             }
                         }
-                    }
-                )
-                try await localStore.updateMediaTransfer(
-                    transferId: initial.transferId, mediaId: mediaId,
-                    uploadOffset: initial.byteSize, state: "ready_to_send", error: nil
-                )
+                    )
+                }
+                if initial.purpose == "draft" {
+                    mediaId = try await draftSyncCoordinator.withAttachmentUploadPermit(upload)
+                } else {
+                    mediaId = try await upload()
+                }
+                if initial.purpose == "draft" {
+                    // This single SQLCipher transaction marks both the transfer and attachment
+                    // ready and rewrites the coalesced draft mutation. There is no crash boundary
+                    // where a reopened transfer is ready while its draft chip remains uploading.
+                    try await localStore.updateDraftAttachment(
+                        transferId: initial.transferId,
+                        mediaId: mediaId,
+                        state: "ready",
+                        progress: 1,
+                        error: nil
+                    )
+                    draftReadyCommitted = true
+                } else {
+                    try await localStore.updateMediaTransfer(
+                        transferId: initial.transferId, mediaId: mediaId,
+                        uploadOffset: initial.byteSize, state: "ready_to_send", error: nil
+                    )
+                }
             }
             guard let ready = try await localStore.mediaTransfer(id: initial.transferId) else {
                 throw CloudAppModelError.localStoreUnavailable
+            }
+            if ready.purpose == "draft" {
+                if !draftReadyCommitted {
+                    // Repairs a row persisted by an older build at the former two-transaction
+                    // boundary, while using the same atomic operation for all new completions.
+                    try await localStore.updateDraftAttachment(
+                        transferId: ready.transferId,
+                        mediaId: mediaId,
+                        state: "ready",
+                        progress: 1,
+                        error: nil
+                    )
+                }
+                _ = await draftSyncCoordinator.flush(dialogId: ready.dialogId)
+                status = "Attachment ready"
+                return
+            }
+            if ready.purpose == "group_send" {
+                scheduleOutboxRetry()
+                return
             }
             if ready.purpose == "group_photo" {
                 let envelope = try await api.updateGroup(
@@ -5198,6 +6035,17 @@ final class CloudAppModel {
                 status = "Group photo updated"
                 return
             }
+            if let operationId = ready.draftOperationId {
+                guard capabilities.contains(.cloudDrafts) else {
+                    await refreshServerCapabilities()
+                    return
+                }
+                let result = await draftSyncCoordinator.flushDependency(operationId: operationId)
+                guard await acceptDraftFlushResult(result) else {
+                    scheduleOutboxRetry(after: 2)
+                    return
+                }
+            }
             try await localStore.insertSendingMedia(ready, senderAccountId: accountId)
             if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
             try Task.checkCancellation()
@@ -5214,6 +6062,10 @@ final class CloudAppModel {
             let response = try await api.sendMediaMessage(
                 dialogId: ready.dialogId, clientMsgId: ready.clientMsgId,
                 body: ready.caption, mediaId: mediaId, replyToMsgId: ready.replyToMsgId,
+                mentions: ready.mentions,
+                draftConsumeOperationId: capabilities.contains(.cloudDrafts)
+                    ? ready.draftOperationId
+                    : nil,
                 token: token
             )
             try await localStore.markSent(response, senderAccountId: accountId)
@@ -5234,10 +6086,78 @@ final class CloudAppModel {
         } catch {
             let current = try? await localStore.mediaTransfer(id: initial.transferId)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
+            if let apiError = error as? CloudAPIError,
+               apiError.code == "invalid_reply_target",
+               let current,
+               current.draftOperationId != nil,
+               (try? await localStore.restoreSingleMediaAsDraftWithoutReply(
+                   current,
+                   accountId: accountId
+               )) != nil {
+                _ = await draftSyncCoordinator.flush(dialogId: current.dialogId)
+                if activeDialogId == current.dialogId {
+                    await loadLocalLines(dialogId: current.dialogId)
+                }
+                await refreshDialogs()
+                presentNotice(
+                    "Original message unavailable",
+                    message: "The reply was removed. Your attachment and caption are still in your draft."
+                )
+                return
+            }
+            if initial.purpose == "draft" {
+                let disposition = cloudOperationFailureDisposition(
+                    error,
+                    serverAdvertisesFeature: capabilities.contains(.media)
+                )
+                switch disposition {
+                case let .transient(retryAfter):
+                    outboxDrainHalted = true
+                    let delay = retryAfter ?? retryDelay(forRetryCount: initial.retryCount + 1)
+                    try? await localStore.updateDraftAttachment(
+                        transferId: initial.transferId,
+                        mediaId: current?.mediaId,
+                        state: "failed",
+                        progress: current.map {
+                            Double($0.uploadOffset) / Double(max(1, $0.byteSize))
+                        } ?? 0,
+                        error: error.localizedDescription,
+                        retryAfter: delay
+                    )
+                    scheduleOutboxRetry(after: delay)
+                case .authenticationRequired:
+                    outboxDrainHalted = true
+                    try? await localStore.updateDraftAttachment(
+                        transferId: initial.transferId,
+                        mediaId: current?.mediaId,
+                        state: "failed",
+                        progress: current.map {
+                            Double($0.uploadOffset) / Double(max(1, $0.byteSize))
+                        } ?? 0,
+                        error: "Sign in required",
+                        retryAfter: 30
+                    )
+                case .unsupportedServer:
+                    outboxDrainHalted = true
+                    await refreshServerCapabilities()
+                    scheduleOutboxRetry(after: 30)
+                case .permanent:
+                    try? await localStore.updateDraftAttachment(
+                        transferId: initial.transferId,
+                        mediaId: current?.mediaId,
+                        state: "terminal",
+                        progress: 0,
+                        error: error.localizedDescription
+                    )
+                }
+                status = "Draft attachment upload failed: \(error.localizedDescription)"
+                return
+            }
             switch cloudOperationFailureDisposition(
                 error, serverAdvertisesFeature: capabilities.contains(.media)
             ) {
             case let .transient(retryAfter):
+                outboxDrainHalted = true
                 let delay = retryAfter ?? retryDelay(forRetryCount: initial.retryCount + 1)
                 try? await localStore.updateMediaTransfer(
                     transferId: initial.transferId, mediaId: current?.mediaId,
@@ -5249,16 +6169,19 @@ final class CloudAppModel {
                 status = "Attachment queued for retry"
                 scheduleOutboxRetry(after: delay)
             case .unsupportedServer:
-                try? await localStore.markMediaTerminal(
-                    clientMsgId: initial.clientMsgId, error: "Server upgrade required"
-                )
+                outboxDrainHalted = true
                 await refreshServerCapabilities()
-                presentNotice("Server upgrade required", message: "This server does not support attachments yet.")
+                scheduleOutboxRetry(after: 30)
             case .authenticationRequired:
-                try? await localStore.markMediaTerminal(
-                    clientMsgId: initial.clientMsgId, error: "Sign in required"
+                outboxDrainHalted = true
+                try? await localStore.updateMediaTransfer(
+                    transferId: initial.transferId,
+                    mediaId: current?.mediaId,
+                    uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
+                    state: current?.mediaId == nil ? "pending" : "ready_to_send",
+                    error: "Sign in required",
+                    retryAfter: 30
                 )
-                presentNotice("Sign in again", message: "Your session ended before the attachment was sent.")
             case .permanent:
                 try? await localStore.markMediaTerminal(
                     clientMsgId: initial.clientMsgId, error: error.localizedDescription
@@ -5278,6 +6201,55 @@ final class CloudAppModel {
         lines.removeAll { $0.clientMsgId == transfer.clientMsgId }
         if activeDialogId == transfer.dialogId { await loadLocalLines(dialogId: transfer.dialogId) }
         await refreshDialogs()
+    }
+
+    private func recoverTextSendAfterInvalidReply(clientMsgId: String) async -> Bool {
+        guard
+            let accountId = storedSession?.session.accountId,
+            let localStore,
+            let outcome = try? await localStore.recoverTextSendAfterInvalidReply(
+                clientMsgId: clientMsgId,
+                accountId: accountId
+            )
+        else { return false }
+        let dialogId: String
+        let message: String
+        switch outcome {
+        case let .restoredDraft(restoredDialogId):
+            dialogId = restoredDialogId
+            _ = await draftSyncCoordinator.flush(dialogId: dialogId)
+            message = "The reply was removed. Your draft is still here—review it and try again."
+        case let .keptFailedMessage(failedDialogId):
+            dialogId = failedDialogId
+            message = "The reply was removed. Your newer draft was kept, and the failed message is ready to retry."
+        }
+        if activeDialogId == dialogId {
+            await loadLocalLines(dialogId: dialogId)
+        }
+        await refreshDialogs()
+        presentNotice("Original message unavailable", message: message)
+        return true
+    }
+
+    private func cancelMediaTransfers(forRevokedDialogs dialogIds: Set<String>) async {
+        guard let localStore else { return }
+        for dialogId in dialogIds.sorted() {
+            let transfers = (try? await localStore.mediaTransfers(dialogId: dialogId)) ?? []
+            for transfer in transfers {
+                if let activeTask = mediaTransferTasks[transfer.transferId] {
+                    activeTask.cancel()
+                    await activeTask.value
+                } else if let token = storedSession?.session.token {
+                    await cancelMediaTransfer(transfer, token: token)
+                } else {
+                    try? await localStore.cancelMediaTransfer(
+                        transferId: transfer.transferId,
+                        clientMsgId: transfer.clientMsgId
+                    )
+                    await mediaEngine.discardTransfer(transfer)
+                }
+            }
+        }
     }
 
     private static func demoAttachment(
@@ -5315,6 +6287,9 @@ final class CloudAppModel {
                 body: item.body,
                 replyToMsgId: item.replyToMsgId,
                 mentions: item.mentions,
+                draftConsumeOperationId: capabilities.contains(.cloudDrafts)
+                    ? item.draftConsumeOperationId
+                    : nil,
                 token: token
             )
         }
@@ -5338,8 +6313,15 @@ final class CloudAppModel {
     private func nextOutboxRetryDelay() async -> TimeInterval? {
         guard let localStore else { return nil }
         let groupDelay = try? await localStore.nextPendingGroupCreationDelay()
-        let textDelay = try? await localStore.nextPendingOutboxDelay()
-        let mediaDelay = try? await localStore.nextMediaTransferDelay()
+        let textDelay = try? await localStore.nextPendingOutboxDelay(
+            includeCloudDraftDependencies: capabilities.contains(.cloudDrafts)
+        )
+        let mediaDelay = try? await localStore.nextMediaTransferDelay(
+            includeCloudDraftDependencies: capabilities.contains(.cloudDrafts)
+        )
+        let mediaGroupDelay = capabilities.contains(.mediaGroups)
+            ? try? await localStore.nextMediaGroupSendDelay()
+            : nil
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
         let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
         var preferenceDelay: TimeInterval?
@@ -5359,7 +6341,7 @@ final class CloudAppModel {
         }
         return [
             groupDelay, groupMutationDelay, preferenceDelay,
-            textDelay, mediaDelay, mutationDelay,
+            textDelay, mediaDelay, mediaGroupDelay, mutationDelay,
         ].compactMap { $0 }.min()
     }
 
@@ -5396,6 +6378,9 @@ final class CloudAppModel {
             lines[index].isEdited = message.editVersion > 0 && message.state == "visible"
             lines[index].isDeleted = message.state == "deleted_for_all"
             lines[index].media = message.media
+            lines[index].mediaGroupId = message.mediaGroupId
+            lines[index].mediaGroupIndex = message.mediaGroupIndex
+            lines[index].mediaGroupCount = message.mediaGroupCount
             lines[index].mine = mine
             lines[index].delivery = .sent
             lines[index].timestamp = message.serverTs
@@ -5424,7 +6409,10 @@ final class CloudAppModel {
             editVersion: message.editVersion,
             isEdited: message.editVersion > 0 && message.state == "visible",
             isDeleted: message.state == "deleted_for_all",
-            media: message.media
+            media: message.media,
+            mediaGroupId: message.mediaGroupId,
+            mediaGroupIndex: message.mediaGroupIndex,
+            mediaGroupCount: message.mediaGroupCount
         ))
         lines.sort {
             switch ($0.msgId, $1.msgId) {
@@ -5455,8 +6443,7 @@ final class CloudAppModel {
                 body: text,
                 expectedEditVersion: line.editVersion
             )
-            draft = ""
-            composerMode = .text
+            restoreUnderlyingDraftComposer()
             await loadLocalLines(dialogId: dialogId)
             await processMessageMutation(PendingMessageMutation(
                 clientMutationId: mutationId, operation: "edit", dialogId: dialogId,
@@ -5745,8 +6732,6 @@ final class CloudAppModel {
             Dialog(id: "demo-madina", title: "Мадина", subtitle: "Дар роҳам", updatedAt: Self.demoTimestamp(minutesAgo: 1_480), isPending: false, unreadCount: 0, draftPreview: "Пас аз даҳ дақиқа…"),
             Dialog(id: "demo-aziz", title: "Азиз", subtitle: "Созвонимся вечером?", updatedAt: Self.demoTimestamp(minutesAgo: 2_920), isPending: false, unreadCount: 0, isTyping: true, lastMessageMine: true),
         ]
-        draftsByDialog = ["demo-madina": "Пас аз даҳ дақиқа…"]
-
         demoLinesByDialog = [
             "demo-mehrona": [
                 demoLine(dialogId: "demo-mehrona", messageId: 1, text: "Салом! Пагоҳ вақт дорӣ?", mine: false, minutesAgo: 1_565),
@@ -6027,6 +7012,8 @@ private enum CloudAppModelError: LocalizedError {
     case invalidBootstrapCursor
     case invalidMedia
     case invalidGroupMutation
+    case tooManyDraftAttachments
+    case mediaGroupsUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -6040,6 +7027,10 @@ private enum CloudAppModelError: LocalizedError {
             return "The selected media could not be prepared"
         case .invalidGroupMutation:
             return "The saved group change is invalid"
+        case .tooManyDraftAttachments:
+            return "A draft can contain at most 10 attachments"
+        case .mediaGroupsUnavailable:
+            return "This server cannot send multiple attachments as one group yet"
         }
     }
 }
