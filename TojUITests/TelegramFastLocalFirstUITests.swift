@@ -111,12 +111,12 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
 
     func testRemoteDeviceClearConvergesAfterRelaunch() {
         openChat(Fixture.primaryDialog)
-        XCTAssertTrue(element("draft-attachment-ui-draft-0").exists)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").waitForExistence(timeout: 5))
         app.terminate()
         app.launchEnvironment["TOJ_UI_FIXTURE_REMOTE_CLEAR"] = "1"
         launch(reset: false)
         openChat(Fixture.primaryDialog)
-        XCTAssertFalse(element("draft-attachment-ui-draft-0").exists)
+        XCTAssertTrue(element("draft-attachment-ui-draft-0").waitForNonExistence(timeout: 5))
         XCTAssertEqual(app.textFields["Message"].value as? String, "Message")
     }
 
