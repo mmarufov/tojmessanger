@@ -56,7 +56,11 @@ jobs:
           bun run migrate
           DATABASE_URL="${TEST_DATABASE_URL}" bun run migrate
           bun run verify:dialog-preferences-migration
-          bun test --max-concurrency=4
+          while IFS= read -r test_file; do
+            bun test "${test_file}"
+          done < <(
+            find . -path './node_modules' -prune -o -name '*.test.ts' -print | sort
+          )
 
   ios-debug-tests:
     name: ios-debug-tests
