@@ -17,6 +17,57 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.demo.contains(.multipartMedia))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.groups))
         XCTAssertTrue(MessagingCapabilities.demo.contains(.calls))
+        XCTAssertFalse(MessagingCapabilities.demo.contains(.savedMessages))
+        let dailyUseBits: [MessagingCapabilities] = [
+            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch,
+        ]
+        XCTAssertEqual(Set(dailyUseBits.map(\.rawValue)).count, dailyUseBits.count)
+        XCTAssertEqual(MessagingCapabilities.savedMessages.rawValue, 1 << 14)
+        XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
+    }
+
+    func testSavedCapabilityDistinguishesOfflineUnknownSupportAndWithdrawal() {
+        let firstOfflineLaunch = SavedMessagesCapabilityState.unknown
+        XCTAssertEqual(firstOfflineLaunch.resolvingEnsureFailure(statusCode: nil), .unknown)
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.advertised(in: ["core_text", "saved_messages_v1"]),
+            .supported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.advertised(in: ["core_text"]),
+            .unsupported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.supported.resolvingEnsureFailure(statusCode: 404),
+            .unsupported
+        )
+        XCTAssertEqual(
+            SavedMessagesCapabilityState.supported.resolvingEnsureFailure(statusCode: 503),
+            .supported
+        )
+    }
+
+    @MainActor
+    func testForwardingPickerKeepsArchivedSavedMessagesFirst() {
+        var saved = CloudAppModel.Dialog(
+            id: "saved", title: "Saved Messages", type: "saved", subtitle: "",
+            updatedAt: "2026-01-01T00:00:00Z", isPending: false, unreadCount: 0
+        )
+        saved.isArchived = true
+        var hidden = CloudAppModel.Dialog(
+            id: "hidden", title: "Archived", subtitle: "",
+            updatedAt: "2026-07-26T00:00:00Z", isPending: false, unreadCount: 0
+        )
+        hidden.isArchived = true
+        let recent = CloudAppModel.Dialog(
+            id: "recent", title: "Recent", subtitle: "",
+            updatedAt: "2026-07-25T00:00:00Z", isPending: false, unreadCount: 0
+        )
+
+        XCTAssertEqual(
+            CloudAppModel.forwardingPickerDialogs([recent, hidden, saved]).map(\.id),
+            ["saved", "recent"]
+        )
     }
 
     func testMediaBubbleGeometryPreservesNormalRatiosAndBoundsExtremes() {

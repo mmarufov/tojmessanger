@@ -138,6 +138,7 @@ struct TojAvatar: View {
     var size: CGFloat = 52
     var highlighted = false
     var colorIndex: Int? = nil
+    var systemImage: String? = nil
 
     private static let palettes: [(UInt32, UInt32)] = [
         (0x365C78, 0x172B3A),
@@ -168,9 +169,15 @@ struct TojAvatar: View {
                         : colorIndex.map { AnyShapeStyle(TojProfilePalette.gradient($0)) }
                             ?? AnyShapeStyle(LinearGradient(colors: [Color(hex: palette.0), Color(hex: palette.1)], startPoint: .topLeading, endPoint: .bottomTrailing))
                 )
-            Text(initial)
-                .font(TojTheme.heading(.headline, weight: .semibold))
-                .foregroundStyle(highlighted ? TojTheme.gold : TojTheme.text)
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: size * 0.38, weight: .semibold))
+                    .foregroundStyle(TojTheme.gold)
+            } else {
+                Text(initial)
+                    .font(TojTheme.heading(.headline, weight: .semibold))
+                    .foregroundStyle(highlighted ? TojTheme.gold : TojTheme.text)
+            }
         }
         .frame(width: size, height: size)
         .overlay(Circle().stroke(Color.white.opacity(0.08), lineWidth: 0.5))

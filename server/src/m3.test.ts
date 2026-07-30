@@ -996,6 +996,58 @@ describe("M3 cloud sync", () => {
     expect(Number(counts.message_count)).toBe(1);
   });
 
+  test("send idempotency survives 24 hours, old receipt cleanup, and canonical recovery", async () => {
+    const { alice, dialogId } = await makePair();
+    const clientMsgId = crypto.randomUUID();
+    const first = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId,
+      body: "retry after a long offline period",
+    });
+    await db`
+      UPDATE send_requests
+      SET created_at = now() - interval '8 days'
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`;
+
+    await cleanupExpiredData(db, 100);
+    expect(await db`
+      SELECT status FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)
+      .toEqual([expect.objectContaining({ status: "completed" })]);
+
+    // Reproduce a database upgraded from the old 24-hour receipt cleanup behavior.
+    await db`
+      DELETE FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`;
+    const recovered = await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId,
+      body: "retry after a long offline period",
+    });
+    expect(recovered).toMatchObject({
+      duplicate: true,
+      msgId: first.msgId,
+      senderPts: first.senderPts,
+      text: "retry after a long offline period",
+    });
+    expect(Number((await db`
+      SELECT count(*) AS count FROM messages
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0].count))
+      .toBe(1);
+    expect((await db`
+      SELECT status, msg_id, sender_pts FROM send_requests
+      WHERE sender_account_id = ${alice.accountId} AND client_msg_id = ${clientMsgId}`)[0])
+      .toMatchObject({
+        status: "completed",
+        msg_id: String(first.msgId),
+        sender_pts: String(first.senderPts),
+      });
+  });
+
   test("replies survive difference, history, and bootstrap contracts", async () => {
     const { alice, bob, dialogId } = await makePair();
     const original = await sendMessage(db, {

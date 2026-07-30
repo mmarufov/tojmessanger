@@ -246,7 +246,20 @@ final class CloudAppModel {
         var presentationIsLastInGroup = true
     }
 
-    private(set) var storedSession: StoredCloudSession?
+    private(set) var storedSession: StoredCloudSession? {
+        didSet {
+            let oldIdentity = oldValue.map {
+                "\($0.session.accountId)\u{0}\($0.session.deviceId)\u{0}\($0.session.token)"
+            }
+            let newIdentity = storedSession.map {
+                "\($0.session.accountId)\u{0}\($0.session.deviceId)\u{0}\($0.session.token)"
+            }
+            if oldIdentity != newIdentity {
+                savedMessagesSessionGeneration &+= 1
+                savedMessagesCapabilityState = .unknown
+            }
+        }
+    }
     private(set) var launchPhase: LaunchPhase = .restoringLocal
     private(set) var status = "Starting"
     private(set) var operationNotice: Notice?
@@ -262,6 +275,10 @@ final class CloudAppModel {
     private(set) var activeDialogId: String?
     private(set) var conversationOpenState: ConversationOpenState = .loadingLocal
     private(set) var dialogs: [Dialog] = []
+    private(set) var savedMessagesDialogId: String?
+    private(set) var savedMessagesSetupInFlight = false
+    private(set) var savedMessagesSetupFailure: String?
+    private(set) var savedMessagesCapabilityState: SavedMessagesCapabilityState = .unknown
     private(set) var groupMembersByDialog: [String: [GroupMember]] = [:]
     private(set) var lines: [Line] = []
     private(set) var openingTimelineAnchor: TimelineAnchor = .bottom
@@ -296,6 +313,17 @@ final class CloudAppModel {
     }
     var accountDeletionCode = ""
 
+    #if DEBUG
+    var uiFixtureDraftPersistenceComplete: Bool {
+        guard TelegramFastUITestFixture.enabled,
+              let dialogId = activeDialogId,
+              (draftPersistenceGenerations[dialogId] ?? 0) > 0 else {
+            return false
+        }
+        return draftPersistenceTasks[dialogId] == nil
+    }
+    #endif
+
     private var draftMentionsByDialog: [String: [DraftMention]] = [:]
 
     var mentionSuggestions: [GroupMember] {
@@ -315,6 +343,7 @@ final class CloudAppModel {
     }
 
     private let api: CloudAPI
+    private let savedMessagesService = SavedMessagesService()
     private let tokenStore: TokenStore
     private var localStore: CloudLocalStore?
     private let localStoreBootstrapper = CloudLocalStoreBootstrapper()
@@ -322,6 +351,7 @@ final class CloudAppModel {
     private let pushCenter: PushRegistrationCenter
     private let voipPushCenter: VoIPPushRegistrationCenter
     private let mediaEngine: CloudMediaTransferEngine
+    private let accessPurgeCoordinator = AccessPurgeCoordinator()
     private let capabilityDefaults: UserDefaults
     private let capabilityCacheKey: String
     private var negotiatedCapabilities: MessagingCapabilities
@@ -365,8 +395,12 @@ final class CloudAppModel {
     private var backgroundMediaRuntimePrepared = false
     private var mediaSchedulerForegrounded = false
     private var composerMediaOperationId: UUID?
+    private var composerMediaDialogId: String?
     private var activeComposerTransferId: String?
+    private var temporaryPreviewURLsByDialog: [String: Set<URL>] = [:]
+    private var dialogPresentationGenerations: [String: UInt64] = [:]
     private var mediaTransferTasks: [String: Task<Void, Never>] = [:]
+    private var mediaTransferDialogIds: [String: String] = [:]
     private var preferenceMutationTasks: [UUID: Task<Void, Never>] = [:]
     private var accountSessionGeneration: UInt64 = 1
     private var isSessionTeardownInProgress = false
@@ -405,6 +439,18 @@ final class CloudAppModel {
     private var dialogSelectionGeneration: UInt64 = 0
     private var timelineLoadGeneration: UInt64 = 0
     private var openingAnchorHydrationGeneration: UInt64 = 0
+    private var savedMessagesSessionGeneration: UInt64 = 0
+    private(set) var sessionTeardownActive = false
+    private struct TrackedSavedOperation {
+        let cancel: () -> Void
+        let wait: () async -> Void
+    }
+    private struct SessionClearBarrier {
+        let id: UUID
+        var waiters: [CheckedContinuation<Void, Never>]
+    }
+    private var trackedSavedOperations: [UUID: TrackedSavedOperation] = [:]
+    private var sessionClearBarrier: SessionClearBarrier?
     private var appliedSyncBatches = 0
     private var lastForegroundSyncFailure: ReplicaSyncState?
     private var timelineForwardCursorByDialog: [String: Int64] = [:]
@@ -412,6 +458,9 @@ final class CloudAppModel {
     private var readReceiptDrainRequested = false
     #if DEBUG
     private var demoLinesByDialog: [String: [Line]] = [:]
+    private var temporaryPreviewAuthorizationGate: (@Sendable (URL) async -> Void)?
+    private var mediaAccessRestoreAuthorizationGate: (@Sendable () async -> Void)?
+    private var mediaAccessPostRestoreValidationGate: (@Sendable () async -> Void)?
     #endif
 
     let callCoordinator: CallCoordinator
@@ -427,6 +476,14 @@ final class CloudAppModel {
         return WebRTCEngineFactory.supportsCameraVideoProfile
             ? negotiatedCapabilities
             : negotiatedCapabilities.subtracting(.videoCalls)
+    }
+
+    private func installAuthenticatedSession(_ session: StoredCloudSession) {
+        // Only explicit authentication/restore entry points may lower the teardown fence.
+        // Profile and other generic refreshes cannot resurrect a session during erasure.
+        guard sessionClearBarrier == nil else { return }
+        sessionTeardownActive = false
+        storedSession = session
     }
 
     var replicaSyncSnapshot: ReplicaSyncSnapshot {
@@ -455,6 +512,7 @@ final class CloudAppModel {
 
     init(
         config: CloudConfig = .current,
+        api injectedAPI: CloudAPI? = nil,
         tokenStore: TokenStore = TokenStore(),
         pushCenter: PushRegistrationCenter = .shared,
         voipPushCenter: VoIPPushRegistrationCenter = .shared,
@@ -462,15 +520,16 @@ final class CloudAppModel {
         callPreferences: CallPrivacyPreferences = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
         useDefaultLocalStore: Bool = true,
+        mediaEngine injectedMediaEngine: CloudMediaTransferEngine? = nil,
         capabilityDefaults: UserDefaults = .standard
     ) {
-        self.api = CloudAPI(config: config)
+        self.api = injectedAPI ?? CloudAPI(config: config)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
         self.voipPushCenter = voipPushCenter
         self.callCoordinator = callCoordinator
         self.callPreferences = callPreferences
-        self.mediaEngine = CloudMediaTransferEngine(config: config)
+        self.mediaEngine = injectedMediaEngine ?? CloudMediaTransferEngine(config: config)
         self.opensDefaultLocalStore = useDefaultLocalStore && injectedLocalStore == nil
         self.capabilityDefaults = capabilityDefaults
         self.capabilityCacheKey = "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
@@ -478,7 +537,8 @@ final class CloudAppModel {
             forKey: "toj.cloud.capabilities.\(config.baseURL.absoluteString)"
         ) as? NSNumber
         self.negotiatedCapabilities = cached.map {
-            MessagingCapabilities(rawValue: $0.uint16Value).subtracting(.videoCalls)
+            MessagingCapabilities(rawValue: $0.uint64Value)
+                .subtracting([.videoCalls, .savedMessages])
         } ?? [.replies]
         self.localStore = injectedLocalStore
         voiceRecorder.onUnexpectedStop = { [weak self] in
@@ -572,7 +632,7 @@ final class CloudAppModel {
             }
             if let saved = savedSession {
                 isSessionTeardownInProgress = false
-                storedSession = saved
+                installAuthenticatedSession(saved)
                 phone = saved.phone
                 displayName = saved.displayName
                 await loadProfileDetails()
@@ -660,7 +720,7 @@ final class CloudAppModel {
             sessionTearingDown = false
             isSessionTeardownInProgress = false
             accountSessionGeneration &+= 1
-            storedSession = stored
+            installAuthenticatedSession(stored)
             profileDetails = Self.profileDetails(from: name)
             try? await tokenStore.saveProfile(profileDetails, accountId: session.accountId)
             resendTask?.cancel()
@@ -784,7 +844,11 @@ final class CloudAppModel {
     }
 
     private func acceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
-        guard let saved = storedSession, saved.session.token == token else { return }
+        guard !sessionTeardownActive,
+              let saved = storedSession,
+              saved.session.token == token
+        else { return }
+        let generation = savedMessagesSessionGeneration
         let details = Self.profileDetails(from: profile, pendingSync: false)
         let updatedSession = StoredCloudSession(
             session: saved.session,
@@ -793,11 +857,16 @@ final class CloudAppModel {
         )
         do {
             try await tokenStore.saveProfile(details, accountId: saved.session.accountId)
-            try await tokenStore.save(updatedSession)
         } catch {
             status = "Profile updated, but local storage could not be refreshed"
             return
         }
+        guard !sessionTeardownActive,
+              savedMessagesSessionGeneration == generation,
+              storedSession?.session.accountId == saved.session.accountId,
+              storedSession?.session.token == token,
+              !Task.isCancelled
+        else { return }
         profileDetails = details
         storedSession = updatedSession
         displayName = details.displayName
@@ -950,11 +1019,43 @@ final class CloudAppModel {
     }
 
     private func clearLocalSession(finalStatus: String) async {
+        if sessionClearBarrier != nil {
+            await withCheckedContinuation { continuation in
+                sessionClearBarrier?.waiters.append(continuation)
+            }
+            return
+        }
+        // This flag changes synchronously before the first suspension point. User actions cannot
+        // enqueue new Saved/forward SQL while teardown is waiting on older work.
+        sessionTeardownActive = true
+        let id = UUID()
+        sessionClearBarrier = SessionClearBarrier(id: id, waiters: [])
+        await performClearLocalSession(finalStatus: finalStatus)
+        if sessionClearBarrier?.id == id {
+            let waiters = sessionClearBarrier?.waiters ?? []
+            sessionClearBarrier = nil
+            waiters.forEach { $0.resume() }
+        }
+    }
+
+    private func performClearLocalSession(finalStatus: String) async {
         beginSessionTeardown()
-        // Both session fences are entered synchronously before the first await. Draft/media work
-        // validates the epoch; preference work validates the account generation.
+        // Both session fences are entered before teardown's first suspension point. Draft/media
+        // work validates the epoch; preference work validates the account generation.
         isSessionTeardownInProgress = true
         accountSessionGeneration &+= 1
+        // Prevent an old ensure from publishing while its exact task is cancelled and awaited.
+        savedMessagesSessionGeneration &+= 1
+        savedMessagesCapabilityState = .unknown
+        let savedOperations = Array(trackedSavedOperations.values)
+        trackedSavedOperations.removeAll()
+        savedOperations.forEach { $0.cancel() }
+        // Saved setup owns a nested, coalesced provisioning task inside the service actor. Reset
+        // that exact task before awaiting the user-facing wrapper; otherwise an unstructured
+        // network task that ignores parent cancellation could keep teardown waiting forever.
+        await savedMessagesService.reset()
+        await accessPurgeCoordinator.reset()
+        for operation in savedOperations { await operation.wait() }
         let accountId = storedSession?.session.accountId
         await draftSyncCoordinator.suspendRetries()
         var cleanupFailures: [String] = []
@@ -1022,8 +1123,12 @@ final class CloudAppModel {
         readReceiptRetryTask = nil
         replicaIntegrityTask = nil
         composerMediaOperationId = nil
+        composerMediaDialogId = nil
         activeComposerTransferId = nil
         mediaTransferTasks.removeAll()
+        mediaTransferDialogIds.removeAll()
+        temporaryPreviewURLsByDialog.removeAll()
+        dialogPresentationGenerations.removeAll()
         preferenceMutationTasks.removeAll()
         mediaTransfersInFlight.removeAll()
         mediaGroupSendsInFlight.removeAll()
@@ -1038,7 +1143,7 @@ final class CloudAppModel {
         retryInFlight = false
 
         await mediaEngine.destroyLocalStateForLogout()
-        MediaPresentationCache.shared.removeAll()
+        MediaPresentationCache.shared.resetForSession()
         backgroundMediaRuntimePrepared = false
         mediaCacheBytes = 0
 
@@ -1084,6 +1189,9 @@ final class CloudAppModel {
         storedSession = nil
         activeDialogId = nil
         dialogs = []
+        savedMessagesDialogId = nil
+        savedMessagesSetupInFlight = false
+        savedMessagesSetupFailure = nil
         lines = []
         loadedLocalMessages = []
         pendingVisibleReadMessages = []
@@ -2342,6 +2450,168 @@ final class CloudAppModel {
         dialogs.first(where: { $0.id == dialogId })?.title ?? shortDialogId(dialogId)
     }
 
+    @discardableResult
+    func ensureSavedMessages(presentsFailure: Bool = true) async -> String? {
+        guard !sessionTeardownActive else { return nil }
+        return await runTrackedSavedOperation {
+            await self.ensureSavedMessagesCore(presentsFailure: presentsFailure)
+        } ?? nil
+    }
+
+    private func ensureSavedMessagesCore(presentsFailure: Bool) async -> String? {
+        guard
+            !sessionTeardownActive,
+            let accountId = storedSession?.session.accountId,
+            let token = storedSession?.session.token,
+            let localStore
+        else { return nil }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ) else { return nil }
+        if let savedMessagesDialogId {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
+            return savedMessagesDialogId
+        }
+        if let local = try? await savedMessagesService.localDialogId(
+            store: localStore,
+            accountId: accountId
+        ) {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
+            savedMessagesDialogId = local
+            savedMessagesSetupFailure = nil
+            return local
+        }
+        guard savedMessagesCapabilityState != .unsupported else {
+            savedMessagesSetupFailure = String(localized: "Unavailable on this server")
+            return nil
+        }
+
+        savedMessagesSetupInFlight = true
+        savedMessagesSetupFailure = nil
+        defer {
+            if savedMessagesSessionGeneration == generation {
+                savedMessagesSetupInFlight = false
+            }
+        }
+        do {
+            let dialogId = try await savedMessagesService.ensure(
+                api: api,
+                store: localStore,
+                accountId: accountId,
+                token: token,
+                generation: generation
+            )
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
+            savedMessagesDialogId = dialogId
+            savedMessagesSetupFailure = nil
+            await refreshDialogs()
+            return dialogId
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return nil }
+            let message: String
+            let apiStatus = (error as? CloudAPIError)?.status
+            savedMessagesCapabilityState = savedMessagesCapabilityState.resolvingEnsureFailure(
+                statusCode: apiStatus
+            )
+            if apiStatus == 404 {
+                negotiatedCapabilities.remove(.savedMessages)
+                message = String(localized: "Unavailable on this server")
+            } else {
+                switch cloudFailureDisposition(error) {
+                case .transient:
+                    message = String(localized: "Connect once to set up Saved Messages")
+                case .authenticationRequired:
+                    message = String(localized: "Sign in again to set up Saved Messages")
+                case .unsupportedServer:
+                    message = String(localized: "Unavailable on this server")
+                case .permanent:
+                    message = String(localized: "Saved Messages could not be set up")
+                }
+            }
+            savedMessagesSetupFailure = message
+            if presentsFailure {
+                presentNotice(String(localized: "Saved Messages"), message: message)
+            }
+            return nil
+        }
+    }
+
+    private func isCurrentSavedMessagesSession(
+        accountId: String,
+        token: String,
+        store: CloudLocalStore,
+        generation: UInt64
+    ) -> Bool {
+        !sessionTeardownActive
+            && savedMessagesSessionGeneration == generation
+            && storedSession?.session.accountId == accountId
+            && storedSession?.session.token == token
+            && localStore === store
+    }
+
+    func saveMessage(_ line: Line) async {
+        guard !sessionTeardownActive else { return }
+        _ = await runTrackedSavedOperation {
+            await self.saveMessageCore(line)
+        }
+    }
+
+    private func saveMessageCore(_ line: Line) async {
+        guard
+            !sessionTeardownActive,
+            !line.isDeleted,
+            line.msgId != nil,
+            line.dialogId != savedMessagesDialogId,
+            let targetDialogId = await ensureSavedMessagesCore(presentsFailure: true)
+        else { return }
+        await forwardMessageCore(line, to: targetDialogId)
+        if status == "Forwarded" {
+            status = String(localized: "Saved to Saved Messages")
+        }
+    }
+
+    private func runTrackedSavedOperation<T: Sendable>(
+        _ operation: @escaping @MainActor () async -> T
+    ) async -> T? {
+        guard !sessionTeardownActive else { return nil }
+        let id = UUID()
+        let task = Task { await operation() }
+        trackedSavedOperations[id] = TrackedSavedOperation(
+            cancel: { task.cancel() },
+            wait: { _ = await task.result }
+        )
+        let result = await task.value
+        trackedSavedOperations.removeValue(forKey: id)
+        guard !sessionTeardownActive, !Task.isCancelled else { return nil }
+        return result
+    }
+
     func startVoiceCall(dialogId: String) async {
         #if DEBUG
         if isDemoMode {
@@ -2643,9 +2913,20 @@ final class CloudAppModel {
         if capabilities.contains(.replies) { actions.insert(.reply, at: 0) }
         if line.msgId != nil, capabilities.contains(.reactions) { actions.insert(.react, at: min(1, actions.count)) }
         if line.mine, line.media == nil, capabilities.contains(.editing) { actions.append(.edit) }
+        let sourceIsSaved = line.dialogId.flatMap { sourceId in
+            dialogs.first(where: { $0.id == sourceId })?.type
+        } == "saved"
+        if line.msgId != nil,
+           !sourceIsSaved,
+           savedMessagesDialogId != nil || capabilities.contains(.savedMessages) {
+            actions.append(.save)
+        }
         if line.msgId != nil, capabilities.contains(.forwarding) { actions.append(.forward) }
         if line.mine, capabilities.contains(.deletion) { actions.append(.delete) }
-        if case .failed = line.delivery { actions.append(.retry) }
+        if case .failed = line.delivery {
+            actions.append(.retry)
+            actions.append(.remove)
+        }
         actions.append(.inspect)
         return actions
     }
@@ -2673,10 +2954,24 @@ final class CloudAppModel {
         }
     }
 
+    func removeFailedMessage(_ line: Line) {
+        guard case .failed = line.delivery, !sessionTeardownActive else { return }
+        Task { [weak self] in
+            guard let self, !self.sessionTeardownActive, let localStore = self.localStore else {
+                return
+            }
+            try? await localStore.removePendingOutboxMessage(clientMsgId: line.clientMsgId)
+            if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                await self.loadLocalLines(dialogId: dialogId)
+            }
+            await self.refreshDialogs()
+        }
+    }
+
     func removeFailedMedia(_ line: Line) {
         guard line.media != nil else { return }
         Task { [weak self] in
-            guard let self, let localStore else { return }
+            guard let self, !self.sessionTeardownActive, let localStore else { return }
             if let groupId = line.mediaGroupId {
                 let transfers = (try? await localStore.removeMediaGroupSend(
                     clientGroupId: groupId
@@ -2692,7 +2987,14 @@ final class CloudAppModel {
             }
             guard
                   let transfer = try? await localStore.mediaTransfer(clientMsgId: line.clientMsgId)
-            else { return }
+            else {
+                try? await localStore.removePendingOutboxMessage(clientMsgId: line.clientMsgId)
+                if let dialogId = line.dialogId, self.activeDialogId == dialogId {
+                    await self.loadLocalLines(dialogId: dialogId)
+                }
+                await self.refreshDialogs()
+                return
+            }
             if let activeTask = mediaTransferTasks[transfer.transferId] {
                 activeTask.cancel()
                 await activeTask.value
@@ -2729,6 +3031,7 @@ final class CloudAppModel {
     func toggleMuted(_ dialogId: String) {
         guard !isSessionTeardownInProgress else { return }
         guard let dialog = dialogs.first(where: { $0.id == dialogId }) else { return }
+        guard dialog.type != "saved" else { return }
         let supportsLegacyGroupMute = dialog.type == "group" && capabilities.contains(.groups)
         guard capabilities.contains(.chatOrganization) || supportsLegacyGroupMute else { return }
         #if DEBUG
@@ -2750,6 +3053,9 @@ final class CloudAppModel {
     func archive(_ dialogId: String) {
         guard !isSessionTeardownInProgress else { return }
         guard capabilities.contains(.chatOrganization) else { return }
+        // Saved Messages is the permanent self-dialog. It can be pinned but is neither muted nor
+        // archived; legacy local archived state is ignored by the forwarding picker.
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         #if DEBUG
         if isDemoMode {
             updateDialog(dialogId) { $0.isArchived = true }
@@ -2766,6 +3072,7 @@ final class CloudAppModel {
     func unarchive(_ dialogId: String) {
         guard !isSessionTeardownInProgress else { return }
         guard capabilities.contains(.chatOrganization) else { return }
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         #if DEBUG
         if isDemoMode {
             updateDialog(dialogId) { $0.isArchived = false }
@@ -2832,6 +3139,17 @@ final class CloudAppModel {
             await self.refreshDialogs()
         }
         preferenceMutationTasks[taskId] = task
+    }
+
+    nonisolated static func forwardingPickerDialogs(_ dialogs: [Dialog]) -> [Dialog] {
+        dialogs
+            .filter { $0.type == "saved" || !$0.isArchived }
+            .sorted {
+                if ($0.type == "saved") != ($1.type == "saved") {
+                    return $0.type == "saved"
+                }
+                return $0.updatedAt > $1.updatedAt
+            }
     }
 
     private func updateDialog(_ dialogId: String, mutation: (inout Dialog) -> Void) {
@@ -3088,11 +3406,15 @@ final class CloudAppModel {
     ) async {
         composerMediaTask?.cancel()
         await composerMediaTask?.value
+        guard !sessionTeardownActive, let dialogId = activeDialogId else { return }
         let operationId = UUID()
         composerMediaOperationId = operationId
+        // Establish dialog ownership before the task can enter mediaEngine.prepare.
+        composerMediaDialogId = dialogId
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performMediaSend(
+                dialogId: dialogId,
                 data: data, kind: kind, contentType: contentType, fileName: fileName,
                 durationMs: durationMs, width: width, height: height, thumbnail: thumbnail
             )
@@ -3102,6 +3424,7 @@ final class CloudAppModel {
         if composerMediaOperationId == operationId {
             composerMediaTask = nil
             composerMediaOperationId = nil
+            composerMediaDialogId = nil
             activeComposerTransferId = nil
         }
     }
@@ -3272,11 +3595,12 @@ final class CloudAppModel {
     }
 
     private func performMediaSend(
+        dialogId: String,
         data: Data, kind: String, contentType: String, fileName: String?,
         durationMs: Int64?, width: Int?, height: Int?, thumbnail: Data?
     ) async {
         guard
-            let dialogId = activeDialogId,
+            !sessionTeardownActive,
             let accountId = storedSession?.session.accountId,
             let localStore
         else { return }
@@ -3407,7 +3731,9 @@ final class CloudAppModel {
         #if DEBUG
         if isDemoMode { return demoMediaBytes(for: media, thumbnail: true) }
         #endif
-        guard let token = storedSession?.session.token else { return nil }
+        guard let token = storedSession?.session.token,
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil
+        else { return nil }
         let state = await mediaEngine.mediaDownloadState(mediaId: media.id, expectedSize: media.byteSize)
         LocalFirstMetrics.cacheResult(hit: state?.hasThumbnail == true, thumbnail: true)
         return try? await mediaEngine.thumbnail(
@@ -3415,6 +3741,65 @@ final class CloudAppModel {
             token: token,
             localStore: localStore
         )
+    }
+
+    private func restoreMediaAccessIfAuthorized(
+        mediaId: String,
+        dialogId: String? = nil
+    ) async -> MediaPresentationAuthorization? {
+        guard !sessionTeardownActive, let localStore else { return nil }
+        guard let authorization = try? await localStore.mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        ) else { return nil }
+        #if DEBUG
+        await mediaAccessRestoreAuthorizationGate?()
+        #endif
+        let lease: MediaAccessRestoreLease
+        do {
+            lease = try await mediaEngine.restoreAuthorizedAccess(mediaId: mediaId)
+        } catch {
+            return nil
+        }
+        #if DEBUG
+        await mediaAccessPostRestoreValidationGate?()
+        #endif
+        if !sessionTeardownActive,
+           (try? await localStore.validatesMediaPresentationAuthorization(
+            authorization
+           )) == true {
+            MediaPresentationCache.shared.restore(mediaIds: [mediaId])
+            return authorization
+        }
+
+        // The exact dialog authorization was stale. Keep the global fence open only when a
+        // separately revalidated SQLCipher reference proves that another dialog (or a newer group
+        // grant) currently owns this media. Otherwise roll back this exact unfencing generation;
+        // rollback fences first and removes any bytes written during the brief unfenced window.
+        if !sessionTeardownActive,
+           let currentAuthorization = try? await localStore.mediaPresentationAuthorization(
+            mediaId: mediaId
+           ),
+           (try? await localStore.validatesMediaPresentationAuthorization(
+            currentAuthorization
+           )) == true {
+            MediaPresentationCache.shared.restore(mediaIds: [mediaId])
+            return nil
+        }
+        _ = await rollbackUnauthorizedMediaPresentation(lease, mediaId: mediaId)
+        return nil
+    }
+
+    @discardableResult
+    private func rollbackUnauthorizedMediaPresentation(
+        _ lease: MediaAccessRestoreLease,
+        mediaId: String
+    ) async -> Bool {
+        guard (try? await mediaEngine.rollbackUnauthorizedAccess(lease)) == true else {
+            return false
+        }
+        MediaPresentationCache.shared.revoke(mediaIds: [mediaId])
+        return true
     }
 
     func presentationImage(
@@ -3438,6 +3823,9 @@ final class CloudAppModel {
         }
         #endif
 
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return nil
+        }
         let engine = mediaEngine
         let store = localStore
         let token = storedSession?.session.token
@@ -3509,6 +3897,9 @@ final class CloudAppModel {
         for media: CloudMedia,
         variant: MediaPresentationVariant
     ) async -> MediaAvailability {
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return .failed
+        }
         let key = MediaPresentationKey(mediaId: media.id, variant: variant)
         if MediaPresentationCache.shared.contains(key) { return .decoded }
         if await mediaEngine.representation(media: media, variant: variant, localStore: localStore) != nil {
@@ -3541,7 +3932,9 @@ final class CloudAppModel {
             return demoMediaBytes(for: media, thumbnail: false) ?? Data()
         }
         #endif
-        guard let token = storedSession?.session.token else {
+        guard let token = storedSession?.session.token,
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil
+        else {
             throw CloudAPIError(status: 401, message: "Sign in required", retryAfter: nil)
         }
         let state = await mediaEngine.mediaDownloadState(mediaId: media.id, expectedSize: media.byteSize)
@@ -3557,7 +3950,10 @@ final class CloudAppModel {
 
     /// A streaming asset that plays this media progressively (chunk-by-chunk) instead of requiring a
     /// full download first. Returns `nil` until there is a session token. Retain the owner while playing.
-    func streamingVideoAsset(for media: CloudMedia) -> StreamingMediaAsset? {
+    func streamingVideoAsset(for media: CloudMedia) async -> StreamingMediaAsset? {
+        guard await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil else {
+            return nil
+        }
         if let prepared = MediaPresentationCache.shared.takePreparedVideoAsset(mediaId: media.id) {
             return prepared
         }
@@ -3571,6 +3967,7 @@ final class CloudAppModel {
 
     private func prewarmStreamingVideoAssetIfLocal(for media: CloudMedia) async {
         guard media.kind == "video",
+              await restoreMediaAccessIfAuthorized(mediaId: media.id) != nil,
               !MediaPresentationCache.shared.hasPreparedVideoAsset(mediaId: media.id),
               let token = storedSession?.session.token,
               await mediaEngine.mediaDownloadState(
@@ -3586,20 +3983,112 @@ final class CloudAppModel {
         MediaPresentationCache.shared.storePreparedVideoAsset(asset, mediaId: media.id)
     }
 
-    func temporaryMediaURL(data: Data, fileExtension: String?) async throws -> URL {
-        try await mediaEngine.temporaryPreview(data: data, fileExtension: fileExtension)
+    @discardableResult
+    func transferTemporaryMediaURL(
+        data: Data,
+        fileExtension: String?,
+        mediaId: String,
+        dialogId: String,
+        transferOwnership: @escaping @MainActor @Sendable (URL) -> Bool
+    ) async throws -> Bool {
+        let accountId = storedSession?.session.accountId
+        let token = storedSession?.session.token
+        let generation = savedMessagesSessionGeneration
+        let store = localStore
+        let presentationGeneration = dialogPresentationGenerations[dialogId, default: 0]
+        #if DEBUG
+        let permitsDemoMedia = isDemoMode
+        #else
+        let permitsDemoMedia = false
+        #endif
+        guard !sessionTeardownActive,
+              permitsDemoMedia || (accountId != nil && token != nil && store != nil)
+        else {
+            throw CloudLocalStoreAccessError.revoked
+        }
+        let authorization: MediaPresentationAuthorization?
+        #if DEBUG
+        if permitsDemoMedia {
+            authorization = nil
+        } else {
+            authorization = try await store?.mediaPresentationAuthorization(
+                mediaId: mediaId,
+                dialogId: dialogId
+            )
+        }
+        #else
+        authorization = try await store?.mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        )
+        #endif
+        guard permitsDemoMedia || authorization != nil else {
+            throw CloudLocalStoreAccessError.revoked
+        }
+        return try await mediaEngine.temporaryPreview(
+            data: data,
+            fileExtension: fileExtension
+        ) { [weak self, store] url in
+            guard !Task.isCancelled else { return false }
+            #if DEBUG
+            await self?.temporaryPreviewAuthorizationGate?(url)
+            #endif
+            if !permitsDemoMedia {
+                guard let store, let authorization,
+                      (try? await store.validatesMediaPresentationAuthorization(
+                        authorization
+                      )) == true
+                else { return false }
+            }
+            return await MainActor.run {
+                guard let self,
+                      !Task.isCancelled,
+                      !self.sessionTeardownActive,
+                      self.savedMessagesSessionGeneration == generation,
+                      self.storedSession?.session.accountId == accountId,
+                      self.storedSession?.session.token == token,
+                      self.localStore === store || permitsDemoMedia,
+                      self.dialogPresentationGenerations[dialogId, default: 0]
+                        == presentationGeneration
+                else { return false }
+                self.temporaryPreviewURLsByDialog[dialogId, default: []].insert(url)
+                let transferred = transferOwnership(url)
+                if !transferred {
+                    self.temporaryPreviewURLsByDialog[dialogId]?.remove(url)
+                    if self.temporaryPreviewURLsByDialog[dialogId]?.isEmpty == true {
+                        self.temporaryPreviewURLsByDialog[dialogId] = nil
+                    }
+                }
+                return transferred
+            }
+        }
     }
 
     func removeTemporaryMediaURL(_ url: URL) async {
+        for dialogId in Array(temporaryPreviewURLsByDialog.keys) {
+            temporaryPreviewURLsByDialog[dialogId]?.remove(url)
+            if temporaryPreviewURLsByDialog[dialogId]?.isEmpty == true {
+                temporaryPreviewURLsByDialog[dialogId] = nil
+            }
+        }
         await mediaEngine.removeTemporaryPreview(url)
     }
 
     private func afterSignIn() async {
-        guard storedSession?.session.token != nil, let accountId = storedSession?.session.accountId else { return }
+        guard
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId
+        else { return }
         do {
             guard let restoredStore = try await ensureLocalStore() else {
                 throw CloudAppModelError.localStoreUnavailable
             }
+            try await drainAccessPurges(
+                store: restoredStore,
+                accountId: accountId,
+                token: token,
+                generation: savedMessagesSessionGeneration
+            )
             let launchSnapshot = try await restoredStore.loadLaunchSnapshot(accountId: accountId)
             await draftSyncCoordinator.configure(
                 store: restoredStore,
@@ -3644,6 +4133,202 @@ final class CloudAppModel {
         }
         scheduleOutboxRetry()
     }
+
+    private func drainAccessPurges(
+        store: CloudLocalStore,
+        accountId: String,
+        token: String,
+        generation: UInt64
+    ) async throws {
+        let scope = AccessPurgeScope(
+            accountId: accountId,
+            token: token,
+            generation: generation,
+            store: store
+        )
+        _ = try await accessPurgeCoordinator.drain(
+            scope: scope,
+            store: store,
+            mediaEngine: mediaEngine,
+            isCurrent: { [weak self, store] in
+                guard let self else { return false }
+                return !self.sessionTeardownActive
+                    && self.savedMessagesSessionGeneration == generation
+                    && self.storedSession?.session.accountId == accountId
+                    && self.storedSession?.session.token == token
+                    && self.localStore === store
+            },
+            invalidatePresentation: { [weak self] job in
+                guard let self else { return }
+                await self.invalidatePresentationForAccessPurge(job)
+            }
+        )
+        if mediaSchedulerForegrounded {
+            await mediaPrefetchScheduler.update(
+                networkClass: ReplicaNetworkMonitor.shared.snapshot().networkClass,
+                foregrounded: true
+            )
+        }
+    }
+
+    private func invalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
+        let dialogId = job.dialogId
+        dialogPresentationGenerations[dialogId, default: 0] &+= 1
+        let temporaryURLs = temporaryPreviewURLsByDialog.removeValue(forKey: dialogId) ?? []
+        for url in temporaryURLs {
+            await mediaEngine.removeTemporaryPreview(url)
+        }
+        // Shared media remains valid in a forwarded copy. Only globally orphaned media receives a
+        // process-wide presentation tombstone.
+        MediaPresentationCache.shared.revoke(mediaIds: job.purgeMediaIds)
+
+        let transferIds = Set(mediaTransferDialogIds.compactMap { transferId, taskDialogId in
+            taskDialogId == dialogId ? transferId : nil
+        })
+        let cancellableTasks = transferIds.compactMap { mediaTransferTasks[$0] }
+        cancellableTasks.forEach { $0.cancel() }
+        let cancelsActiveConversationWork = activeDialogId == dialogId
+        if cancelsActiveConversationWork {
+            mediaDownloadTask?.cancel()
+            historyHydrationTask?.cancel()
+        }
+        let cancelsComposer = composerMediaDialogId == dialogId
+            || activeComposerTransferId.map(transferIds.contains) == true
+        if cancelsComposer { composerMediaTask?.cancel() }
+        for task in cancellableTasks { await task.value }
+        for transferId in transferIds {
+            mediaTransferTasks[transferId] = nil
+            mediaTransferDialogIds[transferId] = nil
+            mediaTransfersInFlight.remove(transferId)
+        }
+        if cancelsActiveConversationWork {
+            await mediaDownloadTask?.value
+            await historyHydrationTask?.value
+            mediaDownloadTask = nil
+            historyHydrationTask = nil
+        }
+        if cancelsComposer {
+            await composerMediaTask?.value
+            composerMediaTask = nil
+            composerMediaDialogId = nil
+            activeComposerTransferId = nil
+            composerMediaOperationId = nil
+        }
+
+        cachedLinesByDialog[dialogId] = nil
+        cachedLocalMessagesByDialog[dialogId] = nil
+        cachedConversationCostByDialog[dialogId] = nil
+        cachedLineDialogOrder.removeAll { $0 == dialogId }
+        timelineForwardCursorByDialog[dialogId] = nil
+        conversationOpenWaiters[dialogId]?.forEach { $0.resume() }
+        conversationOpenWaiters[dialogId] = nil
+        conversationOpenStartedAt[dialogId] = nil
+        dialogs.removeAll { $0.id == dialogId }
+        if savedMessagesDialogId == dialogId { savedMessagesDialogId = nil }
+        if activeDialogId == dialogId {
+            activeDialogId = nil
+            lines = []
+            loadedLocalMessages = []
+            pendingVisibleReadMessages = []
+            canLoadEarlier = false
+        }
+    }
+
+    #if DEBUG
+    func testTrackMediaTransferTask(
+        transferId: String,
+        dialogId: String,
+        task: Task<Void, Never>
+    ) {
+        mediaTransferTasks[transferId] = task
+        mediaTransferDialogIds[transferId] = dialogId
+        mediaTransfersInFlight.insert(transferId)
+    }
+
+    func testTrackComposerPreparation(dialogId: String, task: Task<Void, Never>) {
+        composerMediaTask = task
+        composerMediaDialogId = dialogId
+        composerMediaOperationId = UUID()
+    }
+
+    func testInvalidatePresentationForAccessPurge(_ job: AccessPurgeJob) async {
+        await invalidatePresentationForAccessPurge(job)
+    }
+
+    func testHasTrackedMediaTransfer(_ transferId: String) -> Bool {
+        mediaTransferTasks[transferId] != nil
+    }
+
+    func testCancelTrackedMediaTransfer(_ transferId: String) async {
+        guard let task = mediaTransferTasks.removeValue(forKey: transferId) else { return }
+        mediaTransferDialogIds[transferId] = nil
+        mediaTransfersInFlight.remove(transferId)
+        task.cancel()
+        await task.value
+    }
+
+    func testClearLocalSession() async {
+        await clearLocalSession(finalStatus: "Test session cleared")
+    }
+
+    func testHasSessionClearBarrier() -> Bool {
+        sessionClearBarrier != nil
+    }
+
+    func testInstallAuthenticatedSession(_ session: StoredCloudSession) {
+        installAuthenticatedSession(session)
+    }
+
+    func testAcceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
+        await acceptCanonicalProfile(profile, token: token)
+    }
+
+    func testHandleRevokedSessionHint(deviceId: String? = nil) async {
+        await scheduleSessionClearFromRevokedHint(deviceId: deviceId)?.value
+    }
+
+    func testHandleRevokedSessionHintFromHintTask(deviceId: String? = nil) async {
+        var teardownTask: Task<Void, Never>?
+        let task = Task { @MainActor [weak self] in
+            teardownTask = self?.scheduleSessionClearFromRevokedHint(deviceId: deviceId)
+        }
+        hintTask = task
+        await task.value
+        await teardownTask?.value
+    }
+
+    func testSetTemporaryPreviewAuthorizationGate(
+        _ gate: (@Sendable (URL) async -> Void)?
+    ) {
+        temporaryPreviewAuthorizationGate = gate
+    }
+
+    func testSetMediaAccessRestoreAuthorizationGate(
+        _ gate: (@Sendable () async -> Void)?
+    ) {
+        mediaAccessRestoreAuthorizationGate = gate
+    }
+
+    func testSetMediaAccessPostRestoreValidationGate(
+        _ gate: (@Sendable () async -> Void)?
+    ) {
+        mediaAccessPostRestoreValidationGate = gate
+    }
+
+    func testRestoreMediaAccessIfAuthorized(
+        mediaId: String,
+        dialogId: String? = nil
+    ) async -> MediaPresentationAuthorization? {
+        await restoreMediaAccessIfAuthorized(mediaId: mediaId, dialogId: dialogId)
+    }
+
+    func testRollbackUnauthorizedMediaPresentation(
+        _ lease: MediaAccessRestoreLease,
+        mediaId: String
+    ) async -> Bool {
+        await rollbackUnauthorizedMediaPresentation(lease, mediaId: mediaId)
+    }
+    #endif
 
     private func startReplicaIntegrityVerification(store: CloudLocalStore, accountId: String) {
         replicaIntegrityTask?.cancel()
@@ -3762,7 +4447,7 @@ final class CloudAppModel {
         let fixtureSession = TelegramFastUITestFixture.session
         try await tokenStore.save(fixtureSession)
         isSessionTeardownInProgress = false
-        storedSession = fixtureSession
+        installAuthenticatedSession(fixtureSession)
         phone = fixtureSession.phone
         displayName = fixtureSession.displayName
         profileDetails = StoredProfileDetails(
@@ -3915,15 +4600,21 @@ final class CloudAppModel {
             }
             return resolved
         }
+        savedMessagesDialogId = localDialogs.first(where: { $0.type == "saved" })?.dialogId
         sortDialogsForPresentation()
         if let activeDialogId,
-           previous[activeDialogId]?.type == "group",
+           let removedType = previous[activeDialogId]?.type,
+           removedType == "group" || removedType == "saved",
            !dialogs.contains(where: { $0.id == activeDialogId }) {
             self.activeDialogId = nil
             lines = []
             presentNotice(
-                "Group access ended",
-                message: "You are no longer a member of this group. Its saved messages were removed."
+                removedType == "saved"
+                    ? String(localized: "Saved Messages access ended")
+                    : String(localized: "Group access ended"),
+                message: removedType == "saved"
+                    ? String(localized: "The unauthorized Saved Messages offline copy was removed.")
+                    : String(localized: "You are no longer a member of this group. Its offline copy was removed.")
             )
         }
     }
@@ -4080,15 +4771,19 @@ final class CloudAppModel {
 
     private func refreshServerCapabilities() async {
         guard !isSessionTeardownInProgress else { return }
+        let accountId = storedSession?.session.accountId
+        let token = storedSession?.session.token
+        let savedGeneration = savedMessagesSessionGeneration
         let generation = accountSessionGeneration
-        let expectedAccountId = storedSession?.session.accountId
+        let previouslyHadCloudDrafts = negotiatedCapabilities.contains(.cloudDrafts)
         do {
-            let previouslyHadCloudDrafts = negotiatedCapabilities.contains(.cloudDrafts)
-            let response = try await api.capabilities(token: storedSession?.session.token)
+            let response = try await api.capabilities(token: token)
             guard
                 !Task.isCancelled,
+                savedMessagesSessionGeneration == savedGeneration,
                 generation == accountSessionGeneration,
-                expectedAccountId == storedSession?.session.accountId
+                accountId == storedSession?.session.accountId,
+                token == storedSession?.session.token
             else { return }
             var resolved: MessagingCapabilities = []
             let advertised = Set(response.capabilities)
@@ -4109,12 +4804,16 @@ final class CloudAppModel {
             }
             if advertised.contains("profiles") { resolved.insert(.profiles) }
             if advertised.contains("groups_v1") { resolved.insert(.groups) }
+            savedMessagesCapabilityState = .advertised(in: advertised)
+            if savedMessagesCapabilityState == .supported {
+                resolved.insert(.savedMessages)
+            }
             if advertised.contains("cloud_drafts_v1") { resolved.insert(.cloudDrafts) }
             if advertised.contains("media_groups_v1"), resolved.contains(.media) {
                 resolved.insert(.mediaGroups)
             }
             if advertised.contains("dialog_preferences_v1") {
-                resolved.insert(.chatOrganization)
+                resolved.formUnion([.chatOrganization, .dialogPreferences])
             }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
@@ -4139,12 +4838,15 @@ final class CloudAppModel {
                     self.scheduleOutboxRetry()
                 }
             }
-            // Video rollout is account-scoped. Never let one signed-in account's bucket leak into
-            // another account through the server-wide capability cache.
+            // Account-scoped rollout bits must not leak between sign-ins through the server-wide
+            // capability cache. A locally materialized Saved Messages row still opens offline.
             capabilityDefaults.set(
-                Int(resolved.subtracting(.videoCalls).rawValue),
+                Int(resolved.subtracting([.videoCalls, .savedMessages]).rawValue),
                 forKey: capabilityCacheKey
             )
+            if resolved.contains(.savedMessages) {
+                _ = await ensureSavedMessages(presentsFailure: false)
+            }
             if let localStore, let accountId = storedSession?.session.accountId {
                 if resolved.contains(.chatOrganization) {
                     let reactivated = (try? await localStore
@@ -4153,7 +4855,7 @@ final class CloudAppModel {
                         !Task.isCancelled,
                         !isSessionTeardownInProgress,
                         generation == accountSessionGeneration,
-                        expectedAccountId == storedSession?.session.accountId
+                        accountId == storedSession?.session.accountId
                     else { return }
                     if reactivated > 0 {
                         await retryPendingDialogPreferences()
@@ -4166,7 +4868,7 @@ final class CloudAppModel {
                         !Task.isCancelled,
                         !isSessionTeardownInProgress,
                         generation == accountSessionGeneration,
-                        expectedAccountId == storedSession?.session.accountId
+                        accountId == storedSession?.session.accountId
                     else { return }
                     if moved > 0 {
                         await retryPendingGroupMutations()
@@ -4176,10 +4878,13 @@ final class CloudAppModel {
         } catch let error as CloudAPIError where error.status == 404 {
             guard
                 !Task.isCancelled,
+                savedMessagesSessionGeneration == savedGeneration,
                 generation == accountSessionGeneration,
-                expectedAccountId == storedSession?.session.accountId
+                accountId == storedSession?.session.accountId,
+                token == storedSession?.session.token
             else { return }
             negotiatedCapabilities = [.replies]
+            savedMessagesCapabilityState = .unsupported
             await draftSyncCoordinator.configure(
                 store: localStore,
                 session: storedSession?.session,
@@ -4274,7 +4979,7 @@ final class CloudAppModel {
                 previous = snapshot.networkClass
                 if snapshot.networkClass == .offline {
                     self.setReplicaSyncState(.offline)
-                    self.status = "Offline. Showing saved messages."
+                    self.status = String(localized: "Offline. Showing downloaded conversations.")
                     continue
                 }
                 guard recovered else { continue }
@@ -4454,11 +5159,12 @@ final class CloudAppModel {
                         case .call(let hint):
                             await self.callCoordinator.handle(hint)
                         case .sessionRevoked(let hint):
-                            if let revokedDeviceId = hint.deviceId {
-                                let currentDeviceId = await self.storedSession?.session.deviceId
-                                guard revokedDeviceId == currentDeviceId else { continue }
-                            }
-                            await self.clearLocalSession(finalStatus: "Session ended")
+                            guard await self.scheduleSessionClearFromRevokedHint(
+                                deviceId: hint.deviceId
+                            ) != nil else { continue }
+                            // Teardown runs outside this exact hintTask so it can cancel and await
+                            // both socket loops without ever awaiting itself.
+                            return
                         }
                     }
                 }
@@ -4478,6 +5184,17 @@ final class CloudAppModel {
         }
     }
 
+    @discardableResult
+    private func scheduleSessionClearFromRevokedHint(
+        deviceId: String?
+    ) -> Task<Void, Never>? {
+        let applies = deviceId == nil || deviceId == storedSession?.session.deviceId
+        guard applies else { return nil }
+        return Task { [weak self] in
+            await self?.clearLocalSession(finalStatus: "Session ended")
+        }
+    }
+
     private func scheduleSync(trigger: ReplicaSyncTrigger = .hint) {
         Task { [replicaSyncCoordinator] in
             await replicaSyncCoordinator.trigger(trigger)
@@ -4494,7 +5211,7 @@ final class CloudAppModel {
         let initialNetwork = ReplicaNetworkMonitor.shared.snapshot()
         if initialNetwork.networkClass == .offline {
             setReplicaSyncState(.offline)
-            status = "Offline. Showing saved messages."
+            status = String(localized: "Offline. Showing downloaded conversations.")
             return
         }
         let api = api
@@ -4525,7 +5242,7 @@ final class CloudAppModel {
             lastSuccessfulServerContact = Date()
             if remoteState.pts < pts {
                 setReplicaSyncState(.protocolFailure)
-                status = "Server update state moved backwards. Showing saved messages."
+                status = String(localized: "Server update state moved backwards. Showing the offline copy.")
                 return
             }
             let replicaInitialized = if let localStore,
@@ -4565,7 +5282,7 @@ final class CloudAppModel {
             status = failure.title
         case .timedOut:
             setReplicaSyncState(.connectionSlow)
-            status = "Connection is slow. Showing saved messages."
+            status = String(localized: "Connection is slow. Showing the offline copy.")
         case .cancelled:
             return
         }
@@ -4750,6 +5467,14 @@ final class CloudAppModel {
             )
             if !revokedDialogIds.isEmpty {
                 await cancelMediaTransfers(forRevokedDialogs: revokedDialogIds)
+                if let token = storedSession?.session.token {
+                    try await drainAccessPurges(
+                        store: localStore,
+                        accountId: accountId,
+                        token: token,
+                        generation: savedMessagesSessionGeneration
+                    )
+                }
             }
             if !profileDetails.needsServerSync,
                let token = storedSession?.session.token,
@@ -5161,7 +5886,10 @@ final class CloudAppModel {
     }
 
     private func dialog(from local: LocalDialog) -> Dialog {
-        let title = displayTitle(local.title, fallback: shortDialogId(local.dialogId))
+        let isSavedMessages = local.type == "saved"
+        let title = isSavedMessages
+            ? String(localized: "Saved Messages")
+            : displayTitle(local.title, fallback: shortDialogId(local.dialogId))
         let lastText = local.lastText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let previewKind = ChatListPreviewKind(messageKind: local.lastKind)
         let subtitle: String
@@ -5186,12 +5914,12 @@ final class CloudAppModel {
             subtitle: subtitle,
             updatedAt: local.lastServerTs ?? local.updatedAt,
             isPending: local.lastLocalState == "sending" || local.accessState == "pending",
-            unreadCount: local.unreadCount,
+            unreadCount: isSavedMessages ? 0 : local.unreadCount,
             isPinned: local.isPinned,
             pinnedAt: local.pinnedAt,
-            isMuted: local.isMuted,
-            isArchived: local.isArchived,
-            mentionCount: local.mentionCount,
+            isMuted: isSavedMessages ? false : local.isMuted,
+            isArchived: isSavedMessages ? false : local.isArchived,
+            mentionCount: isSavedMessages ? 0 : local.mentionCount,
             previewKind: previewKind,
             lastMessageMine: local.lastSenderAccountId == storedSession?.session.accountId,
             peerAccountId: local.peerAccountId,
@@ -5200,7 +5928,7 @@ final class CloudAppModel {
             profileColorIndex: local.peerColorIndex,
             memberCount: local.memberCount,
             selfRole: local.selfRole,
-            notificationMode: local.isMuted ? "muted" : "all",
+            notificationMode: isSavedMessages ? "all" : local.notificationMode,
             accessState: local.accessState
         )
     }
@@ -5308,6 +6036,7 @@ final class CloudAppModel {
 
     private func markReadIfNeeded(dialogId: String, messages: [LocalMessage]) async {
         guard let accountId = storedSession?.session.accountId, let localStore else { return }
+        guard dialogs.first(where: { $0.id == dialogId })?.type != "saved" else { return }
         guard let maxMsgId = messages.compactMap(\.msgId).max() else { return }
 
         do {
@@ -5902,12 +6631,14 @@ final class CloudAppModel {
             await self.processMediaTransfer(transfer)
         }
         mediaTransferTasks[transfer.transferId] = task
+        mediaTransferDialogIds[transfer.transferId] = transfer.dialogId
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
             task.cancel()
         }
         mediaTransferTasks.removeValue(forKey: transfer.transferId)
+        mediaTransferDialogIds.removeValue(forKey: transfer.transferId)
     }
 
     private func processMediaTransfer(_ initial: MediaTransferRecord) async {
@@ -5916,6 +6647,14 @@ final class CloudAppModel {
             let token = storedSession?.session.token,
             let accountId = storedSession?.session.accountId,
             let localStore
+        else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ), (try? await localStore.isDialogAccessRevoked(dialogId: initial.dialogId)) == false
         else { return }
         mediaTransfersInFlight.insert(initial.transferId)
         defer { mediaTransfersInFlight.remove(initial.transferId) }
@@ -6021,6 +6760,18 @@ final class CloudAppModel {
                     clientMutationId: ready.transferId,
                     token: token
                 )
+                try Task.checkCancellation()
+                guard
+                    isCurrentSavedMessagesSession(
+                        accountId: accountId,
+                        token: token,
+                        store: localStore,
+                        generation: generation
+                    ),
+                    (try? await localStore.isDialogAccessRevoked(
+                        dialogId: ready.dialogId
+                    )) == false
+                else { throw CancellationError() }
                 try await localStore.applyGroupEnvelope(envelope)
                 let promotedToCache = await mediaEngine.finishUpload(ready, localStore: localStore)
                 try await localStore.completeMediaTransfer(transferId: ready.transferId)
@@ -6050,8 +6801,13 @@ final class CloudAppModel {
             if activeDialogId == ready.dialogId { await loadLocalLines(dialogId: ready.dialogId) }
             try Task.checkCancellation()
             guard
-                storedSession?.session.token == token,
-                storedSession?.session.accountId == accountId
+                isCurrentSavedMessagesSession(
+                    accountId: accountId,
+                    token: token,
+                    store: localStore,
+                    generation: generation
+                ),
+                (try? await localStore.isDialogAccessRevoked(dialogId: ready.dialogId)) == false
             else { throw CancellationError() }
             // Once the idempotent send request begins it is the commit point. Hide the upload cancel
             // control so the UI never promises cancellation after the server may have committed.
@@ -6068,6 +6824,16 @@ final class CloudAppModel {
                     : nil,
                 token: token
             )
+            try Task.checkCancellation()
+            guard
+                isCurrentSavedMessagesSession(
+                    accountId: accountId,
+                    token: token,
+                    store: localStore,
+                    generation: generation
+                ),
+                (try? await localStore.isDialogAccessRevoked(dialogId: ready.dialogId)) == false
+            else { throw CancellationError() }
             try await localStore.markSent(response, senderAccountId: accountId)
             let promotedToCache = await mediaEngine.finishUpload(ready, localStore: localStore)
             try await localStore.completeMediaTransfer(transferId: ready.transferId)
@@ -6084,6 +6850,13 @@ final class CloudAppModel {
             await cancelMediaTransfer(current, token: token)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
         } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: initial.dialogId)) == false
+            else { return }
             let current = try? await localStore.mediaTransfer(id: initial.transferId)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
             if let apiError = error as? CloudAPIError,
@@ -6527,6 +7300,13 @@ final class CloudAppModel {
     }
 
     func forwardMessage(_ line: Line, to targetDialogId: String) async {
+        guard !sessionTeardownActive else { return }
+        _ = await runTrackedSavedOperation {
+            await self.forwardMessageCore(line, to: targetDialogId)
+        }
+    }
+
+    private func forwardMessageCore(_ line: Line, to targetDialogId: String) async {
         #if DEBUG
         if isDemoMode {
             status = "Forwarded"
@@ -6534,45 +7314,88 @@ final class CloudAppModel {
         }
         #endif
         guard
+            !sessionTeardownActive,
             !line.isDeleted,
             let token = storedSession?.session.token,
             let accountId = storedSession?.session.accountId,
+            let localStore,
             let sourceDialogId = line.dialogId,
             let sourceMsgId = line.msgId
         else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ) else { return }
         let clientMsgId = UUID().uuidString.lowercased()
         do {
-            if let localStore {
-                _ = try await localStore.insertSending(
-                    dialogId: targetDialogId,
-                    clientMsgId: clientMsgId,
-                    text: line.text,
-                    senderAccountId: accountId,
-                    forwardedFromAccountId: line.senderAccountId,
-                    forwardedFromDialogId: sourceDialogId,
-                    forwardedFromMsgId: sourceMsgId
-                )
-            }
+            _ = try await localStore.insertSending(
+                dialogId: targetDialogId,
+                clientMsgId: clientMsgId,
+                text: line.text,
+                senderAccountId: accountId,
+                forwardedFromAccountId: line.senderAccountId,
+                forwardedFromDialogId: sourceDialogId,
+                forwardedFromMsgId: sourceMsgId,
+                kind: line.kind,
+                media: line.media
+            )
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { throw CancellationError() }
             await refreshDialogs()
-            try await sendOutboxItem(
-                PendingOutboxItem(
-                    clientMsgId: clientMsgId,
-                    dialogId: targetDialogId,
-                    body: line.text,
-                    replyToMsgId: nil,
-                    forwardedFromDialogId: sourceDialogId,
-                    forwardedFromMsgId: sourceMsgId,
-                    retryCount: 0,
-                    nextRetryAt: nil
-                ),
+            let response = try await api.forwardMessage(
+                dialogId: targetDialogId,
+                clientMsgId: clientMsgId,
+                sourceDialogId: sourceDialogId,
+                sourceMsgId: sourceMsgId,
                 token: token
             )
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { throw CancellationError() }
+            try await localStore.markSent(response, senderAccountId: accountId)
+            if activeDialogId == response.dialogId {
+                await loadLocalLines(dialogId: response.dialogId)
+            }
+            await refreshDialogs()
+            scheduleSync()
             status = "Forwarded"
+        } catch is CancellationError {
+            return
         } catch {
-            if let localStore {
-                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: retryDelay(forRetryCount: 1))
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ) else { return }
+            let disposition = cloudOperationFailureDisposition(
+                error,
+                serverAdvertisesFeature: capabilities.contains(.forwarding)
+            )
+            switch disposition {
+            case let .transient(retryAfter):
+                let delay = retryAfter ?? retryDelay(forRetryCount: 1)
+                try? await localStore.markFailed(clientMsgId: clientMsgId, retryAfter: delay)
                 await refreshDialogs()
-                scheduleOutboxRetry(after: retryDelay(forRetryCount: 1))
+                scheduleOutboxRetry(after: delay)
+                publishTransportFailure(error)
+            case .authenticationRequired, .unsupportedServer, .permanent:
+                // Source deletion/inaccessibility is permanent. Keep one terminal bubble with an
+                // explicit atomic Remove action instead of retrying forever.
+                try? await localStore.markFailed(clientMsgId: clientMsgId, terminal: true)
+                await refreshDialogs()
             }
             status = "Forward failed: \(error.localizedDescription)"
         }
@@ -6602,7 +7425,19 @@ final class CloudAppModel {
 
     private func processMessageMutation(_ mutation: PendingMessageMutation) async {
         guard !messageMutationsInFlight.contains(mutation.clientMutationId) else { return }
-        guard let token = storedSession?.session.token, let localStore else { return }
+        guard
+            let token = storedSession?.session.token,
+            let accountId = storedSession?.session.accountId,
+            let localStore
+        else { return }
+        let generation = savedMessagesSessionGeneration
+        guard isCurrentSavedMessagesSession(
+            accountId: accountId,
+            token: token,
+            store: localStore,
+            generation: generation
+        ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+        else { return }
         messageMutationsInFlight.insert(mutation.clientMutationId)
         defer { messageMutationsInFlight.remove(mutation.clientMutationId) }
 
@@ -6640,6 +7475,14 @@ final class CloudAppModel {
                 throw CloudAppModelError.localStoreUnavailable
             }
 
+            try Task.checkCancellation()
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+            else { return }
             try await localStore.applyMessageMutation(response)
             try await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
             if activeDialogId == mutation.dialogId { await loadLocalLines(dialogId: mutation.dialogId) }
@@ -6647,7 +7490,16 @@ final class CloudAppModel {
             setReplicaSyncState(.ready)
             status = response.duplicate ? "Change confirmed" : "Updated"
             scheduleSync()
+        } catch is CancellationError {
+            return
         } catch {
+            guard isCurrentSavedMessagesSession(
+                accountId: accountId,
+                token: token,
+                store: localStore,
+                generation: generation
+            ), (try? await localStore.isDialogAccessRevoked(dialogId: mutation.dialogId)) == false
+            else { return }
             if let apiError = error as? CloudAPIError, apiError.status == 409 {
                 try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
                 await syncNow()
@@ -6711,11 +7563,11 @@ final class CloudAppModel {
         isDemoMode = true
         isSessionTeardownInProgress = false
         accountSessionGeneration &+= 1
-        storedSession = StoredCloudSession(
+        installAuthenticatedSession(StoredCloudSession(
             session: CloudSession(accountId: "debug-demo-account", deviceId: "debug-demo-device", token: "debug-demo-token"),
             phone: "+992 00 000 00 00",
             displayName: "Меҳмон"
-        )
+        ))
         status = "Demo mode"
         launchPhase = .localReady
         profileDetails = Self.profileDetails(from: "Меҳмон")
@@ -6766,6 +7618,8 @@ final class CloudAppModel {
         storedSession = nil
         activeDialogId = nil
         dialogs = []
+        savedMessagesDialogId = nil
+        savedMessagesSetupFailure = nil
         lines = []
         devices = []
         demoLinesByDialog = [:]

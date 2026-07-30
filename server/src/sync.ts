@@ -123,7 +123,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
     SELECT m.dialog_id, m.msg_id, m.sender_account_id, m.client_msg_id, m.kind,
            m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
            m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
-           m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
+           m.is_forwarded, m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
            m.media_group_id, m.media_group_index, m.media_group_count,
            media.id AS media_object_id, media.kind AS media_object_kind,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
@@ -211,7 +211,11 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       reply_to_msg_id: row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id),
       edit_version: row.edit_version,
       // Source identifiers stay server-side. Recipients only need the marker.
-      forwarded: row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null,
+      // During the rolling backfill, old rows and old writers may still rely on complete
+      // provenance. Detached copies retain the durable marker after their source is deleted.
+      forwarded: row.is_forwarded === true || (
+        row.forwarded_from_dialog_id != null && row.forwarded_from_msg_id != null
+      ),
       reactions: reactions.get(key) ?? [],
       mentions: mentions.get(key) ?? [],
       media: row.state === "deleted_for_all" ? null : media,
@@ -363,6 +367,53 @@ export async function sendMessage(sql: SQL, p: {
     let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     let mentions = normalizeMentions(p.mentions, body);
+    const recoverCanonical = async (): Promise<SendResult | null> => {
+      const canonical = (await tx`
+        SELECT dialog_id, msg_id
+        FROM messages
+        WHERE sender_account_id = ${p.senderAccountId}
+          AND client_msg_id = ${p.clientMsgId}
+        FOR SHARE`)[0];
+      if (!canonical) return null;
+      const dialogId = String(canonical.dialog_id);
+      const msgId = n(canonical.msg_id);
+      const event = (await tx`
+        SELECT pts
+        FROM account_events
+        WHERE account_id = ${p.senderAccountId}
+          AND dialog_id = ${dialogId}
+          AND msg_id = ${msgId}
+          AND type = 'message.new'
+        ORDER BY pts DESC
+        LIMIT 1`)[0];
+      const senderPts = event == null ? 0 : n(event.pts);
+      await tx`
+        UPDATE send_requests
+        SET status = 'completed', dialog_id = ${dialogId}, msg_id = ${msgId},
+            sender_pts = ${senderPts}
+        WHERE sender_account_id = ${p.senderAccountId}
+          AND client_msg_id = ${p.clientMsgId}`;
+      const msg = await loadMessage(tx, dialogId, msgId);
+      if (p.internalService === true && (
+        dialogId !== p.dialogId
+        || msg?.sender_account_id !== p.senderAccountId
+        || msg?.kind !== "service"
+        || msg?.text !== body
+      )) {
+        throw new SyncError("internal send idempotency conflict");
+      }
+      return {
+        dialogId,
+        clientMsgId: p.clientMsgId,
+        msgId,
+        senderPts,
+        duplicate: true,
+        pushes: [],
+        serverTs: msg?.server_ts,
+        text: msg?.text,
+        senderAccountId: msg?.sender_account_id,
+      };
+    };
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
       INSERT INTO send_requests (
@@ -380,13 +431,17 @@ export async function sendMessage(sql: SQL, p: {
         FROM send_requests
         WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}
         FOR UPDATE`)[0];
-      if (row.status !== "completed") throw new SyncError("send already in progress");
       if ((row.draft_consume_operation_id ?? null) !== draftConsumeOperationId) {
         throw new SyncError(
           "client message id already used with a different draft",
           409,
           "send_idempotency_conflict",
         );
+      }
+      if (row.status !== "completed") {
+        const recovered = await recoverCanonical();
+        if (recovered) return recovered;
+        throw new SyncError("send already in progress");
       }
       const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id));
       if (p.internalService === true && (
@@ -406,6 +461,10 @@ export async function sendMessage(sql: SQL, p: {
         serverTs: msg?.server_ts, text: msg?.text, senderAccountId: msg?.sender_account_id,
       };
     }
+    // Older cleanup jobs removed completed receipts after 24 hours while leaving the canonical
+    // message. Rebuild the receipt before touching counters so a very late retry stays idempotent.
+    const recovered = await recoverCanonical();
+    if (recovered) return recovered;
 
     // Lifecycle service rows are authored by the original actor even if account deletion and call
     // termination commit together. `internalService` is never accepted from an HTTP request.
@@ -508,11 +567,11 @@ export async function sendMessage(sql: SQL, p: {
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
                             forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-                            media_id)
+                            is_forwarded, media_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
-              ${mediaId})
+              ${p.forwardedFrom != null}, ${mediaId})
       RETURNING server_ts`;
     if (mentions.length) {
       await tx`
@@ -1399,10 +1458,17 @@ export async function getDifference(
       WHERE profile.id IN (SELECT account_id FROM referenced_accounts)
     )
     SELECT ae.pts, ae.type, ae.dialog_id, ae.msg_id, ae.actor_account_id, ae.data,
-           d.type AS dialog_type, d.revision AS group_revision,
+           d.type AS dialog_type, d.created_by AS dialog_created_by,
+           d.revision AS group_revision,
            self.role AS self_role, self.left_at AS self_left_at, d.closed_at,
+           prior_access.type AS prior_access_type,
+           prior_access.pts AS prior_access_pts,
            peer.id AS peer_account_id,
-           CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS dialog_title,
+           CASE
+             WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+             WHEN d.type = 'saved' THEN 'Saved Messages'
+             ELSE d.title
+           END AS dialog_title,
            profile_payload.profiles
     FROM page ae
     CROSS JOIN profile_payload
@@ -1410,6 +1476,16 @@ export async function getDifference(
     LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
     LEFT JOIN dialog_members self
       ON self.dialog_id = d.id AND self.account_id = ${accountId}
+    LEFT JOIN LATERAL (
+      SELECT boundary.type, boundary.pts
+      FROM account_events boundary
+      WHERE boundary.account_id = ${accountId}
+        AND boundary.dialog_id = ae.dialog_id
+        AND boundary.pts <= ${sincePts}
+        AND boundary.type IN ('dialog.created', 'dialog.access_revoked')
+      ORDER BY boundary.pts DESC
+      LIMIT 1
+    ) prior_access ON true
     LEFT JOIN accounts peer ON peer.id = CASE
       WHEN pair.account_low = ${accountId} THEN pair.account_high
       WHEN pair.account_high = ${accountId} THEN pair.account_low
@@ -1417,22 +1493,49 @@ export async function getDifference(
     END
     ORDER BY ae.pts ASC`;
 
-  const revokedDialogs = new Set(rows
-    .filter((event: any) =>
-      event.dialog_type === "group"
-      && (event.self_role == null || event.self_left_at != null || event.closed_at != null)
-    )
-    .map((event: any) => String(event.dialog_id)));
-  const messageKeys: MessageKey[] = rows.flatMap((event) =>
+  const groupAccess = new Map<string, "active" | "revoked">();
+  const accessDecisions = rows.map((event: any) => {
+    const dialogId = event.dialog_id == null ? null : String(event.dialog_id);
+    if (event.type === "dialog.access_revoked") {
+      if (dialogId && event.dialog_type === "group") groupAccess.set(dialogId, "revoked");
+      return { replaceWithRevocation: true };
+    }
+    if (!dialogId) return { replaceWithRevocation: false };
+    if (event.dialog_type === "saved") {
+      const authorized = event.dialog_created_by === accountId
+        && event.self_role === "owner"
+        && event.self_left_at == null
+        && event.closed_at == null;
+      return { replaceWithRevocation: !authorized };
+    }
+    if (event.dialog_type !== "group") return { replaceWithRevocation: false };
+
+    let state = groupAccess.get(dialogId);
+    if (!state) {
+      if (event.prior_access_type === "dialog.access_revoked") state = "revoked";
+      else if (event.prior_access_type === "dialog.created") state = "active";
+      else {
+        state = event.self_role == null || event.self_left_at != null || event.closed_at != null
+          ? "revoked"
+          : "active";
+      }
+    }
+    if (event.type === "dialog.created") state = "active";
+    groupAccess.set(dialogId, state);
+    return { replaceWithRevocation: state === "revoked" };
+  });
+  const messageKeys: MessageKey[] = rows.flatMap((event, index) =>
     event.msg_id != null && [
       "message.new", "message.edited", "message.deleted", "reaction.updated",
-    ].includes(event.type) && !revokedDialogs.has(event.dialog_id)
+    ].includes(event.type) && !accessDecisions[index].replaceWithRevocation
       ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
       : []
   );
   const messages = await loadMessages(sql, messageKeys);
   const draftDialogIds = rows
-    .filter((event: any) => event.type === "draft.updated" && !revokedDialogs.has(event.dialog_id))
+    .filter((event: any, index: number) =>
+      event.type === "draft.updated" && !accessDecisions[index].replaceWithRevocation
+    )
     .map((event: any) => String(event.dialog_id));
   const drafts = opts.cloudDraftsEnabled === false
     ? new Map<string, DraftDTO>()
@@ -1440,16 +1543,16 @@ export async function getDifference(
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
-  for (const ev of rows) {
+  for (const [index, ev] of rows.entries()) {
     const pts = n(ev.pts);
     let update: any;
-    if (revokedDialogs.has(ev.dialog_id)) {
+    if (accessDecisions[index].replaceWithRevocation) {
       update = {
         pts,
         ptsCount: 1,
         type: "dialog.access_revoked",
         dialog_id: ev.dialog_id,
-        dialog_type: "group",
+        dialog_type: ev.dialog_type ?? ev.data?.dialog_type ?? "group",
       };
     } else if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
       const message = messages.get(`${ev.dialog_id}:${n(ev.msg_id)}`) ?? null;
@@ -1502,12 +1605,53 @@ export async function getDifference(
     lastPts = pts;
   }
   const hasMore = truncated || (rows.length === maxEvents && lastPts < statePts);
-  const eventProfiles: ProfileDTO[] = rows.length
+  const rawProfiles: ProfileDTO[] = rows.length
     ? (typeof rows[0].profiles === "string" ? JSON.parse(rows[0].profiles) : rows[0].profiles)
     : [];
+  // The SQL page is intentionally materialized before authorization is reconciled. Do not let a
+  // legacy unauthorized event smuggle the Saved owner profile alongside its replacement
+  // dialog.access_revoked update. Keep only profiles explicitly referenced by visible updates.
+  const visibleProfileIds = new Set<string>();
+  const collectProfileIds = (value: unknown, key = ""): void => {
+    if (typeof value === "string") {
+      if ([
+        "actor_account_id", "peer_account_id", "subject_account_id",
+        "sender_account_id", "forwarded_from_account_id", "account_id",
+      ].includes(key)) visibleProfileIds.add(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      if (key === "member_account_ids") {
+        for (const item of value) if (typeof item === "string") visibleProfileIds.add(item);
+      } else {
+        for (const item of value) collectProfileIds(item);
+      }
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        collectProfileIds(childValue, childKey);
+      }
+    }
+  };
+  for (const [index, update] of updates.entries()) {
+    collectProfileIds(update);
+    // Lifecycle payloads do not always repeat the account_events actor in data. Preserve that
+    // authorized actor profile for ordinary group/direct events while never retaining the actor
+    // attached to an access-revoked replacement.
+    if (update.type !== "dialog.access_revoked") {
+      const actorAccountId = rows[index]?.actor_account_id;
+      if (typeof actorAccountId === "string") visibleProfileIds.add(actorAccountId);
+    }
+  }
+  const visibleEventProfiles = rawProfiles.filter(
+    (profile) => visibleProfileIds.has(profile.accountId)
+  );
   const draftProfileIds = new Set<string>();
   collectAccountIds([...drafts.values()], draftProfileIds);
-  const profileById = new Map(eventProfiles.map((profile) => [profile.accountId, profile]));
+  const profileById = new Map(
+    visibleEventProfiles.map((profile) => [profile.accountId, profile])
+  );
   for (const profile of await loadProfiles(sql, draftProfileIds)) {
     profileById.set(profile.accountId, profile);
   }
@@ -1560,6 +1704,8 @@ export async function startBootstrap(sql: SQL, accountId: string): Promise<Boots
         JOIN dialogs d ON d.id = dm.dialog_id
         LEFT JOIN dialog_preferences preference
           ON preference.dialog_id = dm.dialog_id AND preference.account_id = dm.account_id
+        WHERE d.type <> 'saved'
+          OR (d.created_by = ${accountId} AND dm.role = 'owner')
         ORDER BY d.updated_at DESC, d.id DESC
         RETURNING snapshot_id
       )
@@ -1624,7 +1770,11 @@ export async function getBootstrapDialogsPage(
   const rows = cursor
     ? await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
-               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               CASE
+                 WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+                 WHEN d.type = 'saved' THEN 'Saved Messages'
+                 ELSE d.title
+               END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
                CASE WHEN bsd.preferences_captured
@@ -1649,6 +1799,10 @@ export async function getBootstrapDialogsPage(
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND self.role = 'owner')
+          )
         LEFT JOIN dialog_preferences preference
           ON preference.dialog_id = d.id AND preference.account_id = ${accountId}
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id
@@ -1663,7 +1817,11 @@ export async function getBootstrapDialogsPage(
         LIMIT ${limit + 1}`
     : await sql`
         SELECT bsd.dialog_id, bsd.ceiling_msg_id, bsd.sort_updated_at, d.type,
-               CASE WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '') ELSE d.title END AS title,
+               CASE
+                 WHEN d.type = 'direct' THEN NULLIF(peer.display_name, '')
+                 WHEN d.type = 'saved' THEN 'Saved Messages'
+                 ELSE d.title
+               END AS title,
                d.updated_at, d.revision, d.photo_media_id,
                self.role AS self_role, self.notification_mode,
                CASE WHEN bsd.preferences_captured
@@ -1688,6 +1846,10 @@ export async function getBootstrapDialogsPage(
         JOIN dialogs d ON d.id = bsd.dialog_id
         JOIN dialog_members self
           ON self.dialog_id = d.id AND self.account_id = ${accountId} AND self.left_at IS NULL
+          AND (
+            d.type <> 'saved'
+            OR (d.created_by = ${accountId} AND self.role = 'owner')
+          )
         LEFT JOIN dialog_preferences preference
           ON preference.dialog_id = d.id AND preference.account_id = ${accountId}
         LEFT JOIN direct_dialog_pairs pair ON pair.dialog_id = d.id

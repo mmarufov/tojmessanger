@@ -7,8 +7,22 @@ nonisolated enum LaunchPhase: Equatable, Sendable {
     case recoveringStore
 }
 
+nonisolated enum SavedMessagesCapabilityState: Equatable, Sendable {
+    case unknown
+    case supported
+    case unsupported
+
+    static func advertised(in capabilities: Set<String>) -> Self {
+        capabilities.contains("saved_messages_v1") ? .supported : .unsupported
+    }
+
+    func resolvingEnsureFailure(statusCode: Int?) -> Self {
+        statusCode == 404 ? .unsupported : self
+    }
+}
+
 nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
-    let rawValue: UInt16
+    let rawValue: UInt64
 
     static let chatOrganization = Self(rawValue: 1 << 0)
     static let replies = Self(rawValue: 1 << 1)
@@ -24,8 +38,11 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let richSearch = Self(rawValue: 1 << 11)
     static let multipartMedia = Self(rawValue: 1 << 12)
     static let videoCalls = Self(rawValue: 1 << 13)
-    static let cloudDrafts = Self(rawValue: 1 << 14)
-    static let mediaGroups = Self(rawValue: 1 << 15)
+    static let savedMessages = Self(rawValue: 1 << 14)
+    static let cloudDrafts = Self(rawValue: 1 << 15)
+    static let dialogPreferences = Self(rawValue: 1 << 16)
+    static let localSearch = Self(rawValue: 1 << 17)
+    static let mediaGroups = Self(rawValue: 1 << 18)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
@@ -41,9 +58,11 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
     case react
     case copy
     case edit
+    case save
     case forward
     case delete
     case retry
+    case remove
     case inspect
 
     var id: String { rawValue }
@@ -54,9 +73,11 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .react: String(localized: "React")
         case .copy: String(localized: "Copy")
         case .edit: String(localized: "Edit")
+        case .save: String(localized: "Save")
         case .forward: String(localized: "Forward")
         case .delete: String(localized: "Delete")
         case .retry: String(localized: "Retry")
+        case .remove: String(localized: "Remove")
         case .inspect: String(localized: "Details")
         }
     }
@@ -67,9 +88,11 @@ nonisolated enum MessageAction: String, CaseIterable, Identifiable, Sendable {
         case .react: "face.smiling"
         case .copy: "doc.on.doc"
         case .edit: "pencil"
+        case .save: "bookmark"
         case .forward: "arrowshape.turn.up.right"
         case .delete: "trash"
         case .retry: "arrow.clockwise"
+        case .remove: "trash"
         case .inspect: "info.circle"
         }
     }

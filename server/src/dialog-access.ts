@@ -13,7 +13,7 @@ export class DialogAccessError extends Error {
 
 export type DialogAccess = {
   dialogId: string;
-  type: "direct" | "group";
+  type: "direct" | "group" | "saved";
   revision: number;
   lastMsgId: number;
   closed: boolean;
@@ -36,6 +36,9 @@ function accessFromRow(row: any): DialogAccess {
 }
 
 function missingAccess(row: any, hadMembership: boolean): never {
+  if (row?.type === "saved") {
+    throw new DialogAccessError("Saved Messages is owner-only", "saved_dialog_forbidden", 403);
+  }
   if (hadMembership && row?.type === "group") {
     throw new DialogAccessError("group access revoked", "group_access_revoked", 410);
   }
@@ -49,7 +52,7 @@ export async function requireDialogReadAccess(
   dialogId: string,
 ): Promise<DialogAccess> {
   const row = (await sql`
-    SELECT d.id, d.type, d.revision, d.last_msg_id, d.closed_at,
+    SELECT d.id, d.type, d.created_by, d.revision, d.last_msg_id, d.closed_at,
            dm.role, dm.notification_mode, dm.left_at
     FROM dialogs d
     LEFT JOIN dialog_members dm
@@ -58,6 +61,11 @@ export async function requireDialogReadAccess(
   if (!row) throw new DialogAccessError("dialog not found", "group_not_found", 404);
   if (row.left_at != null || row.role == null || row.closed_at != null) {
     return missingAccess(row, row.role != null);
+  }
+  if (row.type === "saved" && (
+    row.created_by !== accountId || row.role !== "owner"
+  )) {
+    return missingAccess(row, true);
   }
   return accessFromRow(row);
 }
@@ -72,7 +80,7 @@ export async function lockDialogForMutation(
   dialogId: string,
 ): Promise<DialogAccess> {
   const dialog = (await sql`
-    SELECT id, type, revision, last_msg_id, closed_at
+    SELECT id, type, created_by, revision, last_msg_id, closed_at
     FROM dialogs WHERE id = ${dialogId}
     FOR UPDATE`)[0];
   if (!dialog) throw new DialogAccessError("dialog not found", "group_not_found", 404);
@@ -83,6 +91,11 @@ export async function lockDialogForMutation(
     FOR UPDATE`)[0];
   if (!member || member.left_at != null || dialog.closed_at != null) {
     return missingAccess(dialog, member != null);
+  }
+  if (dialog.type === "saved" && (
+    dialog.created_by !== accountId || member.role !== "owner"
+  )) {
+    return missingAccess(dialog, true);
   }
   return accessFromRow({ ...dialog, ...member });
 }

@@ -1,11 +1,31 @@
 import { $ } from "bun";
-import { DEFAULT_URL } from "./db";
+import { DEFAULT_URL, makeSql } from "./db";
+import { backfillMessageForwardMarkers } from "./message-forward-backfill";
+import { reconcileExistingSavedDialogs } from "./saved-dialog-reconciliation";
 
 // Apply contract DDL atomically, build indexes on existing hot tables without blocking writes,
 // then validate the new constraint under a short lock timeout. Every phase is idempotent.
 const url = process.env.DATABASE_URL ?? DEFAULT_URL;
 const schema = new URL("./schema.sql", import.meta.url).pathname;
 const concurrentSchema = new URL("./schema-concurrent.sql", import.meta.url).pathname;
+const dialogExpandSchema = new URL("./schema-dialogs-expand.sql", import.meta.url).pathname;
+const dialogSwapSchema = new URL("./schema-dialogs-swap.sql", import.meta.url).pathname;
+const messageForwardExpandSchema = new URL(
+  "./schema-message-forward-expand.sql",
+  import.meta.url,
+).pathname;
+const messageForwardContractSchema = new URL(
+  "./schema-message-forward-contract.sql",
+  import.meta.url,
+).pathname;
+const messageForwardBackfillIndexSchema = new URL(
+  "./schema-message-forward-backfill-index.sql",
+  import.meta.url,
+).pathname;
+const savedAccessExpandSchema = new URL(
+  "./schema-saved-access-expand.sql",
+  import.meta.url,
+).pathname;
 const dialogPreferencesExpand = new URL(
   "./schema-dialog-preferences-expand.sql",
   import.meta.url,
@@ -26,6 +46,12 @@ const preferenceBackfillBatchSize = Math.max(
 const migrationStartedAt = performance.now();
 
 await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -c "SET LOCAL lock_timeout = '5s'" -f ${schema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogExpandSchema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_type_check_saved_expand"`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check"`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogSwapSchema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messageForwardExpandSchema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${savedAccessExpandSchema}`.quiet();
 let backfilledCallCount = 0;
 while (true) {
   const query = `
@@ -56,6 +82,22 @@ while (true) {
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE calls VALIDATE CONSTRAINT calls_selectable_media_profiles_not_null"`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE calls ALTER COLUMN selectable_media_profiles SET NOT NULL"`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${concurrentSchema}`.quiet();
+const forwardMigrationComplete = (
+  await $`psql ${url} -v ON_ERROR_STOP=1 -qAt -c "SELECT EXISTS (SELECT 1 FROM schema_migration_progress WHERE migration_name = 'messages_is_forwarded_v1' AND completed_at IS NOT NULL)"`.quiet().text()
+).trim() === "t";
+if (!forwardMigrationComplete) {
+  await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messageForwardBackfillIndexSchema}`.quiet();
+}
+const migrationSql = makeSql(url);
+let messageForwardBackfill;
+let savedDialogReconciliation;
+try {
+  messageForwardBackfill = await backfillMessageForwardMarkers(migrationSql);
+  savedDialogReconciliation = await reconcileExistingSavedDialogs(migrationSql);
+} finally {
+  await migrationSql.end();
+}
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messageForwardContractSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE devices VALIDATE CONSTRAINT devices_voip_push_environment_check"`.quiet();
 
 async function completeConstraintMigration(
@@ -379,6 +421,11 @@ console.log(JSON.stringify({
   event: "database.migrated",
   database: redactUrl(url),
   callsBackfilled: backfilledCallCount,
+  savedMessages: {
+    forwardMarkersProcessed: messageForwardBackfill.processed,
+    forwardMarkerBatches: messageForwardBackfill.batches,
+    dialogsReconciled: savedDialogReconciliation.processed,
+  },
   dialogPreferences: {
     rowsScanned: preferenceRowsScanned,
     rowsInserted: preferenceRowsInserted,

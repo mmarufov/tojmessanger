@@ -566,13 +566,15 @@ private struct CloudChatsView: View {
                                             model.togglePinned(dialog.id)
                                         }
                                     }
-                                    if model.capabilities.contains(.chatOrganization)
+                                    if dialog.type != "saved",
+                                       model.capabilities.contains(.chatOrganization)
                                         || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash") {
                                             model.toggleMuted(dialog.id)
                                         }
                                     }
-                                    if model.capabilities.contains(.chatOrganization) {
+                                    if dialog.type != "saved",
+                                       model.capabilities.contains(.chatOrganization) {
                                         Button(
                                             dialog.isArchived ? "Unarchive" : "Archive",
                                             systemImage: dialog.isArchived ? "tray.and.arrow.up" : "archivebox"
@@ -584,7 +586,8 @@ private struct CloudChatsView: View {
                                     }
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                    if model.capabilities.contains(.chatOrganization) {
+                                    if dialog.type != "saved",
+                                       model.capabilities.contains(.chatOrganization) {
                                         Button {
                                             dialog.isArchived
                                                 ? model.unarchive(dialog.id)
@@ -597,7 +600,8 @@ private struct CloudChatsView: View {
                                         }
                                         .tint(TojTheme.strong)
                                     }
-                                    if model.capabilities.contains(.chatOrganization)
+                                    if dialog.type != "saved",
+                                       model.capabilities.contains(.chatOrganization)
                                         || (dialog.type == "group" && model.capabilities.contains(.groups)) {
                                         Button { model.toggleMuted(dialog.id) } label: {
                                             Label(dialog.isMuted ? "Unmute" : "Mute", systemImage: dialog.isMuted ? "speaker.wave.2" : "speaker.slash")
@@ -826,21 +830,23 @@ private struct CloudChatsView: View {
             if isEditing, model.capabilities.contains(.chatOrganization) {
                 HStack(spacing: 0) {
                     CloudDialogRow(dialog: dialog)
-                    Button {
-                        withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
-                            dialog.isArchived
-                                ? model.unarchive(dialog.id)
-                                : model.archive(dialog.id)
+                    if dialog.type != "saved" {
+                        Button {
+                            withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
+                                dialog.isArchived
+                                    ? model.unarchive(dialog.id)
+                                    : model.archive(dialog.id)
+                            }
+                        } label: {
+                            Image(systemName: dialog.isArchived ? "tray.and.arrow.up.fill" : "archivebox.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(TojTheme.gold)
+                                .frame(width: 44, height: 44)
+                                .background(TojTheme.raised, in: Circle())
                         }
-                    } label: {
-                        Image(systemName: dialog.isArchived ? "tray.and.arrow.up.fill" : "archivebox.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(TojTheme.gold)
-                            .frame(width: 44, height: 44)
-                            .background(TojTheme.raised, in: Circle())
+                        .buttonStyle(.tojPressable)
+                        .accessibilityLabel(dialog.isArchived ? "Unarchive" : "Archive")
                     }
-                    .buttonStyle(.tojPressable)
-                    .accessibilityLabel(dialog.isArchived ? "Unarchive" : "Archive")
                 }
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             } else if let onOpen {
@@ -1008,8 +1014,10 @@ private struct CloudDialogRow: View {
                 title: dialog.title,
                 size: 56,
                 highlighted: false,
-                colorIndex: dialog.profileColorIndex
+                colorIndex: dialog.profileColorIndex,
+                systemImage: dialog.type == "saved" ? "bookmark.fill" : nil
             )
+            .accessibilityIdentifier(dialog.type == "saved" ? "saved-messages-avatar" : "")
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -1022,7 +1030,7 @@ private struct CloudDialogRow: View {
                             .font(.caption2)
                             .foregroundStyle(TojTheme.secondaryText)
                     }
-                    if dialog.isMuted {
+                    if dialog.isMuted && dialog.type != "saved" {
                         Image(systemName: "speaker.slash.fill")
                             .font(.caption2)
                             .foregroundStyle(TojTheme.secondaryText)
@@ -1236,6 +1244,7 @@ private struct CloudSettingsView: View {
     @State private var showingClearMedia = false
     @State private var showingProfileEditor = false
     @State private var profilePhotoData: Data?
+    @State private var navigationPath: [String] = []
 
     private var displayName: String {
         let candidate = model.storedSession?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1251,7 +1260,7 @@ private struct CloudSettingsView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             ScrollView {
                 LazyVStack(spacing: 20) {
                     ZStack(alignment: .topTrailing) {
@@ -1281,12 +1290,22 @@ private struct CloudSettingsView: View {
                     .padding(.top, 16)
 
                     TojSectionCard {
-                        settingsLink(
-                            title: "Saved Messages",
-                            icon: "bookmark.fill",
-                            colors: [Color(hex: 0x4EA5FF), Color(hex: 0x2474ED)],
-                            divider: true,
-                            detail: "Keep notes, links and files close at hand."
+                        Button(action: openSavedMessages) {
+                            SettingsRowLabel(
+                                title: "Saved Messages",
+                                icon: "bookmark.fill",
+                                colors: [Color(hex: 0x4B401F), Color(hex: 0x211D13)],
+                                value: savedMessagesRowValue,
+                                showsDivider: true
+                            )
+                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
+                        .disabled(model.savedMessagesSetupInFlight)
+                        .accessibilityIdentifier("settings-saved-messages")
+                        .accessibilityHint(
+                            model.savedMessagesDialogId == nil
+                                ? String(localized: "Sets up your private notes conversation")
+                                : String(localized: "Opens your private notes conversation")
                         )
                         settingsLink(
                             title: "Recent Calls",
@@ -1496,6 +1515,9 @@ private struct CloudSettingsView: View {
                 .padding(.bottom, 28)
             }
             .background(TojTheme.canvas)
+            .navigationDestination(for: String.self) { dialogId in
+                TojConversationExperience(model: model, dialogId: dialogId)
+            }
             .toolbar(.hidden, for: .navigationBar)
             .task(id: profilePhotoAccountId) {
                 await model.loadDevices()
@@ -1559,6 +1581,39 @@ private struct CloudSettingsView: View {
                     photoAccountId: profilePhotoAccountId
                 )
                 .presentationBackground(TojTheme.canvas)
+            }
+        }
+    }
+
+    private var savedMessagesRowValue: LocalizedStringKey? {
+        if model.savedMessagesSetupInFlight { return "Setting up…" }
+        if let failure = model.savedMessagesSetupFailure {
+            return LocalizedStringKey(failure)
+        }
+        if model.savedMessagesDialogId == nil {
+            switch model.savedMessagesCapabilityState {
+            case .unknown:
+                return "Connect to set up"
+            case .unsupported:
+                return "Unavailable"
+            case .supported:
+                break
+            }
+        }
+        return nil
+    }
+
+    private func openSavedMessages() {
+        if let dialogId = model.savedMessagesDialogId {
+            model.prepareConversationOpen(dialogId: dialogId)
+            navigationPath.append(dialogId)
+            return
+        }
+        Task {
+            guard let dialogId = await model.ensureSavedMessages() else { return }
+            model.prepareConversationOpen(dialogId: dialogId)
+            if navigationPath.last != dialogId {
+                navigationPath.append(dialogId)
             }
         }
     }

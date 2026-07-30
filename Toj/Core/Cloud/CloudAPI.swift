@@ -442,6 +442,14 @@ nonisolated struct DirectDialogResponse: Codable, Sendable {
     let created: Bool
 }
 
+nonisolated struct SavedDialogResponse: Codable, Equatable, Sendable {
+    let dialogId: String
+    let type: String
+    let created: Bool
+    let repaired: Bool
+    let eventPts: Int64?
+}
+
 nonisolated struct DialogPreferencesResponse: Codable, Sendable {
     let preferences: CloudDialogPreferences
     let pts: Int64
@@ -860,6 +868,10 @@ struct CloudAPI: Sendable {
 
     func createDirectDialog(peerAccountId: String, token: String) async throws -> DirectDialogResponse {
         try await post("v1/dialogs/direct", body: ["peerAccountId": peerAccountId], token: token)
+    }
+
+    func ensureSavedMessages(token: String) async throws -> SavedDialogResponse {
+        try await post("v1/dialogs/saved", body: EmptyBody(), token: token)
     }
 
     func createGroup(

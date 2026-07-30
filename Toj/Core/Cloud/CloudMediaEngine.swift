@@ -626,6 +626,18 @@ nonisolated enum MediaDownloadComponent: String, Codable, Sendable {
     case fullMedia = "full"
 }
 
+nonisolated struct MediaAccessRestoreLease: Equatable, Sendable {
+    let mediaId: String
+    let generation: UInt64
+    fileprivate let cache: EncryptedMediaCache
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.mediaId == rhs.mediaId
+            && lhs.generation == rhs.generation
+            && lhs.cache === rhs.cache
+    }
+}
+
 /// Token-free and Codable so the local replica can persist queue items without ever persisting an
 /// account credential. Callers provide the current session token only when executing a dequeued item.
 nonisolated struct MediaDownloadQueueItem: Codable, Equatable, Identifiable, Sendable {
@@ -708,6 +720,8 @@ actor EncryptedMediaCache {
     private var representations: [MediaCacheLedgerKey: ThumbnailEntry] = [:]
     private var activeAccessCounts: [String: Int] = [:]
     private var removedLedgerKeys: Set<MediaCacheLedgerKey> = []
+    private var revokedMediaIds: Set<String> = []
+    private var mediaAccessGenerations: [String: UInt64] = [:]
     private var lastRetentionSweep: Date?
 
     init(
@@ -833,6 +847,7 @@ actor EncryptedMediaCache {
     }
 
     func promoteUpload(_ transfer: MediaTransferRecord, mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let sourceData = try uploadData(for: transfer)
         guard Int64(sourceData.count) == transfer.byteSize else { throw MediaCacheError.invalidState }
@@ -909,6 +924,7 @@ actor EncryptedMediaCache {
     }
 
     func storeThumbnail(_ data: Data, mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let url = root.appending(path: "thumbnails/\(mediaId).tojthumb")
         let oldSize = thumbnails[mediaId]?.cipherBytes ?? 0
@@ -951,6 +967,7 @@ actor EncryptedMediaCache {
         mediaId: String,
         variant: MediaPresentationVariant
     ) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         guard !data.isEmpty, data.count <= 8 * 1_024 * 1_024 else {
             throw MediaCacheError.unsupportedSize
         }
@@ -995,6 +1012,7 @@ actor EncryptedMediaCache {
     }
 
     func storeDownloadChunk(_ data: Data, mediaId: String, offset: Int64) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         let url = chunkURL(mediaId: mediaId, offset: offset)
         let oldCipherSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
@@ -1219,6 +1237,7 @@ actor EncryptedMediaCache {
     }
 
     func beginAccess(mediaId: String) throws {
+        guard !revokedMediaIds.contains(mediaId) else { throw MediaCacheError.accessRevoked }
         try loadIndexIfNeeded()
         activeAccessCounts[mediaId, default: 0] += 1
         try touchMedia(mediaId: mediaId)
@@ -1328,6 +1347,8 @@ actor EncryptedMediaCache {
         representations.removeAll()
         activeAccessCounts.removeAll()
         removedLedgerKeys.removeAll()
+        revokedMediaIds.removeAll()
+        mediaAccessGenerations.removeAll()
     }
 
     @discardableResult
@@ -1360,6 +1381,81 @@ actor EncryptedMediaCache {
             clearedMediaIds: removable,
             protectedMediaIds: protected
         )
+    }
+
+    /// Access revocation overrides active playback leases. UI and network activity are cancelled
+    /// before this call; physical deletion is verified so SQL finalization cannot race ahead of
+    /// encrypted bytes that survived a filesystem error.
+    func purgeRevokedMedia(
+        mediaIds: Set<String>,
+        additionalEncryptedPaths: Set<String>
+    ) throws {
+        try loadIndexIfNeeded()
+        // Install the fence before touching disk. Foreground, background, streaming, and
+        // presentation-representation continuations that arrive after this point are rejected.
+        revokedMediaIds.formUnion(mediaIds)
+        for mediaId in mediaIds {
+            _ = advanceMediaAccessGeneration(mediaId: mediaId)
+            activeAccessCounts[mediaId] = nil
+            removeCachedMedia(mediaId: mediaId)
+            let paths = [
+                downloadDirectory(mediaId),
+                thumbnailURL(mediaId),
+                representationDirectory(mediaId),
+            ]
+            for path in paths where fileManager.fileExists(atPath: path.path) {
+                try fileManager.removeItem(at: path)
+            }
+        }
+        for rawPath in additionalEncryptedPaths where !rawPath.isEmpty {
+            let url = URL(fileURLWithPath: rawPath)
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+            if let uploadBytes = uploadBytesByPath.removeValue(forKey: url.path) {
+                trackedBytes = max(0, trackedBytes - uploadBytes)
+            }
+        }
+    }
+
+    func restoreAuthorizedMedia(mediaId: String) -> MediaAccessRestoreLease {
+        let generation = advanceMediaAccessGeneration(mediaId: mediaId)
+        revokedMediaIds.remove(mediaId)
+        return MediaAccessRestoreLease(
+            mediaId: mediaId,
+            generation: generation,
+            cache: self
+        )
+    }
+
+    /// Reinstalls the fence only if no later purge or authorized restore superseded this lease.
+    /// Deleting again closes the brief unfenced window for late chunk/thumbnail/representation
+    /// writers before the caller learned that its SQLCipher authorization was stale.
+    func rollbackUnauthorizedMedia(_ lease: MediaAccessRestoreLease) throws -> Bool {
+        guard lease.cache === self,
+              mediaAccessGenerations[lease.mediaId] == lease.generation
+        else {
+            return false
+        }
+        _ = advanceMediaAccessGeneration(mediaId: lease.mediaId)
+        revokedMediaIds.insert(lease.mediaId)
+        activeAccessCounts[lease.mediaId] = nil
+        removeCachedMedia(mediaId: lease.mediaId)
+        let paths = [
+            downloadDirectory(lease.mediaId),
+            thumbnailURL(lease.mediaId),
+            representationDirectory(lease.mediaId),
+        ]
+        for path in paths where fileManager.fileExists(atPath: path.path) {
+            try fileManager.removeItem(at: path)
+        }
+        return true
+    }
+
+    private func advanceMediaAccessGeneration(mediaId: String) -> UInt64 {
+        let generation = (mediaAccessGenerations[mediaId] ?? 0) &+ 1
+        mediaAccessGenerations[mediaId] = generation
+        return generation
     }
 
     func createTemporaryPreview(_ data: Data, fileExtension: String?) throws -> URL {
@@ -1805,6 +1901,9 @@ actor CloudMediaTransferEngine {
     private var inFlightFullDownloads: [String: SharedFullDownload] = [:]
     private var inFlightThumbnailDownloads: [String: SharedThumbnailDownload] = [:]
     private let volumeCapacityProvider: (@Sendable () throws -> MediaVolumeCapacity)?
+    #if DEBUG
+    private var rollbackHandoffGate: (@Sendable () async -> Void)?
+    #endif
 
     init(
         config: CloudConfig = .current,
@@ -2914,6 +3013,63 @@ actor CloudMediaTransferEngine {
         }
     }
 
+    func purgeRevokedAccess(
+        allMediaIds: Set<String>,
+        purgeMediaIds: Set<String>,
+        encryptedPaths: Set<String>,
+        localStore: CloudLocalStore
+    ) async throws {
+        guard !allMediaIds.isEmpty || !encryptedPaths.isEmpty else { return }
+        for mediaId in allMediaIds {
+            inFlightFullDownloads.removeValue(forKey: mediaId)?.task.cancel()
+            inFlightThumbnailDownloads.removeValue(forKey: mediaId)?.task.cancel()
+            autoDownloadQueue.removeAll { $0.media.id == mediaId }
+        }
+        try await backgroundDownloads?.cancelAndDelete(mediaIds: allMediaIds)
+        let cache = try resolvedCache()
+        try await hydrateDurableLedgerIfNeeded(localStore: localStore)
+        try await cache.purgeRevokedMedia(
+            mediaIds: purgeMediaIds,
+            additionalEncryptedPaths: encryptedPaths
+        )
+        try await synchronizeRemovedLedgerKeys(localStore: localStore)
+        _ = try await localStore.cancelMediaDownloadJobs(
+            mediaIds: allMediaIds,
+            excluding: []
+        )
+    }
+
+    /// The caller must first prove a live SQLCipher message_media reference in an authorized
+    /// dialog. This only removes the process-local fence; it never creates authorization.
+    func restoreAuthorizedAccess(mediaId: String) async throws -> MediaAccessRestoreLease {
+        let cache = try resolvedCache()
+        return await cache.restoreAuthorizedMedia(mediaId: mediaId)
+    }
+
+    func rollbackUnauthorizedAccess(_ lease: MediaAccessRestoreLease) async throws -> Bool {
+        // Never lazily create or address a replacement session cache for an old lease.
+        guard let cache, cache === lease.cache else { return false }
+        #if DEBUG
+        await rollbackHandoffGate?()
+        #endif
+        let rolledBack = try await cache.rollbackUnauthorizedMedia(lease)
+        // The engine is reentrant across the cache-actor hop. A logout may have installed a new
+        // cache while the old one was rolling back, so never hand that old success to presentation.
+        guard self.cache === cache else { return false }
+        return rolledBack
+    }
+
+    #if DEBUG
+    func testSetRollbackHandoffGate(_ gate: (@Sendable () async -> Void)?) {
+        rollbackHandoffGate = gate
+    }
+
+    func testInstallReplacementCache(_ replacement: EncryptedMediaCache) {
+        precondition(cache == nil, "replacement cache requires completed teardown")
+        cache = replacement
+    }
+    #endif
+
     func cacheUsageBytes() async -> Int64 {
         guard let cache else { return 0 }
         return (try? await cache.downloadedUsageBytes()) ?? 0
@@ -2944,9 +3100,29 @@ actor CloudMediaTransferEngine {
         nextDownloadSequence = 0
     }
 
-    func temporaryPreview(data: Data, fileExtension: String?) async throws -> URL {
+    private func temporaryPreview(data: Data, fileExtension: String?) async throws -> URL {
         let cache = try resolvedCache()
         return try await cache.createTemporaryPreview(data, fileExtension: fileExtension)
+    }
+
+    @discardableResult
+    func temporaryPreview(
+        data: Data,
+        fileExtension: String?,
+        transferOwnership: @escaping @Sendable (URL) async -> Bool
+    ) async throws -> Bool {
+        let url = try await temporaryPreview(data: data, fileExtension: fileExtension)
+        do {
+            try Task.checkCancellation()
+            let transferred = await transferOwnership(url)
+            if !transferred {
+                await removeTemporaryPreview(url)
+            }
+            return transferred
+        } catch {
+            await removeTemporaryPreview(url)
+            throw error
+        }
     }
 
     func removeTemporaryPreview(_ url: URL) async { await cache?.removeTemporaryPreview(url) }
@@ -3089,7 +3265,7 @@ nonisolated final class EncryptedMediaResourceLoader: NSObject, AVAssetResourceL
 
 enum MediaCacheError: LocalizedError {
     case unsupportedSize, thumbnailTooLarge, localQuotaExceeded, encryptionFailed, invalidState
-    case uploadExpired, automaticDownloadDeferred
+    case uploadExpired, automaticDownloadDeferred, accessRevoked
 
     var errorDescription: String? {
         switch self {
@@ -3100,6 +3276,7 @@ enum MediaCacheError: LocalizedError {
         case .invalidState: String(localized: "The media transfer could not be resumed")
         case .uploadExpired: String(localized: "The upload expired and must be restarted")
         case .automaticDownloadDeferred: String(localized: "Automatic media download was deferred")
+        case .accessRevoked: String(localized: "Media access was revoked")
         }
     }
 }

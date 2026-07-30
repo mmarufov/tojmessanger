@@ -47,6 +47,7 @@ final class MediaPresentationCache {
         String: (id: UUID, asset: StreamingMediaAsset, expiresAt: Date)
     ] = [:]
     private var preparedVideoExpiryTasks: [String: Task<Void, Never>] = [:]
+    private var revokedMediaIds: Set<String> = []
 
     private init() {
         images.totalCostLimit = 64 * 1_024 * 1_024
@@ -60,6 +61,7 @@ final class MediaPresentationCache {
         for key: MediaPresentationKey,
         producer: @escaping @Sendable () async -> SafeDecodedImage?
     ) async -> UIImage? {
+        guard !revokedMediaIds.contains(key.mediaId) else { return nil }
         let stringKey = cacheKey(key)
         if let entry = images.object(forKey: stringKey) { return entry.image }
         if let existing = inFlight[key] { return await existing.task.value?.image }
@@ -69,7 +71,7 @@ final class MediaPresentationCache {
         inFlight[key] = (taskID, task)
         let decoded = await task.value
         if inFlight[key]?.id == taskID { inFlight[key] = nil }
-        guard let decoded else { return nil }
+        guard let decoded, !revokedMediaIds.contains(key.mediaId) else { return nil }
         let cost = decoded.image.cgImage.map { $0.bytesPerRow * $0.height }
             ?? max(1, decoded.pixelWidth * decoded.pixelHeight * 4)
         images.setObject(Entry(image: decoded.image), forKey: stringKey, cost: cost)
@@ -102,6 +104,20 @@ final class MediaPresentationCache {
         images.removeAllObjects()
     }
 
+    func revoke(mediaIds: Set<String>) {
+        revokedMediaIds.formUnion(mediaIds)
+        invalidate(mediaIds: mediaIds)
+    }
+
+    func restore(mediaIds: Set<String>) {
+        revokedMediaIds.subtract(mediaIds)
+    }
+
+    func resetForSession() {
+        removeAll()
+        revokedMediaIds.removeAll()
+    }
+
     /// Keeps only the lightweight AVURLAsset/resource-loader descriptor warm. Encrypted video
     /// bytes remain in the durable cache; the descriptor expires quickly and is handed off once.
     func storePreparedVideoAsset(
@@ -109,6 +125,7 @@ final class MediaPresentationCache {
         mediaId: String,
         lifetime: TimeInterval = 15
     ) {
+        guard !revokedMediaIds.contains(mediaId) else { return }
         preparedVideoExpiryTasks.removeValue(forKey: mediaId)?.cancel()
         let id = UUID()
         let expiresAt = Date(timeIntervalSinceNow: max(0, lifetime))
@@ -125,6 +142,7 @@ final class MediaPresentationCache {
     }
 
     func takePreparedVideoAsset(mediaId: String) -> StreamingMediaAsset? {
+        guard !revokedMediaIds.contains(mediaId) else { return nil }
         guard let entry = preparedVideoAssets[mediaId] else { return nil }
         guard entry.expiresAt > Date() else {
             removePreparedVideoAsset(mediaId: mediaId, id: entry.id)

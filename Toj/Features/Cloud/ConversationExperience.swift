@@ -95,6 +95,7 @@ struct TojConversationExperience: View {
     }
 
     private var isGroup: Bool { dialog?.type == "group" }
+    private var isSavedMessages: Bool { dialog?.type == "saved" }
 
     private var canSend: Bool {
         guard model.activeDialogId == dialogId, !model.composerMode.isRecording else {
@@ -205,7 +206,11 @@ struct TojConversationExperience: View {
             }
             Button("Cancel", role: .cancel) { deleteLine = nil }
         } message: {
-            Text("This removes the message for everyone in this conversation.")
+            Text(
+                isSavedMessages
+                    ? String(localized: "This removes the message from Saved Messages on all your devices.")
+                    : String(localized: "This removes the message for everyone in this conversation.")
+            )
         }
         .alert(item: Binding(
             get: { model.operationNotice },
@@ -279,7 +284,7 @@ struct TojConversationExperience: View {
                 Button {
                     if model.replicaSyncState.showsRetry {
                         model.retryReplicaSync()
-                    } else {
+                    } else if !isSavedMessages {
                         showingProfile = isGroup
                             || model.capabilities.contains(.profiles)
                             || model.capabilities.contains(.calls)
@@ -310,20 +315,22 @@ struct TojConversationExperience: View {
                 .buttonStyle(.plain)
                 .tojGlass(
                     in: Capsule(),
-                    interactive: model.capabilities.contains(.profiles)
-                        || model.capabilities.contains(.calls)
-                        || isGroup
-                        || model.replicaSyncState.showsRetry
+                    interactive: model.replicaSyncState.showsRetry
+                        || (!isSavedMessages && (
+                            model.capabilities.contains(.profiles)
+                                || model.capabilities.contains(.calls)
+                                || isGroup
+                        ))
                 )
                 .accessibilityHint(
                     model.replicaSyncState.showsRetry
                         ? "Checks for new messages again"
-                        : (model.capabilities.contains(.profiles) || model.capabilities.contains(.calls)
+                        : (!isSavedMessages && (model.capabilities.contains(.profiles) || model.capabilities.contains(.calls))
                             ? "Opens contact and privacy details"
                             : "Connection status")
                 )
 
-                if !isGroup && model.capabilities.contains(.calls) {
+                if !isGroup && !isSavedMessages && model.capabilities.contains(.calls) {
                     Button {
                         Task { await model.startVoiceCall(dialogId: dialogId) }
                     } label: {
@@ -335,7 +342,7 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Call \(model.dialogTitle(dialogId))")
                 }
 
-                if !isGroup && model.capabilities.contains(.videoCalls) {
+                if !isGroup && !isSavedMessages && model.capabilities.contains(.videoCalls) {
                     Button {
                         Task { await model.startVideoCall(dialogId: dialogId) }
                     } label: {
@@ -348,6 +355,7 @@ struct TojConversationExperience: View {
                 }
 
                 Button {
+                    guard !isSavedMessages else { return }
                     showingProfile = isGroup
                         || model.capabilities.contains(.profiles)
                         || model.capabilities.contains(.calls)
@@ -355,16 +363,21 @@ struct TojConversationExperience: View {
                     TojAvatar(
                         title: model.dialogTitle(dialogId),
                         size: 46,
-                        colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex
+                        colorIndex: model.dialogs.first(where: { $0.id == dialogId })?.profileColorIndex,
+                        systemImage: isSavedMessages ? "bookmark.fill" : nil
                     )
                 }
                 .buttonStyle(.tojPressable)
                 .disabled(
-                    !isGroup
+                    isSavedMessages
+                        || (!isGroup
                         && !model.capabilities.contains(.profiles)
-                        && !model.capabilities.contains(.calls)
+                        && !model.capabilities.contains(.calls))
                 )
-                .accessibilityLabel("Open \(model.dialogTitle(dialogId)) profile")
+                .accessibilityLabel(
+                    isSavedMessages ? "Saved Messages" : "Open \(model.dialogTitle(dialogId)) profile"
+                )
+                .accessibilityIdentifier(isSavedMessages ? "saved-messages-avatar" : "")
             }
         }
     }
@@ -390,7 +403,9 @@ struct TojConversationExperience: View {
     private var headerSubtitle: String {
         switch model.replicaSyncState {
         case .ready:
-            if isGroup {
+            if isSavedMessages {
+                String(localized: "Synced across your devices")
+            } else if isGroup {
                 "\(dialog?.memberCount ?? 0) members"
             } else {
                 isPeerTyping ? String(localized: "typing…") : String(localized: "last seen recently")
@@ -412,7 +427,12 @@ struct TojConversationExperience: View {
 
     @ViewBuilder
     private func serviceRow(for line: CloudAppModel.Line) -> some View {
-        if isGroup {
+        if isSavedMessages {
+            timelinePill(
+                Text(line.text.isEmpty ? String(localized: "Saved item") : line.text),
+                icon: "bookmark.fill"
+            )
+        } else if isGroup {
             GroupLifecycleServiceRow(line: line)
         } else {
             VoiceCallServiceRow(line: line)
@@ -423,7 +443,13 @@ struct TojConversationExperience: View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView {
                 LazyVStack(spacing: 3) {
-                    if !isGroup {
+                    if isSavedMessages {
+                        timelinePill(
+                            Text("Notes and files for your Toj account"),
+                            icon: "bookmark.fill"
+                        )
+                        .padding(.vertical, 8)
+                    } else if !isGroup {
                         timelinePill(Text("Private conversation"), icon: "lock.fill")
                             .padding(.vertical, 8)
                     }
@@ -559,25 +585,39 @@ struct TojConversationExperience: View {
         switch model.conversationOpenState {
         case .loadingLocal, .cached:
             savedMessageSkeleton
-                .accessibilityLabel("Loading saved messages")
+                .accessibilityLabel(String(localized: "Loading offline conversation"))
         case .empty, .ready:
             VStack(spacing: 7) {
-                Image(systemName: "bubble.left.and.bubble.right")
+                Image(systemName: isSavedMessages ? "bookmark.fill" : "bubble.left.and.bubble.right")
                     .font(.system(size: 22, weight: .medium))
-                Text("No messages yet")
+                Text(
+                    isSavedMessages
+                        ? String(localized: "Save something for yourself")
+                        : String(localized: "No messages yet")
+                )
                     .font(.subheadline.weight(.semibold))
-                Text("Messages you send will appear here and stay available offline.")
+                Text(
+                    isSavedMessages
+                        ? String(localized: "Keep notes, media, links and files here. Downloaded items stay available offline.")
+                        : String(localized: "Messages you send will appear here and stay available offline.")
+                )
                     .font(.caption)
                     .multilineTextAlignment(.center)
             }
+            .accessibilityIdentifier(isSavedMessages ? "saved-messages-empty-state" : "")
             .foregroundStyle(TojTheme.secondaryText)
             .padding(.top, 36)
             .padding(.horizontal, 32)
         case .failedLocal:
             VStack(spacing: 10) {
-                Label("Saved messages could not be opened", systemImage: "externaldrive.badge.exclamationmark")
+                Label(
+                    String(localized: "Offline conversation could not be opened"),
+                    systemImage: "externaldrive.badge.exclamationmark"
+                )
                     .font(.subheadline.weight(.semibold))
-                Button("Try saved copy again") { model.retryConversationLocalLoad() }
+                Button(String(localized: "Try offline copy again")) {
+                    model.retryConversationLocalLoad()
+                }
                     .buttonStyle(.glass)
             }
             .foregroundStyle(TojTheme.secondaryText)
@@ -765,6 +805,24 @@ struct TojConversationExperience: View {
                 .onSubmit { if canSend { send() } }
                 .accessibilityLabel("Message")
                 .disabled(model.composerMode.isRecording)
+
+            #if DEBUG
+            if TelegramFastUITestFixture.enabled {
+                Text(
+                    model.uiFixtureDraftPersistenceComplete
+                        ? "Draft saved locally"
+                        : "Draft save pending"
+                )
+                .font(.system(size: 1))
+                .foregroundStyle(.clear)
+                .frame(width: 1, height: 1)
+                .accessibilityLabel(
+                    model.uiFixtureDraftPersistenceComplete
+                        ? "Draft saved locally"
+                        : "Draft save pending"
+                )
+            }
+            #endif
         }
         .tojGlass(in: RoundedRectangle(cornerRadius: 23, style: .continuous), interactive: true)
     }
@@ -976,6 +1034,8 @@ struct TojConversationExperience: View {
         case .edit:
             model.beginEditing(line)
             composerFocused = true
+        case .save:
+            Task { await model.saveMessage(line) }
         case .forward:
             forwardLine = line
             showingForwarding = true
@@ -983,6 +1043,8 @@ struct TojConversationExperience: View {
             deleteLine = line
         case .retry:
             model.retryFailedMessage(line)
+        case .remove:
+            model.removeFailedMessage(line)
         case .inspect:
             detailsLine = line
         }
@@ -1426,11 +1488,12 @@ private struct TojMessageBubble: View {
         )
         .contextMenu {
             ForEach(actions) { action in
-                Button(role: action == .delete ? .destructive : nil) {
+                Button(role: action == .delete || action == .remove ? .destructive : nil) {
                     onAction(action)
                 } label: {
                     Label(action.title, systemImage: action.systemImage)
                 }
+                .accessibilityIdentifier(action == .save ? "message-action-save" : "")
             }
         }
         .accessibilityElement(children: .combine)
@@ -1829,6 +1892,7 @@ private struct InlineVideoPlayerView: View {
     @State private var player: AVQueuePlayer?
     @State private var looper: AVPlayerLooper?
     @State private var owner: StreamingMediaAsset?
+    @State private var startTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -1843,17 +1907,27 @@ private struct InlineVideoPlayerView: View {
     }
 
     private func start() {
-        guard player == nil, let owner = model.streamingVideoAsset(for: media) else { return }
-        self.owner = owner
-        let queue = AVQueuePlayer()
-        queue.isMuted = true
-        queue.actionAtItemEnd = .none
-        looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: owner.asset))
-        player = queue
-        queue.play()
+        guard player == nil else { return }
+        startTask?.cancel()
+        startTask = Task { @MainActor in
+            guard let owner = await model.streamingVideoAsset(for: media),
+                  !Task.isCancelled,
+                  isActive,
+                  player == nil
+            else { return }
+            self.owner = owner
+            let queue = AVQueuePlayer()
+            queue.isMuted = true
+            queue.actionAtItemEnd = .none
+            looper = AVPlayerLooper(player: queue, templateItem: AVPlayerItem(asset: owner.asset))
+            player = queue
+            queue.play()
+        }
     }
 
     private func stop() {
+        startTask?.cancel()
+        startTask = nil
         player?.pause()
         looper = nil
         player = nil
@@ -2879,12 +2953,19 @@ private struct ProductionMediaViewer: View {
                 }
                 downloadProgress = 1
                 shareFetchTask = Task { @MainActor in
-                    guard let downloaded = try? await model.mediaData(for: media),
-                          let url = try? await model.temporaryMediaURL(
-                            data: downloaded,
-                            fileExtension: preferredFileExtension
-                          ), !Task.isCancelled else { return }
-                    temporaryURL = url
+                    guard let dialogId = line.dialogId,
+                          let downloaded = try? await model.mediaData(for: media)
+                    else { return }
+                    _ = try? await model.transferTemporaryMediaURL(
+                        data: downloaded,
+                        fileExtension: preferredFileExtension,
+                        mediaId: media.id,
+                        dialogId: dialogId
+                    ) { url in
+                        guard !Task.isCancelled else { return false }
+                        temporaryURL = url
+                        return true
+                    }
                 }
                 return
             }
@@ -2892,9 +2973,21 @@ private struct ProductionMediaViewer: View {
             let downloaded = try await model.mediaData(for: media) { value in
                 await MainActor.run { downloadProgress = value }
             }
-            temporaryURL = try await model.temporaryMediaURL(
-                data: downloaded, fileExtension: preferredFileExtension
-            )
+            try Task.checkCancellation()
+            guard let dialogId = line.dialogId else {
+                throw MediaPresentationError.unreadable
+            }
+            let transferred = try await model.transferTemporaryMediaURL(
+                data: downloaded,
+                fileExtension: preferredFileExtension,
+                mediaId: media.id,
+                dialogId: dialogId
+            ) { url in
+                guard !Task.isCancelled else { return false }
+                temporaryURL = url
+                return true
+            }
+            if !transferred { throw CancellationError() }
         } catch {
             self.error = error.localizedDescription
         }
@@ -2904,7 +2997,7 @@ private struct ProductionMediaViewer: View {
     /// header + first chunk arrive instead of after a full download. Share/Save get the whole file in
     /// the background (reusing the streaming chunk cache).
     private func loadStreamingVideo() async throws {
-        guard let owner = model.streamingVideoAsset(for: media) else {
+        guard let owner = await model.streamingVideoAsset(for: media) else {
             throw MediaPresentationError.unreadable
         }
         let asset = owner.asset
@@ -2930,12 +3023,19 @@ private struct ProductionMediaViewer: View {
         newPlayer.play()
         isPlaying = true
         shareFetchTask = Task { @MainActor in
-            guard
-                let data = try? await model.mediaData(for: media),
-                let url = try? await model.temporaryMediaURL(data: data, fileExtension: preferredFileExtension),
-                !Task.isCancelled
+            guard let dialogId = line.dialogId,
+                  let data = try? await model.mediaData(for: media)
             else { return }
-            temporaryURL = url
+            _ = try? await model.transferTemporaryMediaURL(
+                data: data,
+                fileExtension: preferredFileExtension,
+                mediaId: media.id,
+                dialogId: dialogId
+            ) { url in
+                guard !Task.isCancelled else { return false }
+                temporaryURL = url
+                return true
+            }
         }
     }
 
@@ -4184,13 +4284,18 @@ private struct DemoForwardingView: View {
 
     var body: some View {
         NavigationStack {
-            List(dialogs.filter { !$0.isArchived }) { dialog in
+            List(CloudAppModel.forwardingPickerDialogs(dialogs)) { dialog in
                 Button {
                     TojFeedback.sent()
                     onDone(dialog.id)
                 } label: {
                     HStack(spacing: 12) {
-                        TojAvatar(title: dialog.title, size: 42, colorIndex: dialog.profileColorIndex)
+                        TojAvatar(
+                            title: dialog.title,
+                            size: 42,
+                            colorIndex: dialog.profileColorIndex,
+                            systemImage: dialog.type == "saved" ? "bookmark.fill" : nil
+                        )
                         Text(dialog.title).foregroundStyle(TojTheme.text)
                         Spacer()
                     }

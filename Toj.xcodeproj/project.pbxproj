@@ -16,6 +16,7 @@
 		5FBC1A8DF7D90DF358C187F1 /* MessagingPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */; };
 		6A1C38E90F4D4F298C027101 /* GroupsV1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A1C38E90F4D4F298C027102 /* GroupsV1Tests.swift */; };
 		7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */; };
+		7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
 		ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
@@ -54,6 +55,7 @@
 		7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackgroundMediaTransferSessionTests.swift; sourceTree = "<group>"; };
 		8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CryptoSpikeTests.swift; sourceTree = "<group>"; };
 		9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessagingPresentationTests.swift; sourceTree = "<group>"; };
+		A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SavedMessagesTests.swift; sourceTree = "<group>"; };
 		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
 		B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.release.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.release.xcconfig"; sourceTree = "<group>"; };
 		C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudLocalStoreTests.swift; sourceTree = "<group>"; };
@@ -119,6 +121,7 @@
 				7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */,
 				E39E727F061194C35B8B4DCE /* LocalFirstPerformanceTests.swift */,
 				E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */,
+				A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */,
 				55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */,
 			);
 			path = TojTests;
@@ -395,6 +398,7 @@
 				DAF0BE9F58109F5B51592FC6 /* BackgroundMediaTransferSessionTests.swift in Sources */,
 				E4A8C89C215B4C37BF5246E1 /* EncryptedProfilePhotoStoreTests.swift in Sources */,
 				7AAA59CDBDDA20B1A1A60E3D /* LocalFirstPerformanceTests.swift in Sources */,
+				7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */,
 				ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

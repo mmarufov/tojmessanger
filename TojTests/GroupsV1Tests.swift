@@ -155,11 +155,15 @@ final class GroupsV1Tests: XCTestCase {
 
         let visibleDialogs = try await store.dialogs(accountId: "account-me")
         let readyOutbox = try await store.pendingOutboxReady()
-        let purgeCount = try await store.drainPendingPurges()
+        let purgeJobs = try await store.pendingAccessPurgeJobs()
+        for job in purgeJobs {
+            try await store.markAccessPurgeFilesDeleted(id: job.id)
+            try await store.finalizeAccessPurge(id: job.id)
+        }
         let timeline = try await store.timeline(dialogId: groupId)
         XCTAssertTrue(visibleDialogs.isEmpty)
         XCTAssertTrue(readyOutbox.isEmpty)
-        XCTAssertGreaterThan(purgeCount, 0)
+        XCTAssertFalse(purgeJobs.isEmpty)
         XCTAssertTrue(timeline.messages.isEmpty)
     }
 
@@ -305,6 +309,205 @@ final class GroupsV1Tests: XCTestCase {
         XCTAssertEqual(readDialogs.first?.mentionCount, 0)
     }
 
+    func testDelayedGroupEnvelopeAndMemberPageCannotClearRevocation() async throws {
+        let store = try makeStore()
+        let groupId = UUID().uuidString.lowercased()
+        try await store.upsertDialog(dialogId: groupId, type: "group", title: "Delayed")
+        try await applyRevocation(store: store, dialogId: groupId, pts: 10)
+        let envelope = groupEnvelope(groupId: groupId, revision: 1)
+
+        do {
+            try await store.applyGroupEnvelope(envelope)
+            XCTFail("delayed envelope must be rejected")
+        } catch CloudLocalStoreAccessError.revoked {
+            // Expected.
+        }
+        do {
+            try await store.applyGroupMembersPage(
+                CloudGroupMembersPage(
+                    group: envelope.group,
+                    members: envelope.members ?? [],
+                    profiles: [],
+                    nextCursor: nil,
+                    hasMore: false
+                ),
+                generation: "pre-revocation"
+            )
+            XCTFail("delayed member page must be rejected")
+        } catch CloudLocalStoreAccessError.revoked {
+            // Expected.
+        }
+        let remainsRevoked = try await store.isDialogAccessRevoked(dialogId: groupId)
+        let visibleDialogs = try await store.dialogs(accountId: "account-me")
+        XCTAssertTrue(remainsRevoked)
+        XCTAssertTrue(visibleDialogs.isEmpty)
+    }
+
+    func testGroupRemoveThenReaddWorksAcrossSeparateAndCombinedDifferencePages() async throws {
+        for combined in [false, true] {
+            let store = try makeStore()
+            let groupId = UUID().uuidString.lowercased()
+            try await store.applyGroupEnvelope(groupEnvelope(groupId: groupId, revision: 1))
+            let revoke = revocationUpdate(dialogId: groupId, pts: 10)
+            let grant = groupGrantUpdate(dialogId: groupId, pts: 11)
+            if combined {
+                try await store.applyDifference(
+                    DifferenceResponse(
+                        kind: "difference", state: .init(pts: 11),
+                        updates: [revoke, grant], profiles: [], hasMore: false
+                    ),
+                    accountId: "account-me"
+                )
+            } else {
+                try await store.applyDifference(
+                    DifferenceResponse(
+                        kind: "difference_slice", state: .init(pts: 10),
+                        updates: [revoke], profiles: [], hasMore: true
+                    ),
+                    accountId: "account-me"
+                )
+                let revokedBetweenPages = try await store.isDialogAccessRevoked(
+                    dialogId: groupId
+                )
+                XCTAssertTrue(revokedBetweenPages)
+                try await store.applyDifference(
+                    DifferenceResponse(
+                        kind: "difference", state: .init(pts: 11),
+                        updates: [grant], profiles: [], hasMore: false
+                    ),
+                    accountId: "account-me"
+                )
+            }
+            let revokedAfterGrant = try await store.isDialogAccessRevoked(dialogId: groupId)
+            let dialogsAfterGrant = try await store.dialogs(accountId: "account-me")
+            let purgeCount = try await store.pendingAccessPurgeCount()
+            XCTAssertFalse(revokedAfterGrant)
+            XCTAssertEqual(dialogsAfterGrant.first?.type, "group")
+            XCTAssertEqual(purgeCount, 0)
+        }
+    }
+
+    func testNewerGroupGrantSurvivesRelaunchButSavedGrantCannotClearTombstone() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "regrant.sqlite").path
+        let key = Data("group-regrant-relaunch".utf8)
+        let groupId = UUID().uuidString.lowercased()
+        let savedId = UUID().uuidString.lowercased()
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            try await store.applyGroupEnvelope(groupEnvelope(groupId: groupId, revision: 1))
+            try await applyRevocation(store: store, dialogId: groupId, pts: 20)
+            try await store.ensureSavedDialog(
+                dialogId: savedId, accountId: "account-me", updatedAt: nil
+            )
+            try await store.applyDifference(
+                DifferenceResponse(
+                    kind: "difference", state: .init(pts: 21),
+                    updates: [
+                        CloudUpdate(
+                            pts: 21, ptsCount: 1, type: "dialog.access_revoked",
+                            dialogId: savedId, dialogTitle: nil, dialogType: "saved",
+                            message: nil, readerAccountId: nil, maxReadMsgId: nil
+                        ),
+                    ],
+                    profiles: [], hasMore: false
+                ),
+                accountId: "account-me"
+            )
+        }
+
+        let reopened = try CloudLocalStore(path: path, key: key)
+        try await reopened.applyDifference(
+            DifferenceResponse(
+                kind: "difference", state: .init(pts: 22),
+                updates: [
+                    groupGrantUpdate(dialogId: groupId, pts: 22),
+                    CloudUpdate(
+                        pts: 22, ptsCount: 1, type: "dialog.created",
+                        dialogId: savedId, dialogTitle: "Saved Messages", dialogType: "saved",
+                        message: nil, readerAccountId: nil, maxReadMsgId: nil
+                    ),
+                ],
+                profiles: [], hasMore: false
+            ),
+            accountId: "account-me"
+        )
+        let groupRevoked = try await reopened.isDialogAccessRevoked(dialogId: groupId)
+        let savedRevoked = try await reopened.isDialogAccessRevoked(dialogId: savedId)
+        XCTAssertFalse(groupRevoked)
+        XCTAssertTrue(savedRevoked)
+    }
+
+    func testAuthoritativeBootstrapRegrantsOnlyNewerGroupSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let path = directory.appending(path: "bootstrap-regrant.sqlite").path
+        let key = Data("bootstrap-regrant-key".utf8)
+        let groupId = UUID().uuidString.lowercased()
+        do {
+            let store = try CloudLocalStore(path: path, key: key)
+            try await store.applyGroupEnvelope(groupEnvelope(groupId: groupId, revision: 1))
+            try await applyRevocation(store: store, dialogId: groupId, pts: 30)
+            try await store.beginBootstrap(
+                accountId: "account-me",
+                token: "bootstrap-token",
+                snapshotPts: 31,
+                mode: .replacement
+            )
+            try await store.applyBootstrapPage(BootstrapDialogsPage(
+                token: "bootstrap-token",
+                state: .init(pts: 31),
+                dialogs: [BootstrapDialog(
+                    dialogId: groupId,
+                    type: "group",
+                    title: "Regranted",
+                    lastMsgId: 0,
+                    updatedAt: "2026-07-28T00:00:00.000Z",
+                    revision: 2,
+                    memberCount: 2,
+                    selfRole: "member",
+                    members: [
+                        BootstrapDialogMember(
+                            accountId: "account-me", role: "member", lastReadMsgId: 0,
+                            isActive: true
+                        ),
+                    ],
+                    messages: []
+                )],
+                nextCursor: nil,
+                hasMore: false
+            ))
+            let stagedRevoked = try await store.isDialogAccessRevoked(dialogId: groupId)
+            let stagedPurgeCount = try await store.pendingAccessPurgeCount()
+            let stagedDialogs = try await store.dialogs(accountId: "account-me")
+            XCTAssertTrue(stagedRevoked)
+            XCTAssertEqual(stagedPurgeCount, 1)
+            XCTAssertTrue(stagedDialogs.isEmpty)
+        }
+
+        // A process death after page commit must not publish the staged grant or discard cleanup.
+        let relaunched = try CloudLocalStore(path: path, key: key)
+        let relaunchedRevoked = try await relaunched.isDialogAccessRevoked(dialogId: groupId)
+        let relaunchedPurgeCount = try await relaunched.pendingAccessPurgeCount()
+        let relaunchedDialogs = try await relaunched.dialogs(accountId: "account-me")
+        XCTAssertTrue(relaunchedRevoked)
+        XCTAssertEqual(relaunchedPurgeCount, 1)
+        XCTAssertTrue(relaunchedDialogs.isEmpty)
+        try await relaunched.finishBootstrap(accountId: "account-me", pts: 31)
+
+        let revokedAfterBootstrap = try await relaunched.isDialogAccessRevoked(dialogId: groupId)
+        let dialogsAfterBootstrap = try await relaunched.dialogs(accountId: "account-me")
+        XCTAssertFalse(revokedAfterBootstrap)
+        XCTAssertEqual(dialogsAfterBootstrap.first?.title, "Regranted")
+        let finalPurgeCount = try await relaunched.pendingAccessPurgeCount()
+        XCTAssertEqual(finalPurgeCount, 0)
+    }
+
     private func makeStore() throws -> CloudLocalStore {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -313,6 +516,60 @@ final class GroupsV1Tests: XCTestCase {
         return try CloudLocalStore(
             path: directory.appending(path: "groups.sqlite").path,
             key: Data(UUID().uuidString.utf8)
+        )
+    }
+
+    private func groupEnvelope(groupId: String, revision: Int64) -> CloudGroupEnvelope {
+        CloudGroupEnvelope(
+            group: CloudGroup(
+                id: groupId, title: "Group", photo: nil, revision: revision,
+                memberCount: 2, selfRole: "member", notificationMode: "all",
+                createdBy: "owner-a", createdAt: "2026-07-28T00:00:00.000Z",
+                closedAt: nil
+            ),
+            members: [
+                CloudGroupMember(
+                    accountId: "account-me", role: "member",
+                    joinedAt: "2026-07-28T00:00:00.000Z", isActive: true
+                ),
+            ],
+            profiles: [],
+            duplicate: false
+        )
+    }
+
+    private func revocationUpdate(dialogId: String, pts: Int64) -> CloudUpdate {
+        CloudUpdate(
+            pts: pts, ptsCount: 1, type: "dialog.access_revoked",
+            dialogId: dialogId, dialogTitle: nil, dialogType: "group",
+            message: nil, readerAccountId: nil, maxReadMsgId: nil
+        )
+    }
+
+    private func groupGrantUpdate(dialogId: String, pts: Int64) -> CloudUpdate {
+        CloudUpdate(
+            pts: pts, ptsCount: 1, type: "dialog.created",
+            dialogId: dialogId, dialogTitle: "Group", dialogType: "group",
+            message: nil,
+            group: CloudUpdateGroup(
+                id: dialogId, title: "Group", revision: pts, memberCount: 2
+            ),
+            readerAccountId: nil, maxReadMsgId: nil
+        )
+    }
+
+    private func applyRevocation(
+        store: CloudLocalStore,
+        dialogId: String,
+        pts: Int64
+    ) async throws {
+        try await store.applyDifference(
+            DifferenceResponse(
+                kind: "difference", state: .init(pts: pts),
+                updates: [revocationUpdate(dialogId: dialogId, pts: pts)],
+                profiles: [], hasMore: false
+            ),
+            accountId: "account-me"
         )
     }
 }

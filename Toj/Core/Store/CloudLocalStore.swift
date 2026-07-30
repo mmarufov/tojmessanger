@@ -208,6 +208,12 @@ nonisolated struct LocalLaunchSnapshot: Equatable, Sendable {
     let dialogs: [LocalDialog]
 }
 
+nonisolated struct MediaPresentationAuthorization: Equatable, Sendable {
+    let dialogId: String
+    let mediaId: String
+    let accessGeneration: Int64
+}
+
 nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let clientMsgId: String
     var id: String { clientMsgId }
@@ -425,6 +431,14 @@ nonisolated enum CloudLocalStoreBootstrapError: LocalizedError, Equatable, Senda
     }
 }
 
+nonisolated enum CloudLocalStoreAccessError: LocalizedError, Equatable, Sendable {
+    case revoked
+
+    var errorDescription: String? {
+        String(localized: "The dialog is no longer authorized for this account")
+    }
+}
+
 nonisolated private struct StagedBootstrapSnapshot: Sendable {
     let dialogs: [BootstrapDialog]
     let profiles: [CloudProfile]
@@ -447,6 +461,22 @@ nonisolated struct MediaCacheEntry: Equatable, Sendable {
     let state: String
     let lastAccessedAt: String
     let protectedUntil: String?
+}
+
+nonisolated enum AccessPurgePhase: String, Equatable, Sendable {
+    case staged
+    case filesDeleted = "files_deleted"
+}
+
+nonisolated struct AccessPurgeJob: Equatable, Sendable, Identifiable {
+    let id: String
+    let dialogId: String
+    let allMediaIds: Set<String>
+    let purgeMediaIds: Set<String>
+    let encryptedPaths: Set<String>
+    let phase: AccessPurgePhase
+    let attempts: Int
+    let lastError: String?
 }
 
 nonisolated enum MediaDownloadJobState: String, Equatable, Sendable {
@@ -812,6 +842,7 @@ actor CloudLocalStore {
 
     func applyHistoryPage(_ page: HistoryPageResponse) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: page.dialogId) else { return }
             for profile in page.profiles ?? [] {
                 try upsertProfile(db, profile: profile)
             }
@@ -857,6 +888,7 @@ actor CloudLocalStore {
     /// continues from its previously persisted position.
     func applyTargetedHistoryPage(_ page: HistoryPageResponse) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: page.dialogId) else { return }
             for profile in page.profiles ?? [] {
                 try upsertProfile(db, profile: profile)
             }
@@ -895,6 +927,16 @@ actor CloudLocalStore {
                 try upsertProfile(db, profile: profile)
             }
             for dialog in snapshot.dialogs {
+                if let revoked = try Self.revokedDialog(db, dialogId: dialog.dialogId) {
+                    let isAuthoritativeGroupGrant = dialog.type == "group"
+                        && revoked.dialogType == "group"
+                        && dialog.selfRole != nil
+                        && pts > revoked.pts
+                    guard isAuthoritativeGroupGrant else { continue }
+                    // Replacement bootstrap remains invisible and fully purge-fenced until this
+                    // transaction publishes the complete authoritative snapshot.
+                    try restoreGroupAccess(db, dialogId: dialog.dialogId, grantedPts: pts)
+                }
                 try mergeBootstrapDialog(
                     db,
                     accountId: accountId,
@@ -2749,6 +2791,43 @@ actor CloudLocalStore {
         }
     }
 
+    func savedMessagesDialogId(accountId: String) throws -> String? {
+        try dbQueue.read { db in
+            try String.fetchOne(
+                db,
+                sql: """
+                SELECT dialog.dialog_id
+                FROM dialogs dialog
+                JOIN dialog_members member ON member.dialog_id = dialog.dialog_id
+                WHERE dialog.type = 'saved'
+                  AND dialog.access_state = 'active'
+                  AND member.account_id = ?
+                  AND member.is_active = 1
+                ORDER BY dialog.updated_at DESC, dialog.dialog_id
+                LIMIT 1
+                """,
+                arguments: [accountId]
+            )
+        }
+    }
+
+    func ensureSavedDialog(
+        dialogId: String,
+        accountId: String,
+        updatedAt: String?
+    ) throws {
+        try Task.checkCancellation()
+        try dbQueue.write { db in
+            try Task.checkCancellation()
+            try ensureSavedDialog(
+                db,
+                dialogId: dialogId,
+                accountId: accountId,
+                updatedAt: updatedAt
+            )
+        }
+    }
+
     @discardableResult
     func createPendingGroup(
         groupId: String,
@@ -3168,6 +3247,9 @@ actor CloudLocalStore {
 
     func applyGroupEnvelope(_ envelope: CloudGroupEnvelope) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: envelope.group.id) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             for profile in envelope.profiles {
                 try upsertProfile(db, profile: profile)
             }
@@ -3189,6 +3271,9 @@ actor CloudLocalStore {
 
     func applyGroupMembersPage(_ page: CloudGroupMembersPage, generation: String) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: page.group.id) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             for profile in page.profiles {
                 try upsertProfile(db, profile: profile)
             }
@@ -3245,8 +3330,14 @@ actor CloudLocalStore {
                 let dialogId: String = purge["dialog_id"]
                 let kind: String = purge["kind"]
                 if kind == "messages" {
-                    try db.execute(sql: "DELETE FROM messages WHERE dialog_id = ?", arguments: [dialogId])
-                    try db.execute(sql: "DELETE FROM message_media WHERE dialog_id = ?", arguments: [dialogId])
+                    try db.execute(
+                        sql: "DELETE FROM messages WHERE dialog_id = ?",
+                        arguments: [dialogId]
+                    )
+                    try db.execute(
+                        sql: "DELETE FROM message_media WHERE dialog_id = ?",
+                        arguments: [dialogId]
+                    )
                 } else {
                     let payload: String? = purge["payload"]
                     let mediaIds = payload?
@@ -3263,9 +3354,228 @@ actor CloudLocalStore {
                         )
                     }
                 }
-                try db.execute(sql: "DELETE FROM pending_purges WHERE id = ?", arguments: [id])
+                try db.execute(
+                    sql: "DELETE FROM pending_purges WHERE id = ?",
+                    arguments: [id]
+                )
             }
             return purges.count
+        }
+    }
+
+    func pendingAccessPurgeJobs(
+        limit: Int = 20,
+        excluding excludedIds: Set<String> = []
+    ) throws -> [AccessPurgeJob] {
+        try dbQueue.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                SELECT id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                       encrypted_paths_json, phase, attempts, last_error
+                FROM pending_access_purges
+                WHERE id NOT IN (SELECT value FROM json_each(?))
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                arguments: [
+                    Self.encodeStringSet(excludedIds),
+                    max(1, min(100, limit)),
+                ]
+            ).compactMap(Self.accessPurgeJob(from:))
+        }
+    }
+
+    func pendingAccessPurgeCount() throws -> Int {
+        try dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT count(*) FROM pending_access_purges") ?? 0
+        }
+    }
+
+    /// Re-snapshots revocation state after UI/network media tasks have been cancelled and awaited.
+    /// This closes the window where an in-flight upload persisted its encrypted path after the
+    /// original difference transaction staged the purge.
+    func refreshAccessPurgeJob(id: String) throws -> AccessPurgeJob? {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                       encrypted_paths_json, phase, attempts, last_error
+                FROM pending_access_purges WHERE id = ?
+                """,
+                arguments: [id]
+            ) else { return nil }
+            guard AccessPurgePhase(rawValue: row["phase"]) == .staged else {
+                return Self.accessPurgeJob(from: row)
+            }
+            let dialogId: String = row["dialog_id"]
+            let previousMediaIds = Self.decodeStringSet(row["all_media_ids_json"])
+            let currentMediaIds = Set(try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
+                arguments: [dialogId]
+            ))
+            let allMediaIds = previousMediaIds.union(currentMediaIds)
+            let purgeMediaIds = try Set(allMediaIds.filter { mediaId in
+                try !Bool.fetchOne(
+                    db,
+                    sql: """
+                    SELECT EXISTS (
+                      SELECT 1 FROM message_media
+                      WHERE media_id = ? AND dialog_id <> ?
+                    )
+                    """,
+                    arguments: [mediaId, dialogId]
+                )!
+            })
+            let previousPaths = Self.decodeStringSet(row["encrypted_paths_json"])
+            let allCachePaths = Set(try String.fetchAll(
+                db,
+                sql: """
+                SELECT encrypted_path FROM media_cache_entries
+                WHERE media_id IN (SELECT value FROM json_each(?))
+                """,
+                arguments: [Self.encodeStringSet(allMediaIds)]
+            ))
+            let currentPaths = Set(try String.fetchAll(
+                db,
+                sql: """
+                SELECT encrypted_path FROM media_cache_entries
+                WHERE media_id IN (SELECT value FROM json_each(?))
+                UNION
+                SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+                UNION
+                SELECT encrypted_thumbnail_path FROM media_transfers
+                WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+                """,
+                arguments: [
+                    Self.encodeStringSet(purgeMediaIds), dialogId, dialogId,
+                ]
+            ))
+            // Keep prior upload paths after their rows were zeroed, but re-derive cache paths so a
+            // late forwarded reference can turn an originally-exclusive media object into shared.
+            let encryptedPaths = previousPaths.subtracting(allCachePaths).union(currentPaths)
+            try db.execute(
+                sql: """
+                UPDATE pending_access_purges
+                SET all_media_ids_json = ?, purge_media_ids_json = ?,
+                    encrypted_paths_json = ?, updated_at = datetime('now')
+                WHERE id = ? AND phase = 'staged'
+                """,
+                arguments: [
+                    Self.encodeStringSet(allMediaIds), Self.encodeStringSet(purgeMediaIds),
+                    Self.encodeStringSet(encryptedPaths), id,
+                ]
+            )
+
+            let pendingLocalIds = try String.fetchAll(
+                db,
+                sql: "SELECT local_id FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
+                arguments: [dialogId]
+            )
+            for localId in pendingLocalIds {
+                try db.execute(
+                    sql: "DELETE FROM message_media WHERE local_id = ?",
+                    arguments: [localId]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
+                arguments: [dialogId]
+            )
+            for table in [
+                "pending_outbox", "media_transfers", "pending_message_mutations",
+                "pending_group_mutations", "media_download_jobs",
+            ] {
+                try db.execute(
+                    sql: "DELETE FROM \(table) WHERE dialog_id = ?",
+                    arguments: [dialogId]
+                )
+            }
+            return AccessPurgeJob(
+                id: id,
+                dialogId: dialogId,
+                allMediaIds: allMediaIds,
+                purgeMediaIds: purgeMediaIds,
+                encryptedPaths: encryptedPaths,
+                phase: .staged,
+                attempts: row["attempts"],
+                lastError: row["last_error"]
+            )
+        }
+    }
+
+    func markAccessPurgeFailed(id: String, error: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_access_purges
+                SET attempts = attempts + 1, last_error = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                arguments: [String(error.prefix(1_000)), id]
+            )
+        }
+    }
+
+    func markAccessPurgeFilesDeleted(id: String) throws {
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                UPDATE pending_access_purges
+                SET phase = 'files_deleted', attempts = attempts + 1, last_error = NULL,
+                    updated_at = datetime('now')
+                WHERE id = ? AND phase = 'staged'
+                """,
+                arguments: [id]
+            )
+        }
+    }
+
+    func finalizeAccessPurge(id: String) throws {
+        try dbQueue.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                SELECT dialog_id, purge_media_ids_json
+                FROM pending_access_purges
+                WHERE id = ? AND phase = 'files_deleted'
+                """,
+                arguments: [id]
+            ) else { return }
+            let dialogId: String = row["dialog_id"]
+            let purgeMediaIds = Self.decodeStringSet(row["purge_media_ids_json"])
+            for mediaId in purgeMediaIds {
+                try db.execute(
+                    sql: "DELETE FROM media_cache_entries WHERE media_id = ?",
+                    arguments: [mediaId]
+                )
+                try db.execute(
+                    sql: "DELETE FROM media_download_jobs WHERE media_id = ?",
+                    arguments: [mediaId]
+                )
+            }
+            for table in [
+                "message_reactions", "message_mentions", "message_media", "messages",
+                "dialog_members", "dialog_unread_summaries", "dialog_summaries",
+                "pending_outbox", "pending_read_receipts", "chat_viewport_state",
+                "dialog_history_state", "group_member_hydration", "pending_group_mutations",
+                "media_transfers", "media_download_jobs", "bootstrap_baseline_dialogs",
+                "bootstrap_staged_messages", "bootstrap_staged_members",
+                "bootstrap_staged_dialogs", "pending_purges",
+            ] {
+                try db.execute(
+                    sql: "DELETE FROM \(table) WHERE dialog_id = ?",
+                    arguments: [dialogId]
+                )
+            }
+            try db.execute(
+                sql: "DELETE FROM pending_group_creations WHERE group_id = ?",
+                arguments: [dialogId]
+            )
+            try db.execute(sql: "DELETE FROM dialogs WHERE dialog_id = ?", arguments: [dialogId])
+            try db.execute(sql: "DELETE FROM pending_access_purges WHERE id = ?", arguments: [id])
         }
     }
 
@@ -3280,14 +3590,22 @@ actor CloudLocalStore {
         requiresCloudDraftSync: Bool = true,
         forwardedFromAccountId: String? = nil,
         forwardedFromDialogId: String? = nil,
-        forwardedFromMsgId: Int64? = nil
+        forwardedFromMsgId: Int64? = nil,
+        kind: String = "text",
+        media: CloudMedia? = nil
     ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
         let mentionsJSON = try String(
             data: JSONEncoder().encode(mentions),
             encoding: .utf8
         ) ?? "[]"
+        let mediaJSON = media
+            .flatMap { try? JSONEncoder().encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try upsertDialog(db, dialogId: dialogId, type: "direct", title: nil, lastMsgId: 0, updatedAt: nil)
             try db.execute(
                 sql: """
@@ -3295,10 +3613,11 @@ actor CloudLocalStore {
                   local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
                   reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
                   forwarded_from_msg_id, is_forwarded, mentions_json,
-                  edit_version, state, server_ts, local_state
+                  media_json, edit_version, state, server_ts, local_state
                 )
-                VALUES (?, ?, NULL, ?, ?, 'text', ?, ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
+                VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'visible', NULL, 'sending')
                 ON CONFLICT(client_msg_id) DO UPDATE SET
+                  kind = excluded.kind,
                   text = excluded.text,
                   reply_to_msg_id = excluded.reply_to_msg_id,
                   forwarded_from_account_id = excluded.forwarded_from_account_id,
@@ -3306,14 +3625,24 @@ actor CloudLocalStore {
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   is_forwarded = excluded.is_forwarded,
                   mentions_json = excluded.mentions_json,
+                  media_json = excluded.media_json,
                   local_state = 'sending'
                 """,
                 arguments: [
-                    localId, dialogId, clientMsgId, senderAccountId, text, replyToMsgId,
+                    localId, dialogId, clientMsgId, senderAccountId, kind, text, replyToMsgId,
                     forwardedFromAccountId, forwardedFromDialogId, forwardedFromMsgId,
-                    forwardedFromMsgId != nil, mentionsJSON
+                    forwardedFromMsgId != nil, mentionsJSON, mediaJSON
                 ]
             )
+            if let media {
+                try Self.upsertMessageMedia(
+                    db,
+                    localId: localId,
+                    dialogId: dialogId,
+                    msgId: nil,
+                    media: media
+                )
+            }
             try db.execute(
                 sql: """
                 INSERT INTO pending_outbox (
@@ -3377,7 +3706,7 @@ actor CloudLocalStore {
             clientMsgId: clientMsgId,
             senderAccountId: senderAccountId,
             senderDisplayName: nil,
-            kind: "text",
+            kind: kind,
             text: text,
             replyToMsgId: replyToMsgId,
             forwardedFromAccountId: forwardedFromAccountId,
@@ -3386,7 +3715,7 @@ actor CloudLocalStore {
             isForwarded: forwardedFromMsgId != nil,
             reactions: [],
             mentions: mentions,
-            media: nil,
+            media: media,
             serviceType: nil,
             serviceData: nil,
             editVersion: 0,
@@ -3444,25 +3773,47 @@ actor CloudLocalStore {
         }
     }
 
-    func removeUnsentMessage(clientMsgId: String) throws {
+    /// Atomically removes a terminal optimistic send and its target attachment reference. Cached
+    /// bytes are keyed by media_id and intentionally remain because the source message may share
+    /// them.
+    func removePendingOutboxMessage(clientMsgId: String) throws {
         try dbQueue.write { db in
-            let dialogId = try String.fetchOne(
+            guard let row = try Row.fetchOne(
                 db,
-                sql: "SELECT dialog_id FROM messages WHERE client_msg_id = ?",
+                sql: """
+                SELECT local_id, dialog_id
+                FROM messages
+                WHERE client_msg_id = ? AND msg_id IS NULL
+                """,
                 arguments: [clientMsgId]
-            )
+            ) else {
+                try db.execute(
+                    sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                    arguments: [clientMsgId]
+                )
+                return
+            }
+            let localId: String = row["local_id"]
+            let dialogId: String = row["dialog_id"]
             try db.execute(
                 sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
                 arguments: [clientMsgId]
             )
             try db.execute(
+                sql: "DELETE FROM message_media WHERE local_id = ?",
+                arguments: [localId]
+            )
+            try db.execute(
                 sql: "DELETE FROM messages WHERE client_msg_id = ? AND msg_id IS NULL",
                 arguments: [clientMsgId]
             )
-            if let dialogId {
-                try refreshDialogSummary(db, dialogId: dialogId)
-            }
+            try refreshDialogSummary(db, dialogId: dialogId)
+            try refreshAllUnreadSummaries(db, dialogId: dialogId)
         }
+    }
+
+    func removeUnsentMessage(clientMsgId: String) throws {
+        try removePendingOutboxMessage(clientMsgId: clientMsgId)
     }
 
     /// Removes only an invalid reply edge after a typed server rejection. The original composer
@@ -3562,6 +3913,13 @@ actor CloudLocalStore {
 
     func markSent(_ response: SendMessageResponse, senderAccountId: String) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: response.dialogId) else {
+                try db.execute(
+                    sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                    arguments: [response.clientMsgId]
+                )
+                return
+            }
             let outboxDraftOperationId = try String.fetchOne(
                 db,
                 sql: """
@@ -3658,6 +4016,9 @@ actor CloudLocalStore {
         caption: String, replyToMsgId: Int64?, purpose: String = "message"
     ) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try db.execute(
                 sql: """
                 INSERT INTO media_transfers (
@@ -3865,12 +4226,16 @@ actor CloudLocalStore {
 
     func insertSendingMedia(_ transfer: MediaTransferRecord, senderAccountId: String) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: transfer.dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try upsertSendingMedia(db, transfer: transfer, senderAccountId: senderAccountId)
         }
     }
 
     func applyMessageMutation(_ response: MessageMutationResponse) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: response.message.dialogId) else { return }
             try upsertMessage(db, message: response.message, localState: "sent")
         }
     }
@@ -3885,6 +4250,9 @@ actor CloudLocalStore {
         emoji: String? = nil
     ) throws {
         try dbQueue.write { db in
+            guard try !Self.isDialogRevoked(db, dialogId: dialogId) else {
+                throw CloudLocalStoreAccessError.revoked
+            }
             try db.execute(
                 sql: """
                 INSERT INTO pending_message_mutations (
@@ -4050,10 +4418,104 @@ actor CloudLocalStore {
                 return
             } else {
                 var messageDialogsToRefresh: Set<String> = []
-                for profile in difference.profiles ?? [] {
+                let updates = difference.updates ?? []
+                // Saved access is owner-only and non-regrantable. Pre-install any Saved revoke in
+                // this page so a legacy receipt that precedes it cannot persist archive/profile
+                // data. Group access remains strictly sequential to preserve remove then re-add.
+                for update in updates where update.type == "dialog.access_revoked"
+                    && update.dialogType == "saved" {
+                    guard let dialogId = update.dialogId else { continue }
+                    try db.execute(
+                        sql: """
+                        INSERT INTO revoked_dialogs (
+                          dialog_id, dialog_type, revoked_pts, created_at
+                        ) VALUES (?, 'saved', ?, datetime('now'))
+                        ON CONFLICT(dialog_id) DO UPDATE SET
+                          dialog_type = 'saved',
+                          revoked_pts = MAX(revoked_dialogs.revoked_pts, excluded.revoked_pts)
+                        """,
+                        arguments: [dialogId, update.pts]
+                    )
+                }
+                let pageDialogIds = Set(updates.compactMap(\.dialogId))
+                var simulatedRevocations: [
+                    String: (dialogType: String?, pts: Int64)
+                ] = [:]
+                for dialogId in pageDialogIds {
+                    simulatedRevocations[dialogId] = try Self.revokedDialog(
+                        db, dialogId: dialogId
+                    )
+                }
+                var blockedUpdates: [Bool] = []
+                blockedUpdates.reserveCapacity(updates.count)
+                for update in updates {
+                    guard let dialogId = update.dialogId else {
+                        blockedUpdates.append(false)
+                        continue
+                    }
+                    if update.type == "dialog.access_revoked" {
+                        let previous = simulatedRevocations[dialogId]
+                        simulatedRevocations[dialogId] = (
+                            update.dialogType ?? previous?.dialogType,
+                            max(previous?.pts ?? 0, update.pts)
+                        )
+                        blockedUpdates.append(true)
+                        continue
+                    }
+                    if update.type == "dialog.created",
+                       let revoked = simulatedRevocations[dialogId],
+                       revoked.dialogType == "group",
+                       update.dialogType == "group",
+                       update.pts > revoked.pts {
+                        simulatedRevocations[dialogId] = nil
+                        blockedUpdates.append(false)
+                        continue
+                    }
+                    blockedUpdates.append(simulatedRevocations[dialogId] != nil)
+                }
+                var blockedProfileIds: Set<String> = []
+                var visibleProfileIds: Set<String> = []
+                var hasVisibleNonRevocation = false
+                for (index, update) in updates.enumerated()
+                    where update.type != "dialog.access_revoked" {
+                    let isBlocked = blockedUpdates[index]
+                    if isBlocked {
+                        blockedProfileIds.formUnion(Self.referencedAccountIds(update))
+                    } else {
+                        hasVisibleNonRevocation = true
+                        visibleProfileIds.formUnion(Self.referencedAccountIds(update))
+                    }
+                }
+                // A legacy page can carry message/profile receipts for a dialog that is reconciled
+                // to access_revoked later in that same page. Suppress the entire profile payload if
+                // no authorized update remains; in a mixed page, suppress identities referenced only
+                // by blocked updates while retaining ordinary lifecycle actor profiles.
+                let visibleProfiles = hasVisibleNonRevocation
+                    ? (difference.profiles ?? []).filter {
+                        !blockedProfileIds.contains($0.accountId)
+                            || visibleProfileIds.contains($0.accountId)
+                    }
+                    : []
+                for profile in visibleProfiles {
                     try upsertProfile(db, profile: profile)
                 }
-                for update in difference.updates ?? [] {
+                for update in updates {
+                    if let dialogId = update.dialogId,
+                       update.type != "dialog.access_revoked",
+                       let revoked = try Self.revokedDialog(db, dialogId: dialogId) {
+                        let isNewerGroupGrant = update.type == "dialog.created"
+                            && revoked.dialogType == "group"
+                            && update.dialogType == "group"
+                            && update.pts > revoked.pts
+                        guard isNewerGroupGrant else {
+                            // Delayed history/member/mutation receipts cannot resurrect a revoked
+                            // dialog. Saved tombstones never satisfy the group-only grant predicate.
+                            continue
+                        }
+                        try restoreGroupAccess(
+                            db, dialogId: dialogId, grantedPts: update.pts
+                        )
+                    }
                     if update.type == "dialog.preferences_updated",
                        let preferences = update.preferences {
                         try upsertDialogPreferences(
@@ -4119,6 +4581,12 @@ actor CloudLocalStore {
                             localState: "sent",
                             refreshSummaries: false
                         )
+                        // A push/difference can beat the HTTP response or arrive after a process
+                        // relaunch. Canonical client_msg_id acknowledgement owns outbox cleanup.
+                        try db.execute(
+                            sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
+                            arguments: [message.clientMsgId]
+                        )
                         let isUnread = message.state == "visible"
                             && message.senderAccountId != accountId
                             && message.msgId > currentRead
@@ -4145,6 +4613,15 @@ actor CloudLocalStore {
                         guard let dialogId = update.dialogId else { continue }
                         let durableType = update.dialogType
                             ?? (update.group == nil ? "direct" : "group")
+                        if durableType == "saved" {
+                            try ensureSavedDialog(
+                                db,
+                                dialogId: dialogId,
+                                accountId: accountId,
+                                updatedAt: nil
+                            )
+                            continue
+                        }
                         try upsertDialog(
                             db,
                             dialogId: dialogId,
@@ -4189,11 +4666,16 @@ actor CloudLocalStore {
                         }
                     case "dialog.access_revoked":
                         guard let dialogId = update.dialogId else { continue }
+                        let reason = update.dialogType == "saved"
+                            ? "This Saved Messages archive is no longer authorized for this account."
+                            : "You no longer have access to this group."
                         try revokeGroupAccess(
                             db,
                             dialogId: dialogId,
                             accessState: "removed",
-                            reason: "You no longer have access to this group."
+                            reason: reason,
+                            revokedPts: update.pts,
+                            explicitDialogType: update.dialogType
                         )
                     case "read.updated":
                         guard
@@ -5138,6 +5620,92 @@ actor CloudLocalStore {
         }
     }
 
+    func isDialogAccessRevoked(dialogId: String) throws -> Bool {
+        try dbQueue.read { db in
+            try Self.isDialogRevoked(db, dialogId: dialogId)
+        }
+    }
+
+    func isMediaPresentable(mediaId: String, dialogId: String) throws -> Bool {
+        try mediaPresentationAuthorization(
+            mediaId: mediaId,
+            dialogId: dialogId
+        ) != nil
+    }
+
+    func mediaPresentationAuthorization(
+        mediaId: String,
+        dialogId: String? = nil
+    ) throws -> MediaPresentationAuthorization? {
+        try dbQueue.read { db in
+            try Row.fetchOne(
+                db,
+                sql: """
+                SELECT media.dialog_id, media.media_id,
+                       COALESCE(access.generation, 0) AS access_generation
+                FROM message_media AS media
+                JOIN dialogs AS dialog ON dialog.dialog_id = media.dialog_id
+                LEFT JOIN dialog_access_generations AS access
+                  ON access.dialog_id = media.dialog_id
+                WHERE media.media_id = ?
+                  AND (? IS NULL OR media.dialog_id = ?)
+                  AND dialog.access_state = 'active'
+                  AND COALESCE(access.authorized, 1) = 1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM revoked_dialogs revoked
+                    WHERE revoked.dialog_id = media.dialog_id
+                  )
+                ORDER BY media.dialog_id
+                LIMIT 1
+                """,
+                arguments: [mediaId, dialogId, dialogId]
+            ).map {
+                MediaPresentationAuthorization(
+                    dialogId: $0["dialog_id"],
+                    mediaId: $0["media_id"],
+                    accessGeneration: $0["access_generation"]
+                )
+            }
+        }
+    }
+
+    func validatesMediaPresentationAuthorization(
+        _ authorization: MediaPresentationAuthorization
+    ) throws -> Bool {
+        try mediaPresentationAuthorization(
+            mediaId: authorization.mediaId,
+            dialogId: authorization.dialogId
+        ) == authorization
+    }
+
+    func containsProfile(accountId: String) throws -> Bool {
+        try dbQueue.read { db in
+            try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM profiles WHERE account_id = ?)",
+                arguments: [accountId]
+            ) ?? false
+        }
+    }
+
+    nonisolated private static func referencedAccountIds(_ update: CloudUpdate) -> Set<String> {
+        var result = Set([
+            update.readerAccountId,
+            update.subjectAccountId,
+            update.peerAccountId,
+            update.member?.accountId,
+            update.message?.senderAccountId,
+            update.message?.forwardedFromAccountId,
+            update.message?.serviceData?.actorAccountId,
+            update.message?.serviceData?.subjectAccountId,
+            update.message?.serviceData?.successorAccountId,
+        ].compactMap { $0 })
+        result.formUnion(update.message?.reactions.map(\.accountId) ?? [])
+        result.formUnion(update.message?.mentions.map(\.accountId) ?? [])
+        result.formUnion(update.message?.serviceData?.memberAccountIds ?? [])
+        return result
+    }
+
     func observeDialogs(accountId: String) -> AsyncThrowingStream<[LocalDialog], Error> {
         let values = ValueObservation
             .tracking { db in try Self.fetchDialogs(db, accountId: accountId) }
@@ -5881,6 +6449,120 @@ actor CloudLocalStore {
             );
             CREATE INDEX IF NOT EXISTS pending_purges_dialog_idx
               ON pending_purges(dialog_id, created_at);
+            """)
+        }
+
+        migrator.registerMigration("v10-access-purge-state-machine") { db in
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS pending_access_purges (
+              id TEXT PRIMARY KEY,
+              dialog_id TEXT NOT NULL UNIQUE,
+              all_media_ids_json TEXT NOT NULL,
+              purge_media_ids_json TEXT NOT NULL,
+              encrypted_paths_json TEXT NOT NULL,
+              phase TEXT NOT NULL CHECK (phase IN ('staged','files_deleted')),
+              attempts INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_access_purges_ready_idx
+              ON pending_access_purges(phase, created_at, id);
+            """)
+
+            // Upgrade interrupted v9 purges without dropping their durable intent. Media shared by
+            // another dialog is excluded from physical deletion.
+            let legacyDialogs = try String.fetchAll(
+                db,
+                sql: "SELECT DISTINCT dialog_id FROM pending_purges ORDER BY dialog_id"
+            )
+            for dialogId in legacyDialogs {
+                let payload = try String.fetchOne(
+                    db,
+                    sql: """
+                    SELECT payload FROM pending_purges
+                    WHERE dialog_id = ? AND kind = 'media'
+                    ORDER BY created_at LIMIT 1
+                    """,
+                    arguments: [dialogId]
+                )
+                let allMediaIds = decodeStringSet(payload)
+                let purgeMediaIds = try Set(allMediaIds.filter { mediaId in
+                    try !Bool.fetchOne(
+                        db,
+                        sql: """
+                        SELECT EXISTS (
+                          SELECT 1 FROM message_media
+                          WHERE media_id = ? AND dialog_id <> ?
+                        )
+                        """,
+                        arguments: [mediaId, dialogId]
+                    )!
+                })
+                let encryptedPaths = try String.fetchAll(
+                    db,
+                    sql: """
+                    SELECT encrypted_path FROM media_cache_entries
+                    WHERE media_id IN (
+                      SELECT value FROM json_each(?)
+                    )
+                    UNION
+                    SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+                    UNION
+                    SELECT encrypted_thumbnail_path FROM media_transfers
+                    WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+                    """,
+                    arguments: [
+                        encodeStringSet(purgeMediaIds), dialogId, dialogId,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                    INSERT OR IGNORE INTO pending_access_purges (
+                      id, dialog_id, all_media_ids_json, purge_media_ids_json,
+                      encrypted_paths_json, phase, attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'staged', 0, datetime('now'), datetime('now'))
+                    """,
+                    arguments: [
+                        UUID().uuidString.lowercased(), dialogId,
+                        encodeStringSet(allMediaIds), encodeStringSet(purgeMediaIds),
+                        encodeStringSet(Set(encryptedPaths)),
+                    ]
+                )
+            }
+        }
+
+        migrator.registerMigration("v11-access-revocation-fences") { db in
+            let purgeColumns = try db.columns(in: "pending_access_purges").map(\.name)
+            if !purgeColumns.contains("last_error") {
+                try db.execute(
+                    sql: "ALTER TABLE pending_access_purges ADD COLUMN last_error TEXT"
+                )
+            }
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS revoked_dialogs (
+              dialog_id TEXT PRIMARY KEY,
+              dialog_type TEXT,
+              revoked_pts INTEGER NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            """)
+        }
+
+        migrator.registerMigration("v12-dialog-access-generations") { db in
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS dialog_access_generations (
+              dialog_id TEXT PRIMARY KEY,
+              generation INTEGER NOT NULL,
+              authorized INTEGER NOT NULL CHECK (authorized IN (0, 1)),
+              dialog_type TEXT,
+              last_pts INTEGER NOT NULL
+            );
+
+            INSERT OR IGNORE INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            )
+            SELECT dialog_id, 1, 0, dialog_type, revoked_pts
+            FROM revoked_dialogs;
             """)
         }
 
@@ -6782,6 +7464,15 @@ actor CloudLocalStore {
     ) throws {
         let encoder = JSONEncoder()
         for dialog in page.dialogs {
+            if let revoked = try Self.revokedDialog(db, dialogId: dialog.dialogId) {
+                let isAuthoritativeGroupGrant = dialog.type == "group"
+                    && revoked.dialogType == "group"
+                    && dialog.selfRole != nil
+                    && page.state.pts > revoked.pts
+                guard isAuthoritativeGroupGrant else { continue }
+                // Stage the grant, but preserve the tombstone and purge job. finishBootstrap owns
+                // the only atomic transition from the old published replica to this snapshot.
+            }
             let photoJSON = dialog.photo
                 .flatMap { try? encoder.encode($0) }
                 .flatMap { String(data: $0, encoding: .utf8) }
@@ -7020,6 +7711,7 @@ actor CloudLocalStore {
         dialog: BootstrapDialog,
         pruneSnapshotWindow: Bool
     ) throws {
+        guard try !Self.isDialogRevoked(db, dialogId: dialog.dialogId) else { return }
         let existingReadRows = try Row.fetchAll(
             db,
             sql: "SELECT account_id, last_read_msg_id FROM dialog_members WHERE dialog_id = ?",
@@ -7787,15 +8479,67 @@ actor CloudLocalStore {
         _ db: Database,
         dialogId: String,
         accessState: String,
-        reason: String
+        reason: String,
+        revokedPts: Int64 = 0,
+        explicitDialogType: String? = nil
     ) throws {
-        let mediaIds = try String.fetchAll(
+        let storedDialogType = try String.fetchOne(
+            db,
+            sql: "SELECT type FROM dialogs WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
+        let dialogType = explicitDialogType ?? storedDialogType
+        try recordDialogRevocation(
+            db,
+            dialogId: dialogId,
+            dialogType: dialogType,
+            revokedPts: revokedPts
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO revoked_dialogs (dialog_id, dialog_type, revoked_pts, created_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              dialog_type = COALESCE(excluded.dialog_type, revoked_dialogs.dialog_type),
+              revoked_pts = MAX(revoked_dialogs.revoked_pts, excluded.revoked_pts)
+            """,
+            arguments: [dialogId, dialogType, revokedPts]
+        )
+        // Receipt replay after a completed purge refreshes the durable tombstone only. It must not
+        // create an empty purge job or any presentation state.
+        guard storedDialogType != nil else { return }
+        let mediaIds = Set(try String.fetchAll(
             db,
             sql: "SELECT DISTINCT media_id FROM message_media WHERE dialog_id = ?",
             arguments: [dialogId]
-        )
-        let mediaPayload = try JSONEncoder().encode(mediaIds)
-        let mediaJSON = String(data: mediaPayload, encoding: .utf8) ?? "[]"
+        ))
+        let purgeMediaIds = try Set(mediaIds.filter { mediaId in
+            try !Bool.fetchOne(
+                db,
+                sql: """
+                SELECT EXISTS (
+                  SELECT 1 FROM message_media
+                  WHERE media_id = ? AND dialog_id <> ?
+                )
+                """,
+                arguments: [mediaId, dialogId]
+            )!
+        })
+        let encryptedPaths = Set(try String.fetchAll(
+            db,
+            sql: """
+            SELECT encrypted_path FROM media_cache_entries
+            WHERE media_id IN (SELECT value FROM json_each(?))
+            UNION
+            SELECT encrypted_source_path FROM media_transfers WHERE dialog_id = ?
+            UNION
+            SELECT encrypted_thumbnail_path FROM media_transfers
+            WHERE dialog_id = ? AND encrypted_thumbnail_path IS NOT NULL
+            """,
+            arguments: [
+                Self.encodeStringSet(purgeMediaIds), dialogId, dialogId,
+            ]
+        ))
         // Access state is the first write in this transaction so every observation hides the
         // conversation even if the process exits before the durable purge is drained.
         try db.execute(
@@ -7803,73 +8547,180 @@ actor CloudLocalStore {
             arguments: [accessState, dialogId]
         )
         try db.execute(
-            sql: "UPDATE pending_outbox SET terminal = 1 WHERE dialog_id = ?",
+            sql: """
+            INSERT INTO pending_access_purges (
+              id, dialog_id, all_media_ids_json, purge_media_ids_json,
+              encrypted_paths_json, phase, attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'staged', 0, datetime('now'), datetime('now'))
+            ON CONFLICT(dialog_id) DO NOTHING
+            """,
+            arguments: [
+                UUID().uuidString.lowercased(), dialogId,
+                Self.encodeStringSet(mediaIds), Self.encodeStringSet(purgeMediaIds),
+                Self.encodeStringSet(encryptedPaths),
+            ]
+        )
+        // Remove plaintext/outbox and encrypted-upload payloads immediately. The canonical message
+        // archive stays hidden until encrypted files are gone, then finalization removes all SQL.
+        let pendingLocalIds = try String.fetchAll(
+            db,
+            sql: "SELECT local_id FROM messages WHERE dialog_id = ? AND msg_id IS NULL",
+            arguments: [dialogId]
+        )
+        for localId in pendingLocalIds {
+            try db.execute(sql: "DELETE FROM message_media WHERE local_id = ?", arguments: [localId])
+        }
+        try db.execute(sql: "DELETE FROM messages WHERE dialog_id = ? AND msg_id IS NULL", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_outbox WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM media_transfers WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_message_mutations WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(sql: "DELETE FROM pending_group_mutations WHERE dialog_id = ?", arguments: [dialogId])
+        try db.execute(
+            sql: "DELETE FROM pending_draft_dependencies WHERE dialog_id = ?",
             arguments: [dialogId]
         )
         try db.execute(
-            sql: "UPDATE media_transfers SET terminal = 1, last_error = ? WHERE dialog_id = ?",
-            arguments: [reason, dialogId]
+            sql: "DELETE FROM pending_draft_mutations WHERE dialog_id = ?",
+            arguments: [dialogId]
         )
         try db.execute(
             sql: """
-            UPDATE pending_message_mutations
-            SET terminal = 1, last_error = ?
-            WHERE dialog_id = ?
+            DELETE FROM pending_media_group_cleanup
+            WHERE client_group_id IN (
+              SELECT client_group_id FROM pending_media_group_sends WHERE dialog_id = ?
+            )
             """,
-            arguments: [reason, dialogId]
+            arguments: [dialogId]
         )
         try db.execute(
-            sql: """
-            UPDATE pending_group_mutations
-            SET terminal = 1, last_error = ?
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
+            sql: "DELETE FROM pending_media_group_sends WHERE dialog_id = ?",
+            arguments: [dialogId]
         )
         try db.execute(
-            sql: """
-            UPDATE pending_draft_mutations
-            SET terminal = 1, last_error = ?, next_retry_at = NULL
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
+            sql: "DELETE FROM draft_attachments WHERE dialog_id = ?",
+            arguments: [dialogId]
         )
         try db.execute(
-            sql: """
-            UPDATE pending_media_group_sends
-            SET terminal = 1, last_error = ?, next_retry_at = NULL
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
-        )
-        try db.execute(
-            sql: """
-            UPDATE drafts SET terminal = 1, last_error = ?
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
-        )
-        try db.execute(
-            sql: """
-            UPDATE draft_attachments
-            SET state = 'terminal', last_error = ?
-            WHERE dialog_id = ?
-            """,
-            arguments: [reason, dialogId]
+            sql: "DELETE FROM drafts WHERE dialog_id = ?",
+            arguments: [dialogId]
         )
         try db.execute(sql: "DELETE FROM media_download_jobs WHERE dialog_id = ?", arguments: [dialogId])
         try db.execute(sql: "DELETE FROM dialog_unread_summaries WHERE dialog_id = ?", arguments: [dialogId])
         try db.execute(sql: "DELETE FROM group_member_hydration WHERE dialog_id = ?", arguments: [dialogId])
+    }
+
+    nonisolated private static func encodeStringSet(_ values: Set<String>) -> String {
+        let data = (try? JSONEncoder().encode(values.sorted())) ?? Data("[]".utf8)
+        return String(data: data, encoding: .utf8) ?? "[]"
+    }
+
+    nonisolated private static func decodeStringSet(_ value: String?) -> Set<String> {
+        guard
+            let value,
+            let data = value.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return Set(decoded)
+    }
+
+    nonisolated private static func accessPurgeJob(from row: Row) -> AccessPurgeJob? {
+        guard let phase = AccessPurgePhase(rawValue: row["phase"]) else { return nil }
+        return AccessPurgeJob(
+            id: row["id"],
+            dialogId: row["dialog_id"],
+            allMediaIds: decodeStringSet(row["all_media_ids_json"]),
+            purgeMediaIds: decodeStringSet(row["purge_media_ids_json"]),
+            encryptedPaths: decodeStringSet(row["encrypted_paths_json"]),
+            phase: phase,
+            attempts: row["attempts"],
+            lastError: row["last_error"]
+        )
+    }
+
+    nonisolated private static func isDialogRevoked(
+        _ db: Database,
+        dialogId: String
+    ) throws -> Bool {
+        try Bool.fetchOne(
+            db,
+            sql: "SELECT EXISTS(SELECT 1 FROM revoked_dialogs WHERE dialog_id = ?)",
+            arguments: [dialogId]
+        ) ?? false
+    }
+
+    nonisolated private static func revokedDialog(
+        _ db: Database,
+        dialogId: String
+    ) throws -> (dialogType: String?, pts: Int64)? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+            SELECT dialog_type, revoked_pts
+            FROM revoked_dialogs
+            WHERE dialog_id = ?
+            """,
+            arguments: [dialogId]
+        ) else { return nil }
+        return (row["dialog_type"], row["revoked_pts"])
+    }
+
+    private func recordDialogRevocation(
+        _ db: Database,
+        dialogId: String,
+        dialogType: String?,
+        revokedPts: Int64
+    ) throws {
         try db.execute(
             sql: """
-            INSERT INTO pending_purges (id, dialog_id, kind, payload, created_at)
-            VALUES (?, ?, 'media', ?, datetime('now')),
-                   (?, ?, 'messages', NULL, datetime('now'))
+            INSERT INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            ) VALUES (?, 1, 0, ?, ?)
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              generation = CASE
+                WHEN dialog_access_generations.authorized = 1
+                  OR excluded.last_pts > dialog_access_generations.last_pts
+                THEN dialog_access_generations.generation + 1
+                ELSE dialog_access_generations.generation
+              END,
+              authorized = 0,
+              dialog_type = COALESCE(excluded.dialog_type, dialog_access_generations.dialog_type),
+              last_pts = MAX(dialog_access_generations.last_pts, excluded.last_pts)
             """,
-            arguments: [
-                UUID().uuidString.lowercased(), dialogId, mediaJSON,
-                UUID().uuidString.lowercased(), dialogId,
-            ]
+            arguments: [dialogId, dialogType, revokedPts]
+        )
+    }
+
+    private func restoreGroupAccess(
+        _ db: Database,
+        dialogId: String,
+        grantedPts: Int64
+    ) throws {
+        // A server-authored grant newer than the durable revoke PTS is the only transition that
+        // removes a group tombstone. Saved tombstones never call this path.
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_access_generations (
+              dialog_id, generation, authorized, dialog_type, last_pts
+            ) VALUES (?, 1, 1, 'group', ?)
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              generation = dialog_access_generations.generation + 1,
+              authorized = 1,
+              dialog_type = 'group',
+              last_pts = excluded.last_pts
+            """,
+            arguments: [dialogId, grantedPts]
+        )
+        try db.execute(
+            sql: "DELETE FROM pending_access_purges WHERE dialog_id = ?",
+            arguments: [dialogId]
+        )
+        try db.execute(
+            sql: "DELETE FROM revoked_dialogs WHERE dialog_id = ? AND dialog_type = 'group'",
+            arguments: [dialogId]
+        )
+        try db.execute(
+            sql: "UPDATE dialogs SET access_state = 'active', updated_at = datetime('now') WHERE dialog_id = ?",
+            arguments: [dialogId]
         )
     }
 
@@ -7897,6 +8748,63 @@ actor CloudLocalStore {
             arguments: [dialogId, type, title, lastMsgId, updatedAt]
         )
         try ensureDialogSummary(db, dialogId: dialogId)
+    }
+
+    private func ensureSavedDialog(
+        _ db: Database,
+        dialogId: String,
+        accountId: String,
+        updatedAt: String?
+    ) throws {
+        try db.execute(
+            sql: """
+            INSERT INTO dialogs (
+              dialog_id, type, title, last_msg_id, updated_at, revision,
+              member_count, self_role, notification_mode, access_state
+            ) VALUES (
+              ?, 'saved', NULL, 0, COALESCE(?, datetime('now')), 0,
+              1, 'owner', 'all', 'active'
+            )
+            ON CONFLICT(dialog_id) DO UPDATE SET
+              type = 'saved',
+              member_count = 1,
+              self_role = 'owner',
+              notification_mode = 'all',
+              access_state = 'active',
+              updated_at = CASE
+                WHEN ? IS NULL THEN dialogs.updated_at
+                ELSE MAX(dialogs.updated_at, excluded.updated_at)
+              END
+            """,
+            arguments: [dialogId, updatedAt, updatedAt]
+        )
+        try ensureDialogSummary(db, dialogId: dialogId)
+        try db.execute(
+            sql: "DELETE FROM dialog_members WHERE dialog_id = ? AND account_id != ?",
+            arguments: [dialogId, accountId]
+        )
+        try db.execute(
+            sql: """
+            INSERT INTO dialog_members (
+              dialog_id, account_id, role, last_read_msg_id, joined_at,
+              left_at, is_active, revision
+            ) VALUES (
+              ?, ?, 'owner', 0, datetime('now'), NULL, 1, 0
+            )
+            ON CONFLICT(dialog_id, account_id) DO UPDATE SET
+              role = 'owner',
+              left_at = NULL,
+              is_active = 1
+            """,
+            arguments: [dialogId, accountId]
+        )
+        try setUnreadSummary(
+            db,
+            dialogId: dialogId,
+            accountId: accountId,
+            unreadCount: 0,
+            isExact: true
+        )
     }
 
     private func ensureDialogPreferences(
@@ -9055,6 +9963,9 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM pending_group_creations")
         try db.execute(sql: "DELETE FROM pending_group_mutations")
         try db.execute(sql: "DELETE FROM pending_purges")
+        try db.execute(sql: "DELETE FROM pending_access_purges")
+        try db.execute(sql: "DELETE FROM revoked_dialogs")
+        try db.execute(sql: "DELETE FROM dialog_access_generations")
         try db.execute(sql: "DELETE FROM bootstrap_baseline_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_staged_messages")
         try db.execute(sql: "DELETE FROM bootstrap_staged_members")

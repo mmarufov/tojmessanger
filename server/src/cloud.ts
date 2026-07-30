@@ -107,6 +107,13 @@ import {
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
 import {
+  ensureSavedMessages,
+  savedMessagesConfigured,
+  savedMessagesEnabledForAccount,
+  savedMessagesSchemaReadiness,
+  SavedMessagesError,
+} from "./saved-messages";
+import {
   dialogPreferencesCapabilityEnabled,
   DialogPreferenceError,
   updateDialogPreferences,
@@ -138,6 +145,7 @@ function cloudCapabilities(
   voiceCalls: boolean,
   videoCalls: boolean,
   groups: boolean,
+  savedMessages: boolean,
   cloudDrafts: boolean,
   mediaGroups: boolean,
   dialogPreferences: boolean,
@@ -146,6 +154,7 @@ function cloudCapabilities(
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
   if (groups) capabilities.push("groups_v1");
+  if (savedMessages) capabilities.push("saved_messages_v1");
   if (cloudDrafts) capabilities.push("cloud_drafts_v1");
   if (mediaGroups) capabilities.push("media_groups_v1");
   if (dialogPreferences) capabilities.push("dialog_preferences_v1");
@@ -312,13 +321,19 @@ export function startCloudServer(
 
         else if (url.pathname === "/v1/capabilities" && req.method === "GET") {
           const capabilityToken = bearer(req);
-          const accountVideoAvailable = capabilityToken
-            ? videoCallsEnabledForAccount((await resolveDevice(db, capabilityToken)).accountId, videoAvailable)
+          const capabilitySession = capabilityToken ? await resolveDevice(db, capabilityToken) : null;
+          const accountVideoAvailable = capabilitySession
+            ? videoCallsEnabledForAccount(capabilitySession.accountId, videoAvailable)
+            : false;
+          const accountSavedMessagesAvailable = capabilitySession
+            ? (await savedMessagesSchemaReadiness(db)).ready
+              && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
           response = json(cloudCapabilities(
             callsAvailable,
             accountVideoAvailable,
             groupsAvailable,
+            accountSavedMessagesAvailable,
             cloudDraftsAvailable,
             mediaGroupsAvailable,
             dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
@@ -368,6 +383,17 @@ export function startCloudServer(
         ) {
           // Hard-close the complete route family during dark deploys. Advertisement alone is not
           // sufficient because stale or modified clients could otherwise create live group events.
+          response = new Response("not found", { status: 404 });
+        }
+
+        else if (
+          url.pathname === "/v1/dialogs/saved"
+          && req.method === "POST"
+          && (
+            !savedMessagesConfigured()
+            || !(await savedMessagesSchemaReadiness(db)).ready
+          )
+        ) {
           response = new Response("not found", { status: 404 });
         }
 
@@ -829,6 +855,32 @@ export function startCloudServer(
           ));
         }
 
+        if (url.pathname === "/v1/dialogs/saved" && req.method === "POST") {
+          if (!savedMessagesEnabledForAccount(session.accountId)) {
+            response = new Response("not found", { status: 404 });
+          } else {
+            const ensureStarted = performance.now();
+            try {
+              const result = await ensureSavedMessages(db, session.accountId, session.deviceId);
+              metrics.recordSavedMessagesEnsure(
+                result.created ? "created" : result.repaired ? "repaired" : "existing",
+                performance.now() - ensureStarted,
+              );
+              pushHints(sockets, result.pushes);
+              response = json({
+                dialogId: result.dialogId,
+                type: result.type,
+                created: result.created,
+                repaired: result.repaired,
+                ...(result.eventPts === undefined ? {} : { eventPts: result.eventPts }),
+              }, result.created ? 201 : 200);
+            } catch (error) {
+              metrics.recordSavedMessagesEnsure("error", performance.now() - ensureStarted);
+              throw error;
+            }
+          }
+        }
+
         if (url.pathname === "/v1/messages/send" && req.method === "POST") {
           const result = await sendMessage(db, {
             senderAccountId: session.accountId,
@@ -988,6 +1040,7 @@ export function startCloudServer(
           : err instanceof MediaError ? err.status
           : err instanceof CallError ? err.status
           : err instanceof GroupError ? err.status
+          : err instanceof SavedMessagesError ? err.status
           : err instanceof DialogPreferenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof DraftError ? err.status
@@ -1017,6 +1070,7 @@ export function startCloudServer(
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof SavedMessagesError ? { code: err.code } : {}),
           ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
           ...(err instanceof DraftError ? { code: err.code } : {}),

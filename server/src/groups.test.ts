@@ -184,6 +184,48 @@ describe("Groups v1", () => {
     expect(difference.updates[0].message).toBeUndefined();
   });
 
+  test("difference preserves group remove then re-add across separate and combined pages", async () => {
+    const { owner, alice, bob } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      groupId,
+      title: "Regrant ordering",
+      memberIds: [alice.accountId, bob.accountId],
+    });
+    const since = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${bob.accountId}`)[0].pts);
+    await removeGroupMember(db, {
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
+      dialogId: groupId,
+      targetAccountId: bob.accountId,
+      clientMutationId: crypto.randomUUID(),
+    });
+    await addGroupMembers(db, {
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
+      dialogId: groupId,
+      memberIds: [bob.accountId],
+      clientMutationId: crypto.randomUUID(),
+    });
+
+    const first = await getDifference(db, bob.accountId, since, { maxEvents: 1 });
+    if (first.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(first.updates.map((update) => update.type)).toEqual(["dialog.access_revoked"]);
+    expect(first.hasMore).toBe(true);
+    const second = await getDifference(db, bob.accountId, first.state.pts, { maxEvents: 1 });
+    if (second.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(second.updates.map((update) => update.type)).toEqual(["dialog.created"]);
+
+    const combined = await getDifference(db, bob.accountId, since);
+    if (combined.kind === "difference_too_long") throw new Error("unexpected rebuild");
+    expect(combined.updates.map((update) => update.type)).toEqual([
+      "dialog.access_revoked",
+      "dialog.created",
+    ]);
+  });
+
   test("member paging is active-only and keyset based", async () => {
     const { owner, alice, bob } = await threeAccounts();
     const groupId = crypto.randomUUID();

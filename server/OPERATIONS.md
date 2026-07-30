@@ -8,11 +8,12 @@ gitignored notes.
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
 - `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider
-  state. It returns `503` whenever the dialog-preference relations, exact runtime column signatures,
-  conflict-key constraints, final compatibility trigger, exact validated event constraint, versioned
-  contract marker, migration cursor, or reconciliation state required by this binary are incomplete,
-  even when both preference rollout switches are off. A database failure returns `500`; deployment
-  tooling must require a `200` before switching traffic.
+  state. It returns `503` until both the complete Saved Messages catalog contract and the complete
+  dialog-preference contract are present: required columns, validated constraints, unique/index
+  contracts, claims schema, mixed-writer/deletion/compatibility triggers, versioned contract markers,
+  completed migration cursors, and empty reconciliation state. These requirements remain active even
+  when rollout switches are off. A database failure returns `500`; deployment tooling must require
+  `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
@@ -36,6 +37,9 @@ completed media are also removed. Completed dialog-preference idempotency record
 account deletion because an offline client can retry a lost response after any fixed cleanup window.
 Pending records are also never aged out. Message history and attached media are not deleted by this
 worker; account events follow the separately configured synchronization retention floor.
+
+Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
+a device retrying after days can recover the canonical `client_msg_id`.
 
 ## Media storage
 
@@ -118,6 +122,83 @@ with non-identifying values, changes the profile name to `Deleted Account`, dest
 credential hash and device name, removes push tokens, kills pending push work, removes OTP rows, and
 revokes all sessions. Existing message rows remain so other participants do not lose their history and
 foreign-key integrity is preserved. A later registration with the same phone creates a new account ID.
+
+Saved Messages is the exception to retained conversation history: it has only the deleting account as
+an active member, so account deletion removes that dialog and its messages in the same transaction.
+Before removal, any direct/group copy forwarded from that archive has its source-account/dialog/message
+foreign keys cleared atomically. The copy retains its immutable `is_forwarded` classification,
+ciphertext, and media references, so recipients keep the forwarded content without retaining a dangling
+identity or a dependency on the deleted archive. Media owned by the deleted account is removed only
+when no retained message still references it.
+
+## Saved Messages rollout
+
+Saved Messages is dark by default. Migrate PostgreSQL before enabling it; API version 5 adds the
+authenticated `saved_messages_v1` capability and `POST /v1/dialogs/saved`.
+
+- `TOJ_SAVED_MESSAGES_V1_ENABLED=1` enables the route family globally.
+- `TOJ_SAVED_MESSAGES_ALLOWLIST` is a comma-separated list of account UUIDs that bypass percentage
+  rollout.
+- `TOJ_SAVED_MESSAGES_ROLLOUT_PERCENT` accepts 0 through 100 and defaults to zero.
+
+The route returns `404` and performs no mutation when the global switch or the authenticated
+account's rollout bucket is off. Deploy the schema and endpoint at zero percent, ship the compatible
+iOS client, then allowlist internal multi-device accounts before increasing deterministic buckets.
+Rollback by setting the percentage to zero or clearing the global switch; existing server and
+encrypted local data is preserved.
+
+After the compatible client is stable at full rollout, provision existing accounts in bounded,
+restart-safe batches:
+
+```bash
+NODE_ENV=production \
+TOJ_SAVED_MESSAGES_V1_ENABLED=1 \
+TOJ_SAVED_MESSAGES_ROLLOUT_PERCENT=100 \
+TOJ_SAVED_MESSAGES_BACKFILL_CONFIRM=PROVISION_ALL_ACTIVE_ACCOUNTS \
+TOJ_SAVED_MESSAGES_BACKFILL_BATCH_SIZE=100 \
+TOJ_SAVED_MESSAGES_BACKFILL_THROTTLE_MS=25 \
+bun run backfill:saved-messages
+```
+
+The command fails closed unless production mode, the global switch, an explicit 100% rollout, and
+the exact confirmation value are all present. It logs aggregate counts only, handles
+`SIGINT`/`SIGTERM` between accounts, and stops on a failed batch rather than hot-looping. Durable
+worker-owned claims prevent concurrent workers from selecting the same account; abandoned claims
+become reclaimable after 15 minutes. A worker refreshes and verifies ownership immediately before
+each account, so a reclaimed lease is never processed by its former owner. The throttle is per
+processed account, defaults to 25 ms, and is bounded to 60 seconds.
+
+The dialog type constraint deploys in expand/validate/contract phases. `schema-dialogs-expand.sql`
+adds the wider constraint as `NOT VALID`, PostgreSQL validates it without blocking ordinary
+reads/writes, and `schema-dialogs-swap.sql` holds `ACCESS EXCLUSIVE` only for the short name swap.
+The forward marker has its own expand/backfill/contract sequence. Expand adds the column and trigger;
+old writers that omit the marker are classified from complete provenance. The temporary partial
+index contains only unfinished legacy rows, and the Bun worker advances a durable `(dialog_id,
+msg_id)` cursor in bounded transactions. Contract validates the invariant and removes the empty
+temporary index. Normal `schema.sql` reruns never update `messages.is_forwarded`, and completed
+migrations skip both temporary-index creation and the keyset worker.
+
+Keep Saved Messages at zero percent until both contracts complete. An application rollback is safe
+only while these database artifacts remain installed. The account-status trigger performs Saved
+archive deletion and provenance detachment at the database boundary, so an older application binary
+cannot strand an archive or cascade-delete forwarded copies. The new binary also refuses readiness
+and capability advertisement if that trigger or any required catalog object is absent. Never roll
+the database contract back while Saved rows may exist; close advertisement/ensure with the feature
+switch instead. The mixed-node regression covers old-writer insertion, new-reader derivation, and
+account deletion. The production-like migration test is:
+
+```bash
+bun run test:migration:forward
+```
+
+It refuses non-local databases unless the database name ends in `_migration_test`, loads 100,000
+messages, runs concurrent writes during bounded backfill, verifies WAL/runtime budgets and both query
+plans, checks interrupted-index cleanup, and reruns the normal migration twice. It does not run the
+production Saved-dialog provisioning backfill.
+
+Protected `/metrics` output includes `toj_saved_messages_ensure_total` by bounded result,
+ensure duration sum/count, and `toj_saved_messages_invariant_violation_total`. Page immediately on
+invariant repairs or sustained ensure errors; none of these series contains account or dialog data.
 
 ## Dialog preference rollout
 

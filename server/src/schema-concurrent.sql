@@ -12,9 +12,14 @@ WHERE namespace.nspname = 'public'
     'messages_call_eligibility_idx',
     'dialog_members_active_owner_idx',
     'dialog_members_active_page_idx',
+    'dialogs_one_saved_per_account_idx',
+    'messages_forward_provenance_idx',
+    'messages_reply_target_idx',
+    'messages_forward_marker_backfill_idx',
     'message_mentions_account_idx',
     'messages_media_group_idx',
     'account_events_retention_idx',
+    'account_events_lifecycle_lookup_idx',
     'media_objects_expiry_idx',
     'media_objects_orphan_expiry_idx',
     'draft_mutation_requests_expiry_idx',
@@ -43,6 +48,18 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS dialog_members_active_page_idx
   ON dialog_members(dialog_id, joined_at, account_id)
   WHERE left_at IS NULL;
 
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS dialogs_one_saved_per_account_idx
+  ON dialogs(created_by)
+  WHERE type = 'saved';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_forward_provenance_idx
+  ON messages(forwarded_from_dialog_id, forwarded_from_msg_id)
+  WHERE forwarded_from_dialog_id IS NOT NULL AND forwarded_from_msg_id IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messages_reply_target_idx
+  ON messages(dialog_id, reply_to_msg_id)
+  WHERE reply_to_msg_id IS NOT NULL;
+
 CREATE INDEX CONCURRENTLY IF NOT EXISTS message_mentions_account_idx
   ON message_mentions(account_id, dialog_id, msg_id);
 
@@ -52,6 +69,10 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS messages_media_group_idx
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_retention_idx
   ON account_events(created_at, account_id, pts);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS account_events_lifecycle_lookup_idx
+  ON account_events(account_id, dialog_id, pts DESC)
+  WHERE type IN ('dialog.created', 'dialog.access_revoked');
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS media_objects_expiry_idx
   ON media_objects(expires_at, id)

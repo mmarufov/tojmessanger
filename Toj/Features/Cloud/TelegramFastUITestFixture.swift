@@ -10,6 +10,7 @@ enum TelegramFastUITestFixture {
     static let secondPeerAccountId = "00000000-0000-4000-8000-000000000103"
     static let primaryDialogId = "00000000-0000-4000-8000-000000000201"
     static let secondDialogId = "00000000-0000-4000-8000-000000000202"
+    static let savedDialogId = "00000000-0000-4000-8000-000000000203"
     static let photoMediaId = "00000000-0000-4000-8000-000000000301"
     static let videoMediaId = "00000000-0000-4000-8000-000000000302"
 
@@ -332,6 +333,27 @@ enum TelegramFastUITestFixture {
 
     private static func ensureDialogMetadata(in store: CloudLocalStore) async throws {
         try await store.savePts(4, accountId: accountId)
+        try await store.ensureSavedDialog(
+            dialogId: savedDialogId,
+            accountId: accountId,
+            updatedAt: "2026-07-18T20:04:00Z"
+        )
+        try await store.applyHistoryPage(HistoryPageResponse(
+            dialogId: savedDialogId,
+            messages: [CloudMessage(
+                dialogId: savedDialogId,
+                msgId: 1,
+                senderAccountId: accountId,
+                clientMsgId: "ui-fixture-saved-note",
+                kind: "text",
+                text: "Saved Messages opens from encrypted local storage.",
+                editVersion: 0,
+                state: "visible",
+                serverTs: "2026-07-18T20:04:00Z"
+            )],
+            nextBeforeMsgId: nil,
+            hasMore: false
+        ))
         try await store.upsertDialog(
             dialogId: primaryDialogId,
             title: "Mehrona Offline",

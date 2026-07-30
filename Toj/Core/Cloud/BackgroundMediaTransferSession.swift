@@ -267,6 +267,26 @@ actor BackgroundMediaTransferSession {
         }
     }
 
+    /// Revocation is narrower than logout: cancel only jobs whose media is no longer authorized and
+    /// durably remove their resume metadata so a background relaunch cannot recreate the download.
+    func cancelAndDelete(mediaIds: Set<String>) async throws {
+        guard !mediaIds.isEmpty else { return }
+        try await ensureStarted(resumesExistingTasks: false)
+        let doomed = jobs.values.filter { mediaIds.contains($0.mediaId) }
+        let doomedIds = Set(doomed.map(\.id))
+        if let session {
+            for task in await session.allTasks where task.taskDescription.map(doomedIds.contains) == true {
+                task.cancel()
+            }
+        }
+        for job in doomed {
+            jobs[job.id] = nil
+            activeTaskIdentifiers[job.id] = nil
+            resumeWaiters(jobId: job.id, result: .failure(CancellationError()))
+        }
+        try persistJobs()
+    }
+
     private func ensureStarted(resumesExistingTasks: Bool = true) async throws {
         guard !started else { return }
         started = true

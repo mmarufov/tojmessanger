@@ -567,6 +567,9 @@ export async function deleteAccount(
     if (!account || !["active", "limited"].includes(account.status)) {
       return new AuthError("account unavailable", 403);
     }
+    // This database-boundary function is also called by the account-status trigger used by old
+    // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
+    await tx`SELECT toj_cleanup_saved_messages_for_account(${accountId})`;
     const anonymizedPhone = seal(`deleted:${accountId}`, PHONE_AAD);
     const anonymizedLookup = randomBytes(32);
     await tx`

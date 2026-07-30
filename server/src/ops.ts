@@ -1,5 +1,6 @@
 import type { SQL } from "bun";
 import { cleanupCallData } from "./calls";
+import { savedMessagesSchemaReadiness } from "./saved-messages";
 import {
   draftMutationReceiptKey,
   lockMutationKeys,
@@ -41,7 +42,7 @@ export function safeRoute(pathname: string): string {
     "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
-    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/messages/send", "/v1/messages/react",
+    "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/dialogs/saved", "/v1/messages/send", "/v1/messages/react",
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
   ]);
@@ -60,6 +61,10 @@ export class OperationalMetrics {
   private readonly startedAt = Date.now();
   private readonly requests = new Map<string, number>();
   private readonly durations = new Map<string, { count: number; sumSeconds: number }>();
+  private readonly savedMessageEnsures = new Map<string, number>();
+  private savedMessageEnsureCount = 0;
+  private savedMessageEnsureSumSeconds = 0;
+  private savedMessageInvariantViolations = 0;
   private cleanupDeleted = 0;
   private cleanupBacklog = 0;
 
@@ -76,6 +81,16 @@ export class OperationalMetrics {
     duration.count += 1;
     duration.sumSeconds += durationMs / 1_000;
     this.durations.set(durationKey, duration);
+  }
+
+  recordSavedMessagesEnsure(
+    result: "created" | "existing" | "repaired" | "error",
+    durationMs: number,
+  ): void {
+    this.savedMessageEnsures.set(result, (this.savedMessageEnsures.get(result) ?? 0) + 1);
+    this.savedMessageEnsureCount += 1;
+    this.savedMessageEnsureSumSeconds += durationMs / 1_000;
+    if (result === "repaired") this.savedMessageInvariantViolations += 1;
   }
 
   render(): string {
@@ -103,6 +118,22 @@ export class OperationalMetrics {
       lines.push(`toj_http_request_duration_seconds_count{${labels}} ${value.count}`);
     }
     lines.push(
+      "# HELP toj_saved_messages_ensure_total Saved Messages ensures by bounded result.",
+      "# TYPE toj_saved_messages_ensure_total counter",
+    );
+    for (const result of ["created", "existing", "repaired", "error"]) {
+      lines.push(`toj_saved_messages_ensure_total{result="${result}"} ${this.savedMessageEnsures.get(result) ?? 0}`);
+    }
+    lines.push(
+      "# HELP toj_saved_messages_ensure_duration_seconds_sum Cumulative Saved Messages ensure duration.",
+      "# TYPE toj_saved_messages_ensure_duration_seconds_sum counter",
+      `toj_saved_messages_ensure_duration_seconds_sum ${this.savedMessageEnsureSumSeconds.toFixed(6)}`,
+      "# HELP toj_saved_messages_ensure_duration_seconds_count Count of timed Saved Messages ensures.",
+      "# TYPE toj_saved_messages_ensure_duration_seconds_count counter",
+      `toj_saved_messages_ensure_duration_seconds_count ${this.savedMessageEnsureCount}`,
+      "# HELP toj_saved_messages_invariant_violation_total Saved Messages rows repaired during ensure.",
+      "# TYPE toj_saved_messages_invariant_violation_total counter",
+      `toj_saved_messages_invariant_violation_total ${this.savedMessageInvariantViolations}`,
       "# HELP toj_cleanup_deleted_total Rows deleted by maintenance cleanup.",
       "# TYPE toj_cleanup_deleted_total counter",
       `toj_cleanup_deleted_total ${this.cleanupDeleted}`,
@@ -172,14 +203,17 @@ export function providerState(value: unknown): ProviderState {
 export async function readiness(sql: SQL, providers: { sms: ProviderState; push: ProviderState }) {
   const started = performance.now();
   await sql`SELECT 1`;
+  const savedMessages = await savedMessagesSchemaReadiness(sql);
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   return {
+    status: savedMessages.ready && preferences.ready ? "ready" : "not_ready",
+    database: "ready",
+    providers,
+    savedMessagesSchema: savedMessages.ready ? "ready" : "incomplete",
+    missingSchemaObjects: savedMessages.missing,
     // Preference relations and snapshot columns are linked into ordinary messaging SQL. Feature
     // switches control entrypoints and behavior, not whether this binary can run on a pre-expand
     // schema, so traffic admission must always fail closed while they are incomplete.
-    status: preferences.ready ? "ready" : "not_ready",
-    database: "ready",
-    providers,
     dialogPreferences: preferences,
     databaseLatencyMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10),
   };
@@ -290,7 +324,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   const sendRequests = await sql`
     WITH doomed AS (
       SELECT sender_account_id, client_msg_id FROM send_requests
-      WHERE created_at < now() - interval '24 hours'
+      WHERE status = 'pending' AND created_at < now() - interval '24 hours'
       ORDER BY created_at LIMIT ${batchSize}
       FOR UPDATE SKIP LOCKED
     )
