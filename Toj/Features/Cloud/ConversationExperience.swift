@@ -805,6 +805,24 @@ struct TojConversationExperience: View {
                 .onSubmit { if canSend { send() } }
                 .accessibilityLabel("Message")
                 .disabled(model.composerMode.isRecording)
+
+            #if DEBUG
+            if TelegramFastUITestFixture.enabled {
+                Text(
+                    model.uiFixtureDraftPersistenceComplete
+                        ? "Draft saved locally"
+                        : "Draft save pending"
+                )
+                .font(.system(size: 1))
+                .foregroundStyle(.clear)
+                .frame(width: 1, height: 1)
+                .accessibilityLabel(
+                    model.uiFixtureDraftPersistenceComplete
+                        ? "Draft saved locally"
+                        : "Draft save pending"
+                )
+            }
+            #endif
         }
         .tojGlass(in: RoundedRectangle(cornerRadius: 23, style: .continuous), interactive: true)
     }

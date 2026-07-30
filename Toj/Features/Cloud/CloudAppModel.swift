@@ -313,6 +313,17 @@ final class CloudAppModel {
     }
     var accountDeletionCode = ""
 
+    #if DEBUG
+    var uiFixtureDraftPersistenceComplete: Bool {
+        guard TelegramFastUITestFixture.enabled,
+              let dialogId = activeDialogId,
+              (draftPersistenceGenerations[dialogId] ?? 0) > 0 else {
+            return false
+        }
+        return draftPersistenceTasks[dialogId] == nil
+    }
+    #endif
+
     private var draftMentionsByDialog: [String: [DraftMention]] = [:]
 
     var mentionSuggestions: [GroupMember] {

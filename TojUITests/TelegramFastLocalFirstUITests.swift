@@ -101,6 +101,10 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
 
         composer.tap()
         composer.typeText("edited")
+        XCTAssertTrue(
+            app.staticTexts["Draft saved locally"].waitForExistence(timeout: 15),
+            "The encrypted local draft write must finish before simulating process death."
+        )
         app.terminate()
         launch(reset: false)
         openChat(Fixture.primaryDialog)
@@ -191,6 +195,14 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         let row = app.buttons["chat-row-\(dialogID)"]
         XCTAssertTrue(row.waitForExistence(timeout: 15))
         row.tap()
+        let conversation = element("conversation-\(dialogID)")
+        if !conversation.waitForExistence(timeout: 5), row.waitForExistence(timeout: 15) {
+            row.tap()
+        }
+        XCTAssertTrue(
+            conversation.waitForExistence(timeout: 15),
+            "The chat row tap did not complete navigation to \(dialogID)."
+        )
     }
 
     private func goBackToChats() {
