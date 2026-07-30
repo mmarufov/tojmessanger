@@ -1064,8 +1064,12 @@ actor CloudLocalStore {
         mediaId: String?,
         state: String,
         progress: Double,
-        error: String?
+        error: String?,
+        retryAfter: TimeInterval? = nil
     ) throws {
+        let nextRetryAt = retryAfter.map {
+            Self.sqliteTimestamp(Date().addingTimeInterval($0))
+        }
         try dbQueue.write { db in
             guard let row = try Row.fetchOne(
                 db,
@@ -1073,7 +1077,7 @@ actor CloudLocalStore {
                 SELECT attachment.account_id, attachment.dialog_id, transfer.kind,
                        transfer.content_type, transfer.file_name, transfer.byte_size,
                        transfer.duration_ms, transfer.width, transfer.height,
-                       transfer.encrypted_thumbnail_path
+                       transfer.encrypted_thumbnail_path, transfer.state AS transfer_state
                 FROM draft_attachments attachment
                 JOIN media_transfers transfer ON transfer.transfer_id = attachment.transfer_id
                 WHERE attachment.transfer_id = ?
@@ -1112,17 +1116,47 @@ actor CloudLocalStore {
                     mediaId, mediaJSON, state, max(0, min(1, progress)), error, transferId,
                 ]
             )
+            let currentTransferState: String = row["transfer_state"]
+            let transferState: String
+            switch state {
+            case "ready":
+                transferState = "ready_to_send"
+            case "uploading":
+                transferState = "uploading"
+            default:
+                // `failed` and `terminal` describe the draft chip, not the transport. Preserve
+                // its valid pending/uploading/ready_to_send state instead of violating the table
+                // domain or making retry scans depend on UI state names.
+                transferState = currentTransferState
+            }
+            let terminal = state == "terminal"
+            let transientFailure = state == "failed"
             try db.execute(
                 sql: """
                 UPDATE media_transfers SET
                   media_id = COALESCE(?, media_id),
                   upload_offset = CASE WHEN ? = 'ready' THEN byte_size ELSE upload_offset END,
                   state = ?,
-                  last_error = ?
+                  last_error = ?,
+                  terminal = CASE
+                    WHEN ? THEN 1
+                    WHEN ? THEN 0
+                    ELSE terminal
+                  END,
+                  next_retry_at = CASE
+                    WHEN ? THEN NULL
+                    WHEN ? THEN ?
+                    ELSE next_retry_at
+                  END,
+                  retry_count = retry_count + CASE WHEN ? THEN 1 ELSE 0 END
                 WHERE transfer_id = ?
                 """,
                 arguments: [
-                    mediaId, state, state == "ready" ? "ready_to_send" : state, error, transferId,
+                    mediaId, state, transferState, error,
+                    terminal, transientFailure,
+                    terminal, transientFailure, nextRetryAt,
+                    transientFailure,
+                    transferId,
                 ]
             )
             let current = try Self.fetchDraftRow(db, accountId: accountId, dialogId: dialogId)

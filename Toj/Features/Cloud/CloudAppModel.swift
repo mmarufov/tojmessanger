@@ -5741,14 +5741,6 @@ final class CloudAppModel {
                 case let .transient(retryAfter):
                     outboxDrainHalted = true
                     let delay = retryAfter ?? retryDelay(forRetryCount: initial.retryCount + 1)
-                    try? await localStore.updateMediaTransfer(
-                        transferId: initial.transferId,
-                        mediaId: current?.mediaId,
-                        uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
-                        state: current?.mediaId == nil ? "pending" : "uploading",
-                        error: error.localizedDescription,
-                        retryAfter: delay
-                    )
                     try? await localStore.updateDraftAttachment(
                         transferId: initial.transferId,
                         mediaId: current?.mediaId,
@@ -5756,19 +5748,12 @@ final class CloudAppModel {
                         progress: current.map {
                             Double($0.uploadOffset) / Double(max(1, $0.byteSize))
                         } ?? 0,
-                        error: error.localizedDescription
+                        error: error.localizedDescription,
+                        retryAfter: delay
                     )
                     scheduleOutboxRetry(after: delay)
                 case .authenticationRequired:
                     outboxDrainHalted = true
-                    try? await localStore.updateMediaTransfer(
-                        transferId: initial.transferId,
-                        mediaId: current?.mediaId,
-                        uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
-                        state: current?.mediaId == nil ? "pending" : "ready_to_send",
-                        error: "Sign in required",
-                        retryAfter: 30
-                    )
                     try? await localStore.updateDraftAttachment(
                         transferId: initial.transferId,
                         mediaId: current?.mediaId,
@@ -5776,7 +5761,8 @@ final class CloudAppModel {
                         progress: current.map {
                             Double($0.uploadOffset) / Double(max(1, $0.byteSize))
                         } ?? 0,
-                        error: "Sign in required"
+                        error: "Sign in required",
+                        retryAfter: 30
                     )
                 case .unsupportedServer:
                     outboxDrainHalted = true

@@ -1203,6 +1203,176 @@ final class CloudDraftsV1Tests: XCTestCase {
         XCTAssertEqual(mutation.attachments.map(\.mediaId), ["media-atomic"])
     }
 
+    func testTransientDraftAttachmentFailureKeepsTransportStateAndRetryMetadata() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-transient-failure",
+            text: "",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let prepared = preparedUpload(9)
+        _ = try await store.stageDraftAttachment(
+            prepared: prepared,
+            accountId: "account-a",
+            dialogId: "dialog-transient-failure",
+            attachmentId: "attachment-transient",
+            position: 0
+        )
+        try await store.updateMediaTransfer(
+            transferId: prepared.transferId,
+            mediaId: "media-upload-in-progress",
+            uploadOffset: 64,
+            state: "uploading",
+            error: nil
+        )
+
+        try await store.updateDraftAttachment(
+            transferId: prepared.transferId,
+            mediaId: "media-upload-in-progress",
+            state: "failed",
+            progress: 0.5,
+            error: "network unavailable",
+            retryAfter: 120
+        )
+
+        let loadedDraft = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-transient-failure"
+        )
+        let draft = try XCTUnwrap(loadedDraft)
+        XCTAssertEqual(draft.attachments.first?.state, "failed")
+        XCTAssertEqual(draft.attachments.first?.lastError, "network unavailable")
+        let loadedTransfer = try await store.mediaTransfer(id: prepared.transferId)
+        let transfer = try XCTUnwrap(loadedTransfer)
+        XCTAssertEqual(transfer.state, "uploading")
+        XCTAssertFalse(transfer.terminal)
+        XCTAssertNotNil(transfer.nextRetryAt)
+        XCTAssertEqual(transfer.retryCount, 1)
+        XCTAssertEqual(transfer.lastError, "network unavailable")
+    }
+
+    func testPermanentDraftAttachmentFailureKeepsTransportStateAndClearsRetry() async throws {
+        let fixture = try makeStoreFixture()
+        let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-permanent-failure",
+            text: "",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let prepared = preparedUpload(10)
+        _ = try await store.stageDraftAttachment(
+            prepared: prepared,
+            accountId: "account-a",
+            dialogId: "dialog-permanent-failure",
+            attachmentId: "attachment-permanent",
+            position: 0
+        )
+        try await store.updateMediaTransfer(
+            transferId: prepared.transferId,
+            mediaId: nil,
+            uploadOffset: 0,
+            state: "pending",
+            error: "temporary",
+            retryAfter: 120
+        )
+
+        try await store.updateDraftAttachment(
+            transferId: prepared.transferId,
+            mediaId: nil,
+            state: "terminal",
+            progress: 0,
+            error: "unsupported file"
+        )
+
+        let loadedDraft = try await store.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-permanent-failure"
+        )
+        let draft = try XCTUnwrap(loadedDraft)
+        XCTAssertEqual(draft.attachments.first?.state, "terminal")
+        XCTAssertEqual(draft.attachments.first?.lastError, "unsupported file")
+        let loadedTransfer = try await store.mediaTransfer(id: prepared.transferId)
+        let transfer = try XCTUnwrap(loadedTransfer)
+        XCTAssertEqual(transfer.state, "pending")
+        XCTAssertTrue(transfer.terminal)
+        XCTAssertNil(transfer.nextRetryAt)
+        XCTAssertEqual(transfer.lastError, "unsupported file")
+    }
+
+    func testDraftAttachmentFailureStatesSurviveTerminateAndReopen() async throws {
+        let fixture = try makeStoreFixture()
+        var store: CloudLocalStore? = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        _ = try await store?.saveLocalDraft(
+            accountId: "account-a",
+            dialogId: "dialog-failure-reopen",
+            text: "",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: []
+        )
+        let transient = preparedUpload(11)
+        let permanent = preparedUpload(12)
+        _ = try await store?.stageDraftAttachment(
+            prepared: transient,
+            accountId: "account-a",
+            dialogId: "dialog-failure-reopen",
+            attachmentId: "attachment-retry",
+            position: 0
+        )
+        _ = try await store?.stageDraftAttachment(
+            prepared: permanent,
+            accountId: "account-a",
+            dialogId: "dialog-failure-reopen",
+            attachmentId: "attachment-terminal",
+            position: 1
+        )
+        try await store?.updateDraftAttachment(
+            transferId: transient.transferId,
+            mediaId: nil,
+            state: "failed",
+            progress: 0.25,
+            error: "retry after relaunch",
+            retryAfter: 300
+        )
+        try await store?.updateDraftAttachment(
+            transferId: permanent.transferId,
+            mediaId: nil,
+            state: "terminal",
+            progress: 0,
+            error: "permanent after relaunch"
+        )
+        store = nil
+
+        let reopened = try CloudLocalStore(path: fixture.path, key: fixture.key)
+        let loadedDraft = try await reopened.loadDraft(
+            accountId: "account-a",
+            dialogId: "dialog-failure-reopen"
+        )
+        let draft = try XCTUnwrap(loadedDraft)
+        XCTAssertEqual(draft.attachments.map(\.state), ["failed", "terminal"])
+        XCTAssertEqual(
+            draft.attachments.map(\.lastError),
+            ["retry after relaunch", "permanent after relaunch"]
+        )
+        let loadedTransientTransfer = try await reopened.mediaTransfer(id: transient.transferId)
+        let loadedPermanentTransfer = try await reopened.mediaTransfer(id: permanent.transferId)
+        let transientTransfer = try XCTUnwrap(loadedTransientTransfer)
+        let permanentTransfer = try XCTUnwrap(loadedPermanentTransfer)
+        XCTAssertEqual(transientTransfer.state, "pending")
+        XCTAssertFalse(transientTransfer.terminal)
+        XCTAssertNotNil(transientTransfer.nextRetryAt)
+        XCTAssertEqual(permanentTransfer.state, "pending")
+        XCTAssertTrue(permanentTransfer.terminal)
+        XCTAssertNil(permanentTransfer.nextRetryAt)
+    }
+
     func testSharedMediaNeverReusesTransferAcrossDialogsAccountsOrPurposes() async throws {
         let fixture = try makeStoreFixture()
         let store = try CloudLocalStore(path: fixture.path, key: fixture.key)
