@@ -19,8 +19,16 @@ import os
 import subprocess
 import sys
 
-TOKENIZE = "unicode61 remove_diacritics 2"
-NORMALIZER_VERSION = 3
+def manifest():
+    """The one place the tokenizer configuration and normalizer version live."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "Toj/Core/Search/search-tokenizer-manifest.json")
+    with open(path) as handle:
+        return json.load(handle)
+
+
+TOKENIZE = manifest()["tokenizer"]
+NORMALIZER_VERSION = manifest()["normalizerVersion"]
 
 # The six Tajik letters a Russian keyboard cannot produce. unicode61 folds none of them.
 TAJIK_FOLDS = {0x04B7: 0x0447, 0x0493: 0x0433, 0x04B3: 0x0445,

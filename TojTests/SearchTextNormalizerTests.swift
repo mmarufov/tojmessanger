@@ -228,11 +228,7 @@ final class SearchTextNormalizerTests: XCTestCase {
     /// Loaded from the test bundle, not from a Mac source path, so this passes on a device and in a
     /// detached build. The same file is committed under server/src for Bun to consume.
     func testMatchesSharedNormalizerVectors() throws {
-        let url = try XCTUnwrap(
-            Bundle(for: Self.self).url(forResource: "search-normalizer-vectors", withExtension: "json"),
-            "fixture is not in the TojTests resource bundle"
-        )
-        let decoded = try JSONDecoder().decode(NormalizerVectorFile.self, from: Data(contentsOf: url))
+        let decoded = try Self.loadVectors()
 
         XCTAssertEqual(decoded.normalizerVersion, SearchTextNormalizer.version)
         XCTAssertEqual(decoded.tokenize, SearchIndexSchema.tokenize)
@@ -249,43 +245,116 @@ final class SearchTextNormalizerTests: XCTestCase {
         }
     }
 
-    /// `normalizer_version` has to cover every table that can change a token, generated or hand
-    /// written. Regenerating the probed tables for a new SQLite release, or editing a
-    /// transliteration entry, silently invalidates every on-device index unless the version moves.
-    func testTokenAffectingTablesMatchPinnedDigest() {
+    /// Recomputes every manifest digest in Swift and compares against the committed file.
+    ///
+    /// This replaced a single hand-pinned constant. The constant covered the tables and maps but
+    /// nothing else, and a regex in CI covered only the token-affecting edits someone had thought
+    /// to enumerate — neither could see a change to `classify`, `forEachToken`, or the tokenizer
+    /// string. The manifest is total: `behavior` digests what the walker actually produces, which
+    /// is the only way to cover a state machine.
+    ///
+    /// Serialization must match `scripts/generate-search-manifest.py` byte for byte, including
+    /// sorting by UTF-8 bytes — Swift compares Strings under canonical equivalence, so sorting by
+    /// `String` would disagree with Python on the decomposed vectors.
+    func testManifestDigestsMatchSwiftBehaviour() throws {
+        let manifest = try Self.loadManifest()
+
+        XCTAssertEqual(
+            manifest.tokenizer, SearchIndexSchema.tokenize,
+            "the manifest is the single source for the tokenizer configuration"
+        )
+        XCTAssertEqual(manifest.normalizerVersion, SearchTextNormalizer.version)
+
+        // tables
         var hasher = SHA256()
         func feed(_ value: UInt32) {
             hasher.update(data: withUnsafeBytes(of: value.littleEndian) { Data($0) })
         }
-        for value in SearchUnicodeTables.separatorRanges { feed(value) }
-        for value in SearchUnicodeTables.ignoredScalars { feed(value) }
-        for value in SearchUnicodeTables.foldPairs { feed(value) }
-        for key in SearchTextNormalizer.tajikFolds.keys.sorted(by: { $0.value < $1.value }) {
-            feed(key.value)
-            feed(SearchTextNormalizer.tajikFolds[key]!.value)
+        for (name, values) in [
+            ("separatorRanges", SearchUnicodeTables.separatorRanges),
+            ("ignoredScalars", SearchUnicodeTables.ignoredScalars),
+            ("foldPairs", SearchUnicodeTables.foldPairs),
+        ] {
+            hasher.update(data: Data("\(name):\(values.count)".utf8))
+            for value in values { feed(value) }
         }
-        for key in SearchTextNormalizer.latinDigraphs.keys.sorted() {
-            hasher.update(data: Data(key.utf8))
-            feed(SearchTextNormalizer.latinDigraphs[key]!.value)
-        }
-        for key in SearchTextNormalizer.latinLetters.keys.sorted(by: { $0.value < $1.value }) {
-            feed(key.value)
-            feed(SearchTextNormalizer.latinLetters[key]!.value)
-        }
-        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(Self.hex(hasher.finalize()), manifest.digests.tables, "tables digest")
 
+        // maps
+        hasher = SHA256()
+        func feedMap(_ name: String, _ pairs: [(String, UInt32)]) {
+            let sorted = pairs.sorted { Array($0.0.utf8).lexicographicallyPrecedes(Array($1.0.utf8)) }
+            hasher.update(data: Data("\(name):\(sorted.count)".utf8))
+            for (key, value) in sorted {
+                hasher.update(data: Data(key.utf8))
+                hasher.update(data: Data([0x1F]))
+                hasher.update(data: withUnsafeBytes(of: value.littleEndian) { Data($0) })
+                hasher.update(data: Data([0x1E]))
+            }
+        }
+        feedMap("tajikFolds", SearchTextNormalizer.tajikFolds.map { (String($0.key), $0.value.value) })
+        feedMap("latinDigraphs", SearchTextNormalizer.latinDigraphs.map { ($0.key, $0.value.value) })
+        feedMap("latinLetters", SearchTextNormalizer.latinLetters.map { (String($0.key), $0.value.value) })
+        XCTAssertEqual(Self.hex(hasher.finalize()), manifest.digests.maps, "maps digest")
+
+        // behavior — computed from Swift's own output, not read back from the fixture, so a
+        // divergence between Swift and the generator surfaces here rather than shipping.
+        let vectors = try Self.loadVectors().vectors
+            .sorted { Array($0.input.utf8).lexicographicallyPrecedes(Array($1.input.utf8)) }
+        hasher = SHA256()
+        for vector in vectors {
+            hasher.update(data: Data(vector.input.utf8))
+            hasher.update(data: Data([0x1F]))
+            hasher.update(data: Data(SearchTextNormalizer.exact(vector.input).utf8))
+            hasher.update(data: Data([0x1F]))
+            hasher.update(data: Data((SearchTextNormalizer.folded(vector.input) ?? "").utf8))
+            hasher.update(data: Data([0x1F]))
+            let tokens = SearchTextNormalizer.tokens(SearchTextNormalizer.foldedForm(vector.input))
+            hasher.update(data: Data(tokens.joined(separator: "\u{1E}").utf8))
+            hasher.update(data: Data([0x1D]))
+        }
         XCTAssertEqual(
-            digest, Self.pinnedTableDigest,
+            Self.hex(hasher.finalize()), manifest.digests.behavior,
             """
-            A token-affecting table changed. Bump SearchTextNormalizer.version, regenerate \
-            server/src/search-normalizer-vectors.json, and update pinnedTableDigest.
+            Swift's normalizer output no longer matches the manifest. If this was intended, bump \
+            normalizerVersion in the manifest and SearchTextNormalizer, then regenerate with \
+            scripts/generate-search-manifest.py.
             """
         )
     }
 
-    /// Digest of every token-affecting table at normalizer version 3.
-    private static let pinnedTableDigest =
-        "a12ea8d4c4b4139e166c74364f12f97bd79a88090dfd0d803e7b93fee2b61c6a"
+    private static func hex(_ digest: SHA256.Digest) -> String {
+        digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func loadManifest() throws -> Manifest {
+        let url = try XCTUnwrap(
+            Bundle(for: SearchTextNormalizerTests.self)
+                .url(forResource: "search-tokenizer-manifest", withExtension: "json"),
+            "manifest is not in the TojTests resource bundle"
+        )
+        return try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: url))
+    }
+
+    private static func loadVectors() throws -> NormalizerVectorFile {
+        let url = try XCTUnwrap(
+            Bundle(for: SearchTextNormalizerTests.self)
+                .url(forResource: "search-normalizer-vectors", withExtension: "json")
+        )
+        return try JSONDecoder().decode(NormalizerVectorFile.self, from: Data(contentsOf: url))
+    }
+
+    private struct Manifest: Decodable {
+        let tokenizer: String
+        let normalizerVersion: Int
+        let digests: Digests
+
+        struct Digests: Decodable {
+            let tables: String
+            let maps: String
+            let behavior: String
+        }
+    }
 
     private struct NormalizerVectorFile: Decodable {
         let normalizerVersion: Int

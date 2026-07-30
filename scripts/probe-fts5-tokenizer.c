@@ -42,15 +42,36 @@ static int utf8_encode(unsigned int cp, char *out) {
     return 4;
 }
 
-static unsigned int utf8_decode_single(const char *s, int len) {
+// Decodes exactly one scalar, or returns -1.
+//
+// Rejects anything that is not a single well-formed scalar: a wrong continuation-byte count, a
+// trailing byte beyond the first scalar, an overlong encoding, a surrogate, or a value past
+// U+10FFFF. The caller feeds this the interior of "a<scalar>b" after stripping the sentinels, and
+// a fold that produced two scalars would otherwise decode as one plausible-looking codepoint and
+// be written into the table as fact.
+static long utf8_decode_single(const char *s, int len) {
+    if (len < 1 || len > 4) return -1;
     unsigned char c = (unsigned char)s[0];
-    if (len == 1) return c;
-    if (len == 2) return ((c & 0x1FU) << 6) | ((unsigned char)s[1] & 0x3FU);
-    if (len == 3)
-        return ((c & 0x0FU) << 12) | (((unsigned char)s[1] & 0x3FU) << 6) |
-               ((unsigned char)s[2] & 0x3FU);
-    return ((c & 0x07U) << 18) | (((unsigned char)s[1] & 0x3FU) << 12) |
-           (((unsigned char)s[2] & 0x3FU) << 6) | ((unsigned char)s[3] & 0x3FU);
+    int expected;
+    long cp;
+    if (c < 0x80) { expected = 1; cp = c; }
+    else if ((c & 0xE0) == 0xC0) { expected = 2; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { expected = 3; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { expected = 4; cp = c & 0x07; }
+    else return -1;                                   // continuation or invalid lead byte
+    if (expected != len) return -1;                   // trailing bytes: more than one scalar
+
+    for (int i = 1; i < len; i++) {
+        unsigned char cc = (unsigned char)s[i];
+        if ((cc & 0xC0) != 0x80) return -1;           // malformed continuation
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    if (len == 2 && cp < 0x80) return -1;             // overlong
+    if (len == 3 && cp < 0x800) return -1;
+    if (len == 4 && cp < 0x10000) return -1;
+    if (cp > 0x10FFFF) return -1;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return -1;      // surrogate
+    return cp;
 }
 
 static void fail(sqlite3 *db, const char *what) {
@@ -112,12 +133,17 @@ int main(int argc, char **argv) {
                     else if (strcmp(first, "ab") == 0) printf("%u\t%d\t-\n", current, CLASS_IGNORED);
                     else {
                         int len = (int)strlen(first);
+                        long folded = -1;
                         if (len >= 2 && first[0] == 'a' && first[len - 1] == 'b') {
-                            unsigned int folded = utf8_decode_single(first + 1, len - 2);
-                            printf("%u\t%d\t%u\n", current, CLASS_TOKEN, folded);
-                        } else {
-                            printf("%u\t%d\t-\n", current, CLASS_SEPARATOR);
+                            folded = utf8_decode_single(first + 1, len - 2);
                         }
+                        if (folded < 0) {
+                            fprintf(stderr,
+                                    "U+%04X folded to %s, which is not a single scalar\n",
+                                    current, first);
+                            return 1;
+                        }
+                        printf("%u\t%d\t%ld\n", current, CLASS_TOKEN, folded);
                     }
                 }
                 current = doc;
@@ -135,12 +161,16 @@ int main(int argc, char **argv) {
             else if (strcmp(first, "ab") == 0) printf("%u\t%d\t-\n", current, CLASS_IGNORED);
             else {
                 int len = (int)strlen(first);
+                long folded = -1;
                 if (len >= 2 && first[0] == 'a' && first[len - 1] == 'b') {
-                    unsigned int folded = utf8_decode_single(first + 1, len - 2);
-                    printf("%u\t%d\t%u\n", current, CLASS_TOKEN, folded);
-                } else {
-                    printf("%u\t%d\t-\n", current, CLASS_SEPARATOR);
+                    folded = utf8_decode_single(first + 1, len - 2);
                 }
+                if (folded < 0) {
+                    fprintf(stderr, "U+%04X folded to %s, which is not a single scalar\n",
+                            current, first);
+                    return 1;
+                }
+                printf("%u\t%d\t%ld\n", current, CLASS_TOKEN, folded);
             }
         }
         sqlite3_reset(select);

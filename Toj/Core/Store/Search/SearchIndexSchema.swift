@@ -54,22 +54,33 @@ nonisolated enum SearchIndexSchema {
     /// `точики` would have an empty folded column and so could never be reached from the Tajik
     /// spelling. Paying for the duplicate postings makes the folded tier a complete fallback index.
     ///
-    /// ## Measured, on 100k messages (`MessageSearchIndexSizeBenchmark`)
+    /// ## Measured on 100k messages, 40 dialogs (`MessageSearchIndexSizeBenchmark`)
     ///
-    /// | design                     | size    | worst 2-char prefix |
-    /// |----------------------------|---------|---------------------|
-    /// | dense, `prefix='2 3 4'`    | 30.5 MB | 0.7 ms              |
-    /// | **dense, `prefix='2'`**    | **18.6 MB** | **0.1 ms**      |
-    /// | sparse, `prefix='2 3 4'`   | 22.0 MB | 0.2 ms              |
-    /// | dense, no prefix index     | 12.5 MB | 1.0 ms              |
+    /// Warm p95 milliseconds by query shape:
     ///
-    /// The duplication is not where the cost was. Prefix indexes accounted for 18 MB of the
-    /// original 30.5 MB while the folded columns cost 8.5 MB, so trimming `prefix` to a single
-    /// length saves more than sparse storage would have — and keeps the correctness sparse gives
-    /// up. `prefix='2'` also measured *fastest*, a smaller index having better locality; longer
-    /// prefixes fall back to a term-index scan, which is cheap because they are more selective.
+    /// | design            | size    | pfx-2 | pfx-3 | pfx-4 | pfx-6+ | multi | scoped |
+    /// |-------------------|---------|-------|-------|-------|--------|-------|--------|
+    /// | `prefix='2'`      | 29.5 MB | 0.0   | 24.7  | 24.4  | 24.1   | 24.3  | 24.0   |
+    /// | **`prefix='2 3'`**| **37.8 MB** | 0.0 | 0.0 | 24.4 | 24.2 | **0.1** | **0.1** |
+    /// | `prefix='2 3 4'`  | 42.9 MB | 0.0   | 0.0   | 0.0   | 24.2   | 0.1   | 0.1    |
+    /// | no prefix index   | 19.9 MB | 24.2  | 24.3  | 23.8  | 23.6   | 23.7  | 24.1   |
+    /// | sparse+wide `'2'` | 23.6 MB | 0.0   | 24.7  | 24.1  | 24.5   | 24.5  | 24.8   |
     ///
-    /// ~195 bytes per message at the shipped design.
+    /// A prefix longer than the widest indexed length falls back to scanning the term index, which
+    /// costs ~24 ms regardless of how selective the prefix is — the scan is proportional to
+    /// vocabulary size, not to match count. That is invisible on a small vocabulary, which is how
+    /// an earlier revision shipped `prefix='2'` believing three-character prefixes were free.
+    ///
+    /// `'2 3'` is the balance point: it covers the short, least selective prefixes where a scan is
+    /// most wasteful, and keeps realistic mixed queries — multi-term and dialog-scoped — on the
+    /// indexed path. Four-plus-character prefixes still scan at ~24 ms, which fits inside the
+    /// 160 ms search debounce; `'2 3 4'` buys those back for another 5 MB if field data says the
+    /// debounce is not enough cover.
+    ///
+    /// Sparse storage plus a widened fallback is 14 MB smaller but reintroduces the same scan at
+    /// three characters, so it trades a latency floor for space rather than winning outright.
+    ///
+    /// ~395 bytes per message at the shipped design.
     static let createVirtualTableSQL = """
         CREATE VIRTUAL TABLE message_search USING fts5(
             exact,
@@ -80,7 +91,7 @@ nonisolated enum SearchIndexSchema {
             link_text_folded,
             dialog_token,
             tokenize = '\(tokenize)',
-            prefix = '2',
+            prefix = '2 3',
             content = '',
             contentless_delete = 1
         )

@@ -72,6 +72,8 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          # verify-search-tables.sh needs a merge base against the PR base; depth 1 has none.
+          fetch-depth: 0
           persist-credentials: false
       - name: Fetch and verify pinned WebRTC artifact
         run: scripts/fetch-webrtc-xcframework.sh
@@ -79,13 +81,24 @@ jobs:
         run: |
           test -d "${DEVELOPER_DIR}"
           pod install
-      - name: Verify search tables match the locked SQLCipher
+      - name: Verify search artifacts match the locked SQLCipher
+        env:
+          # A pull request diffs against its base SHA; a push against the commit it replaced.
+          # Both are real commits in the checkout because this job fetches full history.
+          SEARCH_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: |
-          # The tokenizer tables and normalizer vectors are probed from Pods/SQLCipher rather than
+          # The tokenizer tables, vectors and manifest are probed from Pods/SQLCipher rather than
           # written by hand. Regenerate and diff so a pod bump, or a hand edit, cannot silently
           # leave on-device indexes disagreeing with the code that queries them.
-          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF:-main}" || true
-          scripts/verify-search-tables.sh "origin/${GITHUB_BASE_REF:-main}"
+          #
+          # The script fails closed on missing ancestry, so a shallow checkout is a build failure
+          # rather than a silently skipped check. github.event.before is all-zeroes for a branch's
+          # first push, where there is no previous head to compare against.
+          base="${SEARCH_BASE_SHA:-}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          scripts/verify-search-tables.sh "$base"
       - name: Compile real WebRTC Release path
         env:
           DERIVED_DATA: ${{ runner.temp }}/TojDerivedData
@@ -152,6 +165,8 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+      - name: Search table verification fails closed on missing ancestry
+        run: scripts/tests/verify-search-tables-ancestry.test.sh
       - name: Validate scripts, plist, and coturn policy
         run: |
           find scripts server/scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n

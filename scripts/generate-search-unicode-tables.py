@@ -20,15 +20,23 @@ it changes what tokens exist and requires bumping SearchTextNormalizer.version.
     python3 scripts/generate-search-unicode-tables.py > Toj/Core/Search/SearchUnicodeTables.swift
 """
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 
-TOKENIZE = "unicode61 remove_diacritics 2"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 CLASS_SEPARATOR, CLASS_TOKEN, CLASS_IGNORED = 0, 1, 2
+
+def manifest():
+    """The one place the tokenizer configuration lives."""
+    path = os.path.join(ROOT, "Toj/Core/Search/search-tokenizer-manifest.json")
+    with open(path) as handle:
+        return json.load(handle)
+
+TOKENIZE = manifest()["tokenizer"]
 
 
 def build_and_run():

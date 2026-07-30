@@ -192,6 +192,91 @@ final class SearchPatternBuilderTests: XCTestCase {
         XCTAssertNil(SearchPatternBuilder.pattern(for: "\u{0301}\u{0308}\u{0300}"))
     }
 
+    // MARK: - Exact boundaries
+
+    /// Off-by-one at a limit is where bounds actually break, and "20 terms collapse to 8" cannot
+    /// distinguish a cap of 8 from a cap of 7 or 9. Each limit is asserted on both sides.
+
+    func testTermCapBoundaryAtEightAndNine() throws {
+        let eight = (1...8).map { "term\($0)" }.joined(separator: " ")
+        let nine = (1...9).map { "term\($0)" }.joined(separator: " ")
+
+        let atCap = try XCTUnwrap(SearchPatternBuilder.prepare(eight))
+        XCTAssertEqual(atCap.exactTerms.count, 8, "eight terms must all survive")
+        XCTAssertEqual(atCap.exactTerms.map(\.text).last, "term8")
+
+        let overCap = try XCTUnwrap(SearchPatternBuilder.prepare(nine))
+        XCTAssertEqual(overCap.exactTerms.count, 8, "the ninth term is dropped")
+        XCTAssertEqual(overCap.exactTerms.map(\.text).last, "term8", "the tail is dropped, not the head")
+
+        // The eighth term is last in both, so it is the one that carries the prefix flag.
+        XCTAssertTrue(overCap.exactTerms[7].isPrefix)
+    }
+
+    func testTermLengthBoundaryAtThirtyTwoAndThirtyThree() throws {
+        let exactly = String(repeating: "a", count: SearchPatternBuilder.maximumTermLength)
+        let overBy = String(repeating: "a", count: SearchPatternBuilder.maximumTermLength + 1)
+
+        let atLimit = try XCTUnwrap(SearchPatternBuilder.prepare("\(exactly) tail"))
+        XCTAssertEqual(atLimit.exactTerms[0].text, exactly, "32 characters are not truncated")
+        XCTAssertFalse(atLimit.exactTerms[0].isPrefix, "an untruncated interior term is a whole word")
+
+        let overLimit = try XCTUnwrap(SearchPatternBuilder.prepare("\(overBy) tail"))
+        XCTAssertEqual(overLimit.exactTerms[0].text, exactly, "33 characters truncate to 32")
+        XCTAssertTrue(overLimit.exactTerms[0].isPrefix, "a truncated term must match as a prefix")
+    }
+
+    func testScalarBudgetBoundaryAtFiveTwelveAndFiveThirteen() {
+        // Cyrillic is two UTF-8 bytes per scalar, so 512 scalars is 1024 bytes: both budgets bind
+        // at once and the scalar cap is what the test observes.
+        let atLimit = String(repeating: "ж", count: SearchPatternBuilder.maximumQueryScalars)
+        let overLimit = String(repeating: "ж", count: SearchPatternBuilder.maximumQueryScalars + 1)
+
+        XCTAssertEqual(
+            SearchPatternBuilder.clamp(atLimit).unicodeScalars.count,
+            SearchPatternBuilder.maximumQueryScalars, "512 scalars pass through untouched"
+        )
+        XCTAssertEqual(
+            SearchPatternBuilder.clamp(overLimit).unicodeScalars.count,
+            SearchPatternBuilder.maximumQueryScalars, "513 clamps to 512"
+        )
+    }
+
+    func testByteBudgetBoundaryAtTenTwentyFourAndTenTwentyFive() {
+        // ASCII is one byte per scalar, so the byte budget binds first: 1024 bytes is 1024 scalars,
+        // which is twice the scalar cap — meaning the *scalar* cap is what stops it. Use a
+        // three-byte scalar so the byte budget is the binding constraint instead.
+        let threeByte = "\u{20AC}"  // €, 3 bytes
+        XCTAssertEqual(threeByte.utf8.count, 3)
+
+        let underByLimit = String(repeating: threeByte, count: SearchPatternBuilder.maximumQueryBytes / 3)
+        let clampedUnder = SearchPatternBuilder.clamp(underByLimit)
+        XCTAssertEqual(clampedUnder.utf8.count, (SearchPatternBuilder.maximumQueryBytes / 3) * 3)
+        XCTAssertLessThanOrEqual(clampedUnder.utf8.count, SearchPatternBuilder.maximumQueryBytes)
+
+        // One more scalar would cross 1024, so it must be excluded rather than split.
+        let overByLimit = String(repeating: threeByte, count: SearchPatternBuilder.maximumQueryBytes / 3 + 1)
+        let clampedOver = SearchPatternBuilder.clamp(overByLimit)
+        XCTAssertLessThanOrEqual(
+            clampedOver.utf8.count, SearchPatternBuilder.maximumQueryBytes,
+            "the byte budget is never exceeded"
+        )
+        XCTAssertEqual(
+            clampedOver.utf8.count % 3, 0, "clamping cut on a scalar boundary, not mid-scalar"
+        )
+        XCTAssertEqual(String(clampedOver.unicodeScalars), clampedOver, "result is valid Unicode")
+    }
+
+    /// One ASCII byte per scalar means the scalar cap binds long before the byte cap; asserting it
+    /// pins which limit wins rather than leaving the interaction implicit.
+    func testScalarCapBindsBeforeByteCapForASCII() {
+        let ascii = String(repeating: "a", count: 4_000)
+        let clamped = SearchPatternBuilder.clamp(ascii)
+        XCTAssertEqual(clamped.unicodeScalars.count, SearchPatternBuilder.maximumQueryScalars)
+        XCTAssertEqual(clamped.utf8.count, SearchPatternBuilder.maximumQueryScalars)
+        XCTAssertLessThan(clamped.utf8.count, SearchPatternBuilder.maximumQueryBytes)
+    }
+
     // MARK: - Dialog scoping
 
     func testDialogTokenStripsHyphens() {
