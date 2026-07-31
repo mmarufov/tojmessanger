@@ -10,6 +10,7 @@
 		0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A7237A13A5A375D4580965 /* TojTests.swift */; };
 		160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
+		9A41C7E10012B23D45E6F708 /* MessageSearchStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */; };
 		9A41C7E10010B23D45E6F708 /* SearchIndexerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */; };
 		9A41C7E1000EB23D45E6F708 /* search-tokenizer-manifest.json in Resources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */; };
 		9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */; };
@@ -75,6 +76,7 @@
 		E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EncryptedProfilePhotoStoreTests.swift; sourceTree = "<group>"; };
 		F0C03914F0029DBF5289BE42 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackoffPolicyTests.swift; sourceTree = "<group>"; };
+		9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchStoreTests.swift; sourceTree = "<group>"; };
 		9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchIndexerTests.swift; sourceTree = "<group>"; };
 		9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.json; name = search-tokenizer-manifest.json; path = Toj/Core/Search/search-tokenizer-manifest.json; sourceTree = SOURCE_ROOT; };
 		9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchIndexSizeBenchmark.swift; sourceTree = "<group>"; };
@@ -129,6 +131,7 @@
 			children = (
 				A6A7237A13A5A375D4580965 /* TojTests.swift */,
 				FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */,
+				9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */,
 				9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */,
 				9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */,
 				9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */,
@@ -416,6 +419,7 @@
 			files = (
 				0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */,
 				2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */,
+				9A41C7E10012B23D45E6F708 /* MessageSearchStoreTests.swift in Sources */,
 				9A41C7E10010B23D45E6F708 /* SearchIndexerTests.swift in Sources */,
 				9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */,
 				9A41C7E1000AB23D45E6F708 /* SearchQueryContractTests.swift in Sources */,

@@ -58,6 +58,17 @@ nonisolated struct PreparedSearchQuery: Equatable, Sendable {
         )
     }
 
+    /// The folded tier, restricted to rows the exact tier did not already return.
+    ///
+    /// Without the `NOT`, every hit surfaces twice for any text the two tiers agree on — which is
+    /// all Latin text, since the folded columns are populated unconditionally and fold to the same
+    /// thing. Deduplicating in Swift cannot work across a paginated boundary: page three has no
+    /// memory of page one. Making the tiers disjoint in the query instead means "exact ranks above
+    /// folded" needs no bookkeeping at all.
+    var foldedOnlyExpression: String {
+        "\(foldedExpression) NOT \(exactExpression)"
+    }
+
     var foldedExpression: String {
         SearchPatternBuilder.qualify(
             foldedAlternatives.map(Self.conjunction).joined(separator: " OR "),

@@ -52,7 +52,7 @@ final class SearchIndexerTests: XCTestCase {
         }
     }
 
-    func testMigrationRegistersAllSixTriggers() async throws {
+    func testMigrationRegistersEveryEnqueueTrigger() async throws {
         let triggers = try await store.dbQueue.read { db in
             try String.fetchAll(db, sql: """
                 SELECT name FROM sqlite_master WHERE type = 'trigger'
@@ -60,6 +60,9 @@ final class SearchIndexerTests: XCTestCase {
                 """)
         }
         XCTAssertEqual(triggers, [
+            // Access changes matter as much as message changes: a revocation must reach the index,
+            // and a regrant must bring the conversation back.
+            "search_queue_dialog_access_au",
             "search_queue_media_ad", "search_queue_media_ai", "search_queue_media_au",
             "search_queue_messages_ad", "search_queue_messages_ai", "search_queue_messages_au",
         ])
@@ -194,24 +197,136 @@ final class SearchIndexerTests: XCTestCase {
         XCTAssertEqual(actual13, 1)
     }
 
-    func testRevokedGroupContentDisappearsFromTheIndex() async throws {
-        try await insertMessage(clientMsgId: "c1", text: "groupsecret")
+    /// Revocation goes through the production `revokeGroupAccess`, not a hand-seeded queue entry.
+    ///
+    /// Two separate guarantees, and the test asserts both because either alone is insufficient:
+    /// the query filter hides content the instant `access_state` flips, and the index removal makes
+    /// that durable — the FTS table holds the message text itself, so a filter is only a promise
+    /// the next query has to keep.
+    func testRevokeGroupAccessHidesAndThenRemovesContent() async throws {
+        try await insertMessage(clientMsgId: "c1", text: "groupsecret", localId: "d1:1", msgId: 1)
         try await bootstrapAndDrain()
-        let actual14 = try await searchRowids("groupsecret").count
-        XCTAssertEqual(actual14, 1)
+        let before = try await searchRowids("groupsecret").count
+        XCTAssertEqual(before, 1)
 
+        try await store.revokeGroupAccess(dialogId: "d1", reason: "removed by owner")
+
+        // Immediate: the production query filters on access_state, before any drain runs.
+        let visibleImmediately = try await store.searchMessages(
+            MessageSearchRequest(query: "groupsecret")
+        ).hits
+        XCTAssertTrue(visibleImmediately.isEmpty, "revoked content must vanish from results at once")
+
+        // Durable: the real path enqueued removals, so the text leaves the index too.
+        let queued = try await queueEntries()
+        XCTAssertEqual(queued, [["c1", "delete"]], "revocation enqueues removal via the trigger")
+
+        _ = try await indexer.drain()
+        let indexed = try await searchRowids("groupsecret")
+        XCTAssertTrue(indexed.isEmpty, "revoked message text must not remain in the index")
+    }
+
+    /// Re-adding a member must bring their history back, or a regrant silently leaves the
+    /// conversation unsearchable forever.
+    func testGroupRegrantRestoresSearchability() async throws {
+        try await insertMessage(clientMsgId: "c1", text: "groupsecret", localId: "d1:1", msgId: 1)
+        try await bootstrapAndDrain()
+
+        try await store.revokeGroupAccess(dialogId: "d1", reason: "removed by owner")
+        _ = try await indexer.drain()
+        let afterRevoke = try await searchRowids("groupsecret")
+        XCTAssertTrue(afterRevoke.isEmpty)
+
+        // The acked archive survives revocation until the purge finalizes, so a regrant before then
+        // has something to restore. This is the same UPDATE the grant path issues.
         try await store.dbQueue.write { db in
-            try db.execute(sql: "UPDATE dialogs SET access_state = 'removed' WHERE dialog_id = 'd1'")
-            // Access change does not touch messages, so the reindex is driven explicitly the way
-            // revokeGroupAccess would.
             try db.execute(sql: """
-                INSERT INTO search_index_queue(client_msg_id, op) VALUES ('c1', 'upsert')
-                ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert'
+                UPDATE dialogs SET access_state = 'active', updated_at = datetime('now')
+                 WHERE dialog_id = 'd1'
                 """)
         }
+        let requeued = try await queueEntries()
+        XCTAssertEqual(requeued, [["c1", "upsert"]], "regrant re-enqueues the dialog")
+
         _ = try await indexer.drain()
-        let actual15 = try await searchRowids("groupsecret").isEmpty
-        XCTAssertTrue(actual15)
+        let restored = try await searchMessagesText("groupsecret")
+        XCTAssertEqual(restored, ["groupsecret"], "a re-added member sees their history again")
+    }
+
+    /// Revocation also rewinds the backfill cursor, so history that was never indexed the first
+    /// time is not skipped after a regrant.
+    func testRegrantRewindsTheBackfillCursor() async throws {
+        try await insertMessage(clientMsgId: "c1", text: "history", localId: "d1:1", msgId: 1)
+        await indexer.bootstrap()
+        while try await indexer.backfillStep() {}
+        let completedBefore = try await store.dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT completed FROM search_backfill_state WHERE dialog_id = 'd1'")
+        }
+        XCTAssertEqual(completedBefore, 1)
+
+        try await store.revokeGroupAccess(dialogId: "d1", reason: "removed")
+        try await store.dbQueue.write { db in
+            try db.execute(sql: "UPDATE dialogs SET access_state = 'active' WHERE dialog_id = 'd1'")
+        }
+        let completedAfter = try await store.dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT completed FROM search_backfill_state WHERE dialog_id = 'd1'")
+        }
+        XCTAssertEqual(completedAfter, 0, "a regranted dialog must be walked again")
+    }
+
+    // MARK: - Repair
+
+    /// Several queries can fail on the same corruption within milliseconds. Without single-flight
+    /// each would drop and recreate the table under the others.
+    func testConcurrentRepairsCollapseIntoOne() async throws {
+        try await insertMessage(clientMsgId: "c1", text: "survivor", localId: "d1:1", msgId: 1)
+        try await bootstrapAndDrain()
+
+        let before = try await store.dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT rebuild_count FROM search_index_state WHERE id = 1") ?? 0
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<8 { group.addTask { await self.indexer.repair() } }
+        }
+        let after = try await store.dbQueue.read { db in
+            try Int.fetchOne(db, sql: "SELECT rebuild_count FROM search_index_state WHERE id = 1") ?? 0
+        }
+
+        XCTAssertLessThanOrEqual(
+            after - before, 2,
+            "eight concurrent repairs must not produce eight rebuilds"
+        )
+        let status = try await indexer.coverage().status
+        XCTAssertEqual(status, .ready)
+    }
+
+    /// An intentional discard is not a repair failure. Gating on the persisted `rebuild_count`
+    /// meant a few legitimate rebuilds could permanently disable search on a healthy device.
+    func testIntentionalDiscardsDoNotCountAsRepairFailures() async throws {
+        try await insertMessage(clientMsgId: "c1", text: "survivor", localId: "d1:1", msgId: 1)
+        try await bootstrapAndDrain()
+
+        for reason in ["integrity recovery", "replica wipe", "index schema version changed"] {
+            try await store.dbQueue.write { db in
+                try SearchIndexSchema.discardIndex(db, reason: reason)
+            }
+            await indexer.bootstrap()
+        }
+
+        let failures = await indexer.repairFailures
+        XCTAssertEqual(failures, 0, "discards are not failures")
+        let status = try await indexer.coverage().status
+        XCTAssertEqual(status, .ready, "three deliberate discards must leave search working")
+
+        let recorded = try await store.dbQueue.read { db in
+            try String.fetchOne(
+                db, sql: "SELECT last_discard_reason FROM search_index_state WHERE id = 1")
+        }
+        XCTAssertEqual(recorded, "index schema version changed", "the reason is recorded separately")
+        let lastError = try await store.dbQueue.read { db in
+            try String.fetchOne(db, sql: "SELECT last_error FROM search_index_state WHERE id = 1")
+        }
+        XCTAssertNil(lastError, "a deliberate discard must not look like an error")
     }
 
     // MARK: - Backfill
@@ -433,6 +548,11 @@ final class SearchIndexerTests: XCTestCase {
                 arguments: [clientMsgId]
             )
         }
+    }
+
+    /// Text of every hit the production query API returns.
+    private func searchMessagesText(_ query: String) async throws -> [String] {
+        try await store.searchMessages(MessageSearchRequest(query: query)).hits.map(\.text)
     }
 
     /// Runs the shipped two-tier query and returns matching doc ids.

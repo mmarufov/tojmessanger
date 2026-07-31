@@ -162,14 +162,15 @@ nonisolated enum SearchIndexSchema {
 
     /// Registers the ordinary tables and triggers the index needs.
     ///
-    /// Named `v12` because `v10` and `v11` were taken by dialog preferences; the migrator keys on
-    /// the name, so the number is only a reading aid, but a collision would be silent.
+    /// Named `v13` because main has reached `v12` across several parallel branches. The migrator
+    /// keys on the identifier, not the number, so duplicates would not collide — but they read as a
+    /// mistake, and the next person should not have to check.
     ///
     /// **DDL only.** No seeding, no tokenization, and crucially no virtual table — see the type
     /// doc. `CloudLocalStore.init` gains a few milliseconds of `CREATE` parsing whether the replica
     /// holds a hundred messages or half a million.
     static func registerMigration(in migrator: inout DatabaseMigrator) {
-        migrator.registerMigration("v12-message-search") { db in
+        migrator.registerMigration("v13-message-search") { db in
             try db.execute(sql: """
                 CREATE TABLE message_search_docs (
                     doc_id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,7 +245,10 @@ nonisolated enum SearchIndexSchema {
                     rebuild_count        INTEGER NOT NULL DEFAULT 0,
                     last_optimized_at    TEXT,
                     last_audit_at        TEXT,
+                    -- Strictly failures. An intentional discard is not one, and conflating them
+                    -- lets a few legitimate rebuilds look like a broken index.
                     last_error           TEXT,
+                    last_discard_reason  TEXT,
                     updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
                 )
                 """)
@@ -308,6 +312,31 @@ nonisolated enum SearchIndexSchema {
             ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
         END
         """,
+        // Revocation and regrant are both a single `UPDATE dialogs SET access_state`, so one
+        // trigger covers both. Hooking `revokeGroupAccess` in Swift instead would work today and
+        // rot the moment a third caller appears.
+        //
+        // Revoked content must leave the index, not merely be filtered out of queries: the FTS
+        // table holds the message text itself, and a filter is a promise the next query has to keep.
+        // Regrant re-enqueues so a re-added member sees their history again.
+        """
+        CREATE TRIGGER search_queue_dialog_access_au
+        AFTER UPDATE OF access_state ON dialogs
+        WHEN NEW.access_state IS NOT OLD.access_state
+        BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op)
+            SELECT client_msg_id,
+                   CASE WHEN NEW.access_state IN ('active', 'pending') THEN 'upsert' ELSE 'delete' END
+              FROM messages WHERE dialog_id = NEW.dialog_id
+            ON CONFLICT(client_msg_id) DO UPDATE SET
+                op = excluded.op, enqueued_at = datetime('now');
+
+            UPDATE search_backfill_state
+               SET completed = 0, next_before_msg_id = NULL, pending_swept = 0
+             WHERE dialog_id = NEW.dialog_id
+               AND NEW.access_state IN ('active', 'pending');
+        END
+        """,
     ]
 
     /// Tables the replica wipe must clear alongside the rest, or a signed-out account leaves its
@@ -321,7 +350,7 @@ nonisolated enum SearchIndexSchema {
     ///
     /// Used by both repair and the integrity escape hatch. `'rebuild'` is unavailable on
     /// contentless tables, so recovery is always drop-and-recreate.
-    static func discardIndex(_ db: Database) throws {
+    static func discardIndex(_ db: Database, reason: String = "unspecified") throws {
         try db.execute(sql: dropVirtualTableSQL)
         try db.execute(sql: "DELETE FROM message_links")
         try db.execute(sql: "DELETE FROM message_search_docs")
@@ -330,8 +359,9 @@ nonisolated enum SearchIndexSchema {
         try db.execute(sql: """
             UPDATE search_index_state
                SET status = 'bootstrapping', indexed_count = 0,
-                   rebuild_count = rebuild_count + 1, updated_at = datetime('now')
+                   rebuild_count = rebuild_count + 1, last_discard_reason = ?,
+                   updated_at = datetime('now')
              WHERE id = 1
-            """)
+            """, arguments: [reason])
     }
 }

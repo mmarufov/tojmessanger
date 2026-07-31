@@ -59,6 +59,9 @@ actor SearchIndexer {
         var isComplete: Bool { status == .ready && queueDepth == 0 && dialogsComplete == dialogsTotal }
     }
 
+    /// Session-scoped failure count, for tests and diagnostics.
+    var repairFailures: Int { sessionRepairFailures }
+
     struct AuditReport: Equatable {
         let missing: Int
         let orphaned: Int
@@ -66,8 +69,23 @@ actor SearchIndexer {
         var isClean: Bool { missing == 0 && orphaned == 0 && stale == 0 }
     }
 
+    /// Repair attempts that actually *failed*, this session only.
+    ///
+    /// Deliberately not the persisted `rebuild_count`, which counts every discard — including the
+    /// intentional ones from an integrity recovery or a schema-version change. Gating on that
+    /// number means a handful of legitimate rebuilds permanently disable search on a device whose
+    /// index is fine. Scoping to the session also gives a relaunch a clean try, which matters
+    /// because the usual cause of a failed build is an app update away from being fixed.
+    static let maximumSessionRepairFailures = 3
+
     private let store: CloudLocalStore
     private let signposter = OSSignposter(subsystem: "com.toj.Toj", category: "SearchIndex")
+
+    /// In flight repair, if any. Repair is expensive and idempotent, so concurrent callers join the
+    /// running one rather than starting a second — several queries can fail on the same corruption
+    /// within milliseconds, and each would otherwise drop and recreate the table under the others.
+    private var repairTask: Task<Void, Never>?
+    private var sessionRepairFailures = 0
 
     init(store: CloudLocalStore) {
         self.store = store
@@ -84,9 +102,6 @@ actor SearchIndexer {
     func bootstrap() async {
         do {
             let state = try await readState()
-            if state.status == .unavailable, state.lastError != nil, state.rebuildCount > 3 {
-                return  // Repeatedly failed to build; stop trying every launch.
-            }
 
             let existing = try await dbQueue.read { db in
                 try db.tableExists("message_search")
@@ -96,7 +111,9 @@ actor SearchIndexer {
                 try await createIndex()
             } else if state.indexSchemaVersion != Self.indexSchemaVersion {
                 // The column layout moved. Contentless tables cannot rebuild in place.
-                try await dbQueue.write { db in try SearchIndexSchema.discardIndex(db) }
+                try await dbQueue.write { db in
+                    try SearchIndexSchema.discardIndex(db, reason: "index schema version changed")
+                }
                 try await createIndex()
             } else if state.normalizerVersion != SearchTextNormalizer.version {
                 // Folding rules changed but the shape did not, so the index stays queryable while
@@ -530,17 +547,41 @@ actor SearchIndexer {
         }
     }
 
-    /// Discards and rebuilds the index from `messages`. Never throws: repair is the last resort,
-    /// and a failure here means search stays off rather than that anything else breaks.
+    /// Discards and rebuilds the index from `messages`.
+    ///
+    /// Single-flight: concurrent callers await the repair already running instead of starting
+    /// another. Never throws — repair is the last resort, and a failure here means search stays off
+    /// rather than that anything else breaks.
     func repair() async {
+        if let repairTask {
+            await repairTask.value
+            return
+        }
+        let task = Task { await self.performRepair() }
+        repairTask = task
+        await task.value
+        repairTask = nil
+    }
+
+    private func performRepair() async {
         do {
             try await setStatus(.rebuilding)
-            try await dbQueue.write { db in try SearchIndexSchema.discardIndex(db) }
+            try await dbQueue.write { db in
+                try SearchIndexSchema.discardIndex(db, reason: "repair")
+            }
             try await createIndex()
             try await seedBackfill()
             try await setStatus(.ready)
+            sessionRepairFailures = 0
         } catch {
-            try? await markUnavailable(error)
+            sessionRepairFailures += 1
+            if sessionRepairFailures >= Self.maximumSessionRepairFailures {
+                try? await markUnavailable(error)
+            } else {
+                // Leave the status alone so a later attempt can still run; the index is absent, so
+                // queries find nothing rather than wrong things.
+                try? await recordError(error)
+            }
         }
     }
 
@@ -608,13 +649,23 @@ actor SearchIndexer {
     /// never propagate into a read path that matters.
     private func handleIndexFailure(_ error: Error) async throws {
         guard Self.isIndexCorruption(error) else { return }
-        let attempts = try await readState().rebuildCount
-        if attempts >= 3 {
+        guard sessionRepairFailures < Self.maximumSessionRepairFailures else {
             try await markUnavailable(error)
-        } else {
-            // Detached so the failing query returns now; the caller is already handling an error
-            // and does not need to wait for a rebuild.
-            Task { await self.repair() }
+            return
+        }
+        // Detached so the failing query returns now; the caller is already handling an error and
+        // does not need to wait for a rebuild. `repair()` is single-flight, so a burst of failing
+        // queries produces one rebuild.
+        Task { await self.repair() }
+    }
+
+    /// Records a failure without declaring the index permanently unavailable.
+    private func recordError(_ error: Error) async throws {
+        try await dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE search_index_state SET last_error = ?, updated_at = datetime('now')
+                 WHERE id = 1
+                """, arguments: ["\(error)"])
         }
     }
 

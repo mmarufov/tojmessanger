@@ -705,13 +705,9 @@ actor CloudLocalStore {
     private func recoverByDiscardingSearchIndex() throws -> Bool {
         do {
             try dbQueue.write { db in
-                try SearchIndexSchema.discardIndex(db)
-                try db.execute(sql: """
-                    UPDATE search_index_state
-                       SET last_error = 'discarded by integrity recovery',
-                           updated_at = datetime('now')
-                     WHERE id = 1
-                    """)
+                // A deliberate discard, not a search failure: recorded as such so the indexer's
+                // failure accounting is not poisoned by successful recoveries.
+                try SearchIndexSchema.discardIndex(db, reason: "integrity recovery")
             }
         } catch {
             return false
@@ -10016,7 +10012,7 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM bootstrap_state")
         // Derived from `messages`, but it holds message text of its own: leaving it behind would
         // keep a signed-out account's words searchable.
-        try SearchIndexSchema.discardIndex(db)
+        try SearchIndexSchema.discardIndex(db, reason: "replica wipe")
         if includeMediaTransfers {
             try db.execute(sql: "DELETE FROM pending_message_mutations")
             try db.execute(sql: "DELETE FROM media_transfers")
