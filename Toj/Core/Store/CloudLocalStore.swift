@@ -520,7 +520,13 @@ nonisolated private final class AsyncObservationBox<Element>: @unchecked Sendabl
 }
 
 actor CloudLocalStore {
-    private let dbQueue: DatabasePool
+    /// Internal rather than private so the search index code can live in its own files instead of
+    /// growing this one. `private` in Swift is file-scoped, and nothing outside the module sees it.
+    ///
+    /// `nonisolated` because `DatabasePool` is `Sendable` and does its own serialization: hopping
+    /// the actor to reach it would buy nothing and force every caller into `await` for a property
+    /// read. The pool's own read/write closures remain the synchronization point.
+    nonisolated let dbQueue: DatabasePool
     nonisolated private static let signposter = OSSignposter(
         subsystem: "com.toj.Toj",
         category: "LocalStore"
@@ -673,10 +679,44 @@ actor CloudLocalStore {
     func verifyIntegrity() throws {
         let interval = Self.signposter.beginInterval("DatabaseIntegrity")
         defer { Self.signposter.endInterval("DatabaseIntegrity", interval) }
-        let result = try dbQueue.read { db in
-            try String.fetchAll(db, sql: "PRAGMA quick_check(1)")
+        if try runQuickCheck() { return }
+        guard try recoverByDiscardingSearchIndex() else {
+            throw LocalStoreOpenError.integrityCheckFailed
         }
-        guard result == ["ok"] else { throw LocalStoreOpenError.integrityCheckFailed }
+    }
+
+    private func runQuickCheck() throws -> Bool {
+        try dbQueue.read { db in
+            try String.fetchAll(db, sql: "PRAGMA quick_check(1)") == ["ok"]
+        }
+    }
+
+    /// Drops the search index and re-checks, so damage confined to it does not condemn the replica.
+    ///
+    /// `quick_check` walks every b-tree in the file, and the FTS5 shadow tables are ordinary
+    /// b-trees. Without this, a corrupt *derived* index fails integrity, the caller quarantines,
+    /// and the user loses every chat they have — over data rebuildable from `messages` in the
+    /// background. So the cheap, reversible thing is tried first: discard the index, ask again, and
+    /// only condemn the replica if it still fails.
+    ///
+    /// Returns whether the replica is usable. Any failure here is reported as "not recovered"
+    /// rather than thrown, because this path is already handling corruption and a second error
+    /// changes nothing about what the caller must do.
+    private func recoverByDiscardingSearchIndex() throws -> Bool {
+        do {
+            try dbQueue.write { db in
+                try SearchIndexSchema.discardIndex(db)
+                try db.execute(sql: """
+                    UPDATE search_index_state
+                       SET last_error = 'discarded by integrity recovery',
+                           updated_at = datetime('now')
+                     WHERE id = 1
+                    """)
+            }
+        } catch {
+            return false
+        }
+        return (try? runQuickCheck()) ?? false
     }
 
     func databaseJournalMode() throws -> String {
@@ -6931,6 +6971,8 @@ actor CloudLocalStore {
             """)
         }
 
+        SearchIndexSchema.registerMigration(in: &migrator)
+
         try migrator.migrate(dbPool)
     }
 
@@ -9972,6 +10014,9 @@ actor CloudLocalStore {
         try db.execute(sql: "DELETE FROM bootstrap_staged_profiles")
         try db.execute(sql: "DELETE FROM bootstrap_staged_dialogs")
         try db.execute(sql: "DELETE FROM bootstrap_state")
+        // Derived from `messages`, but it holds message text of its own: leaving it behind would
+        // keep a signed-out account's words searchable.
+        try SearchIndexSchema.discardIndex(db)
         if includeMediaTransfers {
             try db.execute(sql: "DELETE FROM pending_message_mutations")
             try db.execute(sql: "DELETE FROM media_transfers")

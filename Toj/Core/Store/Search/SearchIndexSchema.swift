@@ -157,4 +157,181 @@ nonisolated enum SearchIndexSchema {
             try db.execute(sql: sql)
         }
     }
+
+    // MARK: - Migration
+
+    /// Registers the ordinary tables and triggers the index needs.
+    ///
+    /// Named `v12` because `v10` and `v11` were taken by dialog preferences; the migrator keys on
+    /// the name, so the number is only a reading aid, but a collision would be silent.
+    ///
+    /// **DDL only.** No seeding, no tokenization, and crucially no virtual table — see the type
+    /// doc. `CloudLocalStore.init` gains a few milliseconds of `CREATE` parsing whether the replica
+    /// holds a hundred messages or half a million.
+    static func registerMigration(in migrator: inout DatabaseMigrator) {
+        migrator.registerMigration("v12-message-search") { db in
+            try db.execute(sql: """
+                CREATE TABLE message_search_docs (
+                    doc_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_msg_id     TEXT NOT NULL UNIQUE,
+                    local_id          TEXT NOT NULL,
+                    dialog_id         TEXT NOT NULL,
+                    msg_id            INTEGER,
+                    sender_account_id TEXT NOT NULL,
+                    kind              TEXT NOT NULL,
+                    state             TEXT NOT NULL,
+                    edit_version      INTEGER NOT NULL,
+                    sort_ts           INTEGER NOT NULL,
+                    has_media         INTEGER NOT NULL DEFAULT 0,
+                    link_count        INTEGER NOT NULL DEFAULT 0
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX message_search_docs_dialog_idx
+                    ON message_search_docs(dialog_id, sort_ts DESC)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX message_search_docs_kind_idx
+                    ON message_search_docs(kind, sort_ts DESC)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX message_search_docs_sort_idx
+                    ON message_search_docs(sort_ts DESC, doc_id DESC)
+                """)
+
+            try db.execute(sql: """
+                CREATE TABLE message_links (
+                    doc_id   INTEGER NOT NULL
+                             REFERENCES message_search_docs(doc_id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    url      TEXT NOT NULL,
+                    host     TEXT NOT NULL,
+                    PRIMARY KEY (doc_id, position)
+                )
+                """)
+            try db.execute(sql: "CREATE INDEX message_links_host_idx ON message_links(host, doc_id DESC)")
+
+            try db.execute(sql: """
+                CREATE TABLE search_index_queue (
+                    client_msg_id TEXT PRIMARY KEY,
+                    op            TEXT NOT NULL CHECK (op IN ('upsert','delete')),
+                    enqueued_at   TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX search_index_queue_order_idx
+                    ON search_index_queue(enqueued_at, client_msg_id)
+                """)
+
+            try db.execute(sql: """
+                CREATE TABLE search_backfill_state (
+                    dialog_id          TEXT PRIMARY KEY,
+                    next_before_msg_id INTEGER,
+                    pending_swept      INTEGER NOT NULL DEFAULT 0,
+                    completed          INTEGER NOT NULL DEFAULT 0
+                )
+                """)
+
+            try db.execute(sql: """
+                CREATE TABLE search_index_state (
+                    id                   INTEGER PRIMARY KEY CHECK (id = 1),
+                    status               TEXT NOT NULL DEFAULT 'bootstrapping',
+                    index_schema_version INTEGER NOT NULL DEFAULT 0,
+                    normalizer_version   INTEGER NOT NULL DEFAULT 0,
+                    indexed_count        INTEGER NOT NULL DEFAULT 0,
+                    message_count        INTEGER NOT NULL DEFAULT 0,
+                    deletes_since_merge  INTEGER NOT NULL DEFAULT 0,
+                    rebuild_count        INTEGER NOT NULL DEFAULT 0,
+                    last_optimized_at    TEXT,
+                    last_audit_at        TEXT,
+                    last_error           TEXT,
+                    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """)
+            try db.execute(sql: "INSERT OR IGNORE INTO search_index_state(id) VALUES (1)")
+
+            for sql in triggerSQL { try db.execute(sql: sql) }
+        }
+    }
+
+    /// Triggers that enqueue dirty keys. They never touch `message_search`, which is why they can
+    /// go live at migration time even though the virtual table does not exist yet — until the
+    /// indexer bootstraps, the queue simply accumulates.
+    ///
+    /// This codebase otherwise has no triggers; denormalization is hand-called. The deviation is
+    /// deliberate. Normalization runs in Swift, so a trigger could not write index rows even if we
+    /// wanted it to — only enqueue. And the alternative is a manual call in every one of the write
+    /// funnels plus every funnel added later, where a single omission leaves deleted message text
+    /// searchable. A trigger on the table cannot be forgotten.
+    ///
+    /// Keyed on `client_msg_id` rather than `local_id`, which `markSent` rewrites, or `rowid`,
+    /// which `VACUUM` renumbers and `DELETE` reuses.
+    static let triggerSQL: [String] = [
+        """
+        CREATE TRIGGER search_queue_messages_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op) VALUES (NEW.client_msg_id, 'upsert')
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
+        END
+        """,
+        """
+        CREATE TRIGGER search_queue_messages_au AFTER UPDATE ON messages BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op) VALUES (NEW.client_msg_id, 'upsert')
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
+        END
+        """,
+        """
+        CREATE TRIGGER search_queue_messages_ad AFTER DELETE ON messages BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op) VALUES (OLD.client_msg_id, 'delete')
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'delete', enqueued_at = datetime('now');
+        END
+        """,
+        // Media carries the filename, so a change there changes the indexed text. The WHERE clause
+        // is required: SQLite cannot parse an upsert after INSERT ... SELECT without one.
+        """
+        CREATE TRIGGER search_queue_media_ai AFTER INSERT ON message_media BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op)
+            SELECT client_msg_id, 'upsert' FROM messages WHERE local_id = NEW.local_id
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
+        END
+        """,
+        """
+        CREATE TRIGGER search_queue_media_au AFTER UPDATE ON message_media BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op)
+            SELECT client_msg_id, 'upsert' FROM messages WHERE local_id = NEW.local_id
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
+        END
+        """,
+        """
+        CREATE TRIGGER search_queue_media_ad AFTER DELETE ON message_media BEGIN
+            INSERT INTO search_index_queue(client_msg_id, op)
+            SELECT client_msg_id, 'upsert' FROM messages WHERE local_id = OLD.local_id
+            ON CONFLICT(client_msg_id) DO UPDATE SET op = 'upsert', enqueued_at = datetime('now');
+        END
+        """,
+    ]
+
+    /// Tables the replica wipe must clear alongside the rest, or a signed-out account leaves its
+    /// message text searchable in the index.
+    static let replicaTables = [
+        "message_links", "message_search_docs", "search_index_queue", "search_backfill_state",
+    ]
+
+    /// Discards the index and everything describing its contents, leaving the queue and backfill
+    /// cursors empty so a fresh bootstrap rebuilds from `messages`.
+    ///
+    /// Used by both repair and the integrity escape hatch. `'rebuild'` is unavailable on
+    /// contentless tables, so recovery is always drop-and-recreate.
+    static func discardIndex(_ db: Database) throws {
+        try db.execute(sql: dropVirtualTableSQL)
+        try db.execute(sql: "DELETE FROM message_links")
+        try db.execute(sql: "DELETE FROM message_search_docs")
+        try db.execute(sql: "DELETE FROM search_index_queue")
+        try db.execute(sql: "DELETE FROM search_backfill_state")
+        try db.execute(sql: """
+            UPDATE search_index_state
+               SET status = 'bootstrapping', indexed_count = 0,
+                   rebuild_count = rebuild_count + 1, updated_at = datetime('now')
+             WHERE id = 1
+            """)
+    }
 }
