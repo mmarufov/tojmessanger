@@ -119,6 +119,7 @@ import {
   updateDialogPreferences,
 } from "./dialog-preferences";
 import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
+import { draftMediaSchemaState } from "./draft-media-readiness";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -283,6 +284,13 @@ export function startCloudServer(
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
+  const draftMediaAvailability = async () => {
+    const schema = await draftMediaSchemaState(db);
+    return {
+      cloudDrafts: cloudDraftsAvailable && schema.ready,
+      mediaGroups: mediaGroupsAvailable && schema.ready,
+    };
+  };
   const stopPushWorker = startPushWorker(db, pushSender);
   const stopMaintenanceWorker = startMaintenanceWorker(db, undefined, metrics);
   const stopCallCleanupWorker = startCallCleanupWorker(db);
@@ -329,13 +337,14 @@ export function startCloudServer(
             ? (await savedMessagesSchemaReadiness(db)).ready
               && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
+          const draftMedia = await draftMediaAvailability();
           response = json(cloudCapabilities(
             callsAvailable,
             accountVideoAvailable,
             groupsAvailable,
             accountSavedMessagesAvailable,
-            cloudDraftsAvailable,
-            mediaGroupsAvailable,
+            draftMedia.cloudDrafts,
+            draftMedia.mediaGroups,
             dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
           ));
         }
@@ -812,10 +821,11 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/sync/difference" && req.method === "POST") {
+          const draftMedia = await draftMediaAvailability();
           response = json(await getDifference(db, session.accountId, Number(body.sincePts ?? 0), {
             maxEvents: body.maxEvents,
             maxBytes: body.maxBytes,
-            cloudDraftsEnabled: cloudDraftsAvailable,
+            cloudDraftsEnabled: draftMedia.cloudDrafts,
           }));
         }
 
@@ -824,11 +834,12 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/bootstrap/dialogs" && req.method === "POST") {
+          const draftMedia = await draftMediaAvailability();
           response = json(await getBootstrapDialogsPage(db, session.accountId, body.token, {
             cursor: body.cursor,
             limit: body.limit,
             previewMessages: body.previewMessages,
-            cloudDraftsEnabled: cloudDraftsAvailable,
+            cloudDraftsEnabled: draftMedia.cloudDrafts,
           }));
         }
 
@@ -882,6 +893,7 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/messages/send" && req.method === "POST") {
+          const draftMedia = await draftMediaAvailability();
           const result = await sendMessage(db, {
             senderAccountId: session.accountId,
             senderDeviceId: session.deviceId,
@@ -895,7 +907,7 @@ export function startCloudServer(
             mentions: body.mentions,
             draftConsumeOperationId:
               body.draftConsumeOperationId ?? body.draft_consume_operation_id,
-            allowDraftConsumption: cloudDraftsAvailable,
+            allowDraftConsumption: draftMedia.cloudDrafts,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -903,13 +915,15 @@ export function startCloudServer(
 
         const draftMatch = url.pathname.match(/^\/v1\/drafts\/([0-9a-f-]+)$/i);
         if (draftMatch && req.method === "GET") {
-          if (!cloudDraftsAvailable) {
+          const draftMedia = await draftMediaAvailability();
+          if (!draftMedia.cloudDrafts) {
             throw new DraftError("cloud drafts are unavailable", 404, "capability_unavailable");
           }
           response = json({ draft: await getDraft(db, session.accountId, draftMatch[1]) });
         }
         if (draftMatch && req.method === "PUT") {
-          if (!cloudDraftsAvailable) {
+          const draftMedia = await draftMediaAvailability();
+          if (!draftMedia.cloudDrafts) {
             throw new DraftError("cloud drafts are unavailable", 404, "capability_unavailable");
           }
           const result = await putDraft(db, {
@@ -928,7 +942,8 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/messages/send-group" && req.method === "POST") {
-          if (!mediaGroupsAvailable) {
+          const draftMedia = await draftMediaAvailability();
+          if (!draftMedia.mediaGroups) {
             throw new SyncError(
               "media groups are unavailable",
               404,
@@ -946,7 +961,7 @@ export function startCloudServer(
             mentions: body.mentions,
             draftConsumeOperationId:
               body.draft_consume_operation_id ?? body.draftConsumeOperationId,
-            allowDraftConsumption: cloudDraftsAvailable,
+            allowDraftConsumption: draftMedia.cloudDrafts,
           });
           pushHints(sockets, result.pushes);
           response = json(result);

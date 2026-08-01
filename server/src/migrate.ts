@@ -38,6 +38,14 @@ const dialogPreferencesContract = new URL(
   "./schema-dialog-preferences-contract.sql",
   import.meta.url,
 ).pathname;
+const accountPrivateCleanupExpand = new URL(
+  "./schema-account-private-cleanup-expand.sql",
+  import.meta.url,
+).pathname;
+const accountPrivateCleanupContract = new URL(
+  "./schema-account-private-cleanup-contract.sql",
+  import.meta.url,
+).pathname;
 const callMediaBackfillBatchSize = 1_000;
 const preferenceBackfillBatchSize = Math.max(
   1,
@@ -389,6 +397,106 @@ while (true) {
   legacyPreferenceReconciliations += reconciled;
   if (reconciled === 0) break;
 }
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${accountPrivateCleanupExpand}`.quiet();
+let accountPrivateCleanupReconciliations = 0;
+const cleanupMigrationSql = makeSql(url);
+try {
+  while (true) {
+    const staleAccounts = await cleanupMigrationSql`
+      SELECT account.id
+      FROM public.accounts AS account
+      WHERE account.status = 'deleted'
+        AND (
+          EXISTS (
+            SELECT 1 FROM public.dialogs AS dialog
+            WHERE dialog.type = 'saved' AND dialog.created_by = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.account_dialog_drafts AS draft
+            WHERE draft.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.draft_mutation_requests AS request
+            WHERE request.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.draft_mutation_tombstones AS tombstone
+            WHERE tombstone.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.draft_mutation_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.media_group_send_requests AS request
+            WHERE request.sender_account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.media_group_send_tombstones AS tombstone
+            WHERE tombstone.sender_account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.media_group_send_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.dialog_preferences AS preference
+            WHERE preference.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.dialog_preference_requests AS request
+            WHERE request.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.dialog_preference_action_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM public.dialog_preference_legacy_reconciliation AS reconciliation
+            WHERE reconciliation.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.account_events AS event
+            WHERE event.account_id = account.id
+              AND event.type IN ('draft.updated', 'dialog.preferences_updated')
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.bootstrap_snapshots AS snapshot
+            WHERE snapshot.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM public.media_objects AS media
+            WHERE media.owner_account_id = account.id
+              AND NOT EXISTS (
+                SELECT 1 FROM public.messages AS message
+                WHERE message.media_id = media.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM public.dialogs AS dialog
+                WHERE dialog.photo_media_id = media.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM public.draft_attachments AS attachment
+                WHERE attachment.media_id = media.id
+              )
+          )
+        )
+      ORDER BY account.id
+      LIMIT 100`;
+    if (staleAccounts.length === 0) break;
+    await cleanupMigrationSql.begin(async (tx) => {
+      for (const row of staleAccounts) {
+        await tx`SELECT public.toj_cleanup_account_private_state_v1(${row.id})`;
+      }
+    });
+    accountPrivateCleanupReconciliations += staleAccounts.length;
+  }
+} finally {
+  await cleanupMigrationSql.end();
+}
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${accountPrivateCleanupContract}`.quiet();
 const walBytesText = (
   await $`psql ${url} -v ON_ERROR_STOP=1 -qAt -c "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '${walStart}'::pg_lsn)"`.quiet().text()
 ).trim();
@@ -433,6 +541,9 @@ console.log(JSON.stringify({
     batchSize: preferenceBackfillBatchSize,
     legacyReconciliations: legacyPreferenceReconciliations,
     walBytes: preferenceWalBytes,
+  },
+  accountPrivateCleanup: {
+    accountsReconciled: accountPrivateCleanupReconciliations,
   },
   runtimeMs: migrationRuntimeMs,
 }));

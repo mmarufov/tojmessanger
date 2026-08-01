@@ -125,14 +125,15 @@ struct GroupCreationView: View {
     }
 
     private var groupDetails: some View {
-        VStack(spacing: 22) {
+        let hasPhoto = photoData != nil
+        return VStack(spacing: 22) {
             GroupPhotoPreview(
                 data: photoData,
                 title: title.isEmpty ? String(localized: "Group") : title,
                 size: 88
             )
             PhotosPicker(selection: $photoItem, matching: .images) {
-                Label(photoData == nil ? "Add group photo" : "Change group photo", systemImage: "photo")
+                Label(hasPhoto ? "Change group photo" : "Add group photo", systemImage: "photo")
             }
             .onChange(of: photoItem) { _, item in
                 Task { photoData = try? await item?.loadTransferable(type: Data.self) }

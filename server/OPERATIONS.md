@@ -8,12 +8,12 @@ gitignored notes.
 
 - `GET /health` is process liveness and does not touch PostgreSQL.
 - `GET /ready` checks PostgreSQL and reports only `configured`/`development`/`disabled` provider
-  state. It returns `503` until both the complete Saved Messages catalog contract and the complete
-  dialog-preference contract are present: required columns, validated constraints, unique/index
-  contracts, claims schema, mixed-writer/deletion/compatibility triggers, versioned contract markers,
-  completed migration cursors, and empty reconciliation state. These requirements remain active even
-  when rollout switches are off. A database failure returns `500`; deployment tooling must require
-  `200` before switching traffic.
+  state. It returns `503` until the complete Saved Messages, dialog-preference, and
+  draft/media-group catalog contracts are present: exact runtime columns/defaults/nullability,
+  validated checks, conflict uniqueness, required indexes, mixed-writer/deletion/compatibility
+  triggers, versioned contract markers, completed migration cursors, and empty reconciliation
+  state. These requirements remain active even when rollout switches are off. A database failure
+  returns `500`; deployment tooling must require `200` before switching traffic.
 - Every HTTP response includes `X-Request-ID`. A safe incoming value is preserved; malformed values
   are replaced. JSON request logs contain only time, request ID, method, normalized route, status,
   and duration—never query strings, bodies, bearer tokens, phone numbers, or account IDs.
@@ -131,6 +131,14 @@ ciphertext, and media references, so recipients keep the forwarded content witho
 identity or a dependency on the deleted archive. Media owned by the deleted account is removed only
 when no retained message still references it.
 
+The same database-owned status trigger purges account-private cloud drafts and attachments,
+draft/album replay receipts and mutation budgets, dialog preferences and their requests/budgets,
+draft/preference sync events, and bootstrap snapshots. It runs for a raw legacy
+`UPDATE accounts SET status = 'deleted'` as well as the current API. Media deletion is reference
+checked after all private rows are removed: any surviving message, dialog photo, or another draft
+keeps the encrypted object and chunks. The migration reconciles already-deleted accounts before
+publishing `account-private-cleanup-v1`.
+
 ## Saved Messages rollout
 
 Saved Messages is dark by default. Migrate PostgreSQL before enabling it; API version 5 adds the
@@ -246,6 +254,22 @@ pin/archive/mute values and mirrored legacy group mute remain intact for a later
 Account deletion purges preference rows, idempotency payloads, budget rows, preference events, and
 bootstrap snapshots because they are private presentation state. Delivered message history remains
 under the separate message-retention contract.
+
+## Cloud drafts and media-group rollout
+
+`cloud_drafts_v1` and `media_groups_v1` remain independently controlled by
+`TOJ_CLOUD_DRAFTS_V1_ENABLED` and `TOJ_MEDIA_GROUPS_V1_ENABLED`, but neither capability is advertised
+unless the shared draft/media schema manifest is fully ready. The same effective availability is
+used by draft hydration, difference/bootstrap sync, draft consumption, draft routes, and grouped
+sends, so a partial schema fails closed even if a node is reached outside the load balancer.
+
+Run `bun run migrate` before enabling either switch. The runner validates and swaps the existing
+message/event constraints, builds the cleanup/replay indexes, installs the account-private deletion
+boundary, reconciles any deleted-account residue in bounded batches, and only then publishes the
+`account-private-cleanup-v1` marker. Require `/ready` to return `200`, then verify authenticated and
+unauthenticated capability responses before admitting traffic. Rollback is by clearing the two
+feature switches; do not remove the database cleanup function or status trigger while any binary
+can create draft, album, Saved, or preference state.
 
 ## Voice calls and TURN readiness
 

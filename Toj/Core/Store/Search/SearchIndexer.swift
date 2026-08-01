@@ -4,7 +4,7 @@ import os
 
 /// Keeps `message_search` in step with `messages`, and owns every failure the index can suffer.
 ///
-/// The triggers installed by `v12-message-search` record *that* a message changed; this decides
+/// The triggers installed by `v13-message-search` record *that* a message changed; this decides
 /// what that means. It exists as a separate actor rather than methods on `CloudLocalStore` because
 /// its failure policy is the opposite of the store's: the store must surface errors, and this must
 /// swallow them. Search is derived data. Nothing it does may ever cost a user a message.
@@ -376,8 +376,8 @@ actor SearchIndexer {
     /// one sent today.
     static func sortTimestamp(_ raw: String?) -> Int64 {
         guard let raw, !raw.isEmpty else { return 0 }
-        for formatter in [isoFormatter, isoFractionalFormatter] {
-            if let date = formatter.date(from: raw) { return Int64(date.timeIntervalSince1970 * 1000) }
+        if let date = try? isoFormatter.parse(raw) {
+            return Int64(date.timeIntervalSince1970 * 1000)
         }
         if let date = sqliteFormatter.date(from: raw) {
             return Int64(date.timeIntervalSince1970 * 1000)
@@ -385,17 +385,9 @@ actor SearchIndexer {
         return 0
     }
 
-    private static let isoFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
-    private static let isoFractionalFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
+    // Value-typed and Sendable, unlike ISO8601DateFormatter's shared mutable reference. This style
+    // accepts both whole-second and fractional-second server timestamps.
+    private static let isoFormatter = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
 
     private static let sqliteFormatter: DateFormatter = {
         let formatter = DateFormatter()
