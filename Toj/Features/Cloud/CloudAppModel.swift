@@ -346,6 +346,18 @@ final class CloudAppModel {
     private let savedMessagesService = SavedMessagesService()
     private let tokenStore: TokenStore
     private var localStore: CloudLocalStore?
+
+    /// Owns the search index's lifecycle. Deliberately a separate actor rather than more methods
+    /// here: none of it needs the main actor, and this type is large enough.
+    ///
+    /// Scoped to an account *and* a store instance, so recovering a quarantined replica — which
+    /// produces a new store for the same account — replaces the coordinator rather than letting the
+    /// old one keep writing to a database nobody is reading.
+    private(set) var searchCoordinator: SearchCoordinator?
+
+    /// The store the search screen queries. Exposed rather than routing every search through this
+    /// type, which is large enough already.
+    var searchStore: CloudLocalStore? { localStore }
     private let localStoreBootstrapper = CloudLocalStoreBootstrapper()
     private let opensDefaultLocalStore: Bool
     private let pushCenter: PushRegistrationCenter
@@ -434,6 +446,17 @@ final class CloudAppModel {
     private var timelineTopVisibleMsgId: Int64?
     private var timelineIsAtBottom = true
     private var pendingVisibleReadMessages: [LocalMessage] = []
+    /// Message the timeline should open on and briefly flash, set when a search result is tapped.
+    ///
+    /// Cleared once the flash finishes so returning to the same conversation later does not replay
+    /// it — a highlight that reappears without a search behind it reads as a bug.
+    var focusedSearchMsgId: Int64?
+
+    /// In-chat find state. `nil` when the bar is closed.
+    var inChatSearch: InChatSearchState?
+    private var inChatSearchTask: Task<Void, Never>?
+    private var inChatSearchGeneration: UInt64 = 0
+
     private var timelineBeforeCount = 40
     private var timelineAfterCount = 79
     private var dialogSelectionGeneration: UInt64 = 0
@@ -468,14 +491,17 @@ final class CloudAppModel {
 
     var capabilities: MessagingCapabilities {
         #if DEBUG
-        if isDemoMode { return .demo }
+        if isDemoMode { return .demo.union(searchCapability) }
         #endif
+        let serverCapabilities: MessagingCapabilities
         guard WebRTCEngineFactory.isAvailable else {
-            return negotiatedCapabilities.subtracting([.calls, .videoCalls])
+            serverCapabilities = negotiatedCapabilities.subtracting([.calls, .videoCalls])
+            return serverCapabilities.union(searchCapability)
         }
-        return WebRTCEngineFactory.supportsCameraVideoProfile
+        serverCapabilities = WebRTCEngineFactory.supportsCameraVideoProfile
             ? negotiatedCapabilities
             : negotiatedCapabilities.subtracting(.videoCalls)
+        return serverCapabilities.union(searchCapability)
     }
 
     private func installAuthenticatedSession(_ session: StoredCloudSession) {
@@ -1070,6 +1096,13 @@ final class CloudAppModel {
         let pendingDraftPersistenceTasks = Array(draftPersistenceTasks.values)
         let preferenceTasks = Array(preferenceMutationTasks.values)
         let pendingRetryTask = retryTask
+        // Fence find-in-chat publication immediately, then join its detached FTS child with the
+        // rest of the SQLCipher readers before the replica is cleared or destroyed.
+        inChatSearchGeneration &+= 1
+        let pendingInChatSearchTask = inChatSearchTask
+        inChatSearchTask = nil
+        inChatSearch = nil
+        focusedSearchMsgId = nil
         let backgroundTasks: [Task<Void, Never>] = [
             hintTask, networkObservationTask, memoryPressureTask,
             pendingRetryTask, resendTask, recordingTask,
@@ -1079,7 +1112,7 @@ final class CloudAppModel {
             openingAnchorHydrationTask,
             timelineObservationTask, draftObservationTask,
             viewportPersistenceTask, mediaDownloadTask,
-            readReceiptRetryTask, replicaIntegrityTask,
+            readReceiptRetryTask, replicaIntegrityTask, pendingInChatSearchTask,
         ].compactMap { $0 }
         backgroundTasks.forEach { $0.cancel() }
         transferTasks.forEach { $0.cancel() }
@@ -1092,6 +1125,10 @@ final class CloudAppModel {
         await mediaPrefetchScheduler.stop()
         mediaSchedulerForegrounded = false
         await BackgroundRuntimeCoordinator.shared.removeWorkHandlersAndWait()
+        // Search owns detached observation/drain work against SQLCipher. Quiesce and release that
+        // exact account/store generation before either clearing rows or destroying the replica.
+        await searchCoordinator?.cancelAndWait()
+        searchCoordinator = nil
         for task in backgroundTasks { await task.value }
         for task in transferTasks { await task.value }
         for task in preferenceTasks { await task.value }
@@ -1820,7 +1857,12 @@ final class CloudAppModel {
 
     /// Starts the encrypted local observation before the navigation animation begins. This method
     /// performs no network work and publishes an LRU hit in the same main-actor turn as the tap.
-    func prepareConversationOpen(dialogId: String) {
+    func prepareConversationOpen(dialogId: String, focusMsgId: Int64? = nil) {
+        if let focusMsgId {
+            // Set before selection so `beginConversationSelection` can anchor on it instead of
+            // resetting to the bottom.
+            pendingFocusMsgId = focusMsgId
+        }
         guard activeDialogId != dialogId || timelineObservationTask == nil else { return }
         beginConversationSelection(dialogId)
     }
@@ -1960,6 +2002,9 @@ final class CloudAppModel {
         }
     }
 
+    /// Consumed by the next `beginConversationSelection`, then cleared.
+    private var pendingFocusMsgId: Int64?
+
     private func beginConversationSelection(_ dialogId: String) {
         if let previousDialogId = activeDialogId, previousDialogId != dialogId {
             conversationOpenStartedAt.removeValue(forKey: previousDialogId)
@@ -1983,11 +2028,16 @@ final class CloudAppModel {
         draft = ""
         suppressDraftPersistence = false
         composerMode = .text
-        timelineBeforeCount = 40
-        timelineAfterCount = 79
-        openingTimelineAnchor = .bottom
+        // A search result opens *at* its message, so the window is centred rather than
+        // bottom-weighted and the anchor is the target instead of the unread watermark.
+        let focus = pendingFocusMsgId
+        pendingFocusMsgId = nil
+        timelineBeforeCount = focus == nil ? 40 : 40
+        timelineAfterCount = focus == nil ? 79 : 40
+        openingTimelineAnchor = focus.map { .saved(msgId: $0) } ?? .bottom
+        focusedSearchMsgId = focus
         timelineTopVisibleMsgId = nil
-        timelineIsAtBottom = true
+        timelineIsAtBottom = focus == nil
         pendingVisibleReadMessages = []
         canLoadEarlier = false
         loadingEarlier = false
@@ -2034,6 +2084,215 @@ final class CloudAppModel {
         }
     }
 
+    // MARK: - In-chat search
+
+    /// Find-in-conversation state: the matches and where the user is within them.
+    struct InChatSearchState: Equatable {
+        var query: String = ""
+        /// Newest first, matching how results are ordered everywhere else.
+        var matches: [Int64] = []
+        /// Index into `matches`, or nil before the first jump.
+        var currentIndex: Int?
+
+        var isEmpty: Bool { matches.isEmpty }
+
+        /// "3 of 47", one-based for display.
+        var positionLabel: String? {
+            guard let currentIndex, !matches.isEmpty else { return nil }
+            return String(
+                format: String(localized: "%1$lld of %2$lld"),
+                Int64(currentIndex + 1), Int64(matches.count)
+            )
+        }
+    }
+
+    static let inChatSearchDebounce = Duration.milliseconds(160)
+
+    func openInChatSearch() {
+        inChatSearchGeneration &+= 1
+        inChatSearchTask?.cancel()
+        inChatSearchTask = nil
+        inChatSearch = InChatSearchState()
+    }
+
+    func closeInChatSearch() {
+        inChatSearchGeneration &+= 1
+        inChatSearchTask?.cancel()
+        inChatSearchTask = nil
+        inChatSearch = nil
+        focusedSearchMsgId = nil
+    }
+
+    /// Debounces and re-runs the in-chat query, then jumps to the newest match.
+    ///
+    /// SQL/FTS work runs in a detached worker. Cancellation is propagated to that worker, and both
+    /// result publication and navigation validate the generation, query, and dialog. A slow query
+    /// can therefore do neither of the two harmful stale things: replace newer matches or jump the
+    /// conversation after the user has typed again/closed search/switched chats.
+    func updateInChatSearch(query: String) async {
+        guard var state = inChatSearch, let dialogId = activeDialogId else { return }
+        inChatSearchGeneration &+= 1
+        let generation = inChatSearchGeneration
+        inChatSearchTask?.cancel()
+        state.query = query
+        state.matches = []
+        state.currentIndex = nil
+        inChatSearch = state
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let localStore else {
+            inChatSearchTask = nil
+            return
+        }
+
+        let coordinator = searchCoordinator
+        let task = Task { [weak self, localStore, coordinator] in
+            do {
+                try await Task.sleep(for: Self.inChatSearchDebounce)
+                try Task.checkCancellation()
+                await coordinator?.drainBeforeSearch()
+                try Task.checkCancellation()
+
+                let queryTask = Task.detached(priority: .userInitiated) {
+                    try Task.checkCancellation()
+                    return try await localStore.searchInDialog(dialogId, query: trimmed)
+                }
+                let matches = try await withTaskCancellationHandler {
+                    try await queryTask.value
+                } onCancel: {
+                    queryTask.cancel()
+                }
+                try Task.checkCancellation()
+
+                guard let self,
+                      self.inChatSearchGeneration == generation,
+                      self.activeDialogId == dialogId,
+                      self.inChatSearch?.query == query
+                else { return }
+                self.inChatSearch?.matches = matches
+                self.inChatSearch?.currentIndex = matches.isEmpty ? nil : 0
+                if let first = matches.first {
+                    await self.jumpToSearchMatch(
+                        first, expectedSearchGeneration: generation
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self,
+                      self.inChatSearchGeneration == generation,
+                      self.activeDialogId == dialogId,
+                      self.inChatSearch?.query == query
+                else { return }
+                self.inChatSearch?.matches = []
+                self.inChatSearch?.currentIndex = nil
+            }
+        }
+        inChatSearchTask = task
+        await task.value
+        if inChatSearchGeneration == generation { inChatSearchTask = nil }
+    }
+
+    /// Moves through matches. Wraps, because a find bar that dead-ends at the last match makes the
+    /// user re-type to get back to the first.
+    func stepInChatSearch(forward: Bool) async {
+        guard var state = inChatSearch, !state.matches.isEmpty else { return }
+        let generation = inChatSearchGeneration
+        let count = state.matches.count
+        let current = state.currentIndex ?? 0
+        // `matches` is newest-first, so "next" walks toward older messages.
+        let next = forward ? (current + 1) % count : (current - 1 + count) % count
+        state.currentIndex = next
+        inChatSearch = state
+        await jumpToSearchMatch(
+            state.matches[next], expectedSearchGeneration: generation
+        )
+    }
+
+    /// Scrolls to a match, pulling the surrounding window from the server if it is not local yet.
+    func jumpToSearchMatch(
+        _ msgId: Int64, expectedSearchGeneration: UInt64? = nil
+    ) async {
+        guard let dialogId = activeDialogId else { return }
+        if let expectedSearchGeneration {
+            guard expectedSearchGeneration == inChatSearchGeneration,
+                  inChatSearch != nil
+            else { return }
+        }
+        focusedSearchMsgId = msgId
+
+        let isLocal = loadedLocalMessages.contains { $0.msgId == msgId }
+        if !isLocal {
+            // The match is outside the loaded window. Hydrating first means the jump lands on the
+            // message rather than on whatever happens to be loaded.
+            await hydrateOpeningAnchor(dialogId: dialogId, candidateMsgId: msgId)
+        }
+        guard activeDialogId == dialogId else { return }
+        if let expectedSearchGeneration {
+            guard expectedSearchGeneration == inChatSearchGeneration,
+                  inChatSearch != nil
+            else { return }
+        }
+        openingTimelineAnchor = .saved(msgId: msgId)
+        timelineIsAtBottom = false
+    }
+
+    /// Ends the flash. Called by the view once the animation completes so a later visit to the same
+    /// conversation does not replay it.
+    func clearSearchFocus() {
+        focusedSearchMsgId = nil
+    }
+
+    // MARK: - Search lifecycle
+
+    /// Points the search coordinator at the current account and store, replacing any predecessor.
+    ///
+    /// `cancelAndWait` before constructing the replacement is the load-bearing part: without it the
+    /// outgoing generation's drain overlaps the incoming one's bootstrap, and both write.
+    func refreshSearchCoordinator() async {
+        guard let localStore, let accountId = storedSession?.session.accountId else {
+            await searchCoordinator?.cancelAndWait()
+            searchCoordinator = nil
+            return
+        }
+        if let existing = searchCoordinator, existing.serves(accountId: accountId, store: localStore) {
+            return
+        }
+        await searchCoordinator?.cancelAndWait()
+        let coordinator = SearchCoordinator(store: localStore, accountId: accountId)
+        searchCoordinator = coordinator
+        await coordinator.start()
+    }
+
+    /// Binds and fully drains the coordinator, for tests that need a deterministic index.
+    ///
+    /// Production never waits on the index: `refreshSearchCoordinator` starts a background loop and
+    /// returns. A test that asserted on search results without a settling point would be timing
+    /// dependent, which is worse than slow.
+    func refreshSearchCoordinatorForTesting() async {
+        guard let localStore else { return }
+        await searchCoordinator?.cancelAndWait()
+        let accountId = storedSession?.session.accountId ?? "test-account"
+        let coordinator = SearchCoordinator(store: localStore, accountId: accountId)
+        searchCoordinator = coordinator
+        await coordinator.start()
+        try? await coordinator.waitUntilIdle()
+    }
+
+    func cancelSearchCoordinatorForTesting() async {
+        await searchCoordinator?.cancelAndWait()
+        searchCoordinator = nil
+    }
+
+    /// Search is available while the coordinator serves the current account/store generation.
+    /// Unlike every other capability this is decided locally rather than advertised by the server.
+    var searchCapability: MessagingCapabilities {
+        guard let searchCoordinator, let localStore,
+              let accountId = storedSession?.session.accountId,
+              searchCoordinator.serves(accountId: accountId, store: localStore)
+        else { return [] }
+        return .localSearch
+    }
+
     func retryConversationLocalLoad() {
         guard let activeDialogId else { return }
         conversationOpenState = cachedLinesByDialog[activeDialogId] == nil ? .loadingLocal : .cached
@@ -2042,6 +2301,7 @@ final class CloudAppModel {
 
     func deselectDialog(_ dialogId: String) {
         guard activeDialogId == dialogId else { return }
+        closeInChatSearch()
         conversationOpenStartedAt.removeValue(forKey: dialogId)
         finishConversationOpenWaiters(dialogId: dialogId)
         cacheCurrentLines(for: dialogId)
@@ -2220,7 +2480,11 @@ final class CloudAppModel {
                     || $0.subtitle.localizedStandardContains(trimmed)
             }
         case .people:
-            return dialogs.filter { $0.title.localizedStandardContains(trimmed) }
+            return dialogs.filter {
+                $0.type == "direct"
+                    && !$0.isArchived
+                    && $0.title.localizedStandardContains(trimmed)
+            }
         case .messages:
             #if DEBUG
             if isDemoMode {
@@ -4126,6 +4390,10 @@ final class CloudAppModel {
             }
         }
         await refreshMediaCacheUsage()
+        // Bind search at local-ready time, not only when the UI happens to open the Search tab.
+        // This makes the local capability truthful and lets the existing background runtime service
+        // queue and maintenance work even when the user never visits search.
+        await refreshSearchCoordinator()
         installBackgroundWorkHandlers()
         if let localStore {
             startReplicaIntegrityVerification(store: localStore, accountId: accountId)
@@ -4503,6 +4771,10 @@ final class CloudAppModel {
                     try context.checkCancellation()
                     await self.processMediaDownloadJobs(maximumJobs: 12)
                     try context.checkCancellation()
+                    if let coordinator = await self.searchCoordinator {
+                        await coordinator.runScheduledMaintenance()
+                    }
+                    try context.checkCancellation()
                     if let localStore = await self.localStore {
                         await self.mediaEngine.enforceCachePolicy(localStore: localStore)
                     } else {
@@ -4514,7 +4786,11 @@ final class CloudAppModel {
                 } catch {
                     return .retry
                 }
-            }
+            },
+            // Search maintenance is local and useful offline. Network-backed work already checks
+            // connectivity and remains resumable, so the shared processing task need not require a
+            // network before iOS will launch it.
+            processingRequiresNetworkConnectivity: false
         )
         BackgroundRuntimeCoordinator.shared.schedulePendingWork()
     }

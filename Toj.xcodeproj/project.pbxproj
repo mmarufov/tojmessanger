@@ -10,6 +10,18 @@
 		0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6A7237A13A5A375D4580965 /* TojTests.swift */; };
 		160C89EC164D6880875B2B85 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
 		2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */; };
+		9A41C7E10018B23D45E6F708 /* SearchNavigationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10017B23D45E6F708 /* SearchNavigationTests.swift */; };
+		9A41C7E10016B23D45E6F708 /* MessageSearchControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10015B23D45E6F708 /* MessageSearchControllerTests.swift */; };
+		9A41C7E10014B23D45E6F708 /* SearchCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10013B23D45E6F708 /* SearchCoordinatorTests.swift */; };
+		9A41C7E10012B23D45E6F708 /* MessageSearchStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */; };
+		9A41C7E10010B23D45E6F708 /* SearchIndexerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */; };
+		9A41C7E1000EB23D45E6F708 /* search-tokenizer-manifest.json in Resources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */; };
+		9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */; };
+		9A41C7E1000AB23D45E6F708 /* SearchQueryContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */; };
+		9A41C7E10008B23D45E6F708 /* search-normalizer-vectors.json in Resources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */; };
+		9A41C7E10006B23D45E6F708 /* MessageSearchFTS5Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */; };
+		9A41C7E10004B23D45E6F708 /* SearchPatternBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */; };
+		9A41C7E10002B23D45E6F708 /* SearchTextNormalizerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A41C7E10001B23D45E6F708 /* SearchTextNormalizerTests.swift */; };
 		3466AFEEEDD1A1DFD258075E /* Pods_Toj.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */; };
 		3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */; };
 		4C19CECBBB68FA38A643EACD /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0C03914F0029DBF5289BE42 /* Foundation.framework */; };
@@ -67,6 +79,18 @@
 		E4A8C89C215B4C37BF5246E2 /* EncryptedProfilePhotoStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = EncryptedProfilePhotoStoreTests.swift; sourceTree = "<group>"; };
 		F0C03914F0029DBF5289BE42 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = BackoffPolicyTests.swift; sourceTree = "<group>"; };
+		9A41C7E10017B23D45E6F708 /* SearchNavigationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchNavigationTests.swift; sourceTree = "<group>"; };
+		9A41C7E10015B23D45E6F708 /* MessageSearchControllerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchControllerTests.swift; sourceTree = "<group>"; };
+		9A41C7E10013B23D45E6F708 /* SearchCoordinatorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchCoordinatorTests.swift; sourceTree = "<group>"; };
+		9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchStoreTests.swift; sourceTree = "<group>"; };
+		9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchIndexerTests.swift; sourceTree = "<group>"; };
+		9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.json; name = search-tokenizer-manifest.json; path = Toj/Core/Search/search-tokenizer-manifest.json; sourceTree = SOURCE_ROOT; };
+		9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchIndexSizeBenchmark.swift; sourceTree = "<group>"; };
+		9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchQueryContractTests.swift; sourceTree = "<group>"; };
+		9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.json; name = search-normalizer-vectors.json; path = server/src/search-normalizer-vectors.json; sourceTree = SOURCE_ROOT; };
+		9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessageSearchFTS5Tests.swift; sourceTree = "<group>"; };
+		9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchPatternBuilderTests.swift; sourceTree = "<group>"; };
+		9A41C7E10001B23D45E6F708 /* SearchTextNormalizerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SearchTextNormalizerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -113,6 +137,18 @@
 			children = (
 				A6A7237A13A5A375D4580965 /* TojTests.swift */,
 				FBB4445E3EBC2ADCC6FC11D3 /* BackoffPolicyTests.swift */,
+				9A41C7E10017B23D45E6F708 /* SearchNavigationTests.swift */,
+				9A41C7E10015B23D45E6F708 /* MessageSearchControllerTests.swift */,
+				9A41C7E10013B23D45E6F708 /* SearchCoordinatorTests.swift */,
+				9A41C7E10011B23D45E6F708 /* MessageSearchStoreTests.swift */,
+				9A41C7E1000FB23D45E6F708 /* SearchIndexerTests.swift */,
+				9A41C7E1000DB23D45E6F708 /* search-tokenizer-manifest.json */,
+				9A41C7E1000BB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift */,
+				9A41C7E10009B23D45E6F708 /* SearchQueryContractTests.swift */,
+				9A41C7E10007B23D45E6F708 /* search-normalizer-vectors.json */,
+				9A41C7E10005B23D45E6F708 /* MessageSearchFTS5Tests.swift */,
+				9A41C7E10003B23D45E6F708 /* SearchPatternBuilderTests.swift */,
+				9A41C7E10001B23D45E6F708 /* SearchTextNormalizerTests.swift */,
 				51C7CFFF1F260D7E5C3684BB /* EnvelopeTests.swift */,
 				8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */,
 				C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */,
@@ -299,6 +335,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9A41C7E1000EB23D45E6F708 /* search-tokenizer-manifest.json in Resources */,
+				9A41C7E10008B23D45E6F708 /* search-normalizer-vectors.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -390,6 +428,16 @@
 			files = (
 				0BBCD9372185E82636B10EB8 /* TojTests.swift in Sources */,
 				2C47E4CF7E0299AACAAB6718 /* BackoffPolicyTests.swift in Sources */,
+				9A41C7E10018B23D45E6F708 /* SearchNavigationTests.swift in Sources */,
+				9A41C7E10016B23D45E6F708 /* MessageSearchControllerTests.swift in Sources */,
+				9A41C7E10014B23D45E6F708 /* SearchCoordinatorTests.swift in Sources */,
+				9A41C7E10012B23D45E6F708 /* MessageSearchStoreTests.swift in Sources */,
+				9A41C7E10010B23D45E6F708 /* SearchIndexerTests.swift in Sources */,
+				9A41C7E1000CB23D45E6F708 /* MessageSearchIndexSizeBenchmark.swift in Sources */,
+				9A41C7E1000AB23D45E6F708 /* SearchQueryContractTests.swift in Sources */,
+				9A41C7E10006B23D45E6F708 /* MessageSearchFTS5Tests.swift in Sources */,
+				9A41C7E10004B23D45E6F708 /* SearchPatternBuilderTests.swift in Sources */,
+				9A41C7E10002B23D45E6F708 /* SearchTextNormalizerTests.swift in Sources */,
 				E15E03E7CDB255C43287BA60 /* EnvelopeTests.swift in Sources */,
 				CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */,
 				3812E7D7446584FC01481625 /* CloudLocalStoreTests.swift in Sources */,

@@ -46,6 +46,7 @@ final class BackgroundRuntimeCoordinator {
 
     private var appRefreshHandler: WorkHandler?
     private var processingHandler: WorkHandler?
+    private var processingRequiresNetworkConnectivity = true
     private var sessionEventHandlers: [String: BackgroundSessionEventsHandler] = [:]
     private var pendingSessionEventIdentifiers: Set<String> = []
     private var sessionCompletionHandlers: [String: () -> Void] = [:]
@@ -96,10 +97,12 @@ final class BackgroundRuntimeCoordinator {
     /// Handlers must cooperate with cancellation and persist their own resumable cursors.
     func installWorkHandlers(
         appRefresh: WorkHandler?,
-        processing: WorkHandler?
+        processing: WorkHandler?,
+        processingRequiresNetworkConnectivity: Bool = true
     ) {
         appRefreshHandler = appRefresh
         processingHandler = processing
+        self.processingRequiresNetworkConnectivity = processingRequiresNetworkConnectivity
         startPendingTaskIfPossible(kind: .appRefresh)
         startPendingTaskIfPossible(kind: .processing)
     }
@@ -163,7 +166,7 @@ final class BackgroundRuntimeCoordinator {
             scheduleAppRefresh()
         }
         if processingHandler != nil {
-            scheduleProcessing()
+            scheduleProcessing(requiresNetworkConnectivity: processingRequiresNetworkConnectivity)
         }
     }
 
@@ -230,7 +233,7 @@ final class BackgroundRuntimeCoordinator {
         case .appRefresh:
             scheduleAppRefresh()
         case .processing:
-            scheduleProcessing()
+            scheduleProcessing(requiresNetworkConnectivity: processingRequiresNetworkConnectivity)
         }
 
         execute(task: task, completion: completion, kind: kind, handler: handler)

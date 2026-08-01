@@ -525,6 +525,10 @@ private struct CloudChatsView: View {
 
     private var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// Built once the coordinator exists. Nil means the index is unavailable and the screen falls
+    /// back to filtering titles, which is the old behaviour rather than a blank list.
+    @State private var searchController: MessageSearchController?
+
     private var filteredDialogs: [CloudAppModel.Dialog] {
         model.dialogs(matching: query, scope: searchScope)
     }
@@ -540,21 +544,46 @@ private struct CloudChatsView: View {
                     LazyVStack(spacing: 0) {
                         searchDrawer
                             .id("chat-search")
+                            .task { await syncSearchController() }
+                            .onChange(of: query) { _, newValue in
+                                searchController?.query = newValue
+                            }
+                            .onChange(of: searchScope) { _, newValue in
+                                searchController?.scope = newValue
+                            }
                         Color.clear
                             .frame(height: 0)
                             .id("chat-list-top")
 
-                        if isSearching, model.capabilities.contains(.richSearch) {
+                        if isSearching || searchScope.browsesWithoutQuery,
+                           model.capabilities.contains(.localSearch) || model.capabilities.contains(.richSearch) {
                             TojPillFilter(items: SearchScope.allCases, selection: $searchScope) { $0.title }
                                 .padding(.bottom, 6)
                                 .accessibilityLabel("Search filters")
                         }
 
-                        if !isSearching, !archivedDialogs.isEmpty {
+                        if !isSearching, !archivedDialogs.isEmpty, !searchScope.browsesWithoutQuery {
                             archivedChatsEntry
                         }
 
-                        if filteredDialogs.isEmpty, archivedDialogs.isEmpty || isSearching {
+                        if let controller = searchController,
+                           isSearching || searchScope.browsesWithoutQuery {
+                            // Real message search. The chat-list filter below stays as the fallback
+                            // for a device whose index is unavailable.
+                            SearchResultsView(
+                                controller: controller,
+                                onOpenDialog: { onOpen?($0) },
+                                onOpenMessage: { hit in
+                                    // Focus is set before navigation so the conversation anchors on
+                                    // the match instead of opening at the bottom and scrolling.
+                                    model.prepareConversationOpen(
+                                        dialogId: hit.dialogId, focusMsgId: hit.msgId
+                                    )
+                                    onOpen?(hit.dialogId)
+                                }
+                            )
+                            .frame(minHeight: geometry.size.height * 0.7)
+                        } else if filteredDialogs.isEmpty, archivedDialogs.isEmpty || isSearching {
                             emptyState
                                 .padding(.top, 92)
                         } else {
@@ -754,6 +783,26 @@ private struct CloudChatsView: View {
         .accessibilityIdentifier("archived-chats-entry")
     }
 
+    /// Creates the controller once the coordinator is available, and keeps it fed.
+    ///
+    /// The controller owns debounce and cancellation, so the view only forwards state rather than
+    /// deciding when to query.
+    private func syncSearchController() async {
+        await model.refreshSearchCoordinator()
+        guard let store = model.searchStore, let coordinator = model.searchCoordinator else {
+            searchController = nil
+            return
+        }
+        if searchController == nil {
+            searchController = MessageSearchController(
+                backend: LocalMessageSearchBackend(store: store, coordinator: coordinator),
+                dialogs: { model.dialogs }
+            )
+        }
+        searchController?.query = query
+        searchController?.scope = searchScope
+    }
+
     private var searchDrawer: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
@@ -763,6 +812,7 @@ private struct CloudChatsView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
+                .accessibilityIdentifier("global-search-field")
             if !query.isEmpty {
                 Button {
                     query = ""
@@ -1005,7 +1055,9 @@ private struct ArchivedChatsView: View {
     }
 }
 
-private struct CloudDialogRow: View {
+/// Shared with the search screen, which renders the same chat row so a result looks identical to
+/// the list it came from.
+struct CloudDialogRow: View {
     let dialog: CloudAppModel.Dialog
 
     var body: some View {

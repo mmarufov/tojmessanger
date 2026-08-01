@@ -68,6 +68,7 @@ struct TojConversationExperience: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var composerFocused: Bool
     @State private var showingProfile = false
+    @State private var openSearchAfterProfileDismiss = false
     @State private var showingAttachments = false
     @State private var showingForwarding = false
     @State private var forwardLine: CloudAppModel.Line?
@@ -112,9 +113,15 @@ struct TojConversationExperience: View {
         messageTimeline
             .background(TojTheme.canvas)
             .overlay(alignment: .top) {
-                header
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+                VStack(spacing: 8) {
+                    header
+                    // Below the header rather than replacing it: the user still needs to see which
+                    // conversation they are searching.
+                    InChatSearchBar(model: model)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .animation(reduceMotion ? nil : .snappy, value: model.inChatSearch != nil)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .toolbar(.hidden, for: .navigationBar)
@@ -139,7 +146,11 @@ struct TojConversationExperience: View {
         .onChange(of: model.activeDialogId) { previous, current in
             if previous == dialogId, current == nil { dismiss() }
         }
-        .sheet(isPresented: $showingProfile) {
+        .sheet(isPresented: $showingProfile, onDismiss: {
+            guard openSearchAfterProfileDismiss else { return }
+            openSearchAfterProfileDismiss = false
+            model.openInChatSearch()
+        }) {
             if isGroup {
                 NavigationStack {
                     GroupProfileView(model: model, dialogId: dialogId)
@@ -147,10 +158,18 @@ struct TojConversationExperience: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             } else {
-                TojPeerProfileView(model: model, dialogId: dialogId) {
-                    showingProfile = false
-                    Task { await model.startVoiceCall(dialogId: dialogId) }
-                }
+                TojPeerProfileView(
+                    model: model,
+                    dialogId: dialogId,
+                    onCall: {
+                        showingProfile = false
+                        Task { await model.startVoiceCall(dialogId: dialogId) }
+                    },
+                    onSearch: {
+                        openSearchAfterProfileDismiss = true
+                        showingProfile = false
+                    }
+                )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             }
@@ -498,6 +517,10 @@ struct TojConversationExperience: View {
                             }
                         }
                         .id(item.id)
+                        .searchMatchFlash(
+                            isActive: item.line.msgId != nil
+                                && item.line.msgId == model.focusedSearchMsgId
+                        ) { model.clearSearchFocus() }
                         .transition(
                             reduceMotion
                                 ? .opacity

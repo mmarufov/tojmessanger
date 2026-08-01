@@ -36,3 +36,6 @@ Dependencies/TojWebRTC/WebRTC.xcframework.zip.sha256
 # Coturn deployment secrets and certificates
 infra/coturn/turnserver.conf
 infra/coturn/certs/
+
+# Python bytecode from scripts/
+__pycache__/

@@ -9,6 +9,8 @@ struct TojPeerProfileView: View {
 
     let dialogId: String
     let onCall: () -> Void
+    /// Opens find-in-conversation. Supplied by the conversation, which owns that state.
+    var onSearch: () -> Void = {}
 
     private var title: String { model.dialogTitle(dialogId) }
     private var dialog: CloudAppModel.Dialog? { model.dialogs.first(where: { $0.id == dialogId }) }
@@ -51,7 +53,11 @@ struct TojPeerProfileView: View {
                         profileAction("Video", icon: "video.slash.fill") {}
                             .disabled(true)
                             .opacity(0.42)
-                        profileAction("Search", icon: "magnifyingglass") { dismiss() }
+                        profileAction("Search", icon: "magnifyingglass") {
+                            // The presenting conversation waits for the sheet's onDismiss before
+                            // publishing the find bar, so it cannot be hidden by the transition.
+                            onSearch()
+                        }
                     }
 
                     profileSection("Privacy") {
