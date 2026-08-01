@@ -178,6 +178,19 @@ extension CloudLocalStore {
             """)
         arguments.append(contentsOf: visibleAccessStates)
 
+        // The index is eventually consistent; results are not allowed to be. A message deleted,
+        // edited, or re-attached since the last drain still has its old row in `message_search`,
+        // and showing it would surface text the user believes is gone. Joining `messages` lets the
+        // authoritative row veto the indexed one, and excluding anything still queued covers the
+        // rest — a pending entry is precisely the statement "this doc no longer describes reality".
+        conditions.append("m.state = 'visible'")
+        conditions.append("m.kind <> 'service'")
+        conditions.append("""
+            NOT EXISTS (
+                SELECT 1 FROM search_index_queue q WHERE q.client_msg_id = d.client_msg_id
+            )
+            """)
+
         if let dialogId = request.dialogId {
             conditions.append("d.dialog_id = ?")
             arguments.append(dialogId)

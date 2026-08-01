@@ -177,6 +177,90 @@ final class MessageSearchStoreTests: XCTestCase {
         XCTAssertTrue(after.isEmpty, "no drain has run; the filter alone must hide it")
     }
 
+    // MARK: - Pre-drain staleness
+
+    /// The index is eventually consistent; results are not. Each of these mutates a message and
+    /// queries *before* draining, which is the window where the index still describes the old row.
+
+    func testDeletedMessageDisappearsBeforeTheDrain() async throws {
+        try await insert(1, "конфиденциально")
+        try await index()
+        let before = try await hits("конфиденциально")
+        XCTAssertEqual(before.count, 1)
+
+        try await store.dbQueue.write { db in
+            try db.execute(sql: "UPDATE messages SET state = 'deleted_for_all' WHERE msg_id = 1")
+        }
+        let after = try await hits("конфиденциально")
+        XCTAssertTrue(after.isEmpty, "deleted text must not survive until the next drain")
+    }
+
+    func testHardDeletedMessageDisappearsBeforeTheDrain() async throws {
+        try await insert(1, "конфиденциально")
+        try await index()
+        try await store.dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM messages WHERE msg_id = 1")
+        }
+        let after = try await hits("конфиденциально")
+        XCTAssertTrue(after.isEmpty, "a removed row cannot be resurrected by a stale doc")
+    }
+
+    func testEditedTextDoesNotSurfaceItsOldWordingBeforeTheDrain() async throws {
+        try await insert(1, "original wording")
+        try await index()
+        let before = try await hits("original")
+        XCTAssertEqual(before.count, 1)
+
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE messages SET text = 'replacement wording', edit_version = 1 WHERE msg_id = 1
+                """)
+        }
+        let stale = try await hits("original")
+        XCTAssertTrue(stale.isEmpty, "pre-edit wording must not be findable after the edit")
+    }
+
+    /// A filename change reindexes through the media trigger; until it drains, the doc is stale and
+    /// must not answer for either the old or the new name.
+    func testMediaFilenameChangeSuppressesTheStaleDocBeforeTheDrain() async throws {
+        try await insert(1, "see attached")
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT INTO message_media(local_id, dialog_id, msg_id, media_id, kind, content_type,
+                                          file_name, byte_size, has_thumbnail)
+                VALUES ('d1:1', 'd1', 1, 'm1', 'file', 'application/pdf', 'quarterly.pdf', 10, 0)
+                """)
+        }
+        try await index()
+        let before = try await hits("quarterly")
+        XCTAssertEqual(before.count, 1)
+
+        try await store.dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE message_media SET file_name = 'annual.pdf' WHERE local_id = 'd1:1'
+                """)
+        }
+        let stale = try await hits("quarterly")
+        XCTAssertTrue(stale.isEmpty, "the superseded filename must not answer")
+
+        try await index()
+        let renamed = try await hits("annual")
+        XCTAssertEqual(renamed.count, 1, "and the new one answers once drained")
+    }
+
+    func testServiceMessagesAreExcludedEvenIfADocSomehowExists() async throws {
+        try await insert(1, "regular message")
+        try await index()
+        // Flip the stored row to a service message without touching the index, which is what a
+        // bypassed write path would look like.
+        try await store.dbQueue.write { db in
+            try db.execute(sql: "UPDATE messages SET kind = 'service' WHERE msg_id = 1")
+            try db.execute(sql: "DELETE FROM search_index_queue")
+        }
+        let found = try await hits("regular")
+        XCTAssertTrue(found.isEmpty, "the authoritative row vetoes the indexed one")
+    }
+
     // MARK: - Degradation
 
     /// A missing index is a degraded feature, not an error. Callers get an empty page.
@@ -189,6 +273,10 @@ final class MessageSearchStoreTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func hits(_ query: String) async throws -> [MessageSearchHit] {
+        try await store.searchMessages(MessageSearchRequest(query: query)).hits
+    }
 
     private func index() async throws {
         await indexer.bootstrap()

@@ -112,9 +112,15 @@ struct TojConversationExperience: View {
         messageTimeline
             .background(TojTheme.canvas)
             .overlay(alignment: .top) {
-                header
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+                VStack(spacing: 8) {
+                    header
+                    // Below the header rather than replacing it: the user still needs to see which
+                    // conversation they are searching.
+                    InChatSearchBar(model: model)
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+                .animation(reduceMotion ? nil : .snappy, value: model.inChatSearch != nil)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         .toolbar(.hidden, for: .navigationBar)
@@ -147,10 +153,15 @@ struct TojConversationExperience: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             } else {
-                TojPeerProfileView(model: model, dialogId: dialogId) {
-                    showingProfile = false
-                    Task { await model.startVoiceCall(dialogId: dialogId) }
-                }
+                TojPeerProfileView(
+                    model: model,
+                    dialogId: dialogId,
+                    onCall: {
+                        showingProfile = false
+                        Task { await model.startVoiceCall(dialogId: dialogId) }
+                    },
+                    onSearch: { model.openInChatSearch() }
+                )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             }
@@ -498,6 +509,10 @@ struct TojConversationExperience: View {
                             }
                         }
                         .id(item.id)
+                        .searchMatchFlash(
+                            isActive: item.line.msgId != nil
+                                && item.line.msgId == model.focusedSearchMsgId
+                        ) { model.clearSearchFocus() }
                         .transition(
                             reduceMotion
                                 ? .opacity

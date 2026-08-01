@@ -62,6 +62,9 @@ actor SearchIndexer {
     /// Session-scoped failure count, for tests and diagnostics.
     var repairFailures: Int { sessionRepairFailures }
 
+    /// Clears the backoff window so a test does not have to sleep through it.
+    func resetRepairBackoffForTesting() { repairNotBefore = nil }
+
     struct AuditReport: Equatable {
         let missing: Int
         let orphaned: Int
@@ -87,6 +90,14 @@ actor SearchIndexer {
     private var repairTask: Task<Void, Never>?
     private var sessionRepairFailures = 0
 
+    /// Earliest time a further repair may start. Without it, a failure that recurs on every query
+    /// spins: each attempt drops the table, fails to recreate it, and the next query tries again.
+    private var repairNotBefore: Date?
+
+    /// Backoff between failed repairs, capped. Doubling from a second reaches the cap in four
+    /// attempts, which is inside the window a user would spend on one search session.
+    static let repairBackoff: [TimeInterval] = [1, 2, 4, 8]
+
     init(store: CloudLocalStore) {
         self.store = store
     }
@@ -101,7 +112,15 @@ actor SearchIndexer {
     /// app — and the caller is a detached background task with nobody to report to.
     func bootstrap() async {
         do {
-            let state = try await readState()
+            var state = try await readState()
+            if state.status == .rebuilding {
+                // A previous session died mid-repair. Nothing else will advance this, so treat the
+                // index as absent and rebuild rather than honouring a status with no owner.
+                try await dbQueue.write { db in
+                    try SearchIndexSchema.discardIndex(db, reason: "interrupted repair")
+                }
+                state = try await readState()
+            }
 
             let existing = try await dbQueue.read { db in
                 try db.tableExists("message_search")
@@ -412,6 +431,7 @@ actor SearchIndexer {
                   FROM search_backfill_state b
                   JOIN dialogs d ON d.dialog_id = b.dialog_id
                  WHERE b.completed = 0
+                   AND d.access_state IN ('active', 'pending')
                  ORDER BY d.updated_at DESC
                  LIMIT 1
                 """) else { return false }
@@ -504,11 +524,15 @@ actor SearchIndexer {
             try db.execute(sql: "INSERT INTO message_search(message_search) VALUES('integrity-check')")
 
             // Indexable rows with no doc, inside territory the backfill claims to have finished.
+            // Revoked dialogs are *supposed* to have no docs, so counting them as missing would
+            // make the audit re-enqueue exactly what revocation removed and never converge.
             let missing = try String.fetchAll(db, sql: """
                 SELECT m.client_msg_id FROM messages m
                   JOIN search_backfill_state b ON b.dialog_id = m.dialog_id AND b.completed = 1
+                  JOIN dialogs dl ON dl.dialog_id = m.dialog_id
                   LEFT JOIN message_search_docs x ON x.client_msg_id = m.client_msg_id
                  WHERE x.client_msg_id IS NULL AND m.state = 'visible' AND m.kind <> 'service'
+                   AND dl.access_state IN ('active', 'pending')
                  LIMIT 500
                 """)
 
@@ -516,17 +540,25 @@ actor SearchIndexer {
             let orphaned = try String.fetchAll(db, sql: """
                 SELECT x.client_msg_id FROM message_search_docs x
                   LEFT JOIN messages m ON m.client_msg_id = x.client_msg_id
-                 WHERE m.client_msg_id IS NULL LIMIT 500
+                  LEFT JOIN dialogs dl ON dl.dialog_id = x.dialog_id
+                 WHERE m.client_msg_id IS NULL
+                    OR m.state <> 'visible' OR m.kind = 'service'
+                    OR dl.dialog_id IS NULL
+                    OR dl.access_state NOT IN ('active', 'pending')
+                 LIMIT 500
                 """)
 
             // Docs that disagree with their message about anything the index depends on.
             let stale = try String.fetchAll(db, sql: """
                 SELECT m.client_msg_id FROM messages m
                   JOIN message_search_docs x ON x.client_msg_id = m.client_msg_id
-                 WHERE x.edit_version <> m.edit_version OR x.state <> m.state
-                    OR x.local_id <> m.local_id
-                    OR (x.msg_id IS NULL) <> (m.msg_id IS NULL)
-                    OR (x.msg_id IS NOT NULL AND m.msg_id IS NOT NULL AND x.msg_id <> m.msg_id)
+                  JOIN dialogs dl ON dl.dialog_id = m.dialog_id
+                 WHERE dl.access_state IN ('active', 'pending')
+                   AND m.state = 'visible' AND m.kind <> 'service'
+                   AND (x.edit_version <> m.edit_version OR x.state <> m.state
+                        OR x.local_id <> m.local_id
+                        OR (x.msg_id IS NULL) <> (m.msg_id IS NULL)
+                        OR (x.msg_id IS NOT NULL AND m.msg_id IS NOT NULL AND x.msg_id <> m.msg_id))
                  LIMIT 500
                 """)
 
@@ -564,6 +596,8 @@ actor SearchIndexer {
     }
 
     private func performRepair() async {
+        if let repairNotBefore, Date() < repairNotBefore { return }
+
         do {
             try await setStatus(.rebuilding)
             try await dbQueue.write { db in
@@ -573,15 +607,21 @@ actor SearchIndexer {
             try await seedBackfill()
             try await setStatus(.ready)
             sessionRepairFailures = 0
+            repairNotBefore = nil
         } catch {
             sessionRepairFailures += 1
             if sessionRepairFailures >= Self.maximumSessionRepairFailures {
                 try? await markUnavailable(error)
-            } else {
-                // Leave the status alone so a later attempt can still run; the index is absent, so
-                // queries find nothing rather than wrong things.
-                try? await recordError(error)
+                return
             }
+            // `rebuilding` is a transient state, and leaving it set after a failure is how an index
+            // becomes permanently "in progress": every later call short-circuits on a status that
+            // nothing will ever advance. Fall back to `bootstrapping` so the next attempt — or the
+            // next launch — can pick it up.
+            try? await setStatus(.bootstrapping)
+            try? await recordError(error)
+            let index = min(sessionRepairFailures - 1, Self.repairBackoff.count - 1)
+            repairNotBefore = Date().addingTimeInterval(Self.repairBackoff[index])
         }
     }
 
@@ -593,13 +633,25 @@ actor SearchIndexer {
             return Coverage(
                 status: Status(rawValue: state?["status"] ?? "") ?? .bootstrapping,
                 indexed: state?["indexed_count"] ?? 0,
+                // Counts only indexable messages. Including revoked dialogs or service rows would
+                // make coverage permanently short of 100% and the banner permanently wrong.
                 total: try Int.fetchOne(db, sql: """
-                    SELECT count(*) FROM messages WHERE state = 'visible' AND kind <> 'service'
+                    SELECT count(*) FROM messages m
+                      JOIN dialogs dl ON dl.dialog_id = m.dialog_id
+                     WHERE m.state = 'visible' AND m.kind <> 'service'
+                       AND dl.access_state IN ('active', 'pending')
                     """) ?? 0,
                 queueDepth: try Int.fetchOne(db, sql: "SELECT count(*) FROM search_index_queue") ?? 0,
-                dialogsComplete: try Int.fetchOne(
-                    db, sql: "SELECT count(*) FROM search_backfill_state WHERE completed = 1") ?? 0,
-                dialogsTotal: try Int.fetchOne(db, sql: "SELECT count(*) FROM search_backfill_state") ?? 0
+                dialogsComplete: try Int.fetchOne(db, sql: """
+                    SELECT count(*) FROM search_backfill_state b
+                      JOIN dialogs dl ON dl.dialog_id = b.dialog_id
+                     WHERE b.completed = 1 AND dl.access_state IN ('active', 'pending')
+                    """) ?? 0,
+                dialogsTotal: try Int.fetchOne(db, sql: """
+                    SELECT count(*) FROM search_backfill_state b
+                      JOIN dialogs dl ON dl.dialog_id = b.dialog_id
+                     WHERE dl.access_state IN ('active', 'pending')
+                    """) ?? 0
             )
         }
     }
@@ -653,6 +705,7 @@ actor SearchIndexer {
             try await markUnavailable(error)
             return
         }
+        if let repairNotBefore, Date() < repairNotBefore { return }
         // Detached so the failing query returns now; the caller is already handling an error and
         // does not need to wait for a rebuild. `repair()` is single-flight, so a burst of failing
         // queries produces one rebuild.

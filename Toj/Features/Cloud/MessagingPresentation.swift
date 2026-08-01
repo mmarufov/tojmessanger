@@ -38,9 +38,13 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let richSearch = Self(rawValue: 1 << 11)
     static let multipartMedia = Self(rawValue: 1 << 12)
     static let videoCalls = Self(rawValue: 1 << 13)
+
     static let savedMessages = Self(rawValue: 1 << 14)
     static let cloudDrafts = Self(rawValue: 1 << 15)
     static let dialogPreferences = Self(rawValue: 1 << 16)
+    /// Local message search. Set from the device rather than negotiated with the server: the index
+    /// lives on disk here and nothing about it is advertised. Dropping the bit degrades the search
+    /// screen to chats and people rather than showing a broken Messages tab.
     static let localSearch = Self(rawValue: 1 << 17)
     static let mediaGroups = Self(rawValue: 1 << 18)
 
