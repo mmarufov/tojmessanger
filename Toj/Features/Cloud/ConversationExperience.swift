@@ -68,6 +68,7 @@ struct TojConversationExperience: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var composerFocused: Bool
     @State private var showingProfile = false
+    @State private var openSearchAfterProfileDismiss = false
     @State private var showingAttachments = false
     @State private var showingForwarding = false
     @State private var forwardLine: CloudAppModel.Line?
@@ -145,7 +146,11 @@ struct TojConversationExperience: View {
         .onChange(of: model.activeDialogId) { previous, current in
             if previous == dialogId, current == nil { dismiss() }
         }
-        .sheet(isPresented: $showingProfile) {
+        .sheet(isPresented: $showingProfile, onDismiss: {
+            guard openSearchAfterProfileDismiss else { return }
+            openSearchAfterProfileDismiss = false
+            model.openInChatSearch()
+        }) {
             if isGroup {
                 NavigationStack {
                     GroupProfileView(model: model, dialogId: dialogId)
@@ -160,7 +165,10 @@ struct TojConversationExperience: View {
                         showingProfile = false
                         Task { await model.startVoiceCall(dialogId: dialogId) }
                     },
-                    onSearch: { model.openInChatSearch() }
+                    onSearch: {
+                        openSearchAfterProfileDismiss = true
+                        showingProfile = false
+                    }
                 )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)

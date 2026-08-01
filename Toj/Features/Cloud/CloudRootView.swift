@@ -812,6 +812,7 @@ private struct CloudChatsView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.search)
+                .accessibilityIdentifier("global-search-field")
             if !query.isEmpty {
                 Button {
                     query = ""

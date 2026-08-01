@@ -54,9 +54,8 @@ struct TojPeerProfileView: View {
                             .disabled(true)
                             .opacity(0.42)
                         profileAction("Search", icon: "magnifyingglass") {
-                            // Was a no-op that only dismissed. Dismiss first so the find bar is not
-                            // hidden behind the sheet it was opened from.
-                            dismiss()
+                            // The presenting conversation waits for the sheet's onDismiss before
+                            // publishing the find bar, so it cannot be hidden by the transition.
                             onSearch()
                         }
                     }

@@ -2,6 +2,17 @@ import Foundation
 import GRDB
 import os
 
+/// `AsyncValueObservation` is not declared Sendable even though GRDB's values sequence is safe to
+/// consume from one detached task. Keep the unchecked boundary narrow, matching the store's other
+/// observation adapters.
+nonisolated private final class SearchQueueObservationBox<Element>: @unchecked Sendable {
+    let values: AsyncValueObservation<Element>
+
+    init(_ values: AsyncValueObservation<Element>) {
+        self.values = values
+    }
+}
+
 /// Owns the search index's lifecycle for one account on one store.
 ///
 /// Lives outside `CloudAppModel` deliberately: that type is already 10k lines, and none of this
@@ -45,6 +56,10 @@ actor SearchCoordinator {
     private let signposter = OSSignposter(subsystem: "com.toj.Toj", category: "SearchCoordinator")
 
     private var backgroundTask: Task<Void, Never>?
+    private var queueObservationTask: Task<Void, Never>?
+    /// Set by every queue observation, including one that races with the loop deciding it is idle.
+    /// The actor clears it only when beginning another unit of work.
+    private var backgroundWakeRequested = false
     private var isCancelled = false
 
     init(store: CloudLocalStore, accountId: String) {
@@ -69,13 +84,15 @@ actor SearchCoordinator {
         guard !isCancelled else { return }
         await indexer.bootstrap()
         guard !isCancelled else { return }
-        startBackgroundLoop()
+        startQueueObservation()
+        requestBackgroundDrain()
     }
 
     /// Stops scheduling new work. Returns immediately; in-flight work may still be finishing.
     func cancel() {
         isCancelled = true
         backgroundTask?.cancel()
+        queueObservationTask?.cancel()
     }
 
     /// Stops and waits for the background loop to finish.
@@ -86,8 +103,13 @@ actor SearchCoordinator {
     /// bootstrap.
     func cancelAndWait() async {
         cancel()
-        await backgroundTask?.value
+        let drain = backgroundTask
+        let observation = queueObservationTask
+        await drain?.value
+        await observation?.value
         backgroundTask = nil
+        queueObservationTask = nil
+        backgroundWakeRequested = false
     }
 
     // MARK: - Foreground
@@ -97,6 +119,9 @@ actor SearchCoordinator {
     /// Never throws: a search proceeds against a slightly stale index rather than failing.
     func drainBeforeSearch() async {
         guard !isCancelled else { return }
+        // A deep queue deliberately does not drain on this foreground path. Still wake the utility
+        // loop so it keeps making progress after the query returns.
+        requestBackgroundDrain()
         do {
             try await indexer.drainIfShallow(maxDepth: Self.foregroundDrainBudget)
         } catch {
@@ -111,7 +136,44 @@ actor SearchCoordinator {
 
     // MARK: - Background
 
-    private func startBackgroundLoop() {
+    private func startQueueObservation() {
+        guard queueObservationTask == nil else { return }
+        let values = ValueObservation
+            .tracking { db in
+                try Int.fetchOne(db, sql: "SELECT count(*) FROM search_index_queue") ?? 0
+            }
+            .removeDuplicates()
+            .values(
+                in: store.dbQueue,
+                scheduling: .async(onQueue: .global(qos: .utility)),
+                bufferingPolicy: .bufferingNewest(1)
+            )
+        let box = SearchQueueObservationBox(values)
+        queueObservationTask = Task.detached(priority: .utility) { [weak self] in
+            do {
+                for try await depth in box.values {
+                    guard !Task.isCancelled else { return }
+                    if depth > 0 { await self?.queueDidBecomeNonEmpty() }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                // A later foreground search still calls `requestBackgroundDrain`. Observation is a
+                // wake-up accelerator, never a dependency of querying or replica correctness.
+            }
+        }
+    }
+
+    private func queueDidBecomeNonEmpty() {
+        requestBackgroundDrain()
+    }
+
+    /// Records the wake even when a loop is still winding down. Because both the idle decision and
+    /// this method are actor-isolated, a row cannot land in the gap between "queue empty" and task
+    /// retirement without either the old loop seeing this flag or this method starting a new one.
+    private func requestBackgroundDrain() {
+        guard !isCancelled else { return }
+        backgroundWakeRequested = true
         guard backgroundTask == nil else { return }
         backgroundTask = Task.detached(priority: .utility) { [weak self] in
             await self?.runBackgroundLoop()
@@ -127,6 +189,7 @@ actor SearchCoordinator {
         defer { signposter.endInterval("SearchBackgroundLoop", interval) }
 
         while !isCancelled, !Task.isCancelled {
+            backgroundWakeRequested = false
             var didWork = false
 
             do {
@@ -150,9 +213,16 @@ actor SearchCoordinator {
                 continue
             }
 
-            if !didWork { return }  // Queue empty and backfill complete; nothing left to do.
+            if !didWork {
+                if backgroundWakeRequested { continue }
+                // Retire the task while still isolated to the actor. A queued observation after
+                // this assignment sees nil and starts the same coordinator again.
+                backgroundTask = nil
+                return
+            }
             try? await Task.sleep(nanoseconds: Self.backgroundIdleNanoseconds)
         }
+        backgroundTask = nil
     }
 
     /// Audit plus tombstone merge, for a background task to call on a long cadence.
@@ -171,6 +241,20 @@ actor SearchCoordinator {
         } catch {
             // Maintenance is opportunistic by definition.
         }
+    }
+
+    /// Runs the same bounded maintenance only when its persisted daily cadence is due.
+    /// `audit()` caps each drift class and `runMaintenance()` performs one bounded FTS merge plus
+    /// one queue batch, so a BGTask expiration never strands an unbounded transaction.
+    func runScheduledMaintenance() async {
+        guard !isCancelled else { return }
+        do {
+            guard try await indexer.maintenanceIsDue() else { return }
+        } catch {
+            return
+        }
+        await runMaintenance()
+        requestBackgroundDrain()
     }
 
     /// Drives the index to completion. Test-facing: production never blocks on this.

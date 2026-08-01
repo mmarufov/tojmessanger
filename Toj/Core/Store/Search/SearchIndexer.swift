@@ -33,6 +33,10 @@ actor SearchIndexer {
     /// Tombstones accumulate because an edit is delete-plus-insert. Past this, run a bounded merge.
     static let deletesBeforeMerge = 512
 
+    /// The expensive drift audit is persisted and runs at most daily from the existing BGTask
+    /// runtime. Foreground/background queue draining remains event-driven and is not cadence-bound.
+    static let maintenanceInterval: TimeInterval = 24 * 60 * 60
+
     enum Status: String {
         case bootstrapping
         case ready
@@ -491,6 +495,16 @@ actor SearchIndexer {
     }
 
     // MARK: - Maintenance, audit, repair
+
+    func maintenanceIsDue(now: Date = Date()) async throws -> Bool {
+        let lastRun = try await dbQueue.read { db in
+            try String.fetchOne(
+                db, sql: "SELECT last_audit_at FROM search_index_state WHERE id = 1"
+            )
+        }
+        guard let lastRun, let date = Self.sqliteFormatter.date(from: lastRun) else { return true }
+        return now.timeIntervalSince(date) >= Self.maintenanceInterval
+    }
 
     /// Bounded tombstone merge. The negative rank caps pages touched, so this is safe between
     /// batches; `'optimize'` is O(index) and belongs in a background task, never here.

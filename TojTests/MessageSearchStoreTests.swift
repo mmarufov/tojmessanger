@@ -234,6 +234,8 @@ final class MessageSearchStoreTests: XCTestCase {
         try await index()
         let before = try await hits("quarterly")
         XCTAssertEqual(before.count, 1)
+        XCTAssertEqual(before.first?.dialogTitle, "Test")
+        XCTAssertEqual(before.first?.fileNames, "quarterly.pdf")
 
         try await store.dbQueue.write { db in
             try db.execute(sql: """

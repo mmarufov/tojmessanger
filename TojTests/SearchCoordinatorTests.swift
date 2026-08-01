@@ -92,6 +92,31 @@ final class SearchCoordinatorTests: XCTestCase {
         }
     }
 
+    /// Regression for the completed-task tombstone: the original loop returned while leaving its
+    /// non-nil `Task` in the coordinator, so every later restart request was mistaken for an
+    /// already-running drain. This begins empty, lets that loop retire, then exceeds the foreground
+    /// budget and relies only on the queue observation to wake the same coordinator.
+    func testIdleCoordinatorWakesAndDrainsDeepQueueWithoutRecreation() async throws {
+        await coordinator.start()
+        try await eventually("initial empty index settles") {
+            try await self.coordinator.coverage().isComplete
+        }
+        try await Task.sleep(for: .milliseconds(150))
+
+        let total = SearchCoordinator.foregroundDrainBudget + 37
+        for index in 1...total {
+            try await insert(Int64(index), "wake \(index)")
+        }
+
+        try await eventually("post-idle deep queue drains") {
+            let coverage = try await self.coordinator.coverage()
+            return coverage.indexed == total && coverage.queueDepth == 0
+        }
+        let hits = try await store.searchMessages(MessageSearchRequest(query: "wake")).hits
+        XCTAssertEqual(hits.count, 40, "the default result page is full after the automatic drain")
+        XCTAssertTrue(coordinator.serves(accountId: "acct-1", store: store))
+    }
+
     /// The foreground drain runs on a keystroke, so it is capped rather than exhaustive.
     func testForegroundDrainMakesAJustSentMessageFindable() async throws {
         await coordinator.start()

@@ -24,6 +24,7 @@ final class SearchNavigationTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        await model?.cancelSearchCoordinatorForTesting()
         model = nil
         store = nil
         if let directory { try? FileManager.default.removeItem(at: directory) }
@@ -141,6 +142,35 @@ final class SearchNavigationTests: XCTestCase {
         model.closeInChatSearch()
         XCTAssertNil(model.inChatSearch)
         XCTAssertNil(model.focusedSearchMsgId, "closing the bar removes the highlight")
+    }
+
+    func testRapidInChatQueryChangeCannotPublishOrJumpFromStaleQuery() async throws {
+        try await seed(messages: 8, matchingEvery: 2)
+        await openConversationAndIndex()
+        model.openInChatSearch()
+
+        let stale = Task { await model.updateInChatSearch(query: "needle") }
+        try await Task.sleep(for: .milliseconds(40))
+        await model.updateInChatSearch(query: "absent")
+        await stale.value
+
+        XCTAssertEqual(model.inChatSearch?.query, "absent")
+        XCTAssertTrue(model.inChatSearch?.matches.isEmpty == true)
+        XCTAssertNil(model.focusedSearchMsgId, "the cancelled query must not publish a stale jump")
+    }
+
+    func testClosingInChatSearchCancelsPendingQueryBeforeItCanJump() async throws {
+        try await seed(messages: 4, matchingEvery: 1)
+        await openConversationAndIndex()
+        model.openInChatSearch()
+
+        let pending = Task { await model.updateInChatSearch(query: "needle") }
+        try await Task.sleep(for: .milliseconds(40))
+        model.closeInChatSearch()
+        await pending.value
+
+        XCTAssertNil(model.inChatSearch)
+        XCTAssertNil(model.focusedSearchMsgId)
     }
 
     func testInChatSearchIsScopedToTheOpenConversation() async throws {

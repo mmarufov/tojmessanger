@@ -79,6 +79,70 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         XCTAssertTrue(element("message-ui-fixture-saved-note").waitForExistence(timeout: 15))
     }
 
+    func testGlobalMessageSearchJumpsToAndFlashesTheMatchedMessage() {
+        let searchTab = app.tabBars.buttons["Search"]
+        XCTAssertTrue(searchTab.waitForExistence(timeout: 15))
+        searchTab.tap()
+
+        let field = app.textFields["global-search-field"]
+        XCTAssertTrue(field.waitForExistence(timeout: 15))
+        field.tap()
+        field.typeText("entirely")
+
+        let messagesScope = app.buttons["Messages"]
+        XCTAssertTrue(messagesScope.waitForExistence(timeout: 15))
+        messagesScope.tap()
+
+        let result = app.buttons
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'search-message-'"))
+            .firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 15))
+        XCTAssertTrue(result.label.contains("Mehrona Offline"), result.label)
+        result.tap()
+
+        XCTAssertTrue(element("conversation-\(Fixture.primaryDialog)").waitForExistence(timeout: 15))
+        let flash = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "value == %@", "Search match highlighted"))
+            .firstMatch
+        XCTAssertTrue(
+            flash.waitForExistence(timeout: 3),
+            "Opening a global hit must visibly connect the result to its message."
+        )
+        XCTAssertTrue(element("message-ui-fixture-text").waitForExistence(timeout: 15))
+    }
+
+    func testInChatSearchMovesPreviousAndNextBetweenMatches() {
+        openChat(Fixture.primaryDialog)
+
+        let profile = app.buttons["Open Mehrona Offline profile"]
+        XCTAssertTrue(profile.waitForExistence(timeout: 15))
+        profile.tap()
+        let search = app.buttons["Search"]
+        XCTAssertTrue(search.waitForExistence(timeout: 15))
+        search.tap()
+
+        // The conversation container intentionally carries a stable accessibility identifier,
+        // so locate overlay controls by their user-facing accessibility contract.
+        let field = app.textFields
+            .matching(NSPredicate(format: "placeholderValue == %@", "Search in chat"))
+            .firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 15))
+        field.tap()
+        field.typeText("Saved")
+
+        XCTAssertTrue(app.staticTexts["1 of 3"].waitForExistence(timeout: 15))
+
+        let next = app.buttons["Go Down"]
+        XCTAssertTrue(next.isHittable)
+        next.tap()
+        XCTAssertTrue(app.staticTexts["2 of 3"].waitForExistence(timeout: 15))
+
+        let previous = app.buttons["Go Up"]
+        XCTAssertTrue(previous.isHittable)
+        previous.tap()
+        XCTAssertTrue(app.staticTexts["1 of 3"].waitForExistence(timeout: 15))
+    }
+
     func testDraftTextReplyAndThreeReorderedAttachmentsRestoreAfterTermination() {
         openChat(Fixture.primaryDialog)
         let composer = app.textFields["Message"]
@@ -231,4 +295,5 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any)[identifier]
     }
+
 }

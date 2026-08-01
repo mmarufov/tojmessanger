@@ -97,7 +97,15 @@ final class MessageSearchController {
         guard generation == self.generation else { return }
 
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chats = scope.includesChats ? Self.matchingDialogs(dialogsProvider(), query: trimmed) : []
+        let chats: [CloudAppModel.Dialog]
+        switch scope {
+        case .chats:
+            chats = Self.matchingDialogs(dialogsProvider(), query: trimmed)
+        case .people:
+            chats = Self.matchingPeople(dialogsProvider(), query: trimmed)
+        case .messages, .media, .links, .files:
+            chats = []
+        }
 
         var messages: [MessageSearchHit] = []
         var cursor: MessageSearchCursor?
@@ -160,8 +168,23 @@ final class MessageSearchController {
     /// accents and letter forms.
     func highlightRanges(in hit: MessageSearchHit) -> [Range<String.Index>] {
         SearchTextNormalizer.highlightRanges(
-            of: query.trimmingCharacters(in: .whitespacesAndNewlines), in: hit.text
+            of: query.trimmingCharacters(in: .whitespacesAndNewlines), in: displayText(for: hit)
         )
+    }
+
+    /// Prefer the field that actually matched. Filename-only results used to render an empty
+    /// caption, which made a successful Files search look like a broken blank row.
+    func displayText(for hit: MessageSearchHit) -> String {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = hit.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let files = hit.fileNames.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fileMatched = !query.isEmpty
+            && !SearchTextNormalizer.highlightRanges(of: query, in: files).isEmpty
+
+        if fileMatched || (scope == .files && !files.isEmpty) { return files }
+        if !body.isEmpty { return body }
+        if !files.isEmpty { return files }
+        return String(localized: "Attachment")
     }
 
     /// Non-nil while history is still downloading, so the screen can say results are partial rather
@@ -171,7 +194,10 @@ final class MessageSearchController {
         if coverage.status == .unavailable { return String(localized: "Search is unavailable") }
         guard coverage.dialogsComplete < coverage.dialogsTotal else { return nil }
         return String(
-            localized: "Searching \(coverage.dialogsComplete) of \(coverage.dialogsTotal) chats — still downloading history"
+            format: String(
+                localized: "Searching %1$lld of %2$lld chats — still downloading history"
+            ),
+            Int64(coverage.dialogsComplete), Int64(coverage.dialogsTotal)
         )
     }
 
@@ -188,6 +214,25 @@ final class MessageSearchController {
             guard !dialog.isArchived else { return false }
             let haystack = SearchTextNormalizer.foldedForm("\(dialog.title) \(dialog.subtitle)")
             let tokens = SearchTextNormalizer.tokens(haystack)
+            return needles.allSatisfy { needle in tokens.contains { $0.hasPrefix(needle) } }
+        }
+    }
+
+    /// People scope is the direct-conversation subset and searches identity, not the last-message
+    /// preview. Group and Saved Messages rows stay in Chats, while archived direct conversations
+    /// remain hidden consistently with the main list.
+    static func matchingPeople(
+        _ dialogs: [CloudAppModel.Dialog], query: String
+    ) -> [CloudAppModel.Dialog] {
+        guard !query.isEmpty else { return [] }
+        let needles = SearchTextNormalizer.tokens(SearchTextNormalizer.foldedForm(query))
+        guard !needles.isEmpty else { return [] }
+
+        return dialogs.filter { dialog in
+            guard dialog.type == "direct", !dialog.isArchived else { return false }
+            let tokens = SearchTextNormalizer.tokens(
+                SearchTextNormalizer.foldedForm(dialog.title)
+            )
             return needles.allSatisfy { needle in tokens.contains { $0.hasPrefix(needle) } }
         }
     }
@@ -222,9 +267,6 @@ struct LocalMessageSearchBackend: MessageSearchBackend {
 }
 
 extension SearchScope {
-    /// Whether this scope shows chat rows.
-    var includesChats: Bool { self == .chats }
-
     /// The message-index scope, or `nil` for scopes served entirely from memory.
     var messageScope: MessageSearchScope? {
         switch self {

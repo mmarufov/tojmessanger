@@ -17,7 +17,7 @@ struct SearchResultsView: View {
             }
 
             if !controller.sections.chats.isEmpty {
-                Section("Chats") {
+                Section(controller.scope == .people ? "People" : "Chats") {
                     ForEach(controller.sections.chats) { dialog in
                         Button { onOpenDialog(dialog.id) } label: {
                             CloudDialogRow(dialog: dialog)
@@ -34,6 +34,7 @@ struct SearchResultsView: View {
                         Button { onOpenMessage(hit) } label: {
                             MessageSearchRow(
                                 hit: hit,
+                                text: controller.displayText(for: hit),
                                 highlights: controller.highlightRanges(in: hit)
                             )
                         }
@@ -120,6 +121,7 @@ struct SearchResultsView: View {
 /// One message hit: who, where, when, and the matched text with its matches marked.
 struct MessageSearchRow: View {
     let hit: MessageSearchHit
+    let text: String
     let highlights: [Range<String.Index>]
 
     var body: some View {
@@ -129,7 +131,7 @@ struct MessageSearchRow: View {
                 Text(snippet)
                     .font(.subheadline)
                     .lineLimit(2)
-                Text(hit.dialogId)
+                Text(hit.dialogTitle)
                     .font(.caption2)
                     .foregroundStyle(TojTheme.secondaryText)
                     .lineLimit(1)
@@ -152,7 +154,7 @@ struct MessageSearchRow: View {
     /// The original text with matches marked in the accent, built as an `AttributedString` so the
     /// letters themselves are never altered — only their styling.
     private var snippet: AttributedString {
-        var attributed = AttributedString(hit.text)
+        var attributed = AttributedString(text)
         for range in highlights {
             guard let lower = AttributedString.Index(range.lowerBound, within: attributed),
                   let upper = AttributedString.Index(range.upperBound, within: attributed)

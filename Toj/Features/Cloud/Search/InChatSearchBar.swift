@@ -60,7 +60,6 @@ struct InChatSearchBar: View {
         Binding(
             get: { model.inChatSearch?.query ?? "" },
             set: { newValue in
-                model.inChatSearch?.query = newValue
                 Task { await model.updateInChatSearch(query: newValue) }
             }
         )
@@ -90,7 +89,7 @@ struct SearchMatchFlash: ViewModifier {
     @State private var opacity: Double = 0
 
     /// Long enough to notice while glancing, short enough not to linger over the text.
-    private static let duration: Duration = .milliseconds(1_600)
+    private static let duration: Duration = .milliseconds(2_800)
 
     func body(content: Content) -> some View {
         content
@@ -100,6 +99,7 @@ struct SearchMatchFlash: ViewModifier {
                     .padding(-6)
             )
             .accessibilityAddTraits(isActive ? .isSelected : [])
+            .accessibilityValue(isActive ? String(localized: "Search match highlighted") : "")
             .task(id: isActive) {
                 guard isActive else { return }
                 // Reduce Motion gets the same information without the pulse.

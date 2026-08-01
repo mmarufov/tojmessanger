@@ -23,6 +23,10 @@ nonisolated struct MessageSearchHit: Equatable, Sendable, Identifiable {
     let senderAccountId: String
     let kind: String
     let text: String
+    /// Presentation metadata captured in the same query so rows never expose internal identifiers
+    /// or need an N+1 lookup to resolve a chat/file label.
+    let dialogTitle: String
+    let fileNames: String
     let sortTimestamp: Int64
     let hasMedia: Bool
     let tier: Tier
@@ -219,7 +223,14 @@ extension CloudLocalStore {
 
         let rows = try Row.fetchAll(db, sql: """
             SELECT d.doc_id, d.client_msg_id, d.local_id, d.dialog_id, d.msg_id,
-                   d.sender_account_id, d.kind, d.sort_ts, d.has_media, m.text
+                   d.sender_account_id, d.kind, d.sort_ts, d.has_media, m.text,
+                   COALESCE(NULLIF(dl.title, ''), 'Chat') AS dialog_title,
+                   COALESCE((
+                       SELECT group_concat(mm.file_name, ' · ')
+                         FROM message_media mm
+                        WHERE mm.local_id = m.local_id
+                          AND mm.file_name IS NOT NULL AND mm.file_name <> ''
+                   ), '') AS file_names
               FROM \(source)
               JOIN messages m ON m.client_msg_id = d.client_msg_id
               JOIN dialogs dl ON dl.dialog_id = d.dialog_id
@@ -233,6 +244,7 @@ extension CloudLocalStore {
                 docId: row["doc_id"], clientMsgId: row["client_msg_id"], localId: row["local_id"],
                 dialogId: row["dialog_id"], msgId: row["msg_id"],
                 senderAccountId: row["sender_account_id"], kind: row["kind"], text: row["text"],
+                dialogTitle: row["dialog_title"], fileNames: row["file_names"],
                 sortTimestamp: row["sort_ts"], hasMedia: (row["has_media"] as Int? ?? 0) != 0,
                 tier: tier
             )

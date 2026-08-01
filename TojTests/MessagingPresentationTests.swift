@@ -634,6 +634,26 @@ final class MessagingPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testLocalSearchCapabilityFollowsTheCurrentAccountStoreCoordinator() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try CloudLocalStore(
+            path: directory.appending(path: "cloud.sqlite").path,
+            key: Data(repeating: 0x65, count: 32)
+        )
+        let model = CloudAppModel(localStore: store, useDefaultLocalStore: false)
+        model.enterDemoMode()
+
+        XCTAssertFalse(model.capabilities.contains(.localSearch))
+        await model.refreshSearchCoordinatorForTesting()
+        XCTAssertTrue(model.capabilities.contains(.localSearch))
+
+        await model.cancelSearchCoordinatorForTesting()
+        XCTAssertFalse(model.capabilities.contains(.localSearch))
+    }
+
+    @MainActor
     func testDemoSearchScopesMessagesAndAttachments() async {
         let model = CloudAppModel(useDefaultLocalStore: false)
         model.enterDemoMode()

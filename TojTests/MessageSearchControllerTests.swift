@@ -102,6 +102,15 @@ final class MessageSearchControllerTests: XCTestCase {
         XCTAssertTrue(matches.isEmpty)
     }
 
+    func testPeopleScopeReturnsOnlyMatchingDirectConversations() async throws {
+        controller.scope = .people
+        controller.query = "мехрона"
+        try await settle()
+
+        XCTAssertEqual(controller.sections.chats.map(\.title), ["Меҳрона"])
+        XCTAssertTrue(backend.queries.isEmpty, "People is served from local dialog identity")
+    }
+
     func testMessagesScopeDoesNotRenderChatRows() async throws {
         controller.scope = .messages
         backend.results = ["salom": [Self.hit(1, "салом")]]
@@ -202,6 +211,7 @@ final class MessageSearchControllerTests: XCTestCase {
         MessageSearchHit(
             docId: docId, clientMsgId: "c\(docId)", localId: "d1:\(docId)", dialogId: "d1",
             msgId: docId, senderAccountId: "a1", kind: "text", text: text,
+            dialogTitle: "Test chat", fileNames: "",
             sortTimestamp: 1_000 - docId, hasMedia: false, tier: .exact
         )
     }
@@ -217,12 +227,16 @@ final class MessageSearchControllerTests: XCTestCase {
 
     private static let dialogs: [CloudAppModel.Dialog] = [
         CloudAppModel.Dialog(
-            id: "d1", title: "Тоҷикӣ гурӯҳ", subtitle: "салом", updatedAt: "",
+            id: "d1", title: "Тоҷикӣ гурӯҳ", type: "group", subtitle: "салом", updatedAt: "",
             isPending: false, unreadCount: 0
         ),
         CloudAppModel.Dialog(
             id: "d2", title: "Archived chat", subtitle: "old", updatedAt: "",
             isPending: false, unreadCount: 0, isArchived: true
+        ),
+        CloudAppModel.Dialog(
+            id: "d3", title: "Меҳрона", type: "direct", subtitle: "last message", updatedAt: "",
+            isPending: false, unreadCount: 0
         ),
     ]
 
