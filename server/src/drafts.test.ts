@@ -4,6 +4,7 @@ import { Client } from "pg";
 import { checkVerification, startVerification } from "./auth";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
+import { updateDialogPreferences } from "./dialog-preferences";
 import {
   DraftError,
   getDraft,
@@ -714,6 +715,164 @@ describe("cloud drafts and media groups", () => {
     expect(await db`SELECT id FROM media_objects WHERE id = ${secondMedia}`).toHaveLength(0);
   });
 
+  test("raw old-node account deletion purges merged private state and only orphaned media", async () => {
+    const { alice, bob, dialogId } = await pair();
+    const orphanDraftMedia = await readyMedia(alice.accountId);
+    const sharedMessageMedia = await readyMedia(alice.accountId);
+    const dialogPhotoMedia = await readyMedia(alice.accountId);
+    const unrelatedOwnedOrphan = await readyMedia(alice.accountId);
+    const foreignMedia = await readyMedia(bob.accountId);
+
+    await sendMessage(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      kind: "photo",
+      body: "",
+      mediaId: sharedMessageMedia,
+    });
+    await db`
+      UPDATE dialogs SET photo_media_id = ${dialogPhotoMedia}
+      WHERE id = ${dialogId}`;
+    const draftOperationId = crypto.randomUUID();
+    await putDraft(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      operationId: draftOperationId,
+      text: "private draft",
+      attachments: [
+        {
+          attachment_id: crypto.randomUUID(),
+          media_id: orphanDraftMedia,
+          position: 0,
+        },
+        {
+          attachment_id: crypto.randomUUID(),
+          media_id: sharedMessageMedia,
+          position: 1,
+        },
+      ],
+    });
+    await db`
+      INSERT INTO draft_mutation_tombstones (
+        account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+      )
+      SELECT account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+      FROM draft_mutation_requests
+      WHERE account_id = ${alice.accountId}
+        AND operation_id = ${draftOperationId}`;
+
+    const groupMedia = [
+      await readyMedia(alice.accountId),
+      await readyMedia(alice.accountId),
+    ];
+    const clientGroupId = crypto.randomUUID();
+    await sendMediaGroup(db, {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId,
+      items: groupMedia.map((media_id) => ({ media_id })),
+      body: "retained album",
+    });
+    await db`
+      INSERT INTO media_group_send_tombstones (
+        sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+        first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+      )
+      SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+             first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
+      FROM media_group_send_requests
+      WHERE sender_account_id = ${alice.accountId}
+        AND client_group_id = ${clientGroupId}`;
+
+    await updateDialogPreferences(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      dialogId,
+      clientMutationId: crypto.randomUUID(),
+      patch: { pinned: true, muted: true, archived: true },
+    });
+    await db`
+      INSERT INTO dialog_preference_legacy_reconciliation (dialog_id, account_id)
+      VALUES (${dialogId}, ${alice.accountId})
+      ON CONFLICT (dialog_id, account_id) DO NOTHING`;
+    // Model a mixed-node retry whose canonical row was already removed. The account boundary must
+    // not join through dialog_preferences when clearing this queue.
+    await db`
+      DELETE FROM dialog_preferences
+      WHERE dialog_id = ${dialogId} AND account_id = ${alice.accountId}`;
+    await startBootstrap(db, alice.accountId);
+
+    expect(await db`
+      SELECT 1 FROM account_events
+      WHERE account_id = ${alice.accountId}
+        AND type IN ('draft.updated', 'dialog.preferences_updated')`)
+      .not.toHaveLength(0);
+
+    // This models a previous release that knows only the account status column. The database
+    // trigger, not application cleanup code, must own the complete merged deletion boundary.
+    await db`
+      UPDATE accounts SET status = 'deleted'
+      WHERE id = ${alice.accountId}`;
+
+    for (const [table, accountColumn] of [
+      ["account_dialog_drafts", "account_id"],
+      ["draft_mutation_requests", "account_id"],
+      ["draft_mutation_tombstones", "account_id"],
+      ["draft_mutation_budgets", "account_id"],
+      ["media_group_send_requests", "sender_account_id"],
+      ["media_group_send_tombstones", "sender_account_id"],
+      ["media_group_send_budgets", "account_id"],
+      ["dialog_preferences", "account_id"],
+      ["dialog_preference_requests", "account_id"],
+      ["dialog_preference_action_budgets", "account_id"],
+      ["dialog_preference_legacy_reconciliation", "account_id"],
+      ["bootstrap_snapshots", "account_id"],
+    ] as const) {
+      expect(await db.unsafe(
+        `SELECT 1 FROM public.${table} WHERE ${accountColumn} = $1`,
+        [alice.accountId],
+      ), table).toHaveLength(0);
+    }
+    expect(await db`
+      SELECT 1 FROM account_events
+      WHERE account_id = ${alice.accountId}
+        AND type IN ('draft.updated', 'dialog.preferences_updated')`)
+      .toHaveLength(0);
+
+    expect(await db`
+      SELECT id FROM media_objects
+      WHERE id IN (${orphanDraftMedia}, ${unrelatedOwnedOrphan})`)
+      .toHaveLength(0);
+    const retained = await db`
+      SELECT id FROM media_objects
+      WHERE id IN (
+        ${sharedMessageMedia},
+        ${dialogPhotoMedia},
+        ${groupMedia[0]},
+        ${groupMedia[1]},
+        ${foreignMedia}
+      )
+      ORDER BY id`;
+    expect(new Set(retained.map((row: any) => String(row.id)))).toEqual(new Set([
+      sharedMessageMedia,
+      dialogPhotoMedia,
+      ...groupMedia,
+      foreignMedia,
+    ]));
+    expect(await db`
+      SELECT msg_id FROM messages
+      WHERE dialog_id = ${dialogId}
+        AND media_id IN (
+          ${sharedMessageMedia},
+          ${groupMedia[0]},
+          ${groupMedia[1]}
+        )`).toHaveLength(3);
+  });
+
   test("draft kill switch covers consumption, difference, and bootstrap without pts gaps", async () => {
     const { alice, dialogId } = await pair();
     const draft = await putDraft(db, {
@@ -795,9 +954,10 @@ describe("cloud drafts and media groups", () => {
         'account-events-type-v3',
         'message-mutation-operation-v2',
         'draft-request-dialog-fk-removal-v1',
-        'media-group-request-dialog-fk-removal-v1'
+        'media-group-request-dialog-fk-removal-v1',
+        'account-private-cleanup-v1'
       )`;
-    expect(markers).toHaveLength(8);
+    expect(markers).toHaveLength(9);
     const invalid = await db`
       SELECT conname FROM pg_constraint
       WHERE conname LIKE '%\\_v2' ESCAPE '\\' OR NOT convalidated`;

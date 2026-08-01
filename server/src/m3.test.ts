@@ -8,6 +8,7 @@ import {
   updateProfile,
   startAccountDeletion,
   deleteAccount,
+  requireActiveDevice,
   resolveDevice,
   revokeDevice,
   AuthError,
@@ -59,6 +60,7 @@ import {
   uploadMediaThumbnail,
 } from "./media";
 import { createHash } from "node:crypto";
+import { Client } from "pg";
 
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
@@ -93,6 +95,18 @@ async function resetDb() {
 async function makeAccount(phone: string, name: string) {
   const { code } = await startVerification(db, phone);
   return await checkVerification(db, phone, code, "ios", "Test iPhone", name);
+}
+
+async function waitForBackendLock(client: Client, pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await client.query<{ wait_event_type: string | null }>(
+      "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
+      [pid],
+    );
+    if (result.rows[0]?.wait_event_type === "Lock") return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`backend ${pid} did not block on the account lock`);
 }
 
 function testPhone(suffix: number): string {
@@ -405,6 +419,55 @@ describe("M3 cloud sync", () => {
     expect((await db`SELECT status FROM accounts WHERE id = ${account.accountId}`)[0].status).toBe("deleted");
     expect(await db`
       SELECT id FROM devices WHERE account_id = ${account.accountId} AND revoked_at IS NULL`).toHaveLength(0);
+  });
+
+  test("device revalidation takes the account lock before the device lock", async () => {
+    const account = await makeAccount(testPhone(136), "Lock order");
+    const accountBlocker = new Client({ connectionString: TEST_URL });
+    const deviceProbe = new Client({ connectionString: TEST_URL });
+    await Promise.all([accountBlocker.connect(), deviceProbe.connect()]);
+
+    let validation: Promise<void> | null = null;
+    let deviceWasAvailable = false;
+    let validationError: unknown;
+    try {
+      await accountBlocker.query("BEGIN");
+      await accountBlocker.query(
+        "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+        [account.accountId],
+      );
+
+      let announcePID!: (pid: number) => void;
+      const validationPID = new Promise<number>((resolve) => { announcePID = resolve; });
+      validation = db.begin(async (tx) => {
+        const row = (await tx`SELECT pg_backend_pid() AS pid`)[0];
+        announcePID(Number(row.pid));
+        await requireActiveDevice(tx, account.accountId, account.deviceId);
+      });
+      await waitForBackendLock(deviceProbe, await validationPID);
+
+      await deviceProbe.query("BEGIN");
+      await deviceProbe.query("SET LOCAL lock_timeout = '250ms'");
+      try {
+        await deviceProbe.query(
+          "SELECT id FROM devices WHERE id = $1 FOR UPDATE",
+          [account.deviceId],
+        );
+        deviceWasAvailable = true;
+      } catch {
+        deviceWasAvailable = false;
+      }
+    } finally {
+      await deviceProbe.query("ROLLBACK").catch(() => {});
+      await accountBlocker.query("ROLLBACK").catch(() => {});
+      if (validation) {
+        try { await validation; } catch (error) { validationError = error; }
+      }
+      await Promise.all([accountBlocker.end(), deviceProbe.end()]);
+    }
+
+    expect(validationError).toBeUndefined();
+    expect(deviceWasAvailable).toBe(true);
   });
 
   test("legacy notification writes serialize with account deletion", async () => {

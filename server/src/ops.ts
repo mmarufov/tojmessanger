@@ -7,6 +7,7 @@ import {
   mediaGroupReceiptKey,
 } from "./locks";
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
+import { draftMediaSchemaState } from "./draft-media-readiness";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -205,8 +206,11 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   await sql`SELECT 1`;
   const savedMessages = await savedMessagesSchemaReadiness(sql);
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
+  const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   return {
-    status: savedMessages.ready && preferences.ready ? "ready" : "not_ready",
+    status: savedMessages.ready && preferences.ready && draftMedia.ready
+      ? "ready"
+      : "not_ready",
     database: "ready",
     providers,
     savedMessagesSchema: savedMessages.ready ? "ready" : "incomplete",
@@ -215,6 +219,9 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // switches control entrypoints and behavior, not whether this binary can run on a pre-expand
     // schema, so traffic admission must always fail closed while they are incomplete.
     dialogPreferences: preferences,
+    // Maintenance, bootstrap, difference sync, and send paths all touch these relations whenever
+    // the binary is live. Entry-point switches cannot make a partial schema safe.
+    draftMedia,
     databaseLatencyMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10),
   };
 }

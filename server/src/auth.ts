@@ -460,11 +460,19 @@ export async function requireActiveDevice(
   accountId: string,
   deviceId: string,
 ): Promise<void> {
-  const rows = await sql`
+  // Account deletion locks the account before revoking devices. Take the same explicit order here:
+  // a joined FOR SHARE can lock the device first and deadlock with deletion (account -> device).
+  const accounts = await sql`
+    SELECT id FROM accounts
+    WHERE id = ${accountId} AND status IN ('active','limited')
+    FOR SHARE`;
+  if (!accounts.length) throw new AuthError("device is no longer active", 401);
+
+  const devices = await sql`
     SELECT id FROM devices
     WHERE id = ${deviceId} AND account_id = ${accountId} AND revoked_at IS NULL
     FOR SHARE`;
-  if (!rows.length) throw new AuthError("device is no longer active", 401);
+  if (!devices.length) throw new AuthError("device is no longer active", 401);
 }
 
 export async function revokeDevice(
@@ -569,7 +577,7 @@ export async function deleteAccount(
     }
     // This database-boundary function is also called by the account-status trigger used by old
     // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
-    await tx`SELECT toj_cleanup_saved_messages_for_account(${accountId})`;
+    await tx`SELECT public.toj_cleanup_account_private_state_v1(${accountId})`;
     const anonymizedPhone = seal(`deleted:${accountId}`, PHONE_AAD);
     const anonymizedLookup = randomBytes(32);
     await tx`
@@ -609,17 +617,6 @@ export async function deleteAccount(
         voip_push_environment = NULL,
         voip_push_updated_at = now()
       WHERE account_id = ${accountId}`;
-    // Accounts are privacy-anonymized rather than physically deleted, so preference rows and their
-    // idempotency payloads need explicit lifecycle cleanup instead of relying on FK cascades.
-    await tx`DELETE FROM dialog_preferences WHERE account_id = ${accountId}`;
-    await tx`DELETE FROM dialog_preference_requests WHERE account_id = ${accountId}`;
-    await tx`DELETE FROM dialog_preference_action_budgets WHERE account_id = ${accountId}`;
-    // Preference events and bootstrap copies are private presentation state, not delivered message
-    // history. Purge them under the deletion contract while retaining peers' message history.
-    await tx`
-      DELETE FROM account_events
-      WHERE account_id = ${accountId} AND type = 'dialog.preferences_updated'`;
-    await tx`DELETE FROM bootstrap_snapshots WHERE account_id = ${accountId}`;
     // Device rows are revoked and locked before call rows, matching call-mutation lock order.
     // The injected call cleanup therefore commits atomically with account deletion without letting
     // an in-flight device mutation recreate state after the termination scan.

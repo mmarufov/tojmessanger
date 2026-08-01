@@ -368,7 +368,20 @@
 
     },
     "Attachment" : {
-
+      "localizations" : {
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вложение"
+          }
+        },
+        "tg" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замима"
+          }
+        }
+      }
     },
     "Attachment failed" : {
 
