@@ -937,7 +937,10 @@ private struct QuietReplicaSyncBanner: View {
     }
 
     var body: some View {
-        Group {
+        // Keep a concrete host in the hierarchy while the banner is delayed. A conditional
+        // Group can collapse to EmptyView, which prevents the state-driven task below from
+        // observing a quick checking -> failure transition and leaves the failure hidden.
+        VStack(spacing: 0) {
             if visible {
                 ReplicaSyncBanner(state: state, retry: retry)
                     .padding(.top, 6)
