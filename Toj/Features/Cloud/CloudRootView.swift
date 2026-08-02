@@ -724,12 +724,10 @@ private struct CloudChatsView: View {
         .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
         .safeAreaInset(edge: .top, spacing: 0) {
             if model.replicaSyncState != .ready {
-                ReplicaSyncBanner(state: model.replicaSyncState) {
+                QuietReplicaSyncBanner(state: model.replicaSyncState) {
                     model.retryReplicaSync()
                 }
                 .padding(.horizontal, 16)
-                .padding(.top, 6)
-                .padding(.bottom, 4)
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
@@ -922,6 +920,40 @@ private struct CloudChatsView: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: 300)
+    }
+}
+
+/// Failure states appear immediately, but transient checking/updating states must persist for a
+/// beat before the banner interrupts the chrome — a healthy fast launch stays visually silent.
+private struct QuietReplicaSyncBanner: View {
+    let state: ReplicaSyncState
+    let retry: () -> Void
+    @State private var visible: Bool
+
+    init(state: ReplicaSyncState, retry: @escaping () -> Void) {
+        self.state = state
+        self.retry = retry
+        _visible = State(initialValue: !state.showsProgress)
+    }
+
+    var body: some View {
+        Group {
+            if visible {
+                ReplicaSyncBanner(state: state, retry: retry)
+                    .padding(.top, 6)
+                    .padding(.bottom, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .task(id: state) {
+            if !state.showsProgress {
+                visible = true
+            } else if !visible {
+                try? await Task.sleep(for: .milliseconds(600))
+                guard !Task.isCancelled else { return }
+                visible = true
+            }
+        }
     }
 }
 

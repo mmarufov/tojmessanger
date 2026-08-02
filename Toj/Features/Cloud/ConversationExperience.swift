@@ -2736,7 +2736,16 @@ private struct ProductionMediaViewer: View {
                 Text(media.formattedSize).foregroundStyle(TojTheme.secondaryText)
             }
         } else {
-            MediaDownloadRing(progress: downloadProgress)
+            ZStack {
+                if let thumbnailImage {
+                    Image(uiImage: thumbnailImage)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                MediaDownloadRing(progress: downloadProgress)
+            }
+            .ignoresSafeArea()
         }
     }
 
@@ -2956,6 +2965,10 @@ private struct ProductionMediaViewer: View {
         isPlaying = false
         do {
             if media.kind == "video" {
+                // The cached poster fills the frame while the stream spins up, so the viewer
+                // never opens onto a bare ring.
+                thumbnailImage = await model.presentationImage(for: media, variant: .videoPoster)
+                try Task.checkCancellation()
                 try await loadStreamingVideo()
                 return
             }
@@ -2966,6 +2979,19 @@ private struct ProductionMediaViewer: View {
                 try Task.checkCancellation()
             }
             if media.kind == "photo" {
+                let availability = await model.mediaAvailability(for: media, variant: .screen2048)
+                try Task.checkCancellation()
+                switch availability {
+                case .decoded, .localRepresentation, .localComplete:
+                    break
+                default:
+                    // Full pixels are not local yet: stream them with real progress so the ring
+                    // is honest, then decode from the completed encrypted cache below.
+                    _ = try await model.mediaData(for: media) { value in
+                        await MainActor.run { downloadProgress = value }
+                    }
+                    try Task.checkCancellation()
+                }
                 let image = await model.presentationImage(for: media, variant: .screen2048)
                 try Task.checkCancellation()
                 guard let image else {
