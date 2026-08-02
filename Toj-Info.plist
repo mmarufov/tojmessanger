@@ -52,6 +52,8 @@
 	</array>
 	<key>TOJPushEnabled</key>
 	<string>$(TOJ_PUSH_ENABLED)</string>
+	<key>TOJCloudBaseURL</key>
+	<string>$(TOJ_CLOUD_BASE_URL)</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIStatusBarStyle</key>

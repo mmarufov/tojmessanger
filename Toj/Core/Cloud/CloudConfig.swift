@@ -15,21 +15,49 @@ nonisolated enum CloudConfigValidationIssue: Equatable, Sendable {
 }
 
 nonisolated struct CloudConfig: Sendable {
+    private static let defaultsKey = "TOJ_CLOUD_BASE_URL"
+    private static let bundledURLKey = "TOJCloudBaseURL"
+
     var baseURL: URL
 
     static var current: CloudConfig {
-        resolve(environment: ProcessInfo.processInfo.environment, defaults: .standard)
+        resolve(
+            environment: ProcessInfo.processInfo.environment,
+            defaults: .standard,
+            bundledBaseURL: Bundle.main.object(forInfoDictionaryKey: bundledURLKey) as? String
+        )
     }
 
-    static func resolve(environment: [String: String], defaults: UserDefaults) -> CloudConfig {
-        if let raw = environment["TOJ_CLOUD_BASE_URL"], let url = URL(string: raw) {
-            defaults.set(raw, forKey: "TOJ_CLOUD_BASE_URL")
+    static func resolve(
+        environment: [String: String],
+        defaults: UserDefaults,
+        bundledBaseURL: String? = nil
+    ) -> CloudConfig {
+        if let raw = environment[defaultsKey], let url = validBaseURL(raw) {
+            defaults.set(raw, forKey: defaultsKey)
             return CloudConfig(baseURL: url)
         }
-        if let raw = defaults.string(forKey: "TOJ_CLOUD_BASE_URL"), let url = URL(string: raw) {
+
+        // A signed Release build must win over an endpoint persisted by a previous
+        // developer launch. Debug builds leave this Info.plist value empty, so their
+        // environment override still survives a manual relaunch.
+        if let bundledBaseURL, let url = validBaseURL(bundledBaseURL) {
+            return CloudConfig(baseURL: url)
+        }
+
+        if let raw = defaults.string(forKey: defaultsKey), let url = validBaseURL(raw) {
             return CloudConfig(baseURL: url)
         }
         return CloudConfig(baseURL: URL(string: "http://127.0.0.1:8788")!)
+    }
+
+    private static func validBaseURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else { return nil }
+        return url
     }
 
     func httpURL(path: String) -> URL {

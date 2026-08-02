@@ -1580,6 +1580,53 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertEqual(restored.baseURL, expected)
     }
 
+    func testCloudConfigUsesBundledReleaseURLOnFreshInstall() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let expected = "https://api.sandstrm.online/cloud"
+
+        let config = CloudConfig.resolve(
+            environment: [:],
+            defaults: defaults,
+            bundledBaseURL: expected
+        )
+
+        XCTAssertEqual(config.baseURL.absoluteString, expected)
+        XCTAssertNil(config.validationIssue(environment: [:]))
+    }
+
+    func testBundledReleaseURLOverridesStalePersistedDevelopmentURL() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("http://127.0.0.1:8788", forKey: "TOJ_CLOUD_BASE_URL")
+
+        let config = CloudConfig.resolve(
+            environment: [:],
+            defaults: defaults,
+            bundledBaseURL: "https://api.sandstrm.online/cloud"
+        )
+
+        XCTAssertEqual(config.baseURL.absoluteString, "https://api.sandstrm.online/cloud")
+    }
+
+    func testExplicitEnvironmentURLOverridesBundledReleaseURL() throws {
+        let suiteName = "CloudConfigTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let override = "https://staging.example.test/cloud"
+
+        let config = CloudConfig.resolve(
+            environment: ["TOJ_CLOUD_BASE_URL": override],
+            defaults: defaults,
+            bundledBaseURL: "https://api.sandstrm.online/cloud"
+        )
+
+        XCTAssertEqual(config.baseURL.absoluteString, override)
+        XCTAssertEqual(defaults.string(forKey: "TOJ_CLOUD_BASE_URL"), override)
+    }
+
     func testLocalDatabaseKeyPersistsAcrossLookups() throws {
         let service = "com.toj.tests.cloud-db.\(UUID().uuidString)"
         let account = "sqlcipher-key"
