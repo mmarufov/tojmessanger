@@ -1104,6 +1104,15 @@ export function startCloudServer(
         const set = sockets.get(ws.data.accountId) ?? new Set<ServerWebSocket<SocketData>>();
         set.add(ws);
         sockets.set(ws.data.accountId, set);
+        // Late-join hint: a client reconnecting after a gap learns the current cursor right away
+        // instead of waiting for the next new event to produce a push.
+        getState(db, ws.data.accountId)
+          .then((state) => {
+            if (ws.readyState === 1) {
+              ws.send(JSON.stringify({ type: "sync_hint", pts: state.pts, ptsCount: 0 }));
+            }
+          })
+          .catch(() => {});
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
       },
       close(ws) {

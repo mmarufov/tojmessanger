@@ -86,6 +86,7 @@ nonisolated enum ReplicaSyncTrigger: Equatable, Sendable {
     case socketReconnect
     case push
     case hint
+    case background
 }
 
 /// Owns foreground sync task lifetime away from the main actor. A manual retry invalidates and

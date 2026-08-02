@@ -680,6 +680,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				TOJ_CLOUD_BASE_URL = "";
 				TOJ_PUSH_ENABLED = NO;
 			};
 			name = Debug;
@@ -729,6 +730,7 @@
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				TOJ_CLOUD_BASE_URL = "https://api.sandstrm.online/cloud";
 				TOJ_PUSH_ENABLED = YES;
 			};
 			name = Release;

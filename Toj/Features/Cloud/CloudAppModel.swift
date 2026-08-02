@@ -374,6 +374,7 @@ final class CloudAppModel {
     @ObservationIgnored private lazy var replicaSyncCoordinator = ReplicaSyncCoordinator { [weak self] generation in
         guard let self else { return }
         await self.runForegroundSyncAttempt(generation: generation)
+        self.settleReplicaSyncStateAfterAttempt()
     }
     @ObservationIgnored private lazy var draftSyncCoordinator = DraftSyncCoordinator(api: api)
     @ObservationIgnored private lazy var dialogPreferencesCoordinator =
@@ -381,8 +382,10 @@ final class CloudAppModel {
     private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
+    private var hintSocketToken: String?
     private var hintTask: Task<Void, Never>?
     private var networkObservationTask: Task<Void, Never>?
+    private var offlinePaintTask: Task<Void, Never>?
     private var memoryPressureTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
     private var resendTask: Task<Void, Never>?
@@ -462,6 +465,7 @@ final class CloudAppModel {
     private var dialogSelectionGeneration: UInt64 = 0
     private var timelineLoadGeneration: UInt64 = 0
     private var openingAnchorHydrationGeneration: UInt64 = 0
+    private var openPrefetchGeneration: UInt64 = 0
     private var savedMessagesSessionGeneration: UInt64 = 0
     private(set) var sessionTeardownActive = false
     private struct TrackedSavedOperation {
@@ -1394,6 +1398,72 @@ final class CloudAppModel {
             )
         }
         scheduleMediaDownloadProcessing()
+    }
+
+    /// Telegram-style arrival prefetch: media referenced by newly written messages is queued for
+    /// download immediately under the auto-download policy, so a chat can open with its media
+    /// already on disk. The engine skips components that are already downloaded, so re-applying
+    /// the same messages is cheap.
+    private func enqueueArrivalMediaDownloads(_ messages: [CloudMessage], recentOnly: Bool = false) async {
+        await enqueueArrivalMediaDownloads(
+            messages.map { (media: $0.media, dialogId: $0.dialogId, state: $0.state, serverTs: $0.serverTs) },
+            recentOnly: recentOnly
+        )
+    }
+
+    private func enqueueArrivalMediaDownloads(window messages: [LocalMessage]) async {
+        await enqueueArrivalMediaDownloads(
+            messages.map { (media: $0.media, dialogId: $0.dialogId, state: $0.state, serverTs: $0.serverTs) },
+            recentOnly: false
+        )
+    }
+
+    private func enqueueArrivalMediaDownloads(
+        _ candidates: [(media: CloudMedia?, dialogId: String, state: String, serverTs: String?)],
+        recentOnly: Bool
+    ) async {
+        guard let localStore else { return }
+        let snapshot = ReplicaNetworkMonitor.shared.snapshot()
+        guard snapshot.allowsEssentialSync else { return }
+        let network = snapshot.mediaNetworkClass
+        let cutoff = recentOnly ? Date(timeIntervalSinceNow: -Self.arrivalPrefetchMaxAge) : nil
+        var chatClassByDialog: [String: MediaChatClass] = [:]
+        var enqueuedAny = false
+        for candidate in candidates {
+            guard let media = candidate.media, candidate.state == "visible" else { continue }
+            if let cutoff {
+                guard let serverTs = candidate.serverTs,
+                      let timestamp = Self.serverTimestamp(serverTs),
+                      timestamp >= cutoff else { continue }
+            }
+            let chat: MediaChatClass
+            if let known = chatClassByDialog[candidate.dialogId] {
+                chat = known
+            } else {
+                chat = (try? await localStore.mediaChatClass(dialogId: candidate.dialogId)) ?? .privateChat
+                chatClassByDialog[candidate.dialogId] = chat
+            }
+            _ = await mediaEngine.enqueueAutoDownload(
+                media: media,
+                chat: chat,
+                network: network,
+                dialogId: candidate.dialogId,
+                localStore: localStore
+            )
+            enqueuedAny = true
+        }
+        if enqueuedAny { scheduleMediaDownloadProcessing() }
+    }
+
+    nonisolated static let arrivalPrefetchMaxAge: TimeInterval = 30 * 24 * 60 * 60
+
+    nonisolated static func serverTimestamp(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: value)
     }
 
     private func scheduleMediaDownloadProcessing() {
@@ -2590,6 +2660,7 @@ final class CloudAppModel {
                 token: token
             )
             try await localStore.applyHistoryPage(page)
+            await enqueueArrivalMediaDownloads(page.messages)
             guard activeDialogId == dialogId, dialogSelectionGeneration == selectionGeneration else {
                 return
             }
@@ -4743,7 +4814,7 @@ final class CloudAppModel {
                 do {
                     try context.checkCancellation()
                     let previousPts = await self.pts
-                    await self.syncNow()
+                    await self.runCoordinatedSync(trigger: .background)
                     try context.checkCancellation()
                     await self.retryPendingOutbox()
                     try context.checkCancellation()
@@ -4761,7 +4832,7 @@ final class CloudAppModel {
                 guard let self else { return .noData }
                 do {
                     try context.checkCancellation()
-                    await self.syncNow()
+                    await self.runCoordinatedSync(trigger: .background)
                     try context.checkCancellation()
                     await self.resumeHistoryHydration()
                     try context.checkCancellation()
@@ -5013,6 +5084,7 @@ final class CloudAppModel {
                         token: token
                     )
                     try await localStore.applyHistoryPage(page)
+                    await enqueueArrivalMediaDownloads(page.messages, recentOnly: true)
                     pagesSinceYield += 1
                     madeProgress = true
                 } catch is CancellationError {
@@ -5254,10 +5326,10 @@ final class CloudAppModel {
                 let recovered = previous == .offline && snapshot.networkClass != .offline
                 previous = snapshot.networkClass
                 if snapshot.networkClass == .offline {
-                    self.setReplicaSyncState(.offline)
-                    self.status = String(localized: "Offline. Showing downloaded conversations.")
+                    self.scheduleOfflineStatePaint()
                     continue
                 }
+                self.cancelOfflineStatePaint()
                 guard recovered else { continue }
                 try? await Task.sleep(for: .milliseconds(500))
                 guard !Task.isCancelled,
@@ -5267,6 +5339,26 @@ final class CloudAppModel {
                 await self.resumeHistoryHydration()
             }
         }
+    }
+
+    /// Interface handoffs (Wi-Fi ↔ cellular) report sub-second unsatisfied paths. Painting the
+    /// offline banner is debounced so only a real outage is announced; sync and media gating read
+    /// live snapshots and are unaffected by the delay.
+    private func scheduleOfflineStatePaint() {
+        guard offlinePaintTask == nil else { return }
+        offlinePaintTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard let self, !Task.isCancelled else { return }
+            self.offlinePaintTask = nil
+            guard ReplicaNetworkMonitor.shared.snapshot().networkClass == .offline else { return }
+            self.setReplicaSyncState(.offline)
+            self.status = String(localized: "Offline. Showing downloaded conversations.")
+        }
+    }
+
+    private func cancelOfflineStatePaint() {
+        offlinePaintTask?.cancel()
+        offlinePaintTask = nil
     }
 
     nonisolated static func replicaFailureState(
@@ -5377,7 +5469,7 @@ final class CloudAppModel {
 
     private func syncFromPush() async -> Bool {
         let previousPts = pts
-        _ = await syncNow()
+        await runCoordinatedSync(trigger: .push)
         return pts > previousPts
     }
 
@@ -5418,11 +5510,16 @@ final class CloudAppModel {
     }
 
     private func startHints(token: String) async {
+        // The socket is long-lived: it survives sync passes and reconnects itself with jittered
+        // backoff. Only a token change (or an explicit stop) replaces it — cycling it on every
+        // sync pass would burn round-trips and drop hints raised during each teardown window.
+        if hintSocketToken == token, hintSocket != nil, hintTask?.isCancelled == false { return }
         hintTask?.cancel()
         await hintSocket?.stop()
 
         let socket = CloudHintSocket(url: api.config.wsURL(), token: token)
         hintSocket = socket
+        hintSocketToken = token
         hintTask = Task { [weak self, socket] in
             await socket.start()
             await withTaskGroup(of: Void.self) { group in
@@ -5430,7 +5527,11 @@ final class CloudAppModel {
                     for await event in socket.events {
                         guard let self, !Task.isCancelled else { return }
                         switch event {
-                        case .sync:
+                        case .sync(let hint):
+                            // The payload carries the account cursor; skip the probe entirely when
+                            // the local replica is already at (or past) it.
+                            let localPts = await self.pts
+                            guard hint.pts > localPts else { continue }
                             await self.replicaSyncCoordinator.trigger(.hint)
                         case .call(let hint):
                             await self.callCoordinator.handle(hint)
@@ -5474,6 +5575,27 @@ final class CloudAppModel {
     private func scheduleSync(trigger: ReplicaSyncTrigger = .hint) {
         Task { [replicaSyncCoordinator] in
             await replicaSyncCoordinator.trigger(trigger)
+        }
+    }
+
+    /// Runs one coordinated sync pass and waits for the coordinator to drain. Every sync entry
+    /// point funnels through the coordinator (here or via `scheduleSync`) so passes are
+    /// serialized and an overlap can never be misreported as a network failure.
+    private func runCoordinatedSync(trigger: ReplicaSyncTrigger) async {
+        await replicaSyncCoordinator.trigger(trigger)
+        await replicaSyncCoordinator.waitUntilIdle()
+    }
+
+    /// A cancelled or replaced attempt can return without publishing a state. Once the coordinator
+    /// drains, a pill still stuck on progress means no pass owns it — retrigger once so the state
+    /// always settles to ready or a retryable failure.
+    private func settleReplicaSyncStateAfterAttempt() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.replicaSyncCoordinator.waitUntilIdle()
+            guard self.replicaSyncState.showsProgress,
+                  self.storedSession?.session.token != nil else { return }
+            await self.replicaSyncCoordinator.trigger(.hint)
         }
     }
 
@@ -5532,7 +5654,6 @@ final class CloudAppModel {
             if replicaInitialized, remoteState.pts == pts {
                 setReplicaSyncState(.ready)
                 status = "Chats are up to date"
-                await startHints(token: token)
                 schedulePostSyncWork(token: token)
                 return
             }
@@ -5551,7 +5672,6 @@ final class CloudAppModel {
             }
             setReplicaSyncState(.ready)
             status = "Chats are up to date"
-            await startHints(token: token)
             schedulePostSyncWork(token: token)
         case .failed(let failure):
             setReplicaSyncState(failure)
@@ -5576,6 +5696,7 @@ final class CloudAppModel {
         hintTask = nil
         await hintSocket?.stop()
         hintSocket = nil
+        hintSocketToken = nil
     }
 
     private func schedulePostSyncWork(token: String) {
@@ -5637,6 +5758,10 @@ final class CloudAppModel {
         defer { LocalFirstMetrics.end("Difference sync", syncInterval) }
         guard let token = storedSession?.session.token else { return false }
         if syncInFlight {
+            // Every entry point funnels through ReplicaSyncCoordinator, so overlap indicates a
+            // programming error — never a network failure. Ask the active pass to loop once more
+            // rather than misreporting the connection state.
+            assertionFailure("syncNow is expected to run only via ReplicaSyncCoordinator")
             syncAgain = true
             return false
         }
@@ -5759,6 +5884,10 @@ final class CloudAppModel {
                }).first {
                 await acceptCanonicalProfile(ownProfile, token: token)
             }
+            await enqueueArrivalMediaDownloads((difference.updates ?? []).compactMap { update -> CloudMessage? in
+                guard update.type == "message.new" || update.type == "message.edited" else { return nil }
+                return update.message
+            })
             // Dialog and active-timeline observations publish this transaction once. Explicitly
             // querying both again here caused online-only reload storms during chat opening.
         } else {
@@ -5789,6 +5918,7 @@ final class CloudAppModel {
                     token: token
                 )
                 try await localStore.applyBootstrapPage(page)
+                await enqueueArrivalMediaDownloads(page.dialogs.flatMap(\.messages), recentOnly: true)
                 guard page.hasMore else { return }
                 guard let nextCursor = page.nextCursor else {
                     throw CloudAppModelError.invalidBootstrapCursor
@@ -6026,6 +6156,10 @@ final class CloudAppModel {
                 || (snapshot.oldestServerMsgId != nil && historyState == nil)
             cacheCurrentLines(for: dialogId)
             finishConversationOpenWaiters(dialogId: dialogId)
+            if openPrefetchGeneration != selectionGeneration {
+                openPrefetchGeneration = selectionGeneration
+                await enqueueArrivalMediaDownloads(window: messages)
+            }
         } catch {
             if activeDialogId == dialogId,
                dialogSelectionGeneration == selectionGeneration,
@@ -7778,7 +7912,7 @@ final class CloudAppModel {
             else { return }
             if let apiError = error as? CloudAPIError, apiError.status == 409 {
                 try? await localStore.completeMessageMutation(clientMutationId: mutation.clientMutationId)
-                await syncNow()
+                await runCoordinatedSync(trigger: .hint)
                 if mutation.operation == "edit", let body = mutation.body {
                     draft = body
                     if let current = lines.first(where: { $0.msgId == mutation.msgId }) {

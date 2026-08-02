@@ -607,6 +607,37 @@ describe("M3 cloud sync", () => {
     }
   });
 
+  test("cloud websocket sends a late-join sync hint on open", async () => {
+    const server = startCloudServer(0, db, null, null);
+    try {
+      const session = await makeAccount(testPhone(150), "Hinted");
+      const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/ws`, {
+        headers: { authorization: `Bearer ${session.token}` },
+      });
+      try {
+        const first = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("no hint within 3s of open")), 3000);
+          socket.onmessage = (event) => {
+            clearTimeout(timer);
+            resolve(String(event.data));
+          };
+          socket.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error("socket error"));
+          };
+        });
+        const hint = JSON.parse(first) as { type: string; pts: number; ptsCount: number };
+        expect(hint.type).toBe("sync_hint");
+        expect(typeof hint.pts).toBe("number");
+        expect(hint.pts).toBeGreaterThanOrEqual(0);
+      } finally {
+        socket.close();
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("operations endpoints expose safe readiness, correlation IDs, and protected metrics", async () => {
     const previousMetricsToken = process.env.TOJ_METRICS_TOKEN;
     const previousReturnOTP = process.env.TOJ_RETURN_OTP;
