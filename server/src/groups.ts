@@ -13,7 +13,11 @@ import { loadMediaDTO, type MediaDTO } from "./media";
 import { loadProfiles, type ProfileDTO } from "./sync";
 import { purgeRevokedDialogDraftState } from "./drafts";
 import { updateDialogPreferences } from "./dialog-preferences";
-import { revokeGroupCallAccountInLockedDialog } from "./group-calls";
+import {
+  requireGroupCallSFUBarrierApplied,
+  revokeGroupCallAccountInLockedDialog,
+  type GroupCallSFUControl,
+} from "./group-calls";
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -685,9 +689,10 @@ export async function removeGroupMember(sql: SQL, input: {
   dialogId: string;
   targetAccountId: unknown;
   clientMutationId: unknown;
-}): Promise<GroupEnvelope> {
+}, groupCallSFUControl?: GroupCallSFUControl): Promise<GroupEnvelope> {
   const targetId = requireUUID(input.targetAccountId, "accountId");
-  return sql.begin(async (tx) => {
+  let affectedGroupCallIds: string[] = [];
+  const result = await sql.begin(async (tx) => {
     const claim = await claimMutation(
       tx, input.actorAccountId, input.clientMutationId, input.dialogId, "remove_member", targetId,
     );
@@ -707,7 +712,7 @@ export async function removeGroupMember(sql: SQL, input: {
     // Membership and media authorization share the locked dialog as their linearization point.
     // The removed account loses its group-call participant and forces a fresh epoch in this same
     // commit, so it can never remain an SFU-authorized member after group access is revoked.
-    await revokeGroupCallAccountInLockedDialog(tx, input.dialogId, targetId);
+    affectedGroupCallIds = await revokeGroupCallAccountInLockedDialog(tx, input.dialogId, targetId);
     await purgeRevokedDialogDraftState(tx, targetId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = await emitLifecycle(
@@ -721,6 +726,10 @@ export async function removeGroupMember(sql: SQL, input: {
     await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
     return envelope(tx, input.actorAccountId, input.dialogId, { pushes });
   });
+  if (affectedGroupCallIds.length) {
+    await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
+  }
+  return result;
 }
 
 export async function changeGroupMemberRole(sql: SQL, input: {
@@ -861,11 +870,14 @@ export async function leaveGroup(sql: SQL, input: {
   dialogId: string;
   successorAccountId?: unknown;
   clientMutationId: unknown;
-}): Promise<{ left: true; closed: boolean; pushes: FanoutPush[] }> {
+}, groupCallSFUControl?: GroupCallSFUControl): Promise<{
+  left: true; closed: boolean; pushes: FanoutPush[];
+}> {
   const successorId = input.successorAccountId == null
     ? null
     : requireUUID(input.successorAccountId, "successorAccountId");
-  return sql.begin(async (tx) => {
+  let affectedGroupCallIds: string[] = [];
+  const result = await sql.begin(async (tx) => {
     const claim = await claimMutation(
       tx, input.actorAccountId, input.clientMutationId, input.dialogId, "leave", successorId,
     );
@@ -900,7 +912,11 @@ export async function leaveGroup(sql: SQL, input: {
     await tx`
       UPDATE dialog_members SET left_at = now()
       WHERE dialog_id = ${input.dialogId} AND account_id = ${input.actorAccountId}`;
-    await revokeGroupCallAccountInLockedDialog(tx, input.dialogId, input.actorAccountId);
+    affectedGroupCallIds = await revokeGroupCallAccountInLockedDialog(
+      tx,
+      input.dialogId,
+      input.actorAccountId,
+    );
     await purgeRevokedDialogDraftState(tx, input.actorAccountId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = closed
@@ -919,6 +935,10 @@ export async function leaveGroup(sql: SQL, input: {
     await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
     return { left: true, closed, pushes };
   });
+  if (affectedGroupCallIds.length) {
+    await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
+  }
+  return result;
 }
 
 export async function updateGroupNotifications(sql: SQL, input: {

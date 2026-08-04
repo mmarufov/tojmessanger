@@ -41,6 +41,53 @@ worker; account events follow the separately configured synchronization retentio
 Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
 a device retrying after days can recover the canonical `client_msg_id`.
 
+## Encrypted group-call rollout and drain
+
+Group calls are dark by default. Production requires managed LiveKit Cloud because this version
+uses the provider's room-token revocation cutoff when membership changes; the server rejects a
+self-hosted LiveKit configuration in production. Keep these values in the deployment secret store:
+
+- `TOJ_GROUPS_V1_ENABLED=1`
+- `TOJ_GROUP_CALLS_ENABLED=1`
+- `TOJ_GROUP_CALLS_SFU_READY=1`
+- `TOJ_GROUP_CALLS_E2EE_REQUIRED=1`
+- `TOJ_LIVEKIT_URL`, `TOJ_LIVEKIT_API_KEY`, and `TOJ_LIVEKIT_API_SECRET`
+- `TOJ_LIVEKIT_DEPLOYMENT=cloud`
+- `TOJ_GROUP_CALLS_ALLOWLIST` and `TOJ_GROUP_CALLS_ROLLOUT_PERCENT` (default zero)
+- `TOJ_GROUP_SCREEN_SHARING_ENABLED` and `TOJ_GROUP_SCREEN_SHARING_READY` (both must be `1`)
+
+Deploy in this order:
+
+1. Run the database migration with admission off. Require `GET /ready` to return `200`; the exact
+   group-call schema contract is checked even while the feature is disabled.
+2. Deploy the server and LiveKit credentials with an empty allowlist and zero-percent rollout.
+   Confirm `toj_group_call_schema_available 1` and that the SFU backlog metrics are zero.
+3. Ship the compatible iOS build and its provisioned ReplayKit broadcast extension. Screen sharing
+   stays independently off until both screen-sharing switches are set.
+4. Allowlist internal accounts, then increase the deterministic rollout percentage in stages.
+   Stop expansion on any sustained SFU backlog, lease cleanup, rekey, capacity, thermal, or network
+   regression.
+
+To drain safely, first set `TOJ_GROUP_CALLS_ROLLOUT_PERCENT=0` and clear the allowlist while keeping
+the base group-call switch, SFU-ready switch, E2EE requirement, and LiveKit credentials in place.
+This blocks new starts and joins while existing heartbeats, leaves, membership fencing, and the
+durable SFU reconciliation worker continue. End remaining rooms through the normal admin controls or
+wait for them to close. Do not turn off `TOJ_GROUP_CALLS_ENABLED`, remove the credentials, or stop
+the SFU worker until all of these gauges reach zero:
+
+- `toj_group_call_active_rooms`
+- `toj_group_call_rekeying_rooms`
+- `toj_group_call_sfu_pending_states`
+- `toj_group_call_sfu_failed_states`
+- `toj_group_call_sfu_oldest_pending_seconds`
+- `toj_group_call_expired_media_leases`
+
+After the drain, disabling admission is an application rollback; retain the additive tables,
+constraints, indexes, and migration markers. Page on a nonzero failed-state gauge, a growing oldest
+pending age, or expired leases that survive a cleanup interval. Do not enable beyond internal users
+until multi-region SFU capacity, Apple provisioning, physical-device carrier/thermal behavior, and
+32-participant load and adversarial security tests have passed.
+
 ## Media storage
 
 Media works without an Apple Developer account or a third-party storage provider. Resumable chunks

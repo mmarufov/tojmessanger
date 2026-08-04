@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS devices (
   push_token_key_id     TEXT,
   push_environment      TEXT CHECK (push_environment IN ('sandbox','production')),
   push_updated_at       TIMESTAMPTZ,
+  supported_group_call_versions INT[] NOT NULL DEFAULT ARRAY[]::INT[],
+  group_call_view_version INT NOT NULL DEFAULT 0,
+  supports_group_screen_share BOOLEAN NOT NULL DEFAULT FALSE,
   last_seen_at          TIMESTAMPTZ,
   revoked_at            TIMESTAMPTZ,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -85,11 +88,8 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_updated_at TIMESTAMPTZ;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_protocol_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_media_profile_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS call_view_version INT NOT NULL DEFAULT 1;
--- Group media is a separate capability family because it uses an SFU and frame cryptors rather
--- than the attested 1:1 WebRTC engine. Legacy registrations reset to no group support.
-ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_group_call_versions INT[] NOT NULL DEFAULT ARRAY[]::INT[];
-ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_call_view_version INT NOT NULL DEFAULT 0;
-ALTER TABLE devices ADD COLUMN IF NOT EXISTS supports_group_screen_share BOOLEAN NOT NULL DEFAULT FALSE;
+-- Group-media columns for existing deployments are expanded separately before this contract is
+-- run. Keeping the hot-table ALTERs out of the large schema transaction bounds lock duration.
 DO $$ BEGIN
   ALTER TABLE devices ADD CONSTRAINT devices_push_environment_check
     CHECK (push_environment IN ('sandbox','production'));
@@ -927,6 +927,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS group_call_participants_one_device_per_account
 CREATE INDEX IF NOT EXISTS group_call_participants_device_active_idx
   ON group_call_participants(device_id, joined_at DESC)
   WHERE status IN ('pending_key','active');
+CREATE INDEX IF NOT EXISTS group_call_participants_account_active_idx
+  ON group_call_participants(account_id, call_id, device_id)
+  WHERE status IN ('pending_key','active');
 CREATE INDEX IF NOT EXISTS group_call_participants_stale_idx
   ON group_call_participants(last_seen_at, call_id, device_id)
   WHERE status IN ('pending_key','active');
@@ -997,16 +1000,19 @@ CREATE TABLE IF NOT EXISTS group_call_sfu_participant_states (
   participant_identity UUID NOT NULL,
   desired_status       TEXT NOT NULL DEFAULT 'active'
                          CHECK (desired_status IN ('active','removed')),
+  media_allowed        BOOLEAN NOT NULL DEFAULT FALSE,
   camera_allowed       BOOLEAN NOT NULL DEFAULT FALSE,
   screen_share_allowed BOOLEAN NOT NULL DEFAULT FALSE,
   revision             BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
   applied_revision     BIGINT NOT NULL DEFAULT 1 CHECK (applied_revision >= 0),
   applied_status       TEXT NOT NULL DEFAULT 'active',
+  applied_media_allowed        BOOLEAN NOT NULL DEFAULT FALSE,
   applied_camera_allowed       BOOLEAN NOT NULL DEFAULT FALSE,
   applied_screen_share_allowed BOOLEAN NOT NULL DEFAULT FALSE,
   claim_token          UUID,
   claim_revision       BIGINT,
   claim_expires_at     TIMESTAMPTZ,
+  token_not_before     BIGINT NOT NULL DEFAULT 0,
   attempt_count        INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   next_attempt_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_error_code      TEXT,
@@ -1018,63 +1024,145 @@ CREATE TABLE IF NOT EXISTS group_call_sfu_participant_states (
     (claim_token IS NULL AND claim_revision IS NULL AND claim_expires_at IS NULL)
     OR (claim_token IS NOT NULL AND claim_revision IS NOT NULL AND claim_expires_at IS NOT NULL)
   ),
-  CHECK (desired_status = 'active' OR (NOT camera_allowed AND NOT screen_share_allowed))
+  CONSTRAINT group_call_sfu_applied_status_check
+    CHECK (applied_status IN ('active','removed')),
+  CONSTRAINT group_call_sfu_applied_media_check
+    CHECK (applied_status = 'active'
+      OR (NOT applied_media_allowed
+        AND NOT applied_camera_allowed AND NOT applied_screen_share_allowed)),
+  CONSTRAINT group_call_sfu_removed_media_check
+    CHECK (desired_status = 'active'
+      OR (NOT media_allowed AND NOT camera_allowed AND NOT screen_share_allowed)),
+  CONSTRAINT group_call_sfu_media_gate_check
+    CHECK (media_allowed OR (NOT camera_allowed AND NOT screen_share_allowed)),
+  CONSTRAINT group_call_sfu_token_not_before_check CHECK (token_not_before >= 0)
 );
-ALTER TABLE group_call_sfu_participant_states
-  ADD COLUMN IF NOT EXISTS applied_status TEXT;
-ALTER TABLE group_call_sfu_participant_states
-  ADD COLUMN IF NOT EXISTS applied_camera_allowed BOOLEAN;
-ALTER TABLE group_call_sfu_participant_states
-  ADD COLUMN IF NOT EXISTS applied_screen_share_allowed BOOLEAN;
 -- Existing pending rows may represent an in-flight revoke. Backfill them conservatively as the
 -- opposite applied permission so the worker must execute that revoke before any successor grant.
-UPDATE group_call_sfu_participant_states SET
-  applied_status = CASE
-    WHEN applied_revision = revision THEN desired_status
-    ELSE 'active'
-  END,
-  applied_camera_allowed = CASE
-    WHEN applied_revision = revision THEN camera_allowed
-    ELSE NOT camera_allowed
-  END,
-  applied_screen_share_allowed = CASE
-    WHEN applied_revision = revision THEN screen_share_allowed
-    ELSE NOT screen_share_allowed
-  END
-WHERE applied_status IS NULL
-   OR applied_camera_allowed IS NULL
-   OR applied_screen_share_allowed IS NULL;
-ALTER TABLE group_call_sfu_participant_states
-  ALTER COLUMN applied_status SET DEFAULT 'active',
-  ALTER COLUMN applied_status SET NOT NULL,
-  ALTER COLUMN applied_camera_allowed SET DEFAULT FALSE,
-  ALTER COLUMN applied_camera_allowed SET NOT NULL,
-  ALTER COLUMN applied_screen_share_allowed SET DEFAULT FALSE,
-  ALTER COLUMN applied_screen_share_allowed SET NOT NULL;
-DO $$ BEGIN
-  ALTER TABLE group_call_sfu_participant_states
-    ADD CONSTRAINT group_call_sfu_applied_status_check
-    CHECK (applied_status IN ('active','removed'));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN
-  ALTER TABLE group_call_sfu_participant_states
-    ADD CONSTRAINT group_call_sfu_applied_media_check
-    CHECK (applied_status = 'active'
-      OR (NOT applied_camera_allowed AND NOT applied_screen_share_allowed));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $group_calls_media_fence$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM schema_migrations WHERE name = 'group-calls-media-fence-v2'
+  ) THEN
+    UPDATE group_call_sfu_participant_states SET
+      applied_status = CASE
+        WHEN applied_revision = revision THEN desired_status
+        ELSE 'active'
+      END,
+      applied_camera_allowed = CASE
+        WHEN applied_revision = revision THEN camera_allowed
+        ELSE NOT camera_allowed
+      END,
+      applied_screen_share_allowed = CASE
+        WHEN applied_revision = revision THEN screen_share_allowed
+        ELSE NOT screen_share_allowed
+      END
+    WHERE applied_status IS NULL
+       OR applied_camera_allowed IS NULL
+       OR applied_screen_share_allowed IS NULL;
+
+    -- Before this column existed, an applied active state meant that a room token could publish a
+    -- microphone. Derive the desired state from the exact authenticated epoch and enqueue a revoke
+    -- whenever membership has moved ahead of that epoch.
+    UPDATE group_call_sfu_participant_states AS state SET
+      media_allowed = state.desired_status = 'active'
+        AND call.state = 'active'
+        AND participant.status = 'active'
+        AND participant.ready_media_epoch = call.media_epoch
+        AND epoch.membership_revision = call.membership_revision,
+      applied_media_allowed = state.applied_status = 'active'
+    FROM group_calls AS call
+    JOIN group_call_participants AS participant
+      ON participant.call_id = call.id
+    JOIN group_call_epochs AS epoch
+      ON epoch.call_id = call.id AND epoch.epoch = call.media_epoch
+    WHERE state.call_id = call.id
+      AND state.device_id = participant.device_id
+      AND (state.media_allowed IS NULL OR state.applied_media_allowed IS NULL);
+    UPDATE group_call_sfu_participant_states SET
+      media_allowed = COALESCE(media_allowed, FALSE),
+      applied_media_allowed = COALESCE(applied_media_allowed, FALSE);
+    UPDATE group_call_sfu_participant_states SET
+      camera_allowed = FALSE,
+      screen_share_allowed = FALSE
+    WHERE NOT media_allowed OR desired_status = 'removed';
+    UPDATE group_call_sfu_participant_states SET
+      applied_media_allowed = FALSE,
+      applied_camera_allowed = FALSE,
+      applied_screen_share_allowed = FALSE
+    WHERE applied_status = 'removed';
+    UPDATE group_call_sfu_participant_states SET
+      revision = revision + 1,
+      next_attempt_at = now(),
+      attempt_count = 0,
+      claim_token = NULL,
+      claim_revision = NULL,
+      claim_expires_at = NULL
+    WHERE applied_revision = revision
+      AND (
+        desired_status IS DISTINCT FROM applied_status
+        OR media_allowed IS DISTINCT FROM applied_media_allowed
+        OR camera_allowed IS DISTINCT FROM applied_camera_allowed
+        OR screen_share_allowed IS DISTINCT FROM applied_screen_share_allowed
+      );
+
+    ALTER TABLE group_call_sfu_participant_states
+      ALTER COLUMN applied_status SET DEFAULT 'active',
+      ALTER COLUMN applied_status SET NOT NULL,
+      ALTER COLUMN media_allowed SET DEFAULT FALSE,
+      ALTER COLUMN media_allowed SET NOT NULL,
+      ALTER COLUMN applied_media_allowed SET DEFAULT FALSE,
+      ALTER COLUMN applied_media_allowed SET NOT NULL,
+      ALTER COLUMN applied_camera_allowed SET DEFAULT FALSE,
+      ALTER COLUMN applied_camera_allowed SET NOT NULL,
+      ALTER COLUMN applied_screen_share_allowed SET DEFAULT FALSE,
+      ALTER COLUMN applied_screen_share_allowed SET NOT NULL;
+
+    ALTER TABLE group_call_sfu_participant_states
+      DROP CONSTRAINT IF EXISTS group_call_sfu_applied_status_check,
+      DROP CONSTRAINT IF EXISTS group_call_sfu_applied_media_check,
+      DROP CONSTRAINT IF EXISTS group_call_sfu_media_gate_check,
+      DROP CONSTRAINT IF EXISTS group_call_sfu_removed_media_check,
+      DROP CONSTRAINT IF EXISTS group_call_sfu_token_not_before_check;
+    ALTER TABLE group_call_sfu_participant_states
+      ADD CONSTRAINT group_call_sfu_applied_status_check
+        CHECK (applied_status IN ('active','removed')),
+      ADD CONSTRAINT group_call_sfu_applied_media_check
+        CHECK (applied_status = 'active'
+          OR (NOT applied_media_allowed
+            AND NOT applied_camera_allowed AND NOT applied_screen_share_allowed)),
+      ADD CONSTRAINT group_call_sfu_media_gate_check
+        CHECK (media_allowed OR (NOT camera_allowed AND NOT screen_share_allowed)),
+      ADD CONSTRAINT group_call_sfu_removed_media_check
+        CHECK (desired_status = 'active'
+          OR (NOT media_allowed AND NOT camera_allowed AND NOT screen_share_allowed)),
+      ADD CONSTRAINT group_call_sfu_token_not_before_check CHECK (token_not_before >= 0);
+
+    INSERT INTO schema_migrations(name) VALUES ('group-calls-media-fence-v2')
+    ON CONFLICT (name) DO NOTHING;
+  END IF;
+END;
+$group_calls_media_fence$;
 CREATE INDEX IF NOT EXISTS group_call_sfu_state_device_idx
   ON group_call_sfu_participant_states(call_id, device_id, updated_at);
 CREATE INDEX IF NOT EXISTS group_call_sfu_state_pending_idx
   ON group_call_sfu_participant_states(next_attempt_at, updated_at)
   WHERE applied_revision < revision;
+CREATE INDEX IF NOT EXISTS group_call_sfu_state_retention_idx
+  ON group_call_sfu_participant_states(updated_at, call_id, participant_identity)
+  WHERE desired_status = 'removed' AND applied_revision = revision;
 INSERT INTO group_call_sfu_participant_states (
   call_id, device_id, participant_identity, desired_status,
-  camera_allowed, screen_share_allowed, revision, applied_revision, next_attempt_at
+  media_allowed, camera_allowed, screen_share_allowed, revision, applied_revision, next_attempt_at
 )
 SELECT participant.call_id, participant.device_id, participant.call_local_identity, 'active',
+       participant.status = 'active'
+         AND participant.ready_media_epoch = call.media_epoch
+         AND epoch.membership_revision = call.membership_revision,
        FALSE, FALSE, 1, 0, now()
 FROM group_call_participants participant
 JOIN group_calls call ON call.id = participant.call_id
+JOIN group_call_epochs epoch ON epoch.call_id = call.id AND epoch.epoch = call.media_epoch
 WHERE call.state = 'active' AND participant.status IN ('pending_key','active')
 ON CONFLICT (call_id, participant_identity) DO NOTHING;
 

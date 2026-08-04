@@ -7,22 +7,23 @@ import { makeSql } from "./db";
 import {
   acquireGroupCamera,
   acquireGroupScreenShare,
-  activateGroupCallEpoch,
+  activateGroupCallEpoch as activateGroupCallEpochWithControl,
   expireStaleGroupCallParticipants,
   getGroupCall,
-  getGroupCallCredentials,
+  getGroupCallCredentials as getGroupCallCredentialsWithControl,
   type GroupCallSFUControl,
   groupCallSFUControlConfigured,
   groupCallSchemaReadiness,
   heartbeatGroupCamera,
   heartbeatGroupCall,
   heartbeatGroupScreenShare,
-  joinGroupCall,
-  leaveGroupCall,
-  endGroupCall,
-  removeGroupCallParticipant,
+  joinGroupCall as joinGroupCallWithControl,
+  leaveGroupCall as leaveGroupCallWithControl,
+  endGroupCall as endGroupCallWithControl,
+  removeGroupCallParticipant as removeGroupCallParticipantWithControl,
   reconcileGroupCallSFUParticipant,
   reconcilePendingGroupCallSFUStates,
+  requireGroupCallSFUBarrierApplied,
   releaseGroupCamera,
   releaseGroupScreenShare,
   resolveGroupCallHintTargets,
@@ -34,6 +35,7 @@ import { registerGroupCallCapabilities, registerVoIPPushToken } from "./push";
 const TEST_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/toj_test";
 const db = makeSql(TEST_URL);
 const groupCallEnvironmentKeys = [
+  "NODE_ENV",
   "TOJ_GROUPS_V1_ENABLED",
   "TOJ_GROUP_CALLS_ENABLED",
   "TOJ_GROUP_CALLS_SFU_READY",
@@ -44,6 +46,7 @@ const groupCallEnvironmentKeys = [
   "TOJ_LIVEKIT_URL",
   "TOJ_LIVEKIT_API_KEY",
   "TOJ_LIVEKIT_API_SECRET",
+  "TOJ_LIVEKIT_DEPLOYMENT",
 ] as const;
 const savedGroupCallEnvironment = new Map(
   groupCallEnvironmentKeys.map((key) => [key, process.env[key]]),
@@ -52,15 +55,18 @@ const savedGroupCallEnvironment = new Map(
 class FakeGroupCallSFUControl implements GroupCallSFUControl {
   rooms: Array<{ room: string; participantLimit: number }> = [];
   updates: Array<{
-    room: string; identity: string; cameraAllowed: boolean; screenShareAllowed: boolean;
+    room: string; identity: string; mediaAllowed: boolean;
+    cameraAllowed: boolean; screenShareAllowed: boolean;
   }> = [];
-  removals: Array<{ room: string; identity: string }> = [];
+  removals: Array<{ room: string; identity: string; tokenNotBefore: number }> = [];
   private updateGate: {
     started: () => void;
     resume: Promise<void>;
   } | null = null;
   private failingUpdates = 0;
+  private failingRemovals = 0;
   private updateDelayMs = 0;
+  private cloudTokenCutoffs = false;
   activeUpdates = 0;
   maxConcurrentUpdates = 0;
 
@@ -69,7 +75,8 @@ class FakeGroupCallSFUControl implements GroupCallSFUControl {
   }
 
   async updateParticipant(input: {
-    room: string; identity: string; cameraAllowed: boolean; screenShareAllowed: boolean;
+    room: string; identity: string; mediaAllowed: boolean;
+    cameraAllowed: boolean; screenShareAllowed: boolean;
   }) {
     this.updates.push(input);
     this.activeUpdates += 1;
@@ -94,7 +101,22 @@ class FakeGroupCallSFUControl implements GroupCallSFUControl {
   }
 
   async removeParticipant(room: string, identity: string) {
-    this.removals.push({ room, identity });
+    const tokenNotBefore = this.cloudTokenCutoffs ? Math.floor(Date.now() / 1_000) + 1 : 0;
+    this.removals.push({ room, identity, tokenNotBefore });
+    this.activeUpdates += 1;
+    this.maxConcurrentUpdates = Math.max(this.maxConcurrentUpdates, this.activeUpdates);
+    try {
+      if (this.failingRemovals > 0) {
+        this.failingRemovals -= 1;
+        throw new Error("injected SFU removal failure");
+      }
+      if (this.updateDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.updateDelayMs));
+      }
+    } finally {
+      this.activeUpdates -= 1;
+    }
+    return tokenNotBefore;
   }
 
   pauseNextUpdate(): { started: Promise<void>; resume: () => void } {
@@ -110,14 +132,50 @@ class FakeGroupCallSFUControl implements GroupCallSFUControl {
     this.failingUpdates = count;
   }
 
+  failNextRemovals(count = 1) {
+    this.failingRemovals = count;
+  }
+
   delayUpdates(milliseconds: number) {
     this.updateDelayMs = milliseconds;
+  }
+
+  useCloudTokenCutoffs() {
+    this.cloudTokenCutoffs = true;
   }
 }
 
 let sfu: FakeGroupCallSFUControl;
 
+const joinGroupCall = (
+  sql: Parameters<typeof joinGroupCallWithControl>[0],
+  input: Parameters<typeof joinGroupCallWithControl>[1],
+) => joinGroupCallWithControl(sql, input, sfu);
+const activateGroupCallEpoch = (
+  sql: Parameters<typeof activateGroupCallEpochWithControl>[0],
+  input: Parameters<typeof activateGroupCallEpochWithControl>[1],
+) => activateGroupCallEpochWithControl(sql, input, sfu);
+const leaveGroupCall = (
+  sql: Parameters<typeof leaveGroupCallWithControl>[0],
+  input: Parameters<typeof leaveGroupCallWithControl>[1],
+) => leaveGroupCallWithControl(sql, input, sfu);
+const endGroupCall = (
+  sql: Parameters<typeof endGroupCallWithControl>[0],
+  input: Parameters<typeof endGroupCallWithControl>[1],
+) => endGroupCallWithControl(sql, input, sfu);
+const removeGroupCallParticipant = (
+  sql: Parameters<typeof removeGroupCallParticipantWithControl>[0],
+  input: Parameters<typeof removeGroupCallParticipantWithControl>[1],
+) => removeGroupCallParticipantWithControl(sql, input, sfu);
+const getGroupCallCredentials = (
+  sql: Parameters<typeof getGroupCallCredentialsWithControl>[0],
+  accountId: string,
+  deviceId: string,
+  callId: unknown,
+) => getGroupCallCredentialsWithControl(sql, accountId, deviceId, callId, sfu);
+
 function configureGroupCalls() {
+  process.env.NODE_ENV = "test";
   process.env.TOJ_GROUPS_V1_ENABLED = "1";
   process.env.TOJ_GROUP_CALLS_ENABLED = "1";
   process.env.TOJ_GROUP_CALLS_SFU_READY = "1";
@@ -128,6 +186,7 @@ function configureGroupCalls() {
   process.env.TOJ_LIVEKIT_URL = "wss://group-media.test.toj.example";
   process.env.TOJ_LIVEKIT_API_KEY = "test-key";
   process.env.TOJ_LIVEKIT_API_SECRET = "test-secret-that-is-at-least-thirty-two-bytes-long";
+  process.env.TOJ_LIVEKIT_DEPLOYMENT = "cloud";
 }
 
 async function resetDb() {
@@ -245,8 +304,12 @@ describe("E2EE group calls and screen sharing", () => {
       missingTables: [],
       missingDeviceColumns: [],
       missingCriticalColumns: [],
+      invalidColumns: [],
       invalidPrimaryKeys: [],
       missingIndexes: [],
+      invalidIndexes: [],
+      invalidConstraints: [],
+      missingMigrations: [],
     });
     const alice = await account("+16505554110", "Alice", "b1");
     const capable = (await db`
@@ -287,6 +350,43 @@ describe("E2EE group calls and screen sharing", () => {
     expect(voipExplicitlyCleared.supports_group_screen_share).toBe(false);
   });
 
+  test("schema readiness fails closed on drifted columns, indexes, constraints, and markers", async () => {
+    let readiness: Awaited<ReturnType<typeof groupCallSchemaReadiness>> | undefined;
+    const rollback = new Error("rollback schema drift probe");
+    try {
+      await db.begin(async (transaction) => {
+        await transaction`
+          ALTER TABLE group_call_sfu_participant_states
+          ALTER COLUMN media_allowed DROP NOT NULL`;
+        await transaction`DROP INDEX group_call_sfu_state_retention_idx`;
+        await transaction`
+          CREATE INDEX group_call_sfu_state_retention_idx
+          ON group_call_sfu_participant_states(call_id)`;
+        await transaction`
+          ALTER TABLE group_call_sfu_participant_states
+          DROP CONSTRAINT group_call_sfu_media_gate_check`;
+        await transaction`
+          ALTER TABLE group_call_sfu_participant_states
+          ADD CONSTRAINT group_call_sfu_media_gate_check CHECK (TRUE)`;
+        await transaction`
+          DELETE FROM schema_migrations WHERE name = 'group-calls-media-fence-v2'`;
+        readiness = await groupCallSchemaReadiness(transaction, { bypassCache: true });
+        throw rollback;
+      });
+    } catch (error) {
+      if (error !== rollback) throw error;
+    }
+
+    expect(readiness?.ready).toBe(false);
+    expect(readiness?.invalidColumns).toContain(
+      "group_call_sfu_participant_states.media_allowed",
+    );
+    expect(readiness?.invalidIndexes).toContain("group_call_sfu_state_retention_idx");
+    expect(readiness?.invalidConstraints).toContain("group_call_sfu_media_gate_check");
+    expect(readiness?.missingMigrations).toContain("group-calls-media-fence-v2");
+    expect((await groupCallSchemaReadiness(db, { bypassCache: true })).ready).toBe(true);
+  });
+
   test("group media capability registration does not require or create a PushKit target", async () => {
     const { code } = await startVerification(db, "+16505554111");
     const session = await checkVerification(
@@ -317,6 +417,38 @@ describe("E2EE group calls and screen sharing", () => {
     expect(groupCallSFUControlConfigured()).toBe(false);
   });
 
+  test("production refuses an SFU deployment that cannot revoke cached room tokens", () => {
+    process.env.NODE_ENV = "production";
+    delete process.env.TOJ_LIVEKIT_DEPLOYMENT;
+    expect(groupCallSFUControlConfigured()).toBe(false);
+    process.env.TOJ_LIVEKIT_DEPLOYMENT = "cloud";
+    expect(groupCallSFUControlConfigured()).toBe(true);
+  });
+
+  test("capability discovery is scoped to the authenticated device", async () => {
+    const owner = await account("+16505554120", "Capability", "d1");
+    const legacyDevice = await secondDevice("+16505554120", "Capability", "d2");
+    await registerGroupCallCapabilities(db, legacyDevice.deviceId, [], 0, false);
+    const server = startCloudServer(0, db, null, null, {
+      backgroundWorkers: false,
+      groupCallSFUControl: sfu,
+    });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+      const capabilities = async (token: string) => {
+        const response = await fetch(`${base}/v1/capabilities`, {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        expect(response.status).toBe(200);
+        return (await response.json() as { capabilities: string[] }).capabilities;
+      };
+      expect(await capabilities(owner.token)).toContain("group_calls_v1");
+      expect(await capabilities(legacyDevice.token)).not.toContain("group_calls_v1");
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test("start and rekey issue only room-scoped short-lived credentials after exact envelope coverage", async () => {
     const { owner, alice, groupId } = await fixture();
     const started = await start(owner, groupId);
@@ -344,6 +476,7 @@ describe("E2EE group calls and screen sharing", () => {
     expect(JSON.stringify(claims)).not.toContain(owner.accountId);
     expect(started.credentials.token).not.toContain(process.env.TOJ_LIVEKIT_API_SECRET!);
 
+    sfu.useCloudTokenCutoffs();
     const joined = await joinGroupCall(db, {
       accountId: alice.accountId,
       deviceId: alice.deviceId,
@@ -356,6 +489,16 @@ describe("E2EE group calls and screen sharing", () => {
       .toBe("pending_key");
     await expect(getGroupCallCredentials(db, alice.accountId, alice.deviceId, started.call.id))
       .rejects.toMatchObject({ code: "epoch_not_ready", status: 409 });
+    await expect(startGroupCall(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      callId: started.call.id,
+      dialogId: groupId,
+      initialKind: "video",
+      joinPublicKey: bytes(11),
+      joinNonce: bytes(12),
+      epochKeyCommitment: bytes(13),
+    }, sfu)).rejects.toMatchObject({ code: "epoch_not_ready", status: 409 });
 
     const nextEpoch = started.call.mediaEpoch + 1;
     const activation = await activateGroupCallEpoch(db, {
@@ -378,6 +521,18 @@ describe("E2EE group calls and screen sharing", () => {
     expect((await getGroupCallCredentials(
       db, alice.accountId, alice.deviceId, started.call.id,
     )).credentials.mediaEpoch).toBe(nextEpoch);
+    const replacement = (await getGroupCallCredentials(
+      db, owner.accountId, owner.deviceId, started.call.id,
+    )).credentials;
+    const replacementClaims = JSON.parse(Buffer.from(
+      replacement.token.split(".")[1],
+      "base64url",
+    ).toString("utf8"));
+    const ownerCutoff = Math.max(...sfu.removals
+      .filter((removal) => removal.identity === started.credentials.participantId)
+      .map((removal) => removal.tokenNotBefore));
+    expect(ownerCutoff).toBeGreaterThan(claims.nbf);
+    expect(replacementClaims.nbf).toBeGreaterThanOrEqual(ownerCutoff);
 
     const retry = await activateGroupCallEpoch(db, {
       accountId: owner.accountId,
@@ -390,6 +545,103 @@ describe("E2EE group calls and screen sharing", () => {
       envelopes: [{ recipientDeviceId: alice.deviceId, ciphertext: bytes(24, 48) }],
     });
     expect(retry.duplicate).toBe(true);
+  });
+
+  test("an unjoined device cannot drive a pending SFU reconciliation for a guessed call", async () => {
+    const { owner, bob, groupId } = await fixture();
+    const started = await start(owner, groupId);
+    await db`
+      UPDATE group_call_sfu_participant_states
+      SET revision = revision + 1, updated_at = now(), next_attempt_at = now()
+      WHERE call_id = ${started.call.id} AND device_id = ${owner.deviceId}`;
+    const updateCount = sfu.updates.length;
+    const removalCount = sfu.removals.length;
+
+    await expect(getGroupCallCredentials(
+      db, bob.accountId, bob.deviceId, started.call.id,
+    )).rejects.toMatchObject({ code: "not_joined", status: 409 });
+
+    expect(sfu.updates).toHaveLength(updateCount);
+    expect(sfu.removals).toHaveLength(removalCount);
+    const pending = (await db`
+      SELECT revision, applied_revision
+      FROM group_call_sfu_participant_states
+      WHERE call_id = ${started.call.id} AND device_id = ${owner.deviceId}`)[0];
+    expect(Number(pending.applied_revision)).toBeLessThan(Number(pending.revision));
+  });
+
+  test("membership changes fail closed until every old SFU session is revoked and rekeyed", async () => {
+    const { owner, alice, groupId } = await fixture();
+    const started = await start(owner, groupId);
+    await acquireGroupCamera(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      callId: started.call.id,
+      generation: crypto.randomUUID(),
+    }, sfu);
+
+    sfu.failNextRemovals();
+    await expect(joinGroupCall(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      callId: started.call.id,
+      joinPublicKey: bytes(25),
+      joinNonce: bytes(26),
+    })).rejects.toMatchObject({ code: "sfu_control_unavailable", status: 503 });
+
+    const fenced = await getGroupCall(db, owner.accountId, owner.deviceId, started.call.id);
+    expect(fenced.call.rekeyRequired).toBe(true);
+    expect(fenced.call.participants).toHaveLength(2);
+    expect(await db`
+      SELECT 1 FROM group_call_camera_leases WHERE call_id = ${started.call.id}`)
+      .toHaveLength(0);
+    await expect(getGroupCallCredentials(
+      db, owner.accountId, owner.deviceId, started.call.id,
+    )).rejects.toMatchObject({ code: "sfu_control_unavailable", status: 503 });
+
+    const pending = (await db`
+      SELECT media_allowed, applied_media_allowed, revision, applied_revision,
+        attempt_count, last_error_code
+      FROM group_call_sfu_participant_states
+      WHERE call_id = ${started.call.id} AND device_id = ${owner.deviceId}`)[0];
+    expect(pending.media_allowed).toBe(false);
+    expect(pending.applied_media_allowed).toBe(true);
+    expect(Number(pending.applied_revision)).toBeLessThan(Number(pending.revision));
+    expect(Number(pending.attempt_count)).toBe(1);
+    expect(pending.last_error_code).toBe("request_failed");
+
+    await db`
+      UPDATE group_call_sfu_participant_states SET next_attempt_at = now()
+      WHERE call_id = ${started.call.id}`;
+    await requireGroupCallSFUBarrierApplied(db, [started.call.id], sfu);
+    expect(sfu.removals).toContainEqual(expect.objectContaining({
+      identity: started.credentials.participantId,
+    }));
+    await expect(getGroupCallCredentials(
+      db, owner.accountId, owner.deviceId, started.call.id,
+    )).rejects.toMatchObject({ code: "epoch_not_ready", status: 409 });
+
+    const activated = await activateGroupCallEpoch(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      callId: started.call.id,
+      epoch: 2,
+      expectedMembershipRevision: fenced.call.membershipRevision,
+      keyCommitment: bytes(27),
+      participantSetHash: transcriptHash(fenced.call.participants),
+      envelopes: [{ recipientDeviceId: alice.deviceId, ciphertext: bytes(28, 48) }],
+    });
+    expect(activated.call.rekeyRequired).toBe(false);
+    expect((await getGroupCallCredentials(
+      db, owner.accountId, owner.deviceId, started.call.id,
+    )).credentials.mediaEpoch).toBe(2);
+    const applied = (await db`
+      SELECT attempt_count, last_error_code, applied_media_allowed
+      FROM group_call_sfu_participant_states
+      WHERE call_id = ${started.call.id} AND device_id = ${owner.deviceId}`)[0];
+    expect(Number(applied.attempt_count)).toBe(0);
+    expect(applied.last_error_code).toBeNull();
+    expect(applied.applied_media_allowed).toBe(true);
   });
 
   test("rekey rejects omitted recipients, wrong transcripts, stale revisions, and non-leaders", async () => {
@@ -450,7 +702,7 @@ describe("E2EE group calls and screen sharing", () => {
       dialogId: groupId,
       targetAccountId: alice.accountId,
       clientMutationId: crypto.randomUUID(),
-    });
+    }, sfu);
     const ownerView = await getGroupCall(db, owner.accountId, owner.deviceId, started.call.id);
     expect(ownerView.call.rekeyRequired).toBe(true);
     expect(ownerView.call.participants.map((item) => item.accountId)).toEqual([owner.accountId]);
@@ -550,7 +802,7 @@ describe("E2EE group calls and screen sharing", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    const revocation = revokeDeviceAndTerminateCalls(db, owner.accountId, owner.deviceId);
+    const revocation = revokeDeviceAndTerminateCalls(db, owner.accountId, owner.deviceId, sfu);
     const revocationOutcome = await Promise.race([
       revocation.then(() => "revoked"),
       new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 40)),
@@ -983,7 +1235,7 @@ describe("E2EE group calls and screen sharing", () => {
       dialogId: groupId,
       targetAccountId: owner.accountId,
       clientMutationId: crypto.randomUUID(),
-    });
+    }, sfu);
     await db`UPDATE devices SET revoked_at = now() WHERE id = ${bobOther.deviceId}`;
 
     const targets = await resolveGroupCallHintTargets(db, {
@@ -1223,14 +1475,10 @@ describe("E2EE group calls and screen sharing", () => {
     await db`
       UPDATE group_calls SET ended_at = now() - interval '31 days'
       WHERE id = ${started.call.id}`;
-    await expireStaleGroupCallParticipants(db);
-    expect(await db`SELECT 1 FROM group_calls WHERE id = ${started.call.id}`).toHaveLength(1);
     expect(await db`
       SELECT 1 FROM group_call_sfu_participant_states
       WHERE call_id = ${started.call.id} AND applied_revision < revision`)
-      .not.toHaveLength(0);
-
-    expect(await reconcilePendingGroupCallSFUStates(db, 100, sfu)).toBeGreaterThanOrEqual(1);
+      .toHaveLength(0);
     expect(await expireStaleGroupCallParticipants(db)).toBeGreaterThanOrEqual(1);
     expect(await db`SELECT 1 FROM group_calls WHERE id = ${started.call.id}`).toHaveLength(0);
   });
@@ -1238,6 +1486,11 @@ describe("E2EE group calls and screen sharing", () => {
   test("the route family is hidden when disabled and rollout zero stops new calls but lets joined calls drain", async () => {
     const { owner, alice, groupId } = await fixture();
     const started = await start(owner, groupId);
+    const cameraGeneration = crypto.randomUUID();
+    await acquireGroupCamera(db, {
+      accountId: owner.accountId, deviceId: owner.deviceId,
+      callId: started.call.id, generation: cameraGeneration,
+    }, sfu);
 
     process.env.TOJ_GROUP_CALLS_ROLLOUT_PERCENT = "0";
     expect((await resolveGroupCallHintTargets(db, {
@@ -1282,12 +1535,11 @@ describe("E2EE group calls and screen sharing", () => {
       expect(throttledHeartbeat.status).toBe(429);
       expect(Number(throttledHeartbeat.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
 
-      const cameraGeneration = crypto.randomUUID();
-      const drainingCamera = await acquireGroupCamera(db, {
-        accountId: owner.accountId, deviceId: owner.deviceId,
-        callId: started.call.id, generation: cameraGeneration,
-      }, sfu);
-      expect(drainingCamera.hints.map((target) => target.deviceId)).toEqual([owner.deviceId]);
+      const newCamera = await fetch(`${base}/v1/group-calls/${started.call.id}/camera`, {
+        method: "POST", headers,
+        body: JSON.stringify({ generation: crypto.randomUUID() }),
+      });
+      expect(newCamera.status).toBe(404);
       const released = await fetch(`${base}/v1/group-calls/${started.call.id}/camera/release`, {
         method: "POST", headers, body: JSON.stringify({ generation: cameraGeneration }),
       });

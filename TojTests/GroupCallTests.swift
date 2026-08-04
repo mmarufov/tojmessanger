@@ -276,7 +276,7 @@ final class GroupCallCoordinatorTests: XCTestCase {
         }
         let startSuspended = await eventually { await api.startSuspended }
         XCTAssertTrue(startSuspended)
-        coordinator.unbind()
+        await coordinator.unbind()
         await api.resumeStart()
         await startTask.value
 
@@ -284,6 +284,129 @@ final class GroupCallCoordinatorTests: XCTestCase {
         XCTAssertTrue(compensated)
         XCTAssertFalse(coordinator.hasActiveCall)
         XCTAssertEqual(engine.connectCount, 0)
+    }
+
+    func testEncryptionClaimRequiresAggregateProofForTheCurrentEpoch() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        engine.automaticallyVerifyEncryption = false
+        let coordinator = makeCoordinator(api: api, engine: engine)
+
+        await coordinator.start(
+            dialogId: "0aa7481d-75c6-4c43-9c24-2399936a0d75",
+            title: "Proof test",
+            initialKind: .voice
+        )
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.securityState, .keyReady)
+
+        engine.emit(.encryptionState(
+            epoch: 1,
+            expectedTrackIds: ["audio", "camera"],
+            verifiedTrackIds: ["audio"]
+        ))
+        XCTAssertEqual(coordinator.securityState, .keyReady)
+        engine.emit(.encryptionState(
+            epoch: 1,
+            expectedTrackIds: ["audio", "camera"],
+            verifiedTrackIds: ["audio", "camera"]
+        ))
+        XCTAssertEqual(coordinator.securityState, .verified)
+
+        engine.emit(.encryptionFailure(epoch: 0, trackId: "stale", reason: "old epoch"))
+        await Task.yield()
+        XCTAssertTrue(coordinator.hasActiveCall)
+        XCTAssertEqual(coordinator.securityState, .verified)
+
+        engine.emit(.encryptionWarning(epoch: 1, trackId: "camera", reason: "attaching"))
+        XCTAssertEqual(coordinator.securityState, .keyReady)
+        engine.emit(.encryptionFailure(epoch: 1, trackId: "camera", reason: "failed"))
+        let failed = await eventually { coordinator.state == .failed }
+        XCTAssertTrue(failed)
+    }
+
+    func testStaleEngineCallbackCannotCloseAReplacementRuntime() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(api: api, engine: engine)
+        await coordinator.start(
+            dialogId: "12933dc5-a0a7-41b3-a91e-34db722516de",
+            title: "First call",
+            initialKind: .voice
+        )
+        let staleHandler = try XCTUnwrap(engine.onEvent)
+        await coordinator.leave()
+
+        await coordinator.start(
+            dialogId: "e913d182-bf78-47b6-a812-59888cc67613",
+            title: "Replacement call",
+            initialKind: .voice
+        )
+        XCTAssertTrue(coordinator.hasActiveCall)
+        staleHandler(.encryptionFailure(epoch: 1, trackId: "old", reason: "stale callback"))
+        await Task.yield()
+        XCTAssertTrue(coordinator.hasActiveCall)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.securityState, .verified)
+    }
+
+    func testNegotiatedCapabilityCanDisableScreenSharingOnASupportedDevice() {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(
+            api: api,
+            engine: engine,
+            screenSharingNegotiated: false
+        )
+        XCTAssertFalse(coordinator.canShareScreen)
+    }
+
+    func testCameraLeaseCompletingAfterUnbindCannotRestartCapture() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(api: api, engine: engine)
+        await coordinator.start(
+            dialogId: "41a14a9b-0c73-4bbd-b5ab-621b353b0b0e",
+            title: "Camera fence",
+            initialKind: .video
+        )
+        await api.setSuspendCameraAcquire(true)
+        let cameraTask = Task { @MainActor in await coordinator.toggleCamera() }
+        let cameraAcquireSuspended = await eventually { await api.cameraAcquireSuspended }
+        XCTAssertTrue(cameraAcquireSuspended)
+
+        await coordinator.unbind()
+        await api.resumeCameraAcquire()
+        await cameraTask.value
+
+        XCTAssertFalse(coordinator.hasActiveCall)
+        XCTAssertEqual(engine.cameraStates.last, false)
+        let cameraReleased = await eventually { await api.cameraReleaseCount == 1 }
+        XCTAssertTrue(cameraReleased)
+    }
+
+    func testScreenActivationCompletingAfterUnbindIsCompensated() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(api: api, engine: engine)
+        await coordinator.start(
+            dialogId: "4d2eff8b-91ad-420f-9798-c28739b768b7",
+            title: "Screen fence",
+            initialKind: .video
+        )
+        engine.suspendNextScreenEnable()
+        let screenTask = Task { @MainActor in await coordinator.toggleScreenShare() }
+        let screenEnableSuspended = await eventually { engine.screenEnableSuspended }
+        XCTAssertTrue(screenEnableSuspended)
+
+        await coordinator.unbind()
+        engine.resumeScreenEnable(active: true)
+        await screenTask.value
+
+        XCTAssertFalse(coordinator.hasActiveCall)
+        XCTAssertEqual(engine.screenShareStates.last, false)
+        let screenReleased = await eventually { await api.screenReleaseCount == 1 }
+        XCTAssertTrue(screenReleased)
     }
 
     func testOutOfOrderSnapshotCannotRollBackAuthorizationState() async throws {
@@ -388,9 +511,125 @@ final class GroupCallCoordinatorTests: XCTestCase {
         await coordinator.leave()
     }
 
+    func testEpochActivationReconnectsWithCredentialsForTheNewMediaEpoch() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(api: api, engine: engine)
+        await coordinator.start(
+            dialogId: "1ccb7448-6bbf-4bbc-bbaf-82af09817416",
+            title: "Credential fence",
+            initialKind: .voice
+        )
+
+        let base = try XCTUnwrap(coordinator.activeCall)
+        let remoteIdentity = GroupCallJoinIdentity()
+        let remote = CloudGroupCallParticipant(
+            accountId: "4a77c741-70bf-47f4-b76c-b6cb121d5184",
+            deviceId: "01992718-7053-42e5-8f6e-e80ad7bb95c4",
+            participantId: "new-epoch-participant",
+            status: .pendingKey,
+            joinPublicKey: remoteIdentity.publicKey.base64EncodedString(),
+            joinNonce: remoteIdentity.nonce.base64EncodedString(),
+            joinedMembershipRevision: 2,
+            readyMediaEpoch: nil,
+            joinedAt: "2026-08-02T00:00:01.000Z",
+            isSelf: false,
+            isKeyLeader: false
+        )
+        let rekeying = copySnapshot(
+            base,
+            stateRevision: 2,
+            membershipRevision: 2,
+            keyLeaderDeviceId: session.deviceId,
+            rekeyRequired: true,
+            participants: [base.participants[0], remote]
+        )
+        await api.setCurrentSnapshot(rekeying)
+
+        await coordinator.handle(GroupCallSocketHint(
+            type: "group_call",
+            callId: base.id,
+            stateRevision: rekeying.stateRevision
+        ))
+
+        let reconnected = await eventually {
+            engine.connectCount == 2 && coordinator.activeCall?.mediaEpoch == 2
+        }
+        XCTAssertTrue(reconnected)
+        XCTAssertEqual(engine.installedEpochs, [1, 2])
+        XCTAssertEqual(engine.connectedCredentialEpochs, [1, 2])
+        let credentialEpochs = await api.credentialEpochs
+        XCTAssertEqual(credentialEpochs, [2])
+        XCTAssertEqual(coordinator.state, .connected)
+        await coordinator.leave()
+    }
+
+    func testStaleReconnectFailureCannotTearDownANewerConnection() async throws {
+        let api = FakeGroupCallAPI(session: session)
+        let engine = FakeGroupCallEngine()
+        let coordinator = makeCoordinator(api: api, engine: engine)
+        await coordinator.start(
+            dialogId: "6829427d-4be8-4f37-86d2-2f71bfda52e8",
+            title: "Reconnect race",
+            initialKind: .voice
+        )
+
+        let base = try XCTUnwrap(coordinator.activeCall)
+        let remoteIdentity = GroupCallJoinIdentity()
+        let remote = CloudGroupCallParticipant(
+            accountId: "3ca11c15-750c-4ef4-ae26-03f6323b75e6",
+            deviceId: "15645402-5e5c-4f56-b943-b83972d9605f",
+            participantId: "reconnect-race-participant",
+            status: .pendingKey,
+            joinPublicKey: remoteIdentity.publicKey.base64EncodedString(),
+            joinNonce: remoteIdentity.nonce.base64EncodedString(),
+            joinedMembershipRevision: 2,
+            readyMediaEpoch: nil,
+            joinedAt: "2026-08-02T00:00:01.000Z",
+            isSelf: false,
+            isKeyLeader: false
+        )
+        let rekeying = copySnapshot(
+            base,
+            stateRevision: 2,
+            membershipRevision: 2,
+            keyLeaderDeviceId: session.deviceId,
+            rekeyRequired: true,
+            participants: [base.participants[0], remote]
+        )
+        await api.setCurrentSnapshot(rekeying)
+        engine.suspendNextConnect()
+
+        let staleReconnect = Task { @MainActor in
+            await coordinator.handle(GroupCallSocketHint(
+                type: "group_call",
+                callId: base.id,
+                stateRevision: rekeying.stateRevision
+            ))
+        }
+        let connectSuspended = await eventually { engine.connectSuspended }
+        XCTAssertTrue(connectSuspended)
+
+        await coordinator.reconcileAfterSocketReconnect()
+        XCTAssertEqual(engine.connectCount, 3)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.activeCall?.mediaEpoch, 2)
+
+        engine.resumeConnect(throwing: GroupCallEngineError.notConnected)
+        await staleReconnect.value
+        await Task.yield()
+
+        XCTAssertTrue(coordinator.hasActiveCall)
+        XCTAssertTrue(engine.isConnected)
+        XCTAssertEqual(coordinator.state, .connected)
+        XCTAssertEqual(coordinator.activeCall?.mediaEpoch, 2)
+        await coordinator.leave()
+    }
+
     private func makeCoordinator(
         api: FakeGroupCallAPI,
-        engine: FakeGroupCallEngine
+        engine: FakeGroupCallEngine,
+        screenSharingNegotiated: Bool = true
     ) -> GroupCallCoordinator {
         let coordinator = GroupCallCoordinator(
             permissions: AllowingCallPermissions(),
@@ -400,7 +639,11 @@ final class GroupCallCoordinatorTests: XCTestCase {
             screenShareAvailable: { true },
             engineFactory: { engine }
         )
-        coordinator.configure(api: api, session: session) { accountId, _ in accountId }
+        coordinator.configure(
+            api: api,
+            session: session,
+            screenSharingNegotiated: { screenSharingNegotiated }
+        ) { accountId, _ in accountId }
         return coordinator
     }
 
@@ -426,17 +669,27 @@ private final class AllowingCallPermissions: CallPermissionProviding {
 @MainActor
 private final class FakeGroupCallEngine: GroupCallMediaEngine {
     var onEvent: ((GroupCallEngineEvent) -> Void)?
+    var automaticallyVerifyEncryption = true
     private(set) var isConnected = false
     private(set) var connectCount = 0
+    private(set) var connectedCredentialEpochs: [Int64] = []
     private(set) var disconnectCount = 0
     private(set) var installedEpochs: [Int64] = []
     private(set) var authorizedParticipantSets: [Set<String>] = []
     private(set) var microphoneStates: [Bool] = []
     private(set) var cameraStates: [Bool] = []
     private(set) var screenShareStates: [Bool] = []
+    private var currentEpoch: Int64?
+    private var shouldSuspendNextConnect = false
+    private var pendingConnect: CheckedContinuation<Void, Error>?
+    private var shouldSuspendNextScreenEnable = false
+    private var pendingScreenEnable: CheckedContinuation<Bool, Never>?
+    var connectSuspended: Bool { pendingConnect != nil }
+    var screenEnableSuspended: Bool { pendingScreenEnable != nil }
 
     func installEpoch(_ material: GroupCallEpochMaterial) throws {
         installedEpochs.append(material.epoch)
+        currentEpoch = material.epoch
     }
 
     func retireEpoch(_ epoch: Int64) { _ = epoch }
@@ -451,10 +704,37 @@ private final class FakeGroupCallEngine: GroupCallMediaEngine {
     }
 
     func connect(credentials: CloudGroupCallCredentials) async throws {
-        _ = credentials
         connectCount += 1
+        connectedCredentialEpochs.append(credentials.mediaEpoch)
+        if shouldSuspendNextConnect {
+            shouldSuspendNextConnect = false
+            try await withCheckedThrowingContinuation {
+                pendingConnect = $0
+            }
+        }
         isConnected = true
         onEvent?(.connection(.connected))
+        if automaticallyVerifyEncryption, let currentEpoch {
+            onEvent?(.encryptionState(
+                epoch: currentEpoch,
+                expectedTrackIds: ["local-audio"],
+                verifiedTrackIds: ["local-audio"]
+            ))
+        }
+    }
+
+    func suspendNextConnect() {
+        shouldSuspendNextConnect = true
+    }
+
+    func resumeConnect(throwing error: Error? = nil) {
+        guard let pendingConnect else { return }
+        self.pendingConnect = nil
+        if let error {
+            pendingConnect.resume(throwing: error)
+        } else {
+            pendingConnect.resume(returning: ())
+        }
     }
 
     func setMicrophone(enabled: Bool) async throws {
@@ -474,13 +754,31 @@ private final class FakeGroupCallEngine: GroupCallMediaEngine {
     func senderSample() async -> GroupCallSenderSample? { nil }
     func setScreenShare(enabled: Bool) async throws -> Bool {
         screenShareStates.append(enabled)
+        if enabled, shouldSuspendNextScreenEnable {
+            shouldSuspendNextScreenEnable = false
+            return await withCheckedContinuation { pendingScreenEnable = $0 }
+        }
         return enabled
+    }
+
+    func suspendNextScreenEnable() {
+        shouldSuspendNextScreenEnable = true
+    }
+
+    func resumeScreenEnable(active: Bool) {
+        guard let pendingScreenEnable else { return }
+        self.pendingScreenEnable = nil
+        pendingScreenEnable.resume(returning: active)
     }
 
     func disconnect() async {
         disconnectCount += 1
         isConnected = false
         onEvent?(.connection(.disconnected))
+    }
+
+    func emit(_ event: GroupCallEngineEvent) {
+        onEvent?(event)
     }
 }
 
@@ -491,18 +789,25 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
     private var shouldSuspendStart = false
     private var shouldSuspendLeave = false
     private var shouldSuspendCameraRelease = false
+    private var shouldSuspendCameraAcquire = false
     private var pendingStart: CheckedContinuation<CloudGroupCallStartResponse, Error>?
     private var pendingLeave: CheckedContinuation<CloudGroupCallJoinResponse, Error>?
     private var pendingGroupCall: CheckedContinuation<CloudGroupCallResponse, Error>?
     private var pendingCameraRelease: CheckedContinuation<Void, Never>?
+    private var pendingCameraAcquire: CheckedContinuation<CloudGroupCallCameraLeaseResponse, Error>?
+    private var pendingCameraAcquireResponse: CloudGroupCallCameraLeaseResponse?
     private var suspendedGroupCallResponse: CloudGroupCallResponse?
     private(set) var startCount = 0
     private(set) var leaveCount = 0
     private(set) var leaveStarted = false
+    private(set) var cameraReleaseCount = 0
+    private(set) var screenReleaseCount = 0
+    private(set) var credentialEpochs: [Int64] = []
 
     var startSuspended: Bool { pendingStart != nil }
     var groupCallSuspended: Bool { pendingGroupCall != nil }
     var cameraReleaseSuspended: Bool { pendingCameraRelease != nil }
+    var cameraAcquireSuspended: Bool { pendingCameraAcquire != nil }
 
     init(session: CloudSession) {
         self.session = session
@@ -511,6 +816,7 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
     func setSuspendStart(_ value: Bool) { shouldSuspendStart = value }
     func setSuspendLeave(_ value: Bool) { shouldSuspendLeave = value }
     func setSuspendCameraRelease(_ value: Bool) { shouldSuspendCameraRelease = value }
+    func setSuspendCameraAcquire(_ value: Bool) { shouldSuspendCameraAcquire = value }
     func setCurrentSnapshot(_ snapshot: CloudGroupCallSnapshot) { currentSnapshot = snapshot }
 
     func suspendNextGroupCall(returning snapshot: CloudGroupCallSnapshot) {
@@ -540,6 +846,13 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         guard let pendingCameraRelease else { return }
         self.pendingCameraRelease = nil
         pendingCameraRelease.resume()
+    }
+
+    func resumeCameraAcquire() {
+        guard let pendingCameraAcquire, let pendingCameraAcquireResponse else { return }
+        self.pendingCameraAcquire = nil
+        self.pendingCameraAcquireResponse = nil
+        pendingCameraAcquire.resume(returning: pendingCameraAcquireResponse)
     }
 
     func startGroupCall(
@@ -583,8 +896,54 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         body: ActivateCloudGroupCallEpochRequest,
         token: String
     ) async throws -> CloudGroupCallJoinResponse {
-        _ = (id, body, token)
-        return CloudGroupCallJoinResponse(call: try requiredSnapshot(), duplicate: false)
+        _ = (id, token)
+        let snapshot = try requiredSnapshot()
+        let participants = snapshot.participants.map { participant in
+            CloudGroupCallParticipant(
+                accountId: participant.accountId,
+                deviceId: participant.deviceId,
+                participantId: participant.participantId,
+                status: .active,
+                joinPublicKey: participant.joinPublicKey,
+                joinNonce: participant.joinNonce,
+                joinedMembershipRevision: participant.joinedMembershipRevision,
+                readyMediaEpoch: body.epoch,
+                joinedAt: participant.joinedAt,
+                isSelf: participant.isSelf,
+                isKeyLeader: participant.deviceId == snapshot.keyLeaderDeviceId
+            )
+        }
+        let activated = CloudGroupCallSnapshot(
+            id: snapshot.id,
+            dialogId: snapshot.dialogId,
+            initialKind: snapshot.initialKind,
+            state: snapshot.state,
+            participantLimit: snapshot.participantLimit,
+            publisherLimit: snapshot.publisherLimit,
+            membershipRevision: snapshot.membershipRevision,
+            stateRevision: snapshot.stateRevision + 1,
+            selfRole: snapshot.selfRole,
+            mediaEpoch: body.epoch,
+            keyLeaderDeviceId: snapshot.keyLeaderDeviceId,
+            rekeyRequired: false,
+            epoch: CloudGroupCallEpoch(
+                epoch: body.epoch,
+                membershipRevision: body.expectedMembershipRevision,
+                keyCommitment: body.keyCommitment,
+                participantSetHash: body.participantSetHash,
+                activatedAt: "2026-08-02T00:00:02.000Z",
+                previousEpochGraceExpiresAt: "2026-08-02T00:00:12.000Z"
+            ),
+            participants: participants,
+            selfEnvelope: nil,
+            cameraPublishers: [],
+            screenShare: nil,
+            createdAt: snapshot.createdAt,
+            endedAt: snapshot.endedAt,
+            endReason: snapshot.endReason
+        )
+        currentSnapshot = activated
+        return CloudGroupCallJoinResponse(call: activated, duplicate: false)
     }
 
     func groupCallCredentials(
@@ -592,6 +951,8 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         token: String
     ) async throws -> CloudGroupCallCredentialsResponse {
         _ = (id, token)
+        let snapshot = try requiredSnapshot()
+        credentialEpochs.append(snapshot.mediaEpoch)
         return CloudGroupCallCredentialsResponse(credentials: try credentials())
     }
 
@@ -638,11 +999,15 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         token: String
     ) async throws -> CloudGroupCallCameraLeaseResponse {
         _ = (callId, token)
-        return CloudGroupCallCameraLeaseResponse(
+        let response = CloudGroupCallCameraLeaseResponse(
             generation: generation,
             expiresAt: "2026-08-02T00:01:00.000Z",
             call: currentSnapshot
         )
+        guard shouldSuspendCameraAcquire else { return response }
+        shouldSuspendCameraAcquire = false
+        pendingCameraAcquireResponse = response
+        return try await withCheckedThrowingContinuation { pendingCameraAcquire = $0 }
     }
 
     func heartbeatGroupCamera(
@@ -659,6 +1024,7 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         token: String
     ) async throws -> CloudGroupCallScreenReleaseResponse {
         _ = (callId, generation, token)
+        cameraReleaseCount += 1
         if shouldSuspendCameraRelease {
             shouldSuspendCameraRelease = false
             await withCheckedContinuation { pendingCameraRelease = $0 }
@@ -693,6 +1059,7 @@ private actor FakeGroupCallAPI: GroupCallAPITransport {
         token: String
     ) async throws -> CloudGroupCallScreenReleaseResponse {
         _ = (callId, generation, token)
+        screenReleaseCount += 1
         return CloudGroupCallScreenReleaseResponse(released: true)
     }
 

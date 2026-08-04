@@ -1086,6 +1086,8 @@ final class CloudAppModel {
         // Prevent an old ensure from publishing while its exact task is cancelled and awaited.
         savedMessagesSessionGeneration &+= 1
         savedMessagesCapabilityState = .unknown
+        // Capture must be fenced before teardown reaches any unrelated actor or disk await.
+        await groupCallCoordinator.unbind()
         let savedOperations = Array(trackedSavedOperations.values)
         trackedSavedOperations.removeAll()
         savedOperations.forEach { $0.cancel() }
@@ -1272,7 +1274,6 @@ final class CloudAppModel {
         uploadedVoIPPushRegistration = nil
         uploadedGroupCallCapabilityRegistration = nil
         callCoordinator.unbind()
-        groupCallCoordinator.unbind()
         pts = 0
         phone = "+992 "
         displayName = ""
@@ -4531,7 +4532,13 @@ final class CloudAppModel {
             callCoordinator.configure(api: api, session: session) { [weak self] dialogId, _ in
                 self?.dialogTitle(dialogId) ?? String(localized: "Toj caller")
             }
-            groupCallCoordinator.configure(api: api, session: session) { [weak self] accountId, dialogId in
+            groupCallCoordinator.configure(
+                api: api,
+                session: session,
+                screenSharingNegotiated: { [weak self] in
+                    self?.negotiatedCapabilities.contains(.screenSharing) == true
+                }
+            ) { [weak self] accountId, dialogId in
                 self?.groupCallParticipantName(accountId: accountId, dialogId: dialogId)
                     ?? String(accountId.prefix(8))
             }
@@ -5667,6 +5674,7 @@ final class CloudAppModel {
                         guard state == .connected else { continue }
                         if hasConnected {
                             await self.replicaSyncCoordinator.trigger(.socketReconnect)
+                            await self.groupCallCoordinator.reconcileAfterSocketReconnect()
                         }
                         hasConnected = true
                     }

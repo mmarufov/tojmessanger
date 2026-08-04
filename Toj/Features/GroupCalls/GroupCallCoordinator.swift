@@ -32,7 +32,7 @@ final class GroupCallCoordinator {
     }
 
     var activeDialogId: String? { runtime?.dialogId }
-    var canShareScreen: Bool { screenShareAvailable() }
+    var canShareScreen: Bool { screenShareAvailable() && screenSharingNegotiated() }
     var isKeyLeader: Bool { activeCall?.keyLeaderDeviceId == session?.deviceId }
     var canManageGroupCall: Bool {
         activeCall?.selfRole == "owner" || activeCall?.selfRole == "admin"
@@ -43,6 +43,7 @@ final class GroupCallCoordinator {
     @ObservationIgnored private let engineAvailable: @MainActor @Sendable () -> Bool
     @ObservationIgnored private let screenShareAvailable: @MainActor @Sendable () -> Bool
     @ObservationIgnored private let engineFactory: @MainActor @Sendable () -> any GroupCallMediaEngine
+    @ObservationIgnored private var screenSharingNegotiated: @MainActor @Sendable () -> Bool = { false }
     @ObservationIgnored private var api: (any GroupCallAPITransport)?
     @ObservationIgnored private var session: CloudSession?
     @ObservationIgnored private var participantName: ((String, String) -> String)?
@@ -64,6 +65,8 @@ final class GroupCallCoordinator {
     @ObservationIgnored private var pressuredCameraIds: Set<String> = []
     @ObservationIgnored private var mediaDecisionRunning = false
     @ObservationIgnored private var mediaDecisionPending = false
+    @ObservationIgnored private var mediaDecisionGeneration: UInt64?
+    @ObservationIgnored private var admissionInFlight = false
 
     private final class Runtime {
         let callId: String
@@ -132,24 +135,30 @@ final class GroupCallCoordinator {
     func configure(
         api: any GroupCallAPITransport,
         session: CloudSession,
+        screenSharingNegotiated: @escaping @MainActor @Sendable () -> Bool,
         participantName: @escaping (String, String) -> String
     ) {
         self.api = api
         self.session = session
+        self.screenSharingNegotiated = screenSharingNegotiated
         self.participantName = participantName
     }
 
-    func unbind() {
+    /// Synchronously fences the authenticated session, then waits only for local media teardown.
+    /// Server departure is best effort so sign-out cannot hang on a degraded control plane.
+    func unbind() async {
         let callId = runtime?.callId
         let api = self.api
         let session = self.session
         self.api = nil
         self.session = nil
+        screenSharingNegotiated = { false }
         participantName = nil
+        admissionInFlight = false
         availableCalls.removeAll()
-        Task { [weak self] in
-            await self?.teardown(reportLeave: false, finalState: .ended)
-            if let callId, let api, let session {
+        await teardown(reportLeave: false, finalState: .ended)
+        if let callId, let api, let session {
+            Task {
                 _ = try? await api.leaveGroupCall(id: callId, token: session.token)
             }
         }
@@ -179,6 +188,12 @@ final class GroupCallCoordinator {
             isPresented = true
             return
         }
+        guard !admissionInFlight else {
+            isPresented = true
+            return
+        }
+        admissionInFlight = true
+        defer { admissionInFlight = false }
         guard engineAvailable(),
               let api,
               let session else {
@@ -261,13 +276,53 @@ final class GroupCallCoordinator {
             availableCalls[dialogId] = response.call
             safetyEmojis = GroupCallCrypto.safetyEmojis(callId: callId, epoch: epoch)
             mediaReducer.setSecureMediaReady(true, generation: generation)
-            securityState = .verified
+            securityState = .keyReady
             state = .connecting
             try await engine.connect(credentials: response.credentials)
             guard runtime?.generation == generation else { return }
             runtime?.connectedEpoch = epoch.epoch
             startHeartbeat(generation: generation)
+        } catch let error as CloudAPIError
+            where error.code == "call_already_active" && error.existingCallId != nil {
+            guard self.session?.token == session.token,
+                  runtime == nil,
+                  generation == mediaReducer.generation,
+                  let existingCallId = error.existingCallId else { return }
+            do {
+                var existing = try await api.groupCall(id: existingCallId, token: session.token).call
+                guard existing.dialogId == dialogId, existing.isActive else {
+                    throw GroupCallCryptoError.invalidIdentifier
+                }
+                // A prior process may have started this call and lost its private join key before
+                // persisting a runtime. Leave that unrecoverable identity before joining with a
+                // fresh key; otherwise the server correctly rejects the changed key transcript.
+                if existing.selfParticipant != nil {
+                    existing = try await api.leaveGroupCall(
+                        id: existingCallId,
+                        token: session.token
+                    ).call
+                }
+                guard self.session?.token == session.token,
+                      runtime == nil,
+                      generation == mediaReducer.generation else { return }
+                mediaReducer.endRuntime()
+                admissionInFlight = false
+                if existing.isActive {
+                    availableCalls[dialogId] = existing
+                    await join(existing, title: title)
+                } else {
+                    await start(dialogId: dialogId, title: title, initialKind: initialKind)
+                }
+            } catch {
+                guard self.session?.token == session.token,
+                      runtime == nil,
+                      generation == mediaReducer.generation else { return }
+                await fail(error)
+            }
         } catch {
+            guard self.session?.token == session.token,
+                  generation == mediaReducer.generation,
+                  runtime == nil || runtime?.generation == generation else { return }
             await fail(error)
         }
     }
@@ -277,6 +332,12 @@ final class GroupCallCoordinator {
             isPresented = true
             return
         }
+        guard !admissionInFlight else {
+            isPresented = true
+            return
+        }
+        admissionInFlight = true
+        defer { admissionInFlight = false }
         guard call.isActive,
               engineAvailable(),
               let api,
@@ -324,6 +385,9 @@ final class GroupCallCoordinator {
             startHeartbeat(generation: generation)
             await processSnapshot(response.call, generation: generation)
         } catch {
+            guard self.session?.token == session.token,
+                  generation == mediaReducer.generation,
+                  runtime == nil || runtime?.generation == generation else { return }
             await fail(error)
         }
     }
@@ -372,6 +436,22 @@ final class GroupCallCoordinator {
                     availableCalls[dialogId] = nil
                 }
             }
+        }
+    }
+
+    /// Socket hints are lossy wake-ups. After transport reconnect, re-read the authoritative
+    /// room snapshot even when no hint survived the outage.
+    func reconcileAfterSocketReconnect() async {
+        guard let runtime, let api, let session else { return }
+        do {
+            let response = try await api.groupCall(id: runtime.callId, token: session.token)
+            guard self.session?.token == session.token,
+                  self.runtime === runtime else { return }
+            await processSnapshot(response.call, generation: runtime.generation)
+        } catch let error as CloudAPIError where error.status == 404 || error.status == 410 {
+            await teardown(reportLeave: false, finalState: .ended)
+        } catch {
+            // The call heartbeat and the next reconnect retry retain ownership of recovery.
         }
     }
 
@@ -425,8 +505,10 @@ final class GroupCallCoordinator {
         cameraPosition = mediaReducer.preferredCamera
         do {
             try await runtime.engine.switchCamera(to: cameraPosition)
+            guard !Task.isCancelled, self.runtime === runtime else { return }
             runtime.appliedCameraPosition = cameraPosition
         } catch {
+            guard self.runtime === runtime else { return }
             failureMessage = String(localized: "The other camera is unavailable.")
         }
     }
@@ -454,6 +536,7 @@ final class GroupCallCoordinator {
             )
             await teardown(reportLeave: false, finalState: .ended)
         } catch {
+            guard self.runtime === runtime else { return }
             failureMessage = String(localized: "Only a group administrator can end this call for everyone.")
             state = runtime.engine.isConnected ? .connected : .reconnecting
         }
@@ -473,6 +556,7 @@ final class GroupCallCoordinator {
             )
             await processSnapshot(response.call, generation: runtime.generation)
         } catch {
+            guard self.runtime === runtime else { return }
             failureMessage = userMessage(for: error)
         }
     }
@@ -485,7 +569,15 @@ final class GroupCallCoordinator {
 
     private func installRuntime(_ runtime: Runtime) {
         self.runtime = runtime
-        runtime.engine.onEvent = { [weak self] event in self?.handleEngineEvent(event) }
+        let generation = runtime.generation
+        let engineIdentity = ObjectIdentifier(runtime.engine)
+        runtime.engine.onEvent = { [weak self] event in
+            self?.handleEngineEvent(
+                event,
+                generation: generation,
+                engineIdentity: engineIdentity
+            )
+        }
         isMuted = true
         isCameraEnabled = false
         isScreenSharing = false
@@ -526,6 +618,7 @@ final class GroupCallCoordinator {
             guard cameraPublishers.isSubset(of: activeParticipantIds),
                   snapshot.screenShare.map({ activeParticipantIds.contains($0.participantId) }) ?? true
             else { throw GroupCallCryptoError.invalidParticipantSet }
+            if !snapshot.rekeyRequired { securityState = .keyReady }
             try await runtime.engine.setAuthorizedParticipants(
                 activeParticipantIds,
                 cameraPublishers: cameraPublishers,
@@ -581,8 +674,11 @@ final class GroupCallCoordinator {
             runtime.rekeyStartedAt = nil
             cancelRekeyWatchdog()
             mediaReducer.setSecureMediaReady(true, generation: generation)
-            securityState = .verified
-            if !runtime.engine.isConnected {
+            // Every membership epoch is preceded by a server-side participant removal and token
+            // revocation. Even if LiveKit has not delivered its disconnect callback yet, the old
+            // transport is no longer authorized and must be replaced with credentials fenced to
+            // this exact epoch.
+            if runtime.connectedEpoch != material.epoch || !runtime.engine.isConnected {
                 guard let api, let session else { return }
                 let credentials = try await api.groupCallCredentials(
                     id: runtime.callId,
@@ -603,7 +699,15 @@ final class GroupCallCoordinator {
                 runtime.connectedEpoch = material.epoch
             }
             await applyMediaDecision(generation: generation)
+        } catch is CancellationError {
+            return
         } catch {
+            guard self.runtime === runtime,
+                  snapshotApplicationIsCurrent(
+                    generation: generation,
+                    stateRevision: snapshot.stateRevision,
+                    nonce: applicationNonce
+                  ) else { return }
             await fail(error)
         }
     }
@@ -879,7 +983,7 @@ final class GroupCallCoordinator {
               let api,
               let session,
               runtime.engine.isConnected,
-              securityState == .verified,
+              securityState == .keyReady || securityState == .verified,
               !runtime.snapshot.rekeyRequired,
               runtime.rekeyStartedAt == nil else {
             failureMessage = String(localized: "Screen sharing is not available in this build.")
@@ -892,7 +996,7 @@ final class GroupCallCoordinator {
                 generation: generationId,
                 token: session.token
             )
-            guard self.runtime?.generation == runtime.generation else {
+            guard !Task.isCancelled, self.runtime === runtime else {
                 _ = try? await api.releaseGroupScreenShare(
                     callId: runtime.callId,
                     generation: generationId,
@@ -908,16 +1012,25 @@ final class GroupCallCoordinator {
             mediaReducer.setScreenShareIntent(true)
             if let snapshot = response.call {
                 await processSnapshot(snapshot, generation: runtime.generation)
-                guard self.runtime?.generation == runtime.generation else { return }
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.screenGeneration == generationId else { return }
             }
-            guard mediaReducer.decision(now: clock.now).screenShareAllowed else {
-                await stopScreenShare()
+            guard !runtime.snapshot.rekeyRequired,
+                  runtime.rekeyStartedAt == nil,
+                  mediaReducer.decision(now: clock.now).screenShareAllowed else {
+                await stopScreenShare(for: runtime)
                 return
             }
             isStartingScreenShare = true
             startScreenHeartbeat(runtimeGeneration: runtime.generation, leaseGeneration: generationId)
             let active = try await runtime.engine.setScreenShare(enabled: true)
-            guard self.runtime?.generation == runtime.generation else {
+            guard !Task.isCancelled,
+                  self.runtime === runtime,
+                  runtime.screenGeneration == generationId,
+                  !runtime.snapshot.rekeyRequired,
+                  runtime.rekeyStartedAt == nil,
+                  mediaReducer.decision(now: clock.now).screenShareAllowed else {
                 _ = try? await runtime.engine.setScreenShare(enabled: false)
                 _ = try? await api.releaseGroupScreenShare(
                     callId: runtime.callId,
@@ -928,14 +1041,23 @@ final class GroupCallCoordinator {
             }
             isScreenSharing = active
             isStartingScreenShare = !active
-            if !active { startScreenActivationRetry(runtimeGeneration: runtime.generation) }
+            if !active {
+                startScreenActivationRetry(
+                    runtimeGeneration: runtime.generation,
+                    leaseGeneration: generationId
+                )
+            }
         } catch {
+            guard self.runtime === runtime else { return }
             failureMessage = error.localizedDescription
-            await stopScreenShare()
+            await stopScreenShare(for: runtime)
         }
     }
 
-    private func startScreenActivationRetry(runtimeGeneration: UInt64) {
+    private func startScreenActivationRetry(
+        runtimeGeneration: UInt64,
+        leaseGeneration: String
+    ) {
         screenActivationTask?.cancel()
         screenActivationTask = Task { [weak self] in
             for _ in 0..<20 {
@@ -943,43 +1065,83 @@ final class GroupCallCoordinator {
                       !Task.isCancelled,
                       let runtime = self.runtime,
                       runtime.generation == runtimeGeneration,
-                      runtime.screenGeneration != nil else { return }
-                try? await self.clock.sleep(for: .seconds(1))
-                if (try? await runtime.engine.setScreenShare(enabled: true)) == true {
+                      runtime.screenGeneration == leaseGeneration,
+                      !runtime.snapshot.rekeyRequired,
+                      runtime.rekeyStartedAt == nil else { return }
+                do { try await self.clock.sleep(for: .seconds(1)) } catch { return }
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.screenGeneration == leaseGeneration,
+                      self.mediaReducer.decision(now: self.clock.now).screenShareAllowed else {
+                    return
+                }
+                let active = (try? await runtime.engine.setScreenShare(enabled: true)) == true
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.screenGeneration == leaseGeneration,
+                      !runtime.snapshot.rekeyRequired,
+                      runtime.rekeyStartedAt == nil,
+                      self.mediaReducer.decision(now: self.clock.now).screenShareAllowed else {
+                    if active { _ = try? await runtime.engine.setScreenShare(enabled: false) }
+                    return
+                }
+                if active {
                     self.isStartingScreenShare = false
                     self.isScreenSharing = true
                     return
                 }
             }
-            await self?.stopScreenShare()
+            guard let self, let runtime = self.runtime,
+                  runtime.generation == runtimeGeneration,
+                  runtime.screenGeneration == leaseGeneration else { return }
+            await self.stopScreenShare(for: runtime)
         }
     }
 
     private func startScreenHeartbeat(runtimeGeneration: UInt64, leaseGeneration: String) {
         screenHeartbeatTask?.cancel()
         screenHeartbeatTask = Task { [weak self] in
+            var transientFailures = 0
+            var nextDelay = Duration.seconds(5)
             while let self, !Task.isCancelled {
-                try? await self.clock.sleep(for: .seconds(5))
+                do { try await self.clock.sleep(for: nextDelay) } catch { return }
+                nextDelay = .seconds(5)
                 guard let runtime = self.runtime,
                       runtime.generation == runtimeGeneration,
                       runtime.screenGeneration == leaseGeneration,
                       let api = self.api,
                       let session = self.session else { return }
                 do {
-                    _ = try await api.heartbeatGroupScreenShare(
+                    let response = try await api.heartbeatGroupScreenShare(
                         callId: runtime.callId,
                         generation: leaseGeneration,
                         token: session.token
                     )
+                    guard !Task.isCancelled,
+                          self.runtime === runtime,
+                          runtime.screenGeneration == leaseGeneration else { return }
+                    transientFailures = 0
+                    if let snapshot = response.call {
+                        await self.processSnapshot(snapshot, generation: runtimeGeneration)
+                    }
                 } catch {
-                    await self.stopScreenShare()
+                    transientFailures += 1
+                    if case .transient = cloudFailureDisposition(error), transientFailures < 2 {
+                        // Retry inside the 15-second lease instead of waiting another full interval.
+                        nextDelay = .milliseconds(500)
+                        continue
+                    }
+                    guard self.runtime === runtime,
+                          runtime.screenGeneration == leaseGeneration else { return }
+                    await self.stopScreenShare(for: runtime)
                     return
                 }
             }
         }
     }
 
-    private func stopScreenShare() async {
+    private func stopScreenShare(for expectedRuntime: Runtime? = nil) async {
+        if let expectedRuntime, runtime !== expectedRuntime { return }
         screenHeartbeatTask?.cancel()
         screenHeartbeatTask = nil
         screenActivationTask?.cancel()
@@ -1001,8 +1163,10 @@ final class GroupCallCoordinator {
                 token: session.token
             )
         }
-        isScreenSharing = false
-        isStartingScreenShare = false
+        if self.runtime === runtime {
+            isScreenSharing = false
+            isStartingScreenShare = false
+        }
     }
 
     private func applyMediaDecision(generation: UInt64) async {
@@ -1010,7 +1174,13 @@ final class GroupCallCoordinator {
         mediaDecisionPending = true
         guard !mediaDecisionRunning else { return }
         mediaDecisionRunning = true
-        defer { mediaDecisionRunning = false }
+        mediaDecisionGeneration = generation
+        defer {
+            if mediaDecisionGeneration == generation {
+                mediaDecisionRunning = false
+                mediaDecisionGeneration = nil
+            }
+        }
         while mediaDecisionPending,
               !Task.isCancelled,
               runtime?.generation == generation {
@@ -1021,7 +1191,7 @@ final class GroupCallCoordinator {
 
     private func applyMediaDecisionOnce(generation: UInt64) async {
         guard let runtime, runtime.generation == generation, runtime.engine.isConnected else { return }
-        let decision = mediaReducer.decision(now: clock.now)
+        var decision = mediaReducer.decision(now: clock.now)
         qualityTier = decision.qualityTier
         if (isScreenSharing || isStartingScreenShare) && !decision.screenShareAllowed {
             await stopScreenShare()
@@ -1030,11 +1200,27 @@ final class GroupCallCoordinator {
         do {
             if runtime.appliedMicrophoneEnabled != decision.microphoneActive {
                 try await runtime.engine.setMicrophone(enabled: decision.microphoneActive)
+                guard !Task.isCancelled, self.runtime === runtime else {
+                    if decision.microphoneActive {
+                        try? await runtime.engine.setMicrophone(enabled: false)
+                    }
+                    return
+                }
+                let latest = mediaReducer.decision(now: clock.now)
+                guard latest.microphoneActive == decision.microphoneActive else {
+                    if decision.microphoneActive {
+                        try? await runtime.engine.setMicrophone(enabled: false)
+                        runtime.appliedMicrophoneEnabled = false
+                    }
+                    mediaDecisionPending = true
+                    return
+                }
                 runtime.appliedMicrophoneEnabled = decision.microphoneActive
             }
-            guard self.runtime?.generation == generation else { return }
+            guard !Task.isCancelled, self.runtime === runtime else { return }
             isMuted = !decision.microphoneActive
         } catch {
+            guard self.runtime === runtime else { return }
             isMuted = true
             if decision.microphoneActive {
                 failureMessage = String(localized: "The microphone is unavailable. Tap mute to try again.")
@@ -1051,7 +1237,13 @@ final class GroupCallCoordinator {
                 if !isCameraEnabled { mediaReducer.resetNetworkAdaptation() }
                 try await ensureCameraLease(for: runtime)
             }
-            guard self.runtime?.generation == generation else { return }
+            guard !Task.isCancelled, self.runtime === runtime else { return }
+            decision = mediaReducer.decision(now: clock.now)
+            qualityTier = decision.qualityTier
+            if !decision.cameraActive {
+                await releaseCameraLease(for: runtime)
+                guard self.runtime === runtime else { return }
+            }
             if runtime.appliedCameraEnabled != decision.cameraActive
                 || runtime.appliedCameraPosition != mediaReducer.preferredCamera
                 || runtime.appliedCameraTier != decision.qualityTier {
@@ -1060,17 +1252,45 @@ final class GroupCallCoordinator {
                     position: mediaReducer.preferredCamera,
                     tier: decision.qualityTier
                 )
+                guard !Task.isCancelled, self.runtime === runtime else {
+                    if decision.cameraActive {
+                        try? await runtime.engine.setCamera(
+                            enabled: false,
+                            position: mediaReducer.preferredCamera,
+                            tier: decision.qualityTier
+                        )
+                    }
+                    return
+                }
+                let latest = mediaReducer.decision(now: clock.now)
+                guard latest.cameraActive == decision.cameraActive,
+                      latest.qualityTier == decision.qualityTier else {
+                    if decision.cameraActive && !latest.cameraActive {
+                        try? await runtime.engine.setCamera(
+                            enabled: false,
+                            position: mediaReducer.preferredCamera,
+                            tier: latest.qualityTier
+                        )
+                        runtime.appliedCameraEnabled = false
+                        await releaseCameraLease(for: runtime)
+                    }
+                    mediaDecisionPending = true
+                    return
+                }
                 runtime.appliedCameraEnabled = decision.cameraActive
                 runtime.appliedCameraPosition = mediaReducer.preferredCamera
                 runtime.appliedCameraTier = decision.qualityTier
             }
-            guard self.runtime?.generation == generation else { return }
+            guard !Task.isCancelled, self.runtime === runtime else { return }
             if !decision.cameraActive {
                 await releaseCameraLease(for: runtime)
             }
             isCameraEnabled = decision.cameraActive
             cameraPosition = mediaReducer.preferredCamera
+        } catch is CancellationError {
+            if self.runtime === runtime { mediaDecisionPending = true }
         } catch {
+            guard self.runtime === runtime else { return }
             mediaReducer.setCameraIntent(false)
             try? await runtime.engine.setCamera(
                 enabled: false,
@@ -1088,14 +1308,25 @@ final class GroupCallCoordinator {
 
     private func ensureCameraLease(for runtime: Runtime) async throws {
         guard let api, let session else { throw GroupCallEngineError.notConnected }
-        if runtime.cameraGeneration != nil { return }
+        if runtime.cameraGeneration != nil {
+            guard !Task.isCancelled,
+                  self.runtime === runtime,
+                  mediaReducer.decision(now: clock.now).cameraActive else {
+                throw CancellationError()
+            }
+            return
+        }
         let leaseGeneration = UUID().uuidString.lowercased()
         let response = try await api.acquireGroupCamera(
             callId: runtime.callId,
             generation: leaseGeneration,
             token: session.token
         )
-        guard self.runtime?.generation == runtime.generation else {
+        guard !Task.isCancelled,
+              self.runtime === runtime,
+              !runtime.snapshot.rekeyRequired,
+              runtime.rekeyStartedAt == nil,
+              mediaReducer.decision(now: clock.now).cameraActive else {
             _ = try? await api.releaseGroupCamera(
                 callId: runtime.callId,
                 generation: leaseGeneration,
@@ -1107,11 +1338,22 @@ final class GroupCallCoordinator {
         startCameraHeartbeat(runtimeGeneration: runtime.generation, leaseGeneration: leaseGeneration)
         if let snapshot = response.call {
             await processSnapshot(snapshot, generation: runtime.generation)
-            guard self.runtime?.generation == runtime.generation else { throw CancellationError() }
+            guard !Task.isCancelled,
+                  self.runtime === runtime,
+                  runtime.cameraGeneration == leaseGeneration,
+                  !runtime.snapshot.rekeyRequired,
+                  runtime.rekeyStartedAt == nil,
+                  mediaReducer.decision(now: clock.now).cameraActive else {
+                if self.runtime === runtime, runtime.cameraGeneration == leaseGeneration {
+                    await releaseCameraLease(for: runtime)
+                }
+                throw CancellationError()
+            }
         }
     }
 
     private func releaseCameraLease(for runtime: Runtime) async {
+        guard self.runtime === runtime else { return }
         cameraHeartbeatTask?.cancel()
         cameraHeartbeatTask = nil
         guard let leaseGeneration = runtime.cameraGeneration else { return }
@@ -1156,20 +1398,38 @@ final class GroupCallCoordinator {
     private func startCameraHeartbeat(runtimeGeneration: UInt64, leaseGeneration: String) {
         cameraHeartbeatTask?.cancel()
         cameraHeartbeatTask = Task { [weak self] in
+            var transientFailures = 0
+            var nextDelay = Duration.seconds(5)
             while let self, !Task.isCancelled {
-                do { try await self.clock.sleep(for: .seconds(5)) } catch { return }
+                do { try await self.clock.sleep(for: nextDelay) } catch { return }
+                nextDelay = .seconds(5)
                 guard let runtime = self.runtime,
                       runtime.generation == runtimeGeneration,
                       runtime.cameraGeneration == leaseGeneration,
                       let api = self.api,
                       let session = self.session else { return }
                 do {
-                    _ = try await api.heartbeatGroupCamera(
+                    let response = try await api.heartbeatGroupCamera(
                         callId: runtime.callId,
                         generation: leaseGeneration,
                         token: session.token
                     )
+                    guard !Task.isCancelled,
+                          self.runtime === runtime,
+                          runtime.cameraGeneration == leaseGeneration else { return }
+                    transientFailures = 0
+                    if let snapshot = response.call {
+                        await self.processSnapshot(snapshot, generation: runtimeGeneration)
+                    }
                 } catch {
+                    transientFailures += 1
+                    if case .transient = cloudFailureDisposition(error), transientFailures < 2 {
+                        // Retry inside the 15-second lease instead of waiting another full interval.
+                        nextDelay = .milliseconds(500)
+                        continue
+                    }
+                    guard self.runtime === runtime,
+                          runtime.cameraGeneration == leaseGeneration else { return }
                     runtime.cameraGeneration = nil
                     self.mediaReducer.setCameraIntent(false)
                     try? await runtime.engine.setCamera(
@@ -1177,6 +1437,7 @@ final class GroupCallCoordinator {
                         position: self.mediaReducer.preferredCamera,
                         tier: self.qualityTier
                     )
+                    guard self.runtime === runtime else { return }
                     runtime.appliedCameraEnabled = false
                     runtime.appliedCameraPosition = self.mediaReducer.preferredCamera
                     runtime.appliedCameraTier = self.qualityTier
@@ -1188,8 +1449,14 @@ final class GroupCallCoordinator {
         }
     }
 
-    private func handleEngineEvent(_ event: GroupCallEngineEvent) {
-        guard let runtime else { return }
+    private func handleEngineEvent(
+        _ event: GroupCallEngineEvent,
+        generation: UInt64,
+        engineIdentity: ObjectIdentifier
+    ) {
+        guard let runtime,
+              runtime.generation == generation,
+              ObjectIdentifier(runtime.engine) == engineIdentity else { return }
         switch event {
         case .connection(let connection):
             switch connection {
@@ -1250,30 +1517,24 @@ final class GroupCallCoordinator {
                 return
             }
             videoTracks = tracks
-        case .encryptionVerified:
-            securityState = .verified
-        case .encryptionWarning:
-            securityState = .rekeying
-            state = .waitingForKey
-            Task {
-                do {
-                    try await self.pauseMediaForRekey(generation: runtime.generation)
-                    guard let api = self.api, let session = self.session else {
-                        throw GroupCallEngineError.encryptionFailure
-                    }
-                    let response = try await api.groupCall(id: runtime.callId, token: session.token)
-                    guard response.call.rekeyRequired else {
-                        // A cryptor warning without a matching authenticated epoch transition is
-                        // not recoverable by simply reasserting the old key.
-                        throw GroupCallEngineError.encryptionFailure
-                    }
-                    self.scheduleRekeyWatchdog(generation: runtime.generation)
-                    await self.processSnapshot(response.call, generation: runtime.generation)
-                } catch {
-                    await self.fail(error)
-                }
-            }
-        case .encryptionFailure:
+        case .encryptionState(let epoch, let expectedTrackIds, let verifiedTrackIds):
+            guard runtime.currentEpoch?.epoch == epoch,
+                  runtime.rekeyStartedAt == nil,
+                  !runtime.snapshot.rekeyRequired else { return }
+            securityState = !expectedTrackIds.isEmpty
+                && expectedTrackIds.isSubset(of: verifiedTrackIds)
+                ? .verified
+                : .keyReady
+        case .encryptionWarning(let epoch, _, _):
+            guard runtime.currentEpoch?.epoch == epoch,
+                  runtime.rekeyStartedAt == nil,
+                  !runtime.snapshot.rekeyRequired else { return }
+            // Individual cryptors can report a short missing-key transition while a track is
+            // attaching. Drop the verified claim immediately; the engine escalates only after
+            // repeated failures for this exact epoch.
+            securityState = .keyReady
+        case .encryptionFailure(let epoch, _, _):
+            guard runtime.currentEpoch?.epoch == epoch else { return }
             Task { await self.fail(GroupCallEngineError.encryptionFailure) }
         }
     }
@@ -1303,17 +1564,25 @@ final class GroupCallCoordinator {
                     generation: leaseGeneration,
                     token: session.token
                 )
-                guard self.runtime?.generation == generation,
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
                       runtime.cameraGeneration == leaseGeneration else { return }
                 if let snapshot = response.call {
                     await processSnapshot(snapshot, generation: generation)
                 }
-                guard self.runtime?.generation == generation else { return }
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.cameraGeneration == leaseGeneration,
+                      !runtime.snapshot.rekeyRequired,
+                      runtime.rekeyStartedAt == nil,
+                      mediaReducer.decision(now: clock.now).cameraActive else { return }
                 startCameraHeartbeat(
                     runtimeGeneration: generation,
                     leaseGeneration: leaseGeneration
                 )
             } catch {
+                guard self.runtime === runtime,
+                      runtime.cameraGeneration == leaseGeneration else { return }
                 cameraHeartbeatTask?.cancel()
                 cameraHeartbeatTask = nil
                 runtime.cameraGeneration = nil
@@ -1323,6 +1592,7 @@ final class GroupCallCoordinator {
                     position: mediaReducer.preferredCamera,
                     tier: qualityTier
                 )
+                guard self.runtime === runtime else { return }
                 runtime.appliedCameraEnabled = false
                 runtime.appliedCameraPosition = mediaReducer.preferredCamera
                 runtime.appliedCameraTier = qualityTier
@@ -1343,23 +1613,45 @@ final class GroupCallCoordinator {
                     generation: leaseGeneration,
                     token: session.token
                 )
-                guard self.runtime?.generation == generation,
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
                       runtime.screenGeneration == leaseGeneration else { return }
                 if let snapshot = response.call {
                     await processSnapshot(snapshot, generation: generation)
                 }
-                guard self.runtime?.generation == generation else { return }
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.screenGeneration == leaseGeneration,
+                      !runtime.snapshot.rekeyRequired,
+                      runtime.rekeyStartedAt == nil,
+                      mediaReducer.decision(now: clock.now).screenShareAllowed else { return }
                 startScreenHeartbeat(
                     runtimeGeneration: generation,
                     leaseGeneration: leaseGeneration
                 )
                 let active = try await runtime.engine.setScreenShare(enabled: true)
+                guard !Task.isCancelled,
+                      self.runtime === runtime,
+                      runtime.screenGeneration == leaseGeneration,
+                      !runtime.snapshot.rekeyRequired,
+                      runtime.rekeyStartedAt == nil,
+                      mediaReducer.decision(now: clock.now).screenShareAllowed else {
+                    if active { _ = try? await runtime.engine.setScreenShare(enabled: false) }
+                    return
+                }
                 isScreenSharing = active
                 isStartingScreenShare = !active
-                if !active { startScreenActivationRetry(runtimeGeneration: generation) }
+                if !active {
+                    startScreenActivationRetry(
+                        runtimeGeneration: generation,
+                        leaseGeneration: leaseGeneration
+                    )
+                }
             } catch {
+                guard self.runtime === runtime,
+                      runtime.screenGeneration == leaseGeneration else { return }
                 failureMessage = String(localized: "Screen sharing stopped while the call reconnected.")
-                await stopScreenShare()
+                await stopScreenShare(for: runtime)
             }
         }
 
@@ -1441,11 +1733,18 @@ final class GroupCallCoordinator {
         reportLeave: Bool,
         finalState: GroupCallConnectionState
     ) async {
-        guard let runtime else {
+        guard let retiringRuntime = runtime else {
+            mediaReducer.endRuntime()
             state = finalState
             return
         }
         state = .ending
+        // Claim the runtime before the first await. Every in-flight permission, lease, ReplayKit,
+        // and engine callback now fails its identity/generation check and cannot resurrect media.
+        runtime = nil
+        retiringRuntime.engine.onEvent = nil
+        mediaReducer.endRuntime()
+        let teardownGeneration = mediaReducer.generation
         heartbeatTask?.cancel()
         heartbeatTask = nil
         rekeyTask?.cancel()
@@ -1465,24 +1764,13 @@ final class GroupCallCoordinator {
         keyRetirementTasks.removeAll()
         let api = self.api
         let session = self.session
-        let cameraGeneration = runtime.cameraGeneration
-        let screenGeneration = runtime.screenGeneration
-        runtime.cameraGeneration = nil
-        runtime.screenGeneration = nil
-        mediaReducer.setSecureMediaReady(false, generation: runtime.generation)
-        mediaReducer.setScreenLeaseHeld(false, generation: runtime.generation)
-        try? await runtime.engine.setMicrophone(enabled: false)
-        try? await runtime.engine.setCamera(
-            enabled: false,
-            position: mediaReducer.preferredCamera,
-            tier: qualityTier
-        )
-        _ = try? await runtime.engine.setScreenShare(enabled: false)
-        await runtime.engine.disconnect()
-        guard self.runtime?.generation == runtime.generation else { return }
-        mediaReducer.endRuntime()
-        availableCalls[runtime.dialogId] = nil
-        self.runtime = nil
+        let cameraGeneration = retiringRuntime.cameraGeneration
+        let screenGeneration = retiringRuntime.screenGeneration
+        retiringRuntime.cameraGeneration = nil
+        retiringRuntime.screenGeneration = nil
+        if availableCalls[retiringRuntime.dialogId]?.id == retiringRuntime.callId {
+            availableCalls[retiringRuntime.dialogId] = nil
+        }
         activeCall = nil
         participants = []
         videoTracks = []
@@ -1492,14 +1780,29 @@ final class GroupCallCoordinator {
         isStartingScreenShare = false
         mediaDecisionPending = false
         mediaDecisionRunning = false
+        mediaDecisionGeneration = nil
         connectedAt = nil
-        state = finalState
+
+        // Start every local stop together; disconnect is the final fence after all publication
+        // calls settle. Their failures are irrelevant because disconnect still closes transport.
+        async let microphoneStop: Void? = try? await retiringRuntime.engine.setMicrophone(enabled: false)
+        async let cameraStop: Void? = try? await retiringRuntime.engine.setCamera(
+            enabled: false,
+            position: mediaReducer.preferredCamera,
+            tier: qualityTier
+        )
+        async let screenStop: Bool? = try? await retiringRuntime.engine.setScreenShare(enabled: false)
+        _ = await (microphoneStop, cameraStop, screenStop)
+        await retiringRuntime.engine.disconnect()
+        if runtime == nil, mediaReducer.generation == teardownGeneration {
+            state = finalState
+        }
 
         // Local capture and transport are already stopped. Network cleanup is deliberately
         // detached from the user's Leave action; renewable server leases and stale-participant
         // cleanup are the crash-safe fallback if these best-effort calls time out.
         if let api, let session {
-            let callId = runtime.callId
+            let callId = retiringRuntime.callId
             Task {
                 if reportLeave {
                     _ = try? await api.leaveGroupCall(id: callId, token: session.token)

@@ -46,9 +46,15 @@ enum GroupCallEngineEvent {
     case connection(GroupCallEngineConnectionState)
     case participants([GroupCallEngineParticipant])
     case videoTracks([GroupCallVideoTrackReference])
-    case encryptionVerified(trackId: String)
-    case encryptionWarning(trackId: String, reason: String)
-    case encryptionFailure(trackId: String, reason: String)
+    /// Aggregate proof for the exact installed epoch. A room is verified only when every
+    /// currently expected encrypted publication has produced a cryptor success callback.
+    case encryptionState(
+        epoch: Int64,
+        expectedTrackIds: Set<String>,
+        verifiedTrackIds: Set<String>
+    )
+    case encryptionWarning(epoch: Int64, trackId: String, reason: String)
+    case encryptionFailure(epoch: Int64, trackId: String, reason: String)
 }
 
 nonisolated enum GroupCallEngineError: Error, Equatable {

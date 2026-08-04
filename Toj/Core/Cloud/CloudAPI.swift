@@ -1337,7 +1337,7 @@ struct CloudAPI: Sendable {
         _ body: StartCloudGroupCallRequest,
         token: String
     ) async throws -> CloudGroupCallStartResponse {
-        try await post("v1/group-calls", body: body, token: token, timeoutInterval: 10)
+        try await post("v1/group-calls", body: body, token: token, timeoutInterval: 15)
     }
 
     func activeGroupCall(dialogId: String, token: String) async throws -> CloudActiveGroupCallResponse {
@@ -1345,7 +1345,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/active",
             queryItems: [URLQueryItem(name: "dialogId", value: dialogId)],
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1358,7 +1358,7 @@ struct CloudAPI: Sendable {
         body: JoinCloudGroupCallRequest,
         token: String
     ) async throws -> CloudGroupCallJoinResponse {
-        try await post("v1/group-calls/\(id)/join", body: body, token: token, timeoutInterval: 10)
+        try await post("v1/group-calls/\(id)/join", body: body, token: token, timeoutInterval: 15)
     }
 
     func activateGroupCallEpoch(
@@ -1366,11 +1366,11 @@ struct CloudAPI: Sendable {
         body: ActivateCloudGroupCallEpochRequest,
         token: String
     ) async throws -> CloudGroupCallJoinResponse {
-        try await post("v1/group-calls/\(id)/epochs", body: body, token: token, timeoutInterval: 12)
+        try await post("v1/group-calls/\(id)/epochs", body: body, token: token, timeoutInterval: 15)
     }
 
     func groupCallCredentials(id: String, token: String) async throws -> CloudGroupCallCredentialsResponse {
-        try await get("v1/group-calls/\(id)/credentials", token: token, timeoutInterval: 8)
+        try await get("v1/group-calls/\(id)/credentials", token: token, timeoutInterval: 15)
     }
 
     func heartbeatGroupCall(id: String, token: String) async throws -> CloudGroupCallHeartbeatResponse {
@@ -1378,7 +1378,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(id)/heartbeat",
             body: CloudGroupCallEmptyRequest(),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1387,7 +1387,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(id)/leave",
             body: CloudGroupCallEmptyRequest(),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1396,7 +1396,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(id)/end",
             body: CloudGroupCallEndRequest(reason: reason),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1405,7 +1405,11 @@ struct CloudAPI: Sendable {
         deviceId: String,
         token: String
     ) async throws -> CloudGroupCallResponse {
-        try await delete("v1/group-calls/\(callId)/participants/\(deviceId)", token: token)
+        try await delete(
+            "v1/group-calls/\(callId)/participants/\(deviceId)",
+            token: token,
+            timeoutInterval: 15
+        )
     }
 
     func acquireGroupCamera(
@@ -1417,7 +1421,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/camera",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1430,7 +1434,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/camera/heartbeat",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 3
         )
     }
 
@@ -1443,7 +1447,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/camera/release",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1456,7 +1460,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/screen-share",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1469,7 +1473,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/screen-share/heartbeat",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 3
         )
     }
 
@@ -1482,7 +1486,7 @@ struct CloudAPI: Sendable {
             "v1/group-calls/\(callId)/screen-share/release",
             body: CloudGroupCallScreenLeaseRequest(generation: generation),
             token: token,
-            timeoutInterval: 8
+            timeoutInterval: 15
         )
     }
 
@@ -1672,9 +1676,14 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
-    private func delete<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
+    private func delete<Response: Decodable>(
+        _ path: String,
+        token: String?,
+        timeoutInterval: TimeInterval? = nil
+    ) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "DELETE"
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }

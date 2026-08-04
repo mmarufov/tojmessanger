@@ -109,17 +109,25 @@ export type GroupCallCredentials = {
   mediaEpoch: number;
 };
 
-type LiveKitConfiguration = { url: string; apiKey: string; apiSecret: string };
+type LiveKitConfiguration = {
+  url: string;
+  apiKey: string;
+  apiSecret: string;
+  managedCloud: boolean;
+};
 
 export type GroupCallSFUControl = {
   ensureRoom(room: string, participantLimit: number): Promise<void>;
   updateParticipant(input: {
     room: string;
     identity: string;
+    mediaAllowed: boolean;
     cameraAllowed: boolean;
     screenShareAllowed: boolean;
   }): Promise<void>;
-  removeParticipant(room: string, identity: string): Promise<void>;
+  /// Returns the minimum JWT `nbf` accepted after this revocation, or zero when the provider
+  /// does not implement durable token revocation (development/test controls only).
+  removeParticipant(room: string, identity: string): Promise<number>;
 };
 
 function iso(value: unknown): string {
@@ -173,6 +181,7 @@ function liveKitConfiguration(): LiveKitConfiguration {
   const rawURL = (process.env.TOJ_LIVEKIT_URL ?? "").trim();
   const apiKey = (process.env.TOJ_LIVEKIT_API_KEY ?? "").trim();
   const apiSecret = (process.env.TOJ_LIVEKIT_API_SECRET ?? "").trim();
+  const managedCloud = process.env.TOJ_LIVEKIT_DEPLOYMENT === "cloud";
   let url: URL;
   try {
     url = new URL(rawURL);
@@ -185,10 +194,13 @@ function liveKitConfiguration(): LiveKitConfiguration {
     && (url.protocol === "ws:" || url.protocol === "http:");
   if ((!secure && !localDevelopment) || url.username || url.password || url.search || url.hash
     || apiKey.length < 6 || apiSecret.length < 32
-    || /^(change-?me|placeholder|secret)$/i.test(apiSecret)) {
+    || /^(change-?me|placeholder|secret)$/i.test(apiSecret)
+    // RemoveParticipant's token-revocation timestamp is enforced by LiveKit Cloud. Refuse a
+    // production configuration that cannot invalidate every pre-membership-change room token.
+    || (process.env.NODE_ENV === "production" && !managedCloud)) {
     throw new GroupCallError("group media is unavailable", "sfu_unavailable", 503);
   }
-  return { url: url.toString().replace(/\/$/, ""), apiKey, apiSecret };
+  return { url: url.toString().replace(/\/$/, ""), apiKey, apiSecret, managedCloud };
 }
 
 export function groupCallsConfigured(groupsReady = process.env.TOJ_GROUPS_V1_ENABLED === "1"): boolean {
@@ -274,18 +286,24 @@ const REQUIRED_GROUP_CALL_COLUMNS: Record<string, readonly string[]> = {
   ],
   group_call_epochs: [
     "call_id", "epoch", "membership_revision", "leader_device_id", "key_commitment",
-    "participant_set_hash", "activated_at", "grace_expires_at",
+    "participant_set_hash", "created_at", "activated_at", "grace_expires_at",
   ],
   group_call_epoch_envelopes: [
     "call_id", "epoch", "recipient_device_id", "sender_public_key", "recipient_public_key", "ciphertext",
+    "created_at",
   ],
-  group_call_camera_leases: ["call_id", "device_id", "generation", "expires_at", "updated_at"],
-  group_call_screen_share_leases: ["call_id", "device_id", "generation", "expires_at", "updated_at"],
+  group_call_camera_leases: [
+    "call_id", "device_id", "generation", "expires_at", "created_at", "updated_at",
+  ],
+  group_call_screen_share_leases: [
+    "call_id", "device_id", "generation", "expires_at", "created_at", "updated_at",
+  ],
   group_call_sfu_participant_states: [
-    "call_id", "device_id", "participant_identity", "desired_status", "camera_allowed",
+    "call_id", "device_id", "participant_identity", "desired_status", "media_allowed", "camera_allowed",
     "screen_share_allowed", "revision", "applied_revision", "applied_status",
-    "applied_camera_allowed", "applied_screen_share_allowed", "claim_token", "claim_revision",
-    "claim_expires_at", "attempt_count", "next_attempt_at", "last_error_code", "updated_at",
+    "applied_media_allowed", "applied_camera_allowed", "applied_screen_share_allowed", "claim_token", "claim_revision",
+    "claim_expires_at", "token_not_before", "attempt_count", "next_attempt_at", "last_error_code",
+    "created_at", "updated_at",
   ],
   group_call_action_budgets: ["id", "account_id", "device_id", "action", "created_at"],
 };
@@ -305,21 +323,178 @@ const REQUIRED_GROUP_CALL_INDEXES = [
   "group_calls_one_active_per_dialog_idx",
   "group_call_participants_one_device_per_account_idx",
   "group_call_participants_stale_idx",
+  "group_call_participants_account_active_idx",
   "group_call_camera_lease_expiry_idx",
   "group_call_screen_share_expiry_idx",
   "group_call_sfu_state_device_idx",
   "group_call_sfu_state_pending_idx",
+  "group_call_sfu_state_retention_idx",
   "group_call_action_budgets_window_idx",
   "group_call_action_budgets_retention_idx",
 ] as const;
+
+const REQUIRED_GROUP_CALL_INDEX_DEFINITIONS: Record<string, string> = {
+  group_calls_one_active_per_dialog_idx:
+    "CREATE UNIQUE INDEX group_calls_one_active_per_dialog_idx ON public.group_calls USING btree (dialog_id) WHERE (state = 'active'::text)",
+  group_call_participants_one_device_per_account_idx:
+    "CREATE UNIQUE INDEX group_call_participants_one_device_per_account_idx ON public.group_call_participants USING btree (call_id, account_id) WHERE (status = ANY (ARRAY['pending_key'::text, 'active'::text]))",
+  group_call_participants_stale_idx:
+    "CREATE INDEX group_call_participants_stale_idx ON public.group_call_participants USING btree (last_seen_at, call_id, device_id) WHERE (status = ANY (ARRAY['pending_key'::text, 'active'::text]))",
+  group_call_participants_account_active_idx:
+    "CREATE INDEX group_call_participants_account_active_idx ON public.group_call_participants USING btree (account_id, call_id, device_id) WHERE (status = ANY (ARRAY['pending_key'::text, 'active'::text]))",
+  group_call_camera_lease_expiry_idx:
+    "CREATE INDEX group_call_camera_lease_expiry_idx ON public.group_call_camera_leases USING btree (expires_at)",
+  group_call_screen_share_expiry_idx:
+    "CREATE INDEX group_call_screen_share_expiry_idx ON public.group_call_screen_share_leases USING btree (expires_at)",
+  group_call_sfu_state_device_idx:
+    "CREATE INDEX group_call_sfu_state_device_idx ON public.group_call_sfu_participant_states USING btree (call_id, device_id, updated_at)",
+  group_call_sfu_state_pending_idx:
+    "CREATE INDEX group_call_sfu_state_pending_idx ON public.group_call_sfu_participant_states USING btree (next_attempt_at, updated_at) WHERE (applied_revision < revision)",
+  group_call_sfu_state_retention_idx:
+    "CREATE INDEX group_call_sfu_state_retention_idx ON public.group_call_sfu_participant_states USING btree (updated_at, call_id, participant_identity) WHERE ((desired_status = 'removed'::text) AND (applied_revision = revision))",
+  group_call_action_budgets_window_idx:
+    "CREATE INDEX group_call_action_budgets_window_idx ON public.group_call_action_budgets USING btree (account_id, action, created_at DESC)",
+  group_call_action_budgets_retention_idx:
+    "CREATE INDEX group_call_action_budgets_retention_idx ON public.group_call_action_budgets USING btree (created_at, id)",
+};
+
+const REQUIRED_GROUP_CALL_CONSTRAINTS: Record<string, { table: string; definition: string }> = {
+  group_call_sfu_applied_status_check: {
+    table: "group_call_sfu_participant_states",
+    definition: "CHECK ((applied_status = ANY (ARRAY['active'::text, 'removed'::text])))",
+  },
+  group_call_sfu_applied_media_check: {
+    table: "group_call_sfu_participant_states",
+    definition: "CHECK (((applied_status = 'active'::text) OR ((NOT applied_media_allowed) AND (NOT applied_camera_allowed) AND (NOT applied_screen_share_allowed))))",
+  },
+  group_call_sfu_removed_media_check: {
+    table: "group_call_sfu_participant_states",
+    definition: "CHECK (((desired_status = 'active'::text) OR ((NOT media_allowed) AND (NOT camera_allowed) AND (NOT screen_share_allowed))))",
+  },
+  group_call_sfu_media_gate_check: {
+    table: "group_call_sfu_participant_states",
+    definition: "CHECK ((media_allowed OR ((NOT camera_allowed) AND (NOT screen_share_allowed))))",
+  },
+  group_call_sfu_token_not_before_check: {
+    table: "group_call_sfu_participant_states",
+    definition: "CHECK ((token_not_before >= 0))",
+  },
+};
+
+function normalizeCatalogDefinition(value: unknown): string {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+type GroupCallColumnContract = {
+  table: string;
+  column: string;
+  type: string;
+  notNull: boolean;
+  default: string | null;
+};
+
+const NULLABLE_GROUP_CALL_COLUMNS = new Set([
+  "group_calls.ended_at", "group_calls.end_reason",
+  "group_call_participants.ready_media_epoch", "group_call_participants.left_at",
+  "group_call_epochs.grace_expires_at",
+  "group_call_sfu_participant_states.claim_token",
+  "group_call_sfu_participant_states.claim_revision",
+  "group_call_sfu_participant_states.claim_expires_at",
+  "group_call_sfu_participant_states.last_error_code",
+]);
+
+const GROUP_CALL_COLUMN_DEFAULTS = new Map<string, string>([
+  ["devices.supported_group_call_versions", "ARRAY[]::integer[]"],
+  ["devices.group_call_view_version", "0"],
+  ["devices.supports_group_screen_share", "false"],
+  ["group_calls.state", "'active'::text"],
+  ["group_calls.participant_limit", "32"],
+  ["group_calls.publisher_limit", "16"],
+  ["group_calls.membership_revision", "1"],
+  ["group_calls.state_revision", "1"],
+  ["group_calls.media_epoch", "1"],
+  ["group_calls.created_at", "now()"],
+  ["group_calls.updated_at", "now()"],
+  ["group_call_participants.joined_at", "now()"],
+  ["group_call_participants.last_seen_at", "now()"],
+  ["group_call_participants.last_heartbeat_at", "(now() - '00:00:20'::interval)"],
+  ["group_call_epochs.created_at", "now()"],
+  ["group_call_epochs.activated_at", "now()"],
+  ["group_call_epoch_envelopes.created_at", "now()"],
+  ["group_call_camera_leases.created_at", "now()"],
+  ["group_call_camera_leases.updated_at", "now()"],
+  ["group_call_screen_share_leases.created_at", "now()"],
+  ["group_call_screen_share_leases.updated_at", "now()"],
+  ["group_call_sfu_participant_states.desired_status", "'active'::text"],
+  ["group_call_sfu_participant_states.media_allowed", "false"],
+  ["group_call_sfu_participant_states.camera_allowed", "false"],
+  ["group_call_sfu_participant_states.screen_share_allowed", "false"],
+  ["group_call_sfu_participant_states.revision", "1"],
+  ["group_call_sfu_participant_states.applied_revision", "1"],
+  ["group_call_sfu_participant_states.applied_status", "'active'::text"],
+  ["group_call_sfu_participant_states.applied_media_allowed", "false"],
+  ["group_call_sfu_participant_states.applied_camera_allowed", "false"],
+  ["group_call_sfu_participant_states.applied_screen_share_allowed", "false"],
+  ["group_call_sfu_participant_states.token_not_before", "0"],
+  ["group_call_sfu_participant_states.attempt_count", "0"],
+  ["group_call_sfu_participant_states.next_attempt_at", "now()"],
+  ["group_call_sfu_participant_states.created_at", "now()"],
+  ["group_call_sfu_participant_states.updated_at", "now()"],
+  ["group_call_action_budgets.id", "nextval('group_call_action_budgets_id_seq'::regclass)"],
+  ["group_call_action_budgets.created_at", "now()"],
+]);
+
+function groupCallColumnType(table: string, column: string): string {
+  if (table === "devices" && column === "supported_group_call_versions") return "integer[]";
+  if (table === "devices" && column === "group_call_view_version") return "integer";
+  if (table === "devices" && column === "supports_group_screen_share") return "boolean";
+  if (table === "group_call_action_budgets" && column === "id") return "bigint";
+  if (column === "participant_limit" || column === "publisher_limit") return "smallint";
+  if (column === "attempt_count") return "integer";
+  if (["membership_revision", "state_revision", "media_epoch", "epoch",
+    "joined_membership_revision", "ready_media_epoch", "revision", "applied_revision",
+    "claim_revision", "token_not_before"].includes(column)) return "bigint";
+  if (["join_public_key", "join_nonce", "epoch_key_commitment", "key_commitment",
+    "participant_set_hash", "sender_public_key", "recipient_public_key", "ciphertext"]
+    .includes(column)) return "bytea";
+  if (["media_allowed", "camera_allowed", "screen_share_allowed",
+    "applied_media_allowed", "applied_camera_allowed", "applied_screen_share_allowed"]
+    .includes(column)) return "boolean";
+  if (column.endsWith("_at")) return "timestamp with time zone";
+  if (column === "id" || column.endsWith("_id") || column === "generation"
+    || column === "claim_token" || column === "call_local_identity"
+    || column === "participant_identity") return "uuid";
+  return "text";
+}
+
+const REQUIRED_GROUP_CALL_COLUMN_CONTRACTS: readonly GroupCallColumnContract[] = [
+  ...REQUIRED_DEVICE_COLUMNS.map((column) => ({ table: "devices", column })),
+  ...Object.entries(REQUIRED_GROUP_CALL_COLUMNS).flatMap(([table, columns]) =>
+    columns.map((column) => ({ table, column }))),
+].map(({ table, column }) => {
+  const key = `${table}.${column}`;
+  return {
+    table,
+    column,
+    type: groupCallColumnType(table, column),
+    notNull: !NULLABLE_GROUP_CALL_COLUMNS.has(key),
+    default: GROUP_CALL_COLUMN_DEFAULTS.get(key) ?? null,
+  };
+});
+
+const REQUIRED_GROUP_CALL_MIGRATIONS = ["group-calls-media-fence-v2"] as const;
 
 export type GroupCallSchemaReadiness = {
   ready: boolean;
   missingTables: string[];
   missingDeviceColumns: string[];
   missingCriticalColumns: string[];
+  invalidColumns: string[];
   invalidPrimaryKeys: string[];
   missingIndexes: string[];
+  invalidIndexes: string[];
+  invalidConstraints: string[];
+  missingMigrations: string[];
 };
 
 type CachedGroupCallSchemaReadiness = {
@@ -339,50 +514,102 @@ async function inspectGroupCallSchema(sql: SQL): Promise<GroupCallSchemaReadines
     SELECT requested.name, to_regclass('public.' || requested.name) IS NOT NULL AS present
     FROM unnest(${sql.array([...REQUIRED_GROUP_CALL_TABLES], "text")}::text[]) AS requested(name)`;
   const columns = await sql`
-    SELECT requested.name, EXISTS (
-      SELECT 1 FROM pg_catalog.pg_attribute attribute
-      WHERE attribute.attrelid = to_regclass('public.devices')
-        AND attribute.attname = requested.name
-        AND attribute.attnum > 0 AND NOT attribute.attisdropped
-    ) AS present
-    FROM unnest(${sql.array([...REQUIRED_DEVICE_COLUMNS], "text")}::text[]) AS requested(name)`;
-  const requiredColumns = Object.entries(REQUIRED_GROUP_CALL_COLUMNS).flatMap(
-    ([tableName, names]) => names.map((columnName) => [tableName, columnName] as const),
-  );
-  const requiredColumnTables = requiredColumns.map(([tableName]) => tableName);
-  const requiredColumnNames = requiredColumns.map(([, columnName]) => columnName);
-  const criticalColumns = await sql`
-    SELECT requested.table_name, requested.column_name, EXISTS (
-      SELECT 1 FROM pg_catalog.pg_attribute attribute
-      WHERE attribute.attrelid = to_regclass('public.' || requested.table_name)
-        AND attribute.attname = requested.column_name
-        AND attribute.attnum > 0 AND NOT attribute.attisdropped
-    ) AS present
+    SELECT requested.table_name, requested.column_name,
+      attribute.attnum IS NOT NULL AS present,
+      CASE WHEN attribute.attnum IS NULL THEN NULL
+        ELSE pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+      END AS data_type,
+      attribute.attnotnull AS not_null,
+      pg_catalog.pg_get_expr(attribute_default.adbin, attribute_default.adrelid) AS column_default
     FROM unnest(
-      ${sql.array(requiredColumnTables, "text")}::text[],
-      ${sql.array(requiredColumnNames, "text")}::text[]
-    ) AS requested(table_name, column_name)`;
+      ${sql.array(REQUIRED_GROUP_CALL_COLUMN_CONTRACTS.map((contract) => contract.table), "text")}::text[],
+      ${sql.array(REQUIRED_GROUP_CALL_COLUMN_CONTRACTS.map((contract) => contract.column), "text")}::text[]
+    ) AS requested(table_name, column_name)
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.nspname = 'public'
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.relnamespace = table_namespace.oid
+      AND table_row.relname = requested.table_name
+      AND table_row.relkind IN ('r', 'p')
+    LEFT JOIN pg_catalog.pg_attribute attribute
+      ON attribute.attrelid = table_row.oid
+      AND attribute.attname = requested.column_name
+      AND attribute.attnum > 0 AND NOT attribute.attisdropped
+    LEFT JOIN pg_catalog.pg_attrdef attribute_default
+      ON attribute_default.adrelid = table_row.oid
+      AND attribute_default.adnum = attribute.attnum`;
   const primaryKeyTables = Object.keys(REQUIRED_GROUP_CALL_PRIMARY_KEYS);
   const primaryKeys = await sql`
     SELECT table_row.relname AS table_name,
       array_agg(attribute.attname ORDER BY key_column.ordinality) AS columns
     FROM pg_catalog.pg_constraint constraint_row
     JOIN pg_catalog.pg_class table_row ON table_row.oid = constraint_row.conrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+      AND table_namespace.nspname = 'public'
+    JOIN pg_catalog.pg_index primary_index
+      ON primary_index.indexrelid = constraint_row.conindid
     CROSS JOIN LATERAL unnest(constraint_row.conkey)
       WITH ORDINALITY AS key_column(attnum, ordinality)
     JOIN pg_catalog.pg_attribute attribute
       ON attribute.attrelid = constraint_row.conrelid
       AND attribute.attnum = key_column.attnum
     WHERE constraint_row.contype = 'p'
+      AND constraint_row.convalidated
+      AND NOT constraint_row.condeferrable
+      AND primary_index.indisvalid
+      AND primary_index.indisready
+      AND primary_index.indislive
       AND table_row.relname = ANY(${sql.array(primaryKeyTables, "text")}::text[])
     GROUP BY table_row.relname`;
   const indexes = await sql`
-    SELECT requested.name, to_regclass('public.' || requested.name) IS NOT NULL AS present
-    FROM unnest(${sql.array([...REQUIRED_GROUP_CALL_INDEXES], "text")}::text[]) AS requested(name)`;
+    SELECT requested.name, index_row.oid IS NOT NULL AS present,
+      table_namespace.nspname AS table_namespace,
+      index_data.indisvalid, index_data.indisready, index_data.indislive,
+      pg_catalog.pg_get_indexdef(index_row.oid) AS definition
+    FROM unnest(${sql.array([...REQUIRED_GROUP_CALL_INDEXES], "text")}::text[]) AS requested(name)
+    LEFT JOIN pg_catalog.pg_namespace index_namespace
+      ON index_namespace.nspname = 'public'
+    LEFT JOIN pg_catalog.pg_class index_row
+      ON index_row.relnamespace = index_namespace.oid
+      AND index_row.relname = requested.name
+      AND index_row.relkind = 'i'
+    LEFT JOIN pg_catalog.pg_index index_data ON index_data.indexrelid = index_row.oid
+    LEFT JOIN pg_catalog.pg_class table_row ON table_row.oid = index_data.indrelid
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace`;
+  const constraints = await sql`
+    SELECT constraint_row.conname, table_row.relname AS table_name,
+      constraint_row.contype, constraint_row.convalidated, constraint_row.condeferrable,
+      pg_catalog.pg_get_constraintdef(constraint_row.oid) AS definition
+    FROM pg_catalog.pg_constraint constraint_row
+    JOIN pg_catalog.pg_class table_row ON table_row.oid = constraint_row.conrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+      AND table_namespace.nspname = 'public'
+    WHERE table_row.relname = ANY(${sql.array([...REQUIRED_GROUP_CALL_TABLES], "text")}::text[])`;
+  const migrations = await sql`
+    SELECT requested.name, EXISTS (
+      SELECT 1 FROM public.schema_migrations migration WHERE migration.name = requested.name
+    ) AS present
+    FROM unnest(${sql.array([...REQUIRED_GROUP_CALL_MIGRATIONS], "text")}::text[]) AS requested(name)`;
   const missingTables = tables.filter((row: any) => !row.present).map((row: any) => String(row.name));
-  const missingDeviceColumns = columns.filter((row: any) => !row.present).map((row: any) => String(row.name));
-  const missingCriticalColumns = criticalColumns.filter((row: any) => !row.present)
+  const missingDeviceColumns = columns.filter((row: any) =>
+    row.table_name === "devices" && !row.present).map((row: any) => String(row.column_name));
+  const missingCriticalColumns = columns.filter((row: any) =>
+    row.table_name !== "devices" && !row.present)
     .map((row: any) => `${row.table_name}.${row.column_name}`);
+  const expectedColumns = new Map(REQUIRED_GROUP_CALL_COLUMN_CONTRACTS.map((contract) => [
+    `${contract.table}.${contract.column}`, contract,
+  ]));
+  const invalidColumns = columns.filter((row: any) => {
+    if (!row.present) return false;
+    const contract = expectedColumns.get(`${row.table_name}.${row.column_name}`);
+    if (!contract) return true;
+    return String(row.data_type) !== contract.type
+      || Boolean(row.not_null) !== contract.notNull
+      || (row.column_default == null ? null : String(row.column_default)) !== contract.default;
+  }).map((row: any) => `${row.table_name}.${row.column_name}`);
   const actualPrimaryKeys = new Map(primaryKeys.map((row: any) => [
     String(row.table_name), Array.from(row.columns ?? [], String),
   ]));
@@ -395,17 +622,50 @@ async function inspectGroupCallSchema(sql: SQL): Promise<GroupCallSchemaReadines
     .map(([tableName]) => tableName);
   const missingIndexes = indexes.filter((row: any) => !row.present)
     .map((row: any) => String(row.name));
+  const invalidIndexes = indexes.filter((row: any) => row.present && (
+    row.table_namespace !== "public"
+      || !row.indisvalid
+      || !row.indisready
+      || !row.indislive
+      || normalizeCatalogDefinition(row.definition)
+        !== REQUIRED_GROUP_CALL_INDEX_DEFINITIONS[String(row.name)]
+  )).map((row: any) => String(row.name));
+  const actualConstraints = new Map(constraints.map((row: any) => [String(row.conname), row]));
+  const invalidConstraints = Object.entries(REQUIRED_GROUP_CALL_CONSTRAINTS)
+    .filter(([name, contract]) => {
+      const actual = actualConstraints.get(name) as any;
+      return !actual || actual.table_name !== contract.table || actual.contype !== "c"
+        || !actual.convalidated || actual.condeferrable
+        || normalizeCatalogDefinition(actual.definition) !== contract.definition;
+    })
+    .map(([name]) => name);
+  for (const constraint of constraints) {
+    if (!constraint.convalidated) {
+      const name = String(constraint.conname);
+      if (!invalidConstraints.includes(name)) invalidConstraints.push(name);
+    }
+  }
+  const missingMigrations = migrations.filter((row: any) => !row.present)
+    .map((row: any) => String(row.name));
   return {
     ready: missingTables.length === 0
       && missingDeviceColumns.length === 0
       && missingCriticalColumns.length === 0
+      && invalidColumns.length === 0
       && invalidPrimaryKeys.length === 0
-      && missingIndexes.length === 0,
+      && missingIndexes.length === 0
+      && invalidIndexes.length === 0
+      && invalidConstraints.length === 0
+      && missingMigrations.length === 0,
     missingTables,
     missingDeviceColumns,
     missingCriticalColumns,
+    invalidColumns,
     invalidPrimaryKeys,
     missingIndexes,
+    invalidIndexes,
+    invalidConstraints,
+    missingMigrations,
   };
 }
 
@@ -668,6 +928,27 @@ async function authorizedCall(sql: SQL, accountId: string, deviceId: string,
   return row;
 }
 
+async function requireCurrentMediaEpoch(
+  sql: SQL,
+  row: GroupCallRow,
+  deviceId: string,
+): Promise<ParticipantRow> {
+  const participant = (await sql`
+    SELECT participant.*
+    FROM group_call_participants participant
+    JOIN group_call_epochs epoch
+      ON epoch.call_id = participant.call_id AND epoch.epoch = ${row.media_epoch}
+    WHERE participant.call_id = ${row.id} AND participant.device_id = ${deviceId}
+      AND participant.status = 'active'
+      AND participant.ready_media_epoch = ${row.media_epoch}
+      AND epoch.membership_revision = ${row.membership_revision}
+    FOR UPDATE OF participant`)[0];
+  if (!participant) {
+    throw new GroupCallError("current epoch key is not ready", "epoch_not_ready", 409);
+  }
+  return participant;
+}
+
 function initialKind(value: unknown): "voice" | "video" {
   if (value !== "voice" && value !== "video") {
     throw new GroupCallError("initialKind must be voice or video", "invalid_request");
@@ -698,14 +979,14 @@ function makeRoomName(): string {
 }
 
 function makeLiveKitToken(config: LiveKitConfiguration, row: GroupCallRow,
-  participant: ParticipantRow): GroupCallCredentials {
+  participant: ParticipantRow, tokenNotBefore = 0): GroupCallCredentials {
   const now = Math.floor(Date.now() / 1_000);
   const expires = now + TOKEN_TTL_SECONDS;
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
   const claims = Buffer.from(JSON.stringify({
     iss: config.apiKey,
     sub: String(participant.call_local_identity),
-    nbf: now - 5,
+    nbf: Math.max(now - 5, tokenNotBefore),
     iat: now,
     exp: expires,
     jti: crypto.randomUUID(),
@@ -815,9 +1096,11 @@ function defaultGroupCallSFUControl(): GroupCallSFUControl {
       new Set(["already_exists", "alreadyExists"]),
     ),
     updateParticipant: async (input) => {
-      const sources = ["MICROPHONE"];
-      if (input.cameraAllowed) sources.push("CAMERA");
-      if (input.screenShareAllowed) sources.push("SCREEN_SHARE", "SCREEN_SHARE_AUDIO");
+      const sources: string[] = input.mediaAllowed ? ["MICROPHONE"] : [];
+      if (input.mediaAllowed && input.cameraAllowed) sources.push("CAMERA");
+      if (input.mediaAllowed && input.screenShareAllowed) {
+        sources.push("SCREEN_SHARE", "SCREEN_SHARE_AUDIO");
+      }
       await liveKitRoomRequest(
         config,
         "UpdateParticipant",
@@ -825,8 +1108,8 @@ function defaultGroupCallSFUControl(): GroupCallSFUControl {
           room: input.room,
           identity: input.identity,
           permission: {
-            canSubscribe: true,
-            canPublish: true,
+            canSubscribe: input.mediaAllowed,
+            canPublish: input.mediaAllowed,
             canPublishData: false,
             canPublishSources: sources,
             hidden: false,
@@ -837,13 +1120,23 @@ function defaultGroupCallSFUControl(): GroupCallSFUControl {
         { room: input.room, roomAdmin: true },
       );
     },
-    removeParticipant: async (room, identity) => liveKitRoomRequest(
-      config,
-      "RemoveParticipant",
-      { room, identity, revokeTokenTs: Math.floor(Date.now() / 1_000) },
-      { room, roomAdmin: true },
-      new Set(["not_found", "notFound"]),
-    ),
+    removeParticipant: async (room, identity) => {
+      // LiveKit rejects tokens whose `nbf` is earlier than this second. Advance one full second so
+      // an old token issued immediately before the mutation cannot compare equal to the cutoff.
+      const tokenNotBefore = config.managedCloud ? Math.floor(Date.now() / 1_000) + 1 : 0;
+      await liveKitRoomRequest(
+        config,
+        "RemoveParticipant",
+        {
+          room,
+          identity,
+          ...(tokenNotBefore > 0 ? { revokeTokenTs: tokenNotBefore } : {}),
+        },
+        { room, roomAdmin: true },
+        new Set(["not_found", "notFound"]),
+      );
+      return tokenNotBefore;
+    },
   };
 }
 
@@ -852,13 +1145,18 @@ async function initializeParticipantSFUState(
   row: GroupCallRow,
   participant: ParticipantRow,
 ): Promise<void> {
+  const mediaAllowed = row.state === "active"
+    && participant.status === "active"
+    && n(participant.ready_media_epoch) === n(row.media_epoch)
+    && n(participant.joined_membership_revision) === n(row.membership_revision);
   await sql`
     INSERT INTO group_call_sfu_participant_states (
       call_id, device_id, participant_identity, desired_status,
-      camera_allowed, screen_share_allowed, revision, applied_revision
+      media_allowed, camera_allowed, screen_share_allowed, revision, applied_revision,
+      applied_media_allowed
     ) VALUES (
       ${row.id}, ${participant.device_id}, ${participant.call_local_identity}, 'active',
-      FALSE, FALSE, 1, 1
+      ${mediaAllowed}, FALSE, FALSE, 1, 1, ${mediaAllowed}
     )
     ON CONFLICT (call_id, participant_identity) DO NOTHING`;
 }
@@ -874,38 +1172,72 @@ async function queueParticipantSFUState(
     WHERE call_id = ${row.id} AND device_id = ${deviceId}`)[0];
   if (!participant) return;
   const active = participant.status === "active" || participant.status === "pending_key";
-  const cameraAllowed = active && participant.status === "active" && Boolean((await sql`
+  const currentEpoch = (await sql`
+    SELECT membership_revision FROM group_call_epochs
+    WHERE call_id = ${row.id} AND epoch = ${row.media_epoch}`)[0];
+  const mediaAllowed = row.state === "active"
+    && participant.status === "active"
+    && n(participant.ready_media_epoch) === n(row.media_epoch)
+    && n(currentEpoch?.membership_revision) === n(row.membership_revision);
+  const cameraAllowed = mediaAllowed && Boolean((await sql`
     SELECT 1 FROM group_call_camera_leases
     WHERE call_id = ${row.id} AND device_id = ${deviceId} AND expires_at > now()`)[0]);
-  const screenAllowed = active && participant.status === "active" && Boolean((await sql`
+  const screenAllowed = mediaAllowed && Boolean((await sql`
     SELECT 1 FROM group_call_screen_share_leases
     WHERE call_id = ${row.id} AND device_id = ${deviceId} AND expires_at > now()`)[0]);
   const desiredStatus = active ? "active" : "removed";
   await sql`
     INSERT INTO group_call_sfu_participant_states (
       call_id, device_id, participant_identity, desired_status,
-      camera_allowed, screen_share_allowed, revision, applied_revision,
+      media_allowed, camera_allowed, screen_share_allowed, revision, applied_revision,
       next_attempt_at
     ) VALUES (
       ${row.id}, ${deviceId}, ${participant.call_local_identity}, ${desiredStatus},
-      ${cameraAllowed}, ${screenAllowed}, 1, 0, now()
+      ${mediaAllowed}, ${cameraAllowed}, ${screenAllowed}, 1, 0, now()
     )
     ON CONFLICT (call_id, participant_identity) DO UPDATE SET
       device_id = excluded.device_id,
       desired_status = excluded.desired_status,
+      media_allowed = excluded.media_allowed,
       camera_allowed = excluded.camera_allowed,
       screen_share_allowed = excluded.screen_share_allowed,
       revision = CASE WHEN
         ${force}
         OR group_call_sfu_participant_states.desired_status IS DISTINCT FROM excluded.desired_status
+        OR group_call_sfu_participant_states.media_allowed IS DISTINCT FROM excluded.media_allowed
         OR group_call_sfu_participant_states.camera_allowed IS DISTINCT FROM excluded.camera_allowed
         OR group_call_sfu_participant_states.screen_share_allowed IS DISTINCT FROM excluded.screen_share_allowed
         THEN group_call_sfu_participant_states.revision + 1
         ELSE group_call_sfu_participant_states.revision
       END,
+      attempt_count = CASE WHEN
+        ${force}
+        OR group_call_sfu_participant_states.desired_status IS DISTINCT FROM excluded.desired_status
+        OR group_call_sfu_participant_states.media_allowed IS DISTINCT FROM excluded.media_allowed
+        OR group_call_sfu_participant_states.camera_allowed IS DISTINCT FROM excluded.camera_allowed
+        OR group_call_sfu_participant_states.screen_share_allowed IS DISTINCT FROM excluded.screen_share_allowed
+        THEN 0
+        ELSE group_call_sfu_participant_states.attempt_count
+      END,
       next_attempt_at = LEAST(group_call_sfu_participant_states.next_attempt_at, now()),
       last_error_code = NULL,
       updated_at = now()`;
+}
+
+async function queueLiveParticipantSFUStates(
+  sql: SQL,
+  row: GroupCallRow,
+  force = false,
+): Promise<string[]> {
+  const participants = await sql`
+    SELECT device_id FROM group_call_participants
+    WHERE call_id = ${row.id} AND status IN ('pending_key','active')
+    ORDER BY device_id`;
+  const deviceIds = participants.map((participant: any) => String(participant.device_id));
+  for (const deviceId of deviceIds) {
+    await queueParticipantSFUState(sql, row, deviceId, force);
+  }
+  return deviceIds;
 }
 
 type ClaimedSFUState = {
@@ -914,6 +1246,10 @@ type ClaimedSFUState = {
   room: string;
   identity: string;
   desiredStatus: "active" | "removed";
+  mediaAllowed: boolean;
+  appliedMediaAllowed: boolean;
+  appliedCameraAllowed: boolean;
+  appliedScreenShareAllowed: boolean;
   cameraAllowed: boolean;
   screenShareAllowed: boolean;
   revision: number;
@@ -940,6 +1276,11 @@ async function claimParticipantSFUState(
             AND blocker.participant_identity <> state.participant_identity
             AND blocker.applied_revision < blocker.revision
             AND (
+              (state.media_allowed AND (
+                (blocker.applied_status = 'active' AND blocker.desired_status = 'removed')
+                OR (blocker.applied_media_allowed AND NOT blocker.media_allowed)
+              ))
+              OR
               (state.camera_allowed AND (
                 (blocker.applied_status = 'active' AND blocker.desired_status = 'removed')
                 OR (blocker.applied_camera_allowed AND NOT blocker.camera_allowed)
@@ -976,6 +1317,10 @@ async function claimParticipantSFUState(
       room: String(state.sfu_room_name),
       identity: String(state.participant_identity),
       desiredStatus: state.desired_status,
+      mediaAllowed: Boolean(state.media_allowed),
+      appliedMediaAllowed: Boolean(state.applied_media_allowed),
+      appliedCameraAllowed: Boolean(state.applied_camera_allowed),
+      appliedScreenShareAllowed: Boolean(state.applied_screen_share_allowed),
       cameraAllowed: Boolean(state.camera_allowed),
       screenShareAllowed: Boolean(state.screen_share_allowed),
       revision: n(state.revision),
@@ -994,13 +1339,26 @@ export async function reconcileGroupCallSFUParticipant(
     const claimed = await claimParticipantSFUState(sql, callId, deviceId);
     if (claimed === null) return true;
     if (claimed === "busy") return false;
+    let tokenNotBefore = 0;
     try {
-      if (claimed.desiredStatus === "removed") {
-        await control.removeParticipant(claimed.room, claimed.identity);
+      if (claimed.desiredStatus === "removed" || !claimed.mediaAllowed) {
+        tokenNotBefore = await control.removeParticipant(claimed.room, claimed.identity);
+        if (!Number.isSafeInteger(tokenNotBefore) || tokenNotBefore < 0) {
+          throw new GroupCallError("group media control is unavailable", "sfu_control_unavailable", 503);
+        }
+      } else if (!claimed.appliedMediaAllowed
+        && !claimed.appliedCameraAllowed
+        && !claimed.appliedScreenShareAllowed
+        && !claimed.cameraAllowed
+        && !claimed.screenShareAllowed) {
+        // A successful epoch fence disconnects the old session and revokes its token. Moving from
+        // media-denied to microphone-only therefore needs no mutation of a participant that is not
+        // in the room yet; the freshly minted post-epoch token carries the base permission.
       } else {
         await control.updateParticipant({
           room: claimed.room,
           identity: claimed.identity,
+          mediaAllowed: claimed.mediaAllowed,
           cameraAllowed: claimed.cameraAllowed,
           screenShareAllowed: claimed.screenShareAllowed,
         });
@@ -1026,10 +1384,12 @@ export async function reconcileGroupCallSFUParticipant(
       UPDATE group_call_sfu_participant_states SET
         applied_revision = GREATEST(applied_revision, ${claimed.revision}),
         applied_status = ${claimed.desiredStatus},
+        applied_media_allowed = ${claimed.mediaAllowed},
         applied_camera_allowed = ${claimed.cameraAllowed},
         applied_screen_share_allowed = ${claimed.screenShareAllowed},
+        token_not_before = GREATEST(token_not_before, ${tokenNotBefore}),
         claim_token = NULL, claim_revision = NULL, claim_expires_at = NULL,
-        next_attempt_at = now(), last_error_code = NULL, updated_at = now()
+        attempt_count = 0, next_attempt_at = now(), last_error_code = NULL, updated_at = now()
       WHERE call_id = ${callId}
         AND participant_identity = ${claimed.identity}
         AND claim_token = ${claimed.claimToken}`;
@@ -1052,6 +1412,7 @@ export async function reconcilePendingGroupCallSFUStates(
     ORDER BY next_attempt_at, updated_at
     LIMIT ${Math.max(1, Math.min(limit, 1_000))}`;
   let processed = 0;
+  let failed = 0;
   let nextIndex = 0;
   const workerCount = Math.min(8, pending.length);
   await Promise.all(Array.from({ length: workerCount }, async () => {
@@ -1064,9 +1425,19 @@ export async function reconcilePendingGroupCallSFUStates(
           String(state.device_id),
           control,
         )) processed += 1;
-      } catch {}
+      } catch {
+        failed += 1;
+      }
     }
   }));
+  if (failed > 0) {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      event: "group_call.sfu_reconcile.batch_failed",
+      failed,
+      selected: pending.length,
+    }));
+  }
   return processed;
 }
 
@@ -1133,7 +1504,7 @@ export async function startGroupCall(sql: SQL, input: {
       }
       return {
         call: await loadSnapshot(tx, existing, input.accountId, input.deviceId),
-        credentials: makeLiveKitToken(config, existing, participant), hints: [], duplicate: true,
+        credentials: null as GroupCallCredentials | null, hints: [], duplicate: true,
       };
     }
     const active = (await tx`
@@ -1200,16 +1571,30 @@ export async function startGroupCall(sql: SQL, input: {
     }
     throw error;
   }
-  return result;
+  if (result.duplicate) {
+    result.credentials = (await getGroupCallCredentials(
+      sql,
+      input.accountId,
+      input.deviceId,
+      callId,
+      control,
+    )).credentials;
+  }
+  if (!result.credentials) {
+    throw new GroupCallError("group media credentials are unavailable", "sfu_control_unavailable", 503);
+  }
+  return { ...result, credentials: result.credentials };
 }
 
 export async function joinGroupCall(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown; joinPublicKey: unknown; joinNonce: unknown;
-}): Promise<{ call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean }> {
+}, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
+  call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean;
+}> {
   const callId = requireUUID(input.callId, "callId");
   const joinPublicKey = decodeJoinMaterial(input.joinPublicKey, "joinPublicKey");
   const joinNonce = decodeJoinMaterial(input.joinNonce, "joinNonce");
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1277,10 +1662,18 @@ export async function joinGroupCall(sql: SQL, input: {
       UPDATE group_calls SET membership_revision = ${membershipRevision},
         state_revision = state_revision + 1, updated_at = now()
       WHERE id = ${callId} RETURNING *`)[0];
+    // A membership revision invalidates every pre-change room token, not only the newcomer. Leases
+    // are epoch-scoped in practice even though their rows are short lived, so discard them before
+    // queuing the room-wide disconnect barrier.
+    await tx`DELETE FROM group_call_screen_share_leases WHERE call_id = ${callId}`;
+    await tx`DELETE FROM group_call_camera_leases WHERE call_id = ${callId}`;
+    await queueLiveParticipantSFUStates(tx, row);
     await notify(tx, row);
     return { call: await loadSnapshot(tx, row, input.accountId, input.deviceId),
       hints: await hintTargets(tx, row), duplicate: false };
   });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  return result;
 }
 
 type NormalizedEnvelope = { recipientDeviceId: string; ciphertext: Buffer };
@@ -1306,7 +1699,9 @@ export async function activateGroupCallEpoch(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown; epoch: unknown;
   expectedMembershipRevision: unknown; keyCommitment: unknown; participantSetHash: unknown;
   envelopes: unknown;
-}): Promise<{ call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean }> {
+}, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
+  call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean;
+}> {
   const callId = requireUUID(input.callId, "callId");
   const requestedEpoch = Number(input.epoch);
   const expectedRevision = Number(input.expectedMembershipRevision);
@@ -1317,7 +1712,7 @@ export async function activateGroupCallEpoch(sql: SQL, input: {
   const keyCommitment = decodeBase64(input.keyCommitment, "keyCommitment", 32);
   const suppliedSetHash = decodeBase64(input.participantSetHash, "participantSetHash", 32);
   const envelopes = normalizeEnvelopes(input.envelopes);
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1404,10 +1799,13 @@ export async function activateGroupCallEpoch(sql: SQL, input: {
         state_revision = state_revision + 1,
         epoch_key_commitment = ${keyCommitment}, updated_at = now()
       WHERE id = ${callId} RETURNING *`)[0];
+    await queueLiveParticipantSFUStates(tx, row);
     await notify(tx, row);
     return { call: await loadSnapshot(tx, row, input.accountId, input.deviceId),
       hints: await hintTargets(tx, row), duplicate: false };
   });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  return result;
 }
 
 export async function getGroupCall(sql: SQL, accountId: string, deviceId: string,
@@ -1433,17 +1831,54 @@ export async function getActiveGroupCall(sql: SQL, accountId: string, deviceId: 
 }
 
 export async function getGroupCallCredentials(sql: SQL, accountId: string, deviceId: string,
-  rawCallId: unknown): Promise<{ credentials: GroupCallCredentials }> {
+  rawCallId: unknown,
+  control: GroupCallSFUControl = defaultGroupCallSFUControl(),
+): Promise<{ credentials: GroupCallCredentials }> {
   const config = liveKitConfiguration();
   const callId = requireUUID(rawCallId, "callId");
+  // Never let an authenticated non-member use a guessed call UUID to drive the external SFU
+  // reconciliation plane. The final credential transaction revalidates after the barrier.
+  await sql.begin(async (tx) => {
+    const row = await authorizedCall(tx, accountId, deviceId, callId, "share");
+    if (row.state !== "active") {
+      throw new GroupCallError("group call has ended", "call_ended", 410);
+    }
+    const participant = await tx`
+      SELECT 1 FROM group_call_participants
+      WHERE call_id = ${callId} AND device_id = ${deviceId}
+        AND status IN ('pending_key','active')`;
+    if (!participant.length) {
+      throw new GroupCallError("device is not joined", "not_joined", 409);
+    }
+  });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  const tokenFence = (await sql`
+    SELECT state.token_not_before
+    FROM group_call_participants participant
+    JOIN group_call_sfu_participant_states state
+      ON state.call_id = participant.call_id
+      AND state.participant_identity = participant.call_local_identity
+    WHERE participant.call_id = ${callId} AND participant.device_id = ${deviceId}`)[0];
+  const tokenNotBefore = n(tokenFence?.token_not_before ?? 0);
+  const waitMilliseconds = tokenNotBefore * 1_000 - Date.now();
+  if (waitMilliseconds > 5_000) {
+    throw new GroupCallError("group media control is unavailable", "sfu_control_unavailable", 503);
+  }
+  if (waitMilliseconds > 0) {
+    await new Promise((resolve) => setTimeout(resolve, waitMilliseconds));
+  }
   return sql.begin(async (tx) => {
     const row = await authorizedCall(tx, accountId, deviceId, callId, true);
     if (row.state !== "active") throw new GroupCallError("group call has ended", "call_ended", 410);
-    const participant = (await tx`
-      SELECT * FROM group_call_participants
-      WHERE call_id = ${callId} AND device_id = ${deviceId} FOR UPDATE`)[0];
-    if (!participant || participant.status !== "active"
-      || n(participant.ready_media_epoch) !== n(row.media_epoch)) {
+    const participant = await requireCurrentMediaEpoch(tx, row, deviceId);
+    const mediaAuthorization = (await tx`
+      SELECT token_not_before FROM group_call_sfu_participant_states
+      WHERE call_id = ${callId}
+        AND participant_identity = ${participant.call_local_identity}
+        AND desired_status = 'active' AND media_allowed
+        AND applied_revision = revision
+        AND applied_status = 'active' AND applied_media_allowed`)[0];
+    if (!mediaAuthorization) {
       throw new GroupCallError("current epoch key is not ready", "epoch_not_ready", 409);
     }
     if (deviceId !== row.key_leader_device_id) {
@@ -1456,7 +1891,14 @@ export async function getGroupCallCredentials(sql: SQL, accountId: string, devic
     await tx`
       UPDATE group_call_participants SET last_seen_at = now()
       WHERE call_id = ${callId} AND device_id = ${deviceId}`;
-    return { credentials: makeLiveKitToken(config, row, participant) };
+    return {
+      credentials: makeLiveKitToken(
+        config,
+        row,
+        participant,
+        n(mediaAuthorization.token_not_before),
+      ),
+    };
   });
 }
 
@@ -1470,11 +1912,10 @@ async function departParticipantTx(sql: SQL, row: GroupCallRow, deviceId: string
   if (!changed.length) return row;
   await sql`
     DELETE FROM group_call_screen_share_leases
-    WHERE call_id = ${row.id} AND device_id = ${deviceId}`;
+    WHERE call_id = ${row.id}`;
   await sql`
     DELETE FROM group_call_camera_leases
-    WHERE call_id = ${row.id} AND device_id = ${deviceId}`;
-  await queueParticipantSFUState(sql, row, deviceId);
+    WHERE call_id = ${row.id}`;
   const remaining: ParticipantRow[] = await sql`
     SELECT * FROM group_call_participants
     WHERE call_id = ${row.id} AND status IN ('pending_key','active')
@@ -1484,6 +1925,7 @@ async function departParticipantTx(sql: SQL, row: GroupCallRow, deviceId: string
       UPDATE group_calls SET state = 'ended', ended_at = now(), end_reason = ${reason},
         state_revision = state_revision + 1, updated_at = now()
       WHERE id = ${row.id} RETURNING *`)[0];
+    await queueParticipantSFUState(sql, ended, deviceId, true);
     await notify(sql, ended);
     return ended;
   }
@@ -1495,15 +1937,19 @@ async function departParticipantTx(sql: SQL, row: GroupCallRow, deviceId: string
       state_revision = state_revision + 1,
       key_leader_device_id = ${leaderDeviceId}, updated_at = now()
     WHERE id = ${row.id} RETURNING *`)[0];
+  await queueParticipantSFUState(sql, updated, deviceId, true);
+  await queueLiveParticipantSFUStates(sql, updated, true);
   await notify(sql, updated);
   return updated;
 }
 
 export async function leaveGroupCall(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown;
-}): Promise<{ call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean }> {
+}, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
+  call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean;
+}> {
   const callId = requireUUID(input.callId, "callId");
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1518,14 +1964,18 @@ export async function leaveGroupCall(sql: SQL, input: {
     return { call: await loadSnapshot(tx, row, input.accountId, input.deviceId),
       hints: duplicate ? [] : await hintTargets(tx, row), duplicate };
   });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  return result;
 }
 
 export async function removeGroupCallParticipant(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown; targetDeviceId: unknown;
-}): Promise<{ call: GroupCallSnapshot; hints: GroupCallHint[] }> {
+}, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
+  call: GroupCallSnapshot; hints: GroupCallHint[];
+}> {
   const callId = requireUUID(input.callId, "callId");
   const targetDeviceId = requireUUID(input.targetDeviceId, "targetDeviceId");
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1547,16 +1997,20 @@ export async function removeGroupCallParticipant(sql: SQL, input: {
     return { call: await loadSnapshot(tx, row, input.accountId, input.deviceId),
       hints: await hintTargets(tx, row) };
   });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  return result;
 }
 
 export async function endGroupCall(sql: SQL, input: {
   accountId: string; deviceId: string; callId: unknown; reason?: unknown;
-}): Promise<{ call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean }> {
+}, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
+  call: GroupCallSnapshot; hints: GroupCallHint[]; duplicate: boolean;
+}> {
   const callId = requireUUID(input.callId, "callId");
   const allowedReasons = new Set(["ended_by_admin", "failed", "security_error"]);
   const reason = typeof input.reason === "string" && allowedReasons.has(input.reason)
     ? input.reason : "ended_by_admin";
-  return sql.begin(async (tx) => {
+  const result = await sql.begin(async (tx) => {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId);
     const base = (await tx`SELECT dialog_id FROM group_calls WHERE id = ${callId}`)[0];
     if (!base) throw new GroupCallError("group call not found", "not_found", 404);
@@ -1582,12 +2036,14 @@ export async function endGroupCall(sql: SQL, input: {
     await tx`DELETE FROM group_call_screen_share_leases WHERE call_id = ${callId}`;
     await tx`DELETE FROM group_call_camera_leases WHERE call_id = ${callId}`;
     for (const participant of participantDevices) {
-      await queueParticipantSFUState(tx, row, String(participant.device_id));
+      await queueParticipantSFUState(tx, row, String(participant.device_id), true);
     }
     await notify(tx, row);
     return { call: await loadSnapshot(tx, row, input.accountId, input.deviceId),
       hints: await hintTargets(tx, row), duplicate: false };
   });
+  await requireGroupCallSFUBarrierApplied(sql, [callId], control);
+  return result;
 }
 
 export async function heartbeatGroupCall(sql: SQL, input: {
@@ -1636,6 +2092,32 @@ async function requireParticipantSFUStateApplied(
   throw new GroupCallError("group media control is busy", "sfu_control_unavailable", 503);
 }
 
+export async function requireGroupCallSFUBarrierApplied(
+  sql: SQL,
+  callIds: readonly string[],
+  control: GroupCallSFUControl = defaultGroupCallSFUControl(),
+): Promise<void> {
+  for (const callId of [...new Set(callIds)]) {
+    const pending = await sql`
+      SELECT DISTINCT device_id FROM group_call_sfu_participant_states
+      WHERE call_id = ${callId} AND applied_revision < revision
+      ORDER BY device_id`;
+    await Promise.all(pending.map((row: any) => requireParticipantSFUStateApplied(
+      sql,
+      callId,
+      String(row.device_id),
+      control,
+    )));
+    const unresolved = await sql`
+      SELECT 1 FROM group_call_sfu_participant_states
+      WHERE call_id = ${callId} AND applied_revision < revision
+      LIMIT 1`;
+    if (unresolved.length) {
+      throw new GroupCallError("group media control is busy", "sfu_control_unavailable", 503);
+    }
+  }
+}
+
 async function compensateMediaLease(
   sql: SQL,
   callId: string,
@@ -1674,16 +2156,13 @@ export async function acquireGroupCamera(sql: SQL, input: {
 }> {
   const callId = requireUUID(input.callId, "callId");
   const generation = requireUUID(input.generation, "generation");
+  if (!groupCallsEnabledForAccount(input.accountId)) {
+    throw new GroupCallError("group calls are unavailable", "capability_unavailable", 404);
+  }
   const result = await sql.begin(async (tx) => {
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     if (row.state !== "active") throw new GroupCallError("group call has ended", "call_ended", 410);
-    const participant = await tx`
-      SELECT 1 FROM group_call_participants
-      WHERE call_id = ${callId} AND device_id = ${input.deviceId}
-        AND status = 'active' AND ready_media_epoch = ${row.media_epoch}`;
-    if (!participant.length) {
-      throw new GroupCallError("current epoch key is not ready", "epoch_not_ready", 409);
-    }
+    await requireCurrentMediaEpoch(tx, row, input.deviceId);
     const expired = await tx`
       DELETE FROM group_call_camera_leases
       WHERE call_id = ${callId} AND expires_at <= now()
@@ -1776,6 +2255,7 @@ export async function heartbeatGroupCamera(sql: SQL, input: {
   return sql.begin(async (tx) => {
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     if (row.state !== "active") throw new GroupCallError("group call has ended", "call_ended", 410);
+    await requireCurrentMediaEpoch(tx, row, input.deviceId);
     const lease = (await tx`
       UPDATE group_call_camera_leases
       SET expires_at = now() + (${CAMERA_LEASE_SECONDS} * interval '1 second'), updated_at = now()
@@ -1836,7 +2316,7 @@ export async function acquireGroupScreenShare(sql: SQL, input: {
 }, control: GroupCallSFUControl = defaultGroupCallSFUControl()): Promise<{
   generation: string; expiresAt: string; call: GroupCallSnapshot; hints: GroupCallHint[];
 }> {
-  if (!groupScreenSharingConfigured()) {
+  if (!groupScreenSharingConfigured() || !groupCallsEnabledForAccount(input.accountId)) {
     throw new GroupCallError("screen sharing is unavailable", "screen_share_unavailable", 409);
   }
   const callId = requireUUID(input.callId, "callId");
@@ -1845,11 +2325,7 @@ export async function acquireGroupScreenShare(sql: SQL, input: {
     await requireGroupMediaDevice(tx, input.accountId, input.deviceId, true);
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     if (row.state !== "active") throw new GroupCallError("group call has ended", "call_ended", 410);
-    const participant = await tx`
-      SELECT 1 FROM group_call_participants
-      WHERE call_id = ${callId} AND device_id = ${input.deviceId}
-        AND status = 'active' AND ready_media_epoch = ${row.media_epoch}`;
-    if (!participant.length) throw new GroupCallError("current epoch key is not ready", "epoch_not_ready", 409);
+    await requireCurrentMediaEpoch(tx, row, input.deviceId);
     const expired = await tx`DELETE FROM group_call_screen_share_leases
       WHERE call_id = ${callId} AND expires_at <= now()
       RETURNING device_id`;
@@ -1928,6 +2404,7 @@ export async function heartbeatGroupScreenShare(sql: SQL, input: {
   return sql.begin(async (tx) => {
     const row = await authorizedCall(tx, input.accountId, input.deviceId, callId, true);
     if (row.state !== "active") throw new GroupCallError("group call has ended", "call_ended", 410);
+    await requireCurrentMediaEpoch(tx, row, input.deviceId);
     const lease = (await tx`
       UPDATE group_call_screen_share_leases
       SET expires_at = now() + (${SCREEN_SHARE_LEASE_SECONDS} * interval '1 second'), updated_at = now()
@@ -1988,10 +2465,10 @@ export async function revokeGroupCallAccountInLockedDialog(
   sql: SQL,
   dialogId: string,
   accountId: string,
-): Promise<void> {
+): Promise<string[]> {
   const row = (await sql`
     SELECT * FROM group_calls WHERE dialog_id = ${dialogId} AND state = 'active' FOR UPDATE`)[0];
-  if (!row) return;
+  if (!row) return [];
   const participants = await sql`
     SELECT device_id FROM group_call_participants
     WHERE call_id = ${row.id} AND account_id = ${accountId}
@@ -2000,13 +2477,14 @@ export async function revokeGroupCallAccountInLockedDialog(
   for (const participant of participants) {
     current = await departParticipantTx(sql, current, participant.device_id, "removed", "empty");
   }
+  return participants.length ? [String(row.id)] : [];
 }
 
 export async function revokeGroupCallDeviceTx(
   sql: SQL,
   accountId: string,
   deviceId: string,
-): Promise<void> {
+): Promise<string[]> {
   const rows: GroupCallRow[] = await sql`
     SELECT call.* FROM group_calls call
     JOIN group_call_participants participant ON participant.call_id = call.id
@@ -2015,9 +2493,10 @@ export async function revokeGroupCallDeviceTx(
       AND participant.status IN ('pending_key','active')
     ORDER BY call.id FOR UPDATE OF call`;
   for (const row of rows) await departParticipantTx(sql, row, deviceId, "removed", "empty");
+  return rows.map((row) => String(row.id));
 }
 
-export async function revokeGroupCallAccountTx(sql: SQL, accountId: string): Promise<void> {
+export async function revokeGroupCallAccountTx(sql: SQL, accountId: string): Promise<string[]> {
   const rows: GroupCallRow[] = await sql`
     SELECT call.* FROM group_calls call
     JOIN group_call_participants participant ON participant.call_id = call.id
@@ -2034,6 +2513,7 @@ export async function revokeGroupCallAccountTx(sql: SQL, accountId: string): Pro
       current = await departParticipantTx(sql, current, participant.device_id, "removed", "empty");
     }
   }
+  return rows.map((row) => String(row.id));
 }
 
 export async function expireStaleGroupCallParticipants(sql: SQL, limit = 100): Promise<number> {

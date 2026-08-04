@@ -219,6 +219,63 @@ export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> 
   ].join("\n");
 }
 
+export async function groupCallBacklogMetrics(sql: SQL): Promise<string> {
+  const schema = (await sql`
+    SELECT pg_catalog.to_regclass('public.group_calls') IS NOT NULL AS calls_present,
+           pg_catalog.to_regclass('public.group_call_sfu_participant_states') IS NOT NULL
+             AS sfu_states_present`)[0];
+  if (!schema?.calls_present || !schema?.sfu_states_present) {
+    return [
+      "# HELP toj_group_call_schema_available Whether group-call metrics relations exist.",
+      "# TYPE toj_group_call_schema_available gauge",
+      "toj_group_call_schema_available 0",
+      "",
+    ].join("\n");
+  }
+  const row = (await sql`
+    SELECT
+      (SELECT count(*) FROM public.group_calls WHERE state = 'active') AS active_calls,
+      (SELECT count(*) FROM public.group_calls call
+       JOIN public.group_call_epochs epoch
+         ON epoch.call_id = call.id AND epoch.epoch = call.media_epoch
+       WHERE call.state = 'active'
+         AND epoch.membership_revision <> call.membership_revision) AS rekeying_calls,
+      (SELECT count(*) FROM public.group_call_sfu_participant_states
+       WHERE applied_revision < revision) AS pending_sfu_states,
+      (SELECT count(*) FROM public.group_call_sfu_participant_states
+       WHERE applied_revision < revision AND last_error_code IS NOT NULL) AS failed_sfu_states,
+      (SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(updated_at)), 0)
+       FROM public.group_call_sfu_participant_states
+       WHERE applied_revision < revision) AS oldest_pending_sfu_seconds,
+      (SELECT count(*) FROM public.group_call_camera_leases WHERE expires_at <= now())
+        + (SELECT count(*) FROM public.group_call_screen_share_leases WHERE expires_at <= now())
+        AS expired_media_leases`)[0];
+  return [
+    "# HELP toj_group_call_schema_available Whether group-call metrics relations exist.",
+    "# TYPE toj_group_call_schema_available gauge",
+    "toj_group_call_schema_available 1",
+    "# HELP toj_group_call_active_rooms Active group-call rooms.",
+    "# TYPE toj_group_call_active_rooms gauge",
+    `toj_group_call_active_rooms ${Number(row.active_calls)}`,
+    "# HELP toj_group_call_rekeying_rooms Active rooms fenced on a membership epoch transition.",
+    "# TYPE toj_group_call_rekeying_rooms gauge",
+    `toj_group_call_rekeying_rooms ${Number(row.rekeying_calls)}`,
+    "# HELP toj_group_call_sfu_pending_states Durable SFU operations not yet applied.",
+    "# TYPE toj_group_call_sfu_pending_states gauge",
+    `toj_group_call_sfu_pending_states ${Number(row.pending_sfu_states)}`,
+    "# HELP toj_group_call_sfu_failed_states Pending SFU operations with a recorded failure.",
+    "# TYPE toj_group_call_sfu_failed_states gauge",
+    `toj_group_call_sfu_failed_states ${Number(row.failed_sfu_states)}`,
+    "# HELP toj_group_call_sfu_oldest_pending_seconds Age of the oldest pending SFU operation.",
+    "# TYPE toj_group_call_sfu_oldest_pending_seconds gauge",
+    `toj_group_call_sfu_oldest_pending_seconds ${Number(row.oldest_pending_sfu_seconds)}`,
+    "# HELP toj_group_call_expired_media_leases Expired camera and screen leases awaiting cleanup.",
+    "# TYPE toj_group_call_expired_media_leases gauge",
+    `toj_group_call_expired_media_leases ${Number(row.expired_media_leases)}`,
+    "",
+  ].join("\n");
+}
+
 export function providerState(value: unknown): ProviderState {
   return value ? "configured" : "disabled";
 }
@@ -233,8 +290,12 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
   const groupCallInfrastructure = groupCallsConfigured();
   return {
+    // This binary touches group-call device columns and revocation tables from ordinary auth,
+    // PushKit, membership, and account-deletion paths even while admission is dark. Schema is an
+    // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
-      && (!groupCallsRequested || (groupCallInfrastructure && groupCallSchema.ready))
+      && groupCallSchema.ready
+      && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
     database: "ready",

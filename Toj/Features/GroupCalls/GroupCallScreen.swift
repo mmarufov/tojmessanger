@@ -135,15 +135,9 @@ struct TojGroupCallScreen: View {
     private var participantGrid: some View {
         ScrollView {
             LazyVGrid(columns: gridColumns, spacing: 8) {
-                ForEach(coordinator.participants.prefix(9)) { participant in
+                ForEach(coordinator.participants) { participant in
                     participantTile(participant)
                         .aspectRatio(coordinator.participants.count == 1 ? 0.78 : 0.88, contentMode: .fit)
-                }
-                if coordinator.participants.count > 9 {
-                    Text("+\(coordinator.participants.count - 9) more")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity, minHeight: 72)
-                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24))
                 }
             }
             .padding(12)
@@ -357,9 +351,16 @@ struct TojGroupCallScreen: View {
         case .waitingForKey: "Securing the room"
         case .connecting: "Connecting"
         case .connected:
-            coordinator.securityState == .verified
-                ? "\(coordinator.participants.count) in call · end-to-end encrypted"
-                : "Securing the room"
+            switch coordinator.securityState {
+            case .verified:
+                "\(coordinator.participants.count) in call · end-to-end encrypted"
+            case .keyReady:
+                "Encryption ready · checking media"
+            case .preparing, .rekeying:
+                "Securing the room"
+            case .failed:
+                "Security check failed"
+            }
         case .reconnecting: "Reconnecting — audio prioritized"
         case .ending: "Leaving"
         case .ended: "Ended"
@@ -393,7 +394,9 @@ struct TojActiveGroupCallPill: View {
                     .foregroundStyle(TojTheme.secure)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(coordinator.title).font(.subheadline.weight(.semibold))
-                    Text("\(coordinator.participants.count) in encrypted call")
+                    Text(coordinator.securityState == .verified
+                         ? "\(coordinator.participants.count) in end-to-end encrypted call"
+                         : "\(coordinator.participants.count) in group call · checking encryption")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }

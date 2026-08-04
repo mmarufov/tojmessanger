@@ -45,6 +45,7 @@ import {
 import { DraftError, getDraft, putDraft } from "./drafts";
 import {
   dialogPreferenceBacklogMetrics,
+  groupCallBacklogMetrics,
   OperationalMetrics,
   logRequest,
   readiness,
@@ -413,8 +414,19 @@ export function startCloudServer(
               && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
           const groupCallSchema = await groupCallSchemaReadiness(db);
+          const groupCallDevice = capabilitySession != null && groupCallSchema.ready
+            ? (await db`
+                SELECT supports_group_screen_share
+                FROM devices
+                WHERE id = ${capabilitySession.deviceId}
+                  AND account_id = ${capabilitySession.accountId}
+                  AND revoked_at IS NULL
+                  AND 1 = ANY(supported_group_call_versions)
+                  AND group_call_view_version >= 1`)[0]
+            : null;
           const accountGroupCallsAvailable = capabilitySession != null
             && groupCallSchema.ready
+            && groupCallDevice != null
             && groupCallsEnabledForAccount(
               capabilitySession.accountId,
               groupCallInfrastructureAvailable,
@@ -430,6 +442,7 @@ export function startCloudServer(
             dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
             accountGroupCallsAvailable,
             accountGroupCallsAvailable
+              && Boolean(groupCallDevice?.supports_group_screen_share)
               && groupScreenSharingConfigured(groupCallInfrastructureAvailable),
           ));
         }
@@ -439,7 +452,9 @@ export function startCloudServer(
           if (!metricsToken) response = new Response("not found", { status: 404 });
           else if (bearer(req) !== metricsToken) response = new Response("unauthorized", { status: 401 });
           else response = new Response(
-            metrics.render() + await dialogPreferenceBacklogMetrics(db),
+            metrics.render()
+              + await dialogPreferenceBacklogMetrics(db)
+              + await groupCallBacklogMetrics(db),
             { headers: { "content-type": "text/plain; version=0.0.4" } },
           );
         }
@@ -659,7 +674,7 @@ export function startCloudServer(
             dialogId: groupMemberMatch[1],
             targetAccountId: groupMemberMatch[2],
             clientMutationId: body.clientMutationId,
-          });
+          }, options.groupCallSFUControl);
           pushHints(sockets, result.pushes ?? []);
           response = json(result);
         }
@@ -710,7 +725,7 @@ export function startCloudServer(
             dialogId: groupLeaveMatch[1],
             successorAccountId: body.successorAccountId,
             clientMutationId: body.clientMutationId,
-          });
+          }, options.groupCallSFUControl);
           pushHints(sockets, result.pushes);
           response = json({ left: result.left, closed: result.closed });
         }
@@ -780,7 +795,7 @@ export function startCloudServer(
             callId: groupCallActionMatch[1],
             joinPublicKey: body.joinPublicKey,
             joinNonce: body.joinNonce,
-          });
+          }, options.groupCallSFUControl);
           pushGroupCallHints(sockets, result.hints);
           response = json({ call: result.call, duplicate: result.duplicate },
             result.duplicate ? 200 : 202);
@@ -796,7 +811,7 @@ export function startCloudServer(
             keyCommitment: body.keyCommitment,
             participantSetHash: body.participantSetHash,
             envelopes: body.envelopes,
-          });
+          }, options.groupCallSFUControl);
           pushGroupCallHints(sockets, result.hints);
           response = json({ call: result.call, duplicate: result.duplicate });
         }
@@ -804,6 +819,7 @@ export function startCloudServer(
         if (groupCallActionMatch?.[2] === "credentials" && req.method === "GET") {
           response = json(await getGroupCallCredentials(
             db, session.accountId, session.deviceId, groupCallActionMatch[1],
+            options.groupCallSFUControl,
           ));
         }
 
@@ -820,7 +836,7 @@ export function startCloudServer(
             accountId: session.accountId,
             deviceId: session.deviceId,
             callId: groupCallActionMatch[1],
-          });
+          }, options.groupCallSFUControl);
           pushGroupCallHints(sockets, result.hints);
           response = json({ call: result.call, duplicate: result.duplicate });
         }
@@ -831,7 +847,7 @@ export function startCloudServer(
             deviceId: session.deviceId,
             callId: groupCallActionMatch[1],
             reason: body.reason,
-          });
+          }, options.groupCallSFUControl);
           pushGroupCallHints(sockets, result.hints);
           response = json({ call: result.call, duplicate: result.duplicate });
         }
@@ -842,7 +858,7 @@ export function startCloudServer(
             deviceId: session.deviceId,
             callId: groupCallParticipantMatch[1],
             targetDeviceId: groupCallParticipantMatch[2],
-          });
+          }, options.groupCallSFUControl);
           pushGroupCallHints(sockets, result.hints);
           response = json({ call: result.call });
         }
@@ -1094,7 +1110,12 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/session" && req.method === "DELETE") {
-          const result = await revokeDeviceAndTerminateCalls(db, session.accountId, session.deviceId);
+          const result = await revokeDeviceAndTerminateCalls(
+            db,
+            session.accountId,
+            session.deviceId,
+            options.groupCallSFUControl,
+          );
           disconnectDevice(sockets, session.accountId, session.deviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
@@ -1109,7 +1130,12 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/account" && req.method === "DELETE") {
           if (!body.code) throw new AuthError("code required", 400);
-          const result = await deleteAccountAndTerminateCalls(db, session.accountId, String(body.code));
+          const result = await deleteAccountAndTerminateCalls(
+            db,
+            session.accountId,
+            String(body.code),
+            options.groupCallSFUControl,
+          );
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
           disconnectAccount(sockets, session.accountId);
@@ -1126,7 +1152,12 @@ export function startCloudServer(
           if (targetDeviceId === session.deviceId) {
             throw new AuthError("use sign out for the current device", 400);
           }
-          const result = await revokeDeviceAndTerminateCalls(db, session.accountId, targetDeviceId);
+          const result = await revokeDeviceAndTerminateCalls(
+            db,
+            session.accountId,
+            targetDeviceId,
+            options.groupCallSFUControl,
+          );
           disconnectDevice(sockets, session.accountId, targetDeviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);

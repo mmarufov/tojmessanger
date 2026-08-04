@@ -4,6 +4,21 @@ import Foundation
 #if canImport(LiveKit)
 @preconcurrency import LiveKit
 
+private nonisolated final class GroupCallE2EEEventSequencer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        value &+= 1
+        if value == 0 { value = 1 }
+        return value
+    }
+}
+
+private nonisolated let groupCallE2EEEventSequencer = GroupCallE2EEEventSequencer()
+
 /// Tracks which authenticated epoch currently owns each finite cryptor key slot. A delayed
 /// retirement task may target an epoch whose modulo slot has since been reused; in that case it
 /// must not erase the newer occupant.
@@ -61,6 +76,13 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
     private var publishedCameraTier: GroupCallQualityTier?
     private var screenShareActivationRequested = false
     private var failedDecryptions: [String: (count: Int, first: Date)] = [:]
+    private var verifiedTrackEpochs: [String: Int64] = [:]
+    private var e2eeEventFence: UInt64 = 0
+    private var subscriptionSyncRequestedRevision: UInt64 = 0
+    private var subscriptionSyncAppliedRevision: UInt64 = 0
+    private var subscriptionSyncTask: Task<Void, Error>?
+    private var subscriptionSyncToken: UUID?
+    private var transportGeneration: UInt64 = 0
 
     func installEpoch(_ material: GroupCallEpochMaterial) throws {
         guard material.epoch > 0,
@@ -75,6 +97,12 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
             throw GroupCallEngineError.encryptionFailure
         }
         currentEpoch = material.epoch
+        failedDecryptions.removeAll()
+        verifiedTrackEpochs.removeAll()
+        // Delegate callbacks arrive through an independent queue. Fence every callback that was
+        // already in flight before this key became current so an old `.ok` cannot verify a new epoch.
+        e2eeEventFence = groupCallE2EEEventSequencer.next()
+        emitEncryptionState()
     }
 
     func retireEpoch(_ epoch: Int64) {
@@ -106,13 +134,36 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
     }
 
     func connect(credentials: CloudGroupCallCredentials) async throws {
-        guard room == nil else { throw GroupCallEngineError.alreadyConnected }
         guard currentEpoch != nil else { throw GroupCallEngineError.missingEpochKey }
         guard credentials.mediaEpoch == currentEpoch else {
             throw GroupCallEngineError.credentialsEpochMismatch
         }
         guard GroupCallEngineFactory.isAvailable else {
             throw GroupCallEngineError.unsupportedRuntime
+        }
+
+        transportGeneration &+= 1
+        if transportGeneration == 0 { transportGeneration = 1 }
+        let attemptGeneration = transportGeneration
+
+        // LiveKit Cloud membership fencing removes the participant and revokes the old room token.
+        // Replace that transport even when its asynchronous disconnect callback has not arrived.
+        // Delegate callbacks are room-identity fenced below, so the retired room cannot mutate the
+        // replacement connection after this suspension point.
+        if let retiredRoom = room {
+            room = nil
+            subscriptionSyncTask?.cancel()
+            subscriptionSyncTask = nil
+            subscriptionSyncToken = nil
+            subscriptionSyncRequestedRevision = 0
+            subscriptionSyncAppliedRevision = 0
+            _ = try? await retiredRoom.localParticipant.setScreenShare(enabled: false)
+            _ = try? await retiredRoom.localParticipant.setCamera(enabled: false)
+            _ = try? await retiredRoom.localParticipant.setMicrophone(enabled: false)
+            await retiredRoom.disconnect()
+            guard transportGeneration == attemptGeneration else {
+                throw CancellationError()
+            }
         }
 
         try configureAudioSession()
@@ -201,15 +252,23 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
                 connectOptions: connectOptions,
                 roomOptions: options
             )
+            guard transportGeneration == attemptGeneration, self.room === room else {
+                throw CancellationError()
+            }
+            try await synchronizeSubscriptions()
+            guard transportGeneration == attemptGeneration, self.room === room else {
+                throw CancellationError()
+            }
+            emitMediaSnapshot()
         } catch {
             await room.disconnect()
-            self.room = nil
-            participantId = nil
-            onEvent?(.connection(.disconnected))
+            if transportGeneration == attemptGeneration, self.room === room {
+                self.room = nil
+                participantId = nil
+                onEvent?(.connection(.disconnected))
+            }
             throw error
         }
-        try await synchronizeSubscriptions()
-        emitMediaSnapshot()
     }
 
     func setMicrophone(enabled: Bool) async throws {
@@ -325,13 +384,26 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
     }
 
     func disconnect() async {
-        guard let room else { return }
-        BroadcastManager.shared.requestStop()
-        _ = try? await room.localParticipant.setScreenShare(enabled: false)
-        _ = try? await room.localParticipant.setCamera(enabled: false)
-        _ = try? await room.localParticipant.setMicrophone(enabled: false)
-        await room.disconnect()
+        transportGeneration &+= 1
+        if transportGeneration == 0 { transportGeneration = 1 }
+        let disconnectGeneration = transportGeneration
+        let room = self.room
         self.room = nil
+        subscriptionSyncTask?.cancel()
+        subscriptionSyncTask = nil
+        subscriptionSyncToken = nil
+        subscriptionSyncRequestedRevision = 0
+        subscriptionSyncAppliedRevision = 0
+        BroadcastManager.shared.requestStop()
+        if let room {
+            _ = try? await room.localParticipant.setScreenShare(enabled: false)
+            _ = try? await room.localParticipant.setCamera(enabled: false)
+            _ = try? await room.localParticipant.setMicrophone(enabled: false)
+            await room.disconnect()
+        }
+        // A newer connection attempt owns the engine if one began while the retired Room was
+        // unwinding. Never let this delayed teardown erase its key, participant, or callbacks.
+        guard transportGeneration == disconnectGeneration else { return }
         participantId = nil
         currentEpoch = nil
         keySlots.removeAll()
@@ -342,6 +414,8 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
         subscribedCameraPublishers.removeAll()
         authorizedScreenPublisher = nil
         failedDecryptions.removeAll()
+        verifiedTrackEpochs.removeAll()
+        e2eeEventFence = groupCallE2EEEventSequencer.next()
         onEvent?(.videoTracks([]))
         onEvent?(.participants([]))
         onEvent?(.connection(.disconnected))
@@ -385,6 +459,46 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
     }
 
     private func synchronizeSubscriptions() async throws {
+        subscriptionSyncRequestedRevision &+= 1
+        if subscriptionSyncRequestedRevision == 0 { subscriptionSyncRequestedRevision = 1 }
+        let targetRevision = subscriptionSyncRequestedRevision
+        if let subscriptionSyncTask {
+            try await subscriptionSyncTask.value
+            guard subscriptionSyncAppliedRevision >= targetRevision else {
+                throw CancellationError()
+            }
+            return
+        }
+
+        let token = UUID()
+        subscriptionSyncToken = token
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try await self.drainSubscriptionSynchronizations()
+        }
+        subscriptionSyncTask = task
+        defer {
+            if subscriptionSyncToken == token {
+                subscriptionSyncTask = nil
+                subscriptionSyncToken = nil
+            }
+        }
+        try await task.value
+        guard subscriptionSyncAppliedRevision >= targetRevision else {
+            throw CancellationError()
+        }
+    }
+
+    private func drainSubscriptionSynchronizations() async throws {
+        while subscriptionSyncAppliedRevision < subscriptionSyncRequestedRevision {
+            try Task.checkCancellation()
+            let targetRevision = subscriptionSyncRequestedRevision
+            try await synchronizeSubscriptionsPass()
+            subscriptionSyncAppliedRevision = targetRevision
+        }
+    }
+
+    private func synchronizeSubscriptionsPass() async throws {
         guard let room else { return }
         refreshCameraSubscriptionSelection()
         for participant in room.remoteParticipants.values {
@@ -492,6 +606,7 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
         }
         onEvent?(.participants(participants.sorted(by: { $0.id < $1.id })))
         onEvent?(.videoTracks(tracks.sorted(by: { $0.id < $1.id })))
+        emitEncryptionState()
     }
 
     private func qualityName(_ quality: ConnectionQuality) -> String {
@@ -505,14 +620,65 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
         }
     }
 
-    private func handleE2EEState(_ state: E2EEState, trackId: String) {
+    private func expectedEncryptedTrackIds() -> Set<String> {
+        guard let room else { return [] }
+        var expected: Set<String> = []
+        let localId = participantId ?? room.localParticipant.identity?.stringValue
+        if let localId, authorizedParticipantIds.contains(localId) {
+            for publication in room.localParticipant.trackPublications.values
+            where publication.track != nil && !publication.isMuted {
+                let authorized = switch publication.source {
+                case .microphone: true
+                case .camera: authorizedCameraPublishers.contains(localId)
+                case .screenShareVideo, .screenShareAudio: authorizedScreenPublisher == localId
+                case .unknown: false
+                @unknown default: false
+                }
+                if authorized { expected.insert(publication.sid.stringValue) }
+            }
+        }
+        for participant in room.remoteParticipants.values {
+            guard let id = participant.identity?.stringValue,
+                  authorizedParticipantIds.contains(id) else { continue }
+            for publication in participant.trackPublications.values {
+                guard let remote = publication as? RemoteTrackPublication,
+                      remote.track != nil,
+                      !remote.isMuted,
+                      shouldSubscribe(remote, participantId: id) else { continue }
+                expected.insert(remote.sid.stringValue)
+            }
+        }
+        return expected
+    }
+
+    private func emitEncryptionState() {
+        guard let currentEpoch else { return }
+        let expected = expectedEncryptedTrackIds()
+        let verified = Set(expected.filter { verifiedTrackEpochs[$0] == currentEpoch })
+        onEvent?(.encryptionState(
+            epoch: currentEpoch,
+            expectedTrackIds: expected,
+            verifiedTrackIds: verified
+        ))
+    }
+
+    private func handleE2EEState(
+        _ state: E2EEState,
+        trackId: String,
+        arrivalSequence: UInt64
+    ) {
+        guard arrivalSequence > e2eeEventFence else { return }
+        guard let currentEpoch else { return }
         switch state {
         case .ok, .key_ratcheted:
             failedDecryptions[trackId] = nil
-            onEvent?(.encryptionVerified(trackId: trackId))
+            verifiedTrackEpochs[trackId] = currentEpoch
+            emitEncryptionState()
         case .new:
             break
         case .missing_key, .decryption_failed:
+            verifiedTrackEpochs[trackId] = nil
+            emitEncryptionState()
             let now = Date()
             let prior = failedDecryptions[trackId]
             let value: (count: Int, first: Date)
@@ -523,14 +689,34 @@ final class LiveKitGroupCallEngine: NSObject, GroupCallMediaEngine {
             }
             failedDecryptions[trackId] = value
             if value.count >= 3 {
-                onEvent?(.encryptionFailure(trackId: trackId, reason: state.toString()))
+                onEvent?(.encryptionFailure(
+                    epoch: currentEpoch,
+                    trackId: trackId,
+                    reason: state.toString()
+                ))
             } else {
-                onEvent?(.encryptionWarning(trackId: trackId, reason: state.toString()))
+                onEvent?(.encryptionWarning(
+                    epoch: currentEpoch,
+                    trackId: trackId,
+                    reason: state.toString()
+                ))
             }
         case .encryption_failed, .internal_error:
-            onEvent?(.encryptionFailure(trackId: trackId, reason: state.toString()))
+            verifiedTrackEpochs[trackId] = nil
+            emitEncryptionState()
+            onEvent?(.encryptionFailure(
+                epoch: currentEpoch,
+                trackId: trackId,
+                reason: state.toString()
+            ))
         @unknown default:
-            onEvent?(.encryptionFailure(trackId: trackId, reason: "unknown"))
+            verifiedTrackEpochs[trackId] = nil
+            emitEncryptionState()
+            onEvent?(.encryptionFailure(
+                epoch: currentEpoch,
+                trackId: trackId,
+                reason: "unknown"
+            ))
         }
     }
 }
@@ -542,6 +728,7 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         from oldConnectionState: ConnectionState
     ) {
         _ = oldConnectionState
+        let roomIdentity = ObjectIdentifier(room)
         let mapped: GroupCallEngineConnectionState = switch connectionState {
         case .disconnected, .disconnecting: .disconnected
         case .connecting: .connecting
@@ -550,22 +737,32 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         @unknown default: .disconnected
         }
         Task { @MainActor [weak self] in
-            self?.onEvent?(.connection(mapped))
-            self?.emitMediaSnapshot()
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.onEvent?(.connection(mapped))
+            self.emitMediaSnapshot()
         }
     }
 
     nonisolated func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         _ = participant
+        let roomIdentity = ObjectIdentifier(room)
         Task { @MainActor [weak self] in
-            try? await self?.synchronizeSubscriptions()
-            self?.emitMediaSnapshot()
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            try? await self.synchronizeSubscriptions()
+            self.emitMediaSnapshot()
         }
     }
 
     nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         _ = participant
-        Task { @MainActor [weak self] in self?.emitMediaSnapshot() }
+        let roomIdentity = ObjectIdentifier(room)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.emitMediaSnapshot()
+        }
     }
 
     nonisolated func room(
@@ -573,19 +770,25 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         participant: RemoteParticipant,
         didPublishTrack publication: RemoteTrackPublication
     ) {
-        _ = (room, participant, publication)
+        _ = (participant, publication)
+        let roomIdentity = ObjectIdentifier(room)
         Task { @MainActor [weak self] in
-            try? await self?.synchronizeSubscriptions()
-            self?.emitMediaSnapshot()
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            try? await self.synchronizeSubscriptions()
+            self.emitMediaSnapshot()
         }
     }
 
     nonisolated func room(_ room: Room, didUpdateSpeakingParticipants participants: [Participant]) {
         _ = participants
+        let roomIdentity = ObjectIdentifier(room)
         Task { @MainActor [weak self] in
-            self?.refreshCameraSubscriptionSelection()
-            try? await self?.synchronizeSubscriptions()
-            self?.emitMediaSnapshot()
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.refreshCameraSubscriptionSelection()
+            try? await self.synchronizeSubscriptions()
+            self.emitMediaSnapshot()
         }
     }
 
@@ -595,7 +798,12 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         didUpdateConnectionQuality quality: ConnectionQuality
     ) {
         _ = (participant, quality)
-        Task { @MainActor [weak self] in self?.emitMediaSnapshot() }
+        let roomIdentity = ObjectIdentifier(room)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.emitMediaSnapshot()
+        }
     }
 
     nonisolated func room(
@@ -604,7 +812,12 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         didSubscribeTrack publication: RemoteTrackPublication
     ) {
         _ = (participant, publication)
-        Task { @MainActor [weak self] in self?.emitMediaSnapshot() }
+        let roomIdentity = ObjectIdentifier(room)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.emitMediaSnapshot()
+        }
     }
 
     nonisolated func room(
@@ -613,7 +826,12 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         didUnsubscribeTrack publication: RemoteTrackPublication
     ) {
         _ = (participant, publication)
-        Task { @MainActor [weak self] in self?.emitMediaSnapshot() }
+        let roomIdentity = ObjectIdentifier(room)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.emitMediaSnapshot()
+        }
     }
 
     nonisolated func room(
@@ -623,7 +841,12 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         didUpdateIsMuted isMuted: Bool
     ) {
         _ = (participant, trackPublication, isMuted)
-        Task { @MainActor [weak self] in self?.emitMediaSnapshot() }
+        let roomIdentity = ObjectIdentifier(room)
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.emitMediaSnapshot()
+        }
     }
 
     nonisolated func room(
@@ -632,8 +855,16 @@ extension LiveKitGroupCallEngine: RoomDelegate {
         didUpdateE2EEState state: E2EEState
     ) {
         let trackId = trackPublication.sid.stringValue
+        let arrivalSequence = groupCallE2EEEventSequencer.next()
+        let roomIdentity = ObjectIdentifier(room)
         Task { @MainActor [weak self] in
-            self?.handleE2EEState(state, trackId: trackId)
+            guard let self,
+                  self.room.map(ObjectIdentifier.init) == roomIdentity else { return }
+            self.handleE2EEState(
+                state,
+                trackId: trackId,
+                arrivalSequence: arrivalSequence
+            )
         }
     }
 }

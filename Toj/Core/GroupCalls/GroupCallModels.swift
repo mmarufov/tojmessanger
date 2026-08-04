@@ -272,6 +272,7 @@ nonisolated enum GroupCallConnectionState: String, Codable, Equatable, Sendable 
 
 nonisolated enum GroupCallSecurityState: String, Codable, Equatable, Sendable {
     case preparing
+    case keyReady = "key_ready"
     case verified
     case rekeying
     case failed
