@@ -47,6 +47,9 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     /// screen to chats and people rather than showing a broken Messages tab.
     static let localSearch = Self(rawValue: 1 << 17)
     static let mediaGroups = Self(rawValue: 1 << 18)
+    static let groupCalls = Self(rawValue: 1 << 19)
+    static let groupVideoCalls = Self(rawValue: 1 << 20)
+    static let screenSharing = Self(rawValue: 1 << 21)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [

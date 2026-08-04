@@ -136,6 +136,7 @@ struct TojConversationExperience: View {
             timelinePosition = ScrollPosition(idType: TimelineTargetID.self)
             await model.selectDialog(dialogId)
             guard !Task.isCancelled, model.activeDialogId == dialogId else { return }
+            if isGroup { await model.refreshGroupCall(dialogId: dialogId) }
             refreshOpeningUnreadDivider(for: model.openingTimelineAnchor)
             applyOpeningTimelineAnchor()
         }
@@ -373,6 +374,46 @@ struct TojConversationExperience: View {
                     .accessibilityLabel("Video call \(model.dialogTitle(dialogId))")
                 }
 
+                if isGroup && model.capabilities.contains(.groupCalls) {
+                    let activeHere = model.groupCallCoordinator.activeDialogId == dialogId
+                    let available = model.groupCallCoordinator.availableCalls[dialogId] != nil
+                    if activeHere || available {
+                        Button {
+                            if activeHere {
+                                model.groupCallCoordinator.isPresented = true
+                            } else {
+                                Task { await model.joinGroupCall(dialogId: dialogId) }
+                            }
+                        } label: {
+                            Image(systemName: activeHere ? "waveform.circle.fill" : "person.3.fill")
+                                .foregroundStyle(.green)
+                                .frame(width: 46, height: 46)
+                        }
+                        .buttonStyle(.glass)
+                        .accessibilityLabel(activeHere ? "Return to group call" : "Join group call")
+                    } else {
+                        Menu {
+                            Button {
+                                Task { await model.startGroupCall(dialogId: dialogId, initialKind: .voice) }
+                            } label: {
+                                Label("Start voice chat", systemImage: "phone.fill")
+                            }
+                            if model.capabilities.contains(.groupVideoCalls) {
+                                Button {
+                                    Task { await model.startGroupCall(dialogId: dialogId, initialKind: .video) }
+                                } label: {
+                                    Label("Start video chat", systemImage: "video.fill")
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "person.3.fill")
+                                .frame(width: 46, height: 46)
+                        }
+                        .buttonStyle(.glass)
+                        .accessibilityLabel("Start group call")
+                    }
+                }
+
                 Button {
                     guard !isSavedMessages else { return }
                     showingProfile = isGroup
@@ -462,6 +503,38 @@ struct TojConversationExperience: View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView {
                 LazyVStack(spacing: 3) {
+                    if isGroup,
+                       model.groupCallCoordinator.activeDialogId != dialogId,
+                       let activeCall = model.groupCallCoordinator.availableCalls[dialogId] {
+                        Button {
+                            Task { await model.joinGroupCall(dialogId: dialogId) }
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: activeCall.initialKind == .video
+                                    ? "video.fill" : "waveform")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(activeCall.initialKind == .video
+                                        ? "Video chat in progress" : "Voice chat in progress")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text("\(activeCall.participants.count) joined · end-to-end encrypted")
+                                        .font(.caption)
+                                        .foregroundStyle(TojTheme.secondaryText)
+                                }
+                                Spacer()
+                                Text("Join")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(.green)
+                            }
+                            .padding(14)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.vertical, 8)
+                        .accessibilityLabel("Join encrypted group call")
+                    }
+
                     if isSavedMessages {
                         timelinePill(
                             Text("Notes and files for your Toj account"),

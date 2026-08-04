@@ -17,6 +17,7 @@ import {
 import {
   APNsClient,
   PushError,
+  registerGroupCallCapabilities,
   registerPushToken,
   registerVoIPPushToken,
   startPushWorker,
@@ -120,9 +121,45 @@ import {
 } from "./dialog-preferences";
 import { dialogPreferenceBehaviorAvailable } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
+import {
+  acquireGroupCamera,
+  acquireGroupScreenShare,
+  activateGroupCallEpoch,
+  endGroupCall,
+  getActiveGroupCall,
+  getGroupCall,
+  getGroupCallCredentials,
+  groupCallSchemaReadiness,
+  groupCallSFUControlConfigured,
+  groupCallsConfigured,
+  groupCallsEnabledForAccount,
+  groupScreenSharingConfigured,
+  GroupCallError,
+  heartbeatGroupCall,
+  heartbeatGroupCamera,
+  heartbeatGroupScreenShare,
+  joinGroupCall,
+  leaveGroupCall,
+  releaseGroupCamera,
+  releaseGroupScreenShare,
+  removeGroupCallParticipant,
+  resolveGroupCallHintTargets,
+  startGroupCall,
+  startGroupCallCleanupWorker,
+  startGroupCallNotificationListener,
+  startGroupCallSFUWorker,
+  type GroupCallHint,
+  type GroupCallSFUControl,
+} from "./group-calls";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
+
+export type CloudServerOptions = {
+  /** Deterministic integration tests can disable all polling/listener side effects. */
+  backgroundWorkers?: boolean;
+  groupCallSFUControl?: GroupCallSFUControl;
+};
 
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
 const MAX_JSON_BYTES = 64 * 1024;
@@ -150,6 +187,8 @@ function cloudCapabilities(
   cloudDrafts: boolean,
   mediaGroups: boolean,
   dialogPreferences: boolean,
+  groupCalls: boolean,
+  groupScreenSharing: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -159,6 +198,8 @@ function cloudCapabilities(
   if (cloudDrafts) capabilities.push("cloud_drafts_v1");
   if (mediaGroups) capabilities.push("media_groups_v1");
   if (dialogPreferences) capabilities.push("dialog_preferences_v1");
+  if (groupCalls) capabilities.push("group_calls_v1", "group_video_calls_v1");
+  if (groupScreenSharing) capabilities.push("screen_sharing_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -245,6 +286,22 @@ function pushCallHints(sockets: Map<string, Set<ServerWebSocket<SocketData>>>, h
   }
 }
 
+function pushGroupCallHints(
+  sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
+  hints: GroupCallHint[],
+) {
+  for (const hint of hints) {
+    const payload = JSON.stringify({
+      type: "group_call_hint",
+      callId: hint.callId,
+      stateRevision: hint.stateRevision,
+    });
+    for (const ws of sockets.get(hint.accountId) ?? []) {
+      if (ws.data.deviceId === hint.deviceId && ws.readyState === 1) ws.send(payload);
+    }
+  }
+}
+
 function disconnectDevice(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
@@ -275,12 +332,14 @@ export function startCloudServer(
   db: Db = defaultSql,
   pushSender: PushSender | null = APNsClient.fromEnvironment(),
   otpDelivery: OTPDelivery | null = otpDeliveryFromEnvironment(),
+  options: CloudServerOptions = {},
 ) {
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const metrics = new OperationalMetrics();
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
+  const groupCallInfrastructureAvailable = groupCallsConfigured(groupsAvailable);
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
@@ -291,14 +350,21 @@ export function startCloudServer(
       mediaGroups: mediaGroupsAvailable && schema.ready,
     };
   };
-  const stopPushWorker = startPushWorker(db, pushSender);
-  const stopMaintenanceWorker = startMaintenanceWorker(db, undefined, metrics);
-  const stopCallCleanupWorker = startCallCleanupWorker(db);
-  const stopSyncNotifications = startSyncNotificationListener(
+  const backgroundWorkers = options.backgroundWorkers !== false;
+  const stopPushWorker = backgroundWorkers ? startPushWorker(db, pushSender) : () => {};
+  const stopMaintenanceWorker = backgroundWorkers
+    ? startMaintenanceWorker(db, undefined, metrics) : () => {};
+  const stopCallCleanupWorker = backgroundWorkers ? startCallCleanupWorker(db) : () => {};
+  const stopGroupCallCleanupWorker = backgroundWorkers
+    ? startGroupCallCleanupWorker(db) : () => {};
+  const stopGroupCallSFUWorker = backgroundWorkers && groupCallSFUControlConfigured()
+    ? startGroupCallSFUWorker(db, 2_000, options.groupCallSFUControl)
+    : () => {};
+  const stopSyncNotifications = backgroundWorkers ? startSyncNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
     (wakeup) => pushHints(sockets, [wakeup]),
-  );
-  const stopCallNotifications = startCallNotificationListener(
+  ) : () => {};
+  const stopCallNotifications = backgroundWorkers ? startCallNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
     async (wakeup) => {
       const localDeviceIds = [...sockets.values()]
@@ -306,7 +372,16 @@ export function startCloudServer(
       const hints = await resolveCallHintTargets(db, wakeup, [...new Set(localDeviceIds)]);
       pushCallHints(sockets, hints);
     },
-  );
+  ) : () => {};
+  const stopGroupCallNotifications = backgroundWorkers ? startGroupCallNotificationListener(
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
+    async (wakeup) => {
+      const localDeviceIds = [...sockets.values()]
+        .flatMap((set) => [...set].map((socket) => socket.data.deviceId));
+      const hints = await resolveGroupCallHintTargets(db, wakeup, [...new Set(localDeviceIds)]);
+      pushGroupCallHints(sockets, hints);
+    },
+  ) : () => {};
 
   const server = Bun.serve<SocketData>({
     port,
@@ -337,6 +412,13 @@ export function startCloudServer(
             ? (await savedMessagesSchemaReadiness(db)).ready
               && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
+          const groupCallSchema = await groupCallSchemaReadiness(db);
+          const accountGroupCallsAvailable = capabilitySession != null
+            && groupCallSchema.ready
+            && groupCallsEnabledForAccount(
+              capabilitySession.accountId,
+              groupCallInfrastructureAvailable,
+            );
           const draftMedia = await draftMediaAvailability();
           response = json(cloudCapabilities(
             callsAvailable,
@@ -346,6 +428,9 @@ export function startCloudServer(
             draftMedia.cloudDrafts,
             draftMedia.mediaGroups,
             dialogPreferencesConfigured && await dialogPreferenceBehaviorAvailable(db),
+            accountGroupCallsAvailable,
+            accountGroupCallsAvailable
+              && groupScreenSharingConfigured(groupCallInfrastructureAvailable),
           ));
         }
 
@@ -396,6 +481,18 @@ export function startCloudServer(
         }
 
         else if (
+          (url.pathname === "/v1/group-calls" || url.pathname.startsWith("/v1/group-calls/"))
+          && (
+            !groupCallInfrastructureAvailable
+            || !(await groupCallSchemaReadiness(db)).ready
+          )
+        ) {
+          // Hide the complete control plane until the SFU, mandatory frame E2EE, base groups,
+          // and additive schema are all ready. This is also the zero-risk rollback path.
+          response = new Response("not found", { status: 404 });
+        }
+
+        else if (
           url.pathname === "/v1/dialogs/saved"
           && req.method === "POST"
           && (
@@ -421,6 +518,10 @@ export function startCloudServer(
 
         else {
           const session = await authed(db, req);
+          const groupCallsAvailableForSession = groupCallsEnabledForAccount(
+            session.accountId,
+            groupCallInfrastructureAvailable,
+          );
           const uploadChunkMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/chunks$/i);
           const uploadPartMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/parts\/(\d+)$/i);
           const uploadThumbnailMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/thumbnail$/i);
@@ -471,7 +572,9 @@ export function startCloudServer(
           } else {
           const body = await readJson(
             req,
-            /^\/v1\/calls\/[0-9a-f-]+\/events$/i.test(url.pathname) ? 96 * 1024 : MAX_JSON_BYTES,
+            /^\/v1\/calls\/[0-9a-f-]+\/events$/i.test(url.pathname) ? 96 * 1024
+              : /^\/v1\/group-calls\/[0-9a-f-]+\/epochs$/i.test(url.pathname) ? 160 * 1024
+              : MAX_JSON_BYTES,
           );
           const callActionMatch = url.pathname.match(
             /^\/v1\/calls\/([0-9a-f-]+)\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i,
@@ -486,6 +589,25 @@ export function startCloudServer(
           const groupLeaveMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/leave$/i);
           const groupNotificationsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/notifications$/i);
           const groupMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)$/i);
+          const groupCallMatch = url.pathname.match(/^\/v1\/group-calls\/([0-9a-f-]+)$/i);
+          const groupCallActionMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/(join|leave|end|heartbeat|credentials|epochs|camera|screen-share)$/i,
+          );
+          const groupCallCameraHeartbeatMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/camera\/heartbeat$/i,
+          );
+          const groupCallScreenHeartbeatMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/screen-share\/heartbeat$/i,
+          );
+          const groupCallCameraReleaseMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/camera\/release$/i,
+          );
+          const groupCallScreenReleaseMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/screen-share\/release$/i,
+          );
+          const groupCallParticipantMatch = url.pathname.match(
+            /^\/v1\/group-calls\/([0-9a-f-]+)\/participants\/([0-9a-f-]+)$/i,
+          );
           const dialogPreferencesMatch = url.pathname.match(
             /^\/v1\/dialogs\/([0-9a-f-]+)\/preferences$/i,
           );
@@ -608,6 +730,188 @@ export function startCloudServer(
           response = json(result.envelope);
         }
 
+        if (url.pathname === "/v1/group-calls" && req.method === "POST") {
+          if (!groupCallsAvailableForSession) {
+            throw new GroupCallError("group calls are unavailable", "capability_unavailable", 404);
+          }
+          const result = await startGroupCall(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: body.callId,
+            dialogId: body.dialogId,
+            initialKind: body.initialKind,
+            joinPublicKey: body.joinPublicKey,
+            joinNonce: body.joinNonce,
+            epochKeyCommitment: body.epochKeyCommitment,
+          }, options.groupCallSFUControl);
+          pushGroupCallHints(sockets, result.hints);
+          response = json({
+            call: result.call,
+            credentials: result.credentials,
+            duplicate: result.duplicate,
+          }, result.duplicate ? 200 : 201);
+        }
+
+        if (url.pathname === "/v1/group-calls/active" && req.method === "GET") {
+          if (!groupCallsAvailableForSession) {
+            throw new GroupCallError("group calls are unavailable", "capability_unavailable", 404);
+          }
+          response = json(await getActiveGroupCall(
+            db,
+            session.accountId,
+            session.deviceId,
+            url.searchParams.get("dialogId"),
+          ));
+        }
+
+        if (groupCallMatch && req.method === "GET") {
+          response = json(await getGroupCall(
+            db, session.accountId, session.deviceId, groupCallMatch[1],
+          ));
+        }
+
+        if (groupCallActionMatch?.[2] === "join" && req.method === "POST") {
+          if (!groupCallsAvailableForSession) {
+            throw new GroupCallError("group calls are unavailable", "capability_unavailable", 404);
+          }
+          const result = await joinGroupCall(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+            joinPublicKey: body.joinPublicKey,
+            joinNonce: body.joinNonce,
+          });
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ call: result.call, duplicate: result.duplicate },
+            result.duplicate ? 200 : 202);
+        }
+
+        if (groupCallActionMatch?.[2] === "epochs" && req.method === "POST") {
+          const result = await activateGroupCallEpoch(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+            epoch: body.epoch,
+            expectedMembershipRevision: body.expectedMembershipRevision,
+            keyCommitment: body.keyCommitment,
+            participantSetHash: body.participantSetHash,
+            envelopes: body.envelopes,
+          });
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ call: result.call, duplicate: result.duplicate });
+        }
+
+        if (groupCallActionMatch?.[2] === "credentials" && req.method === "GET") {
+          response = json(await getGroupCallCredentials(
+            db, session.accountId, session.deviceId, groupCallActionMatch[1],
+          ));
+        }
+
+        if (groupCallActionMatch?.[2] === "heartbeat" && req.method === "POST") {
+          response = json(await heartbeatGroupCall(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+          }));
+        }
+
+        if (groupCallActionMatch?.[2] === "leave" && req.method === "POST") {
+          const result = await leaveGroupCall(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+          });
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ call: result.call, duplicate: result.duplicate });
+        }
+
+        if (groupCallActionMatch?.[2] === "end" && req.method === "POST") {
+          const result = await endGroupCall(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+            reason: body.reason,
+          });
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ call: result.call, duplicate: result.duplicate });
+        }
+
+        if (groupCallParticipantMatch && req.method === "DELETE") {
+          const result = await removeGroupCallParticipant(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallParticipantMatch[1],
+            targetDeviceId: groupCallParticipantMatch[2],
+          });
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ call: result.call });
+        }
+
+        if (groupCallActionMatch?.[2] === "camera" && req.method === "POST") {
+          const result = await acquireGroupCamera(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+            generation: body.generation,
+          }, options.groupCallSFUControl);
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ generation: result.generation, expiresAt: result.expiresAt, call: result.call });
+        }
+
+        if (groupCallCameraHeartbeatMatch && req.method === "POST") {
+          response = json(await heartbeatGroupCamera(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallCameraHeartbeatMatch[1],
+            generation: body.generation,
+          }));
+        }
+
+        if (groupCallCameraReleaseMatch && req.method === "POST") {
+          const result = await releaseGroupCamera(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallCameraReleaseMatch[1],
+            generation: body.generation,
+          }, options.groupCallSFUControl);
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ released: true });
+        }
+
+        if (groupCallActionMatch?.[2] === "screen-share" && req.method === "POST") {
+          if (!groupCallsAvailableForSession) {
+            throw new GroupCallError("group calls are unavailable", "capability_unavailable", 404);
+          }
+          const result = await acquireGroupScreenShare(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallActionMatch[1],
+            generation: body.generation,
+          }, options.groupCallSFUControl);
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ generation: result.generation, expiresAt: result.expiresAt, call: result.call });
+        }
+
+        if (groupCallScreenHeartbeatMatch && req.method === "POST") {
+          response = json(await heartbeatGroupScreenShare(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallScreenHeartbeatMatch[1],
+            generation: body.generation,
+          }));
+        }
+
+        if (groupCallScreenReleaseMatch && req.method === "POST") {
+          const result = await releaseGroupScreenShare(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            callId: groupCallScreenReleaseMatch[1],
+            generation: body.generation,
+          }, options.groupCallSFUControl);
+          pushGroupCallHints(sockets, result.hints);
+          response = json({ released: true });
+        }
+
         if (dialogPreferencesMatch && req.method === "PUT") {
           const result = await updateDialogPreferences(db, {
             accountId: session.accountId,
@@ -643,6 +947,19 @@ export function startCloudServer(
             body.supportedCallProtocolVersions,
             body.supportedCallMediaProfileVersions,
             body.callViewVersion,
+            body.supportedGroupCallVersions,
+            body.groupCallViewVersion,
+            body.supportsGroupScreenShare,
+          ));
+        }
+
+        if (url.pathname === "/v1/devices/group-call-capabilities" && req.method === "PUT") {
+          response = json(await registerGroupCallCapabilities(
+            db,
+            session.deviceId,
+            body.supportedGroupCallVersions,
+            body.groupCallViewVersion,
+            body.supportsGroupScreenShare,
           ));
         }
 
@@ -1054,6 +1371,7 @@ export function startCloudServer(
           ? err.status
           : err instanceof MediaError ? err.status
           : err instanceof CallError ? err.status
+          : err instanceof GroupCallError ? err.status
           : err instanceof GroupError ? err.status
           : err instanceof SavedMessagesError ? err.status
           : err instanceof DialogPreferenceError ? err.status
@@ -1074,6 +1392,7 @@ export function startCloudServer(
         if (err instanceof AuthError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof MediaError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof CallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof GroupCallError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof GroupError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof DraftError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof DialogPreferenceError && err.retryAfter) {
@@ -1084,6 +1403,7 @@ export function startCloudServer(
           error: message,
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof GroupCallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof SavedMessagesError ? { code: err.code } : {}),
           ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
@@ -1134,8 +1454,11 @@ export function startCloudServer(
     stopPushWorker();
     stopMaintenanceWorker();
     stopCallCleanupWorker();
+    stopGroupCallCleanupWorker();
+    stopGroupCallSFUWorker();
     stopSyncNotifications();
     stopCallNotifications();
+    stopGroupCallNotifications();
     return originalStop(closeActiveConnections);
   }) as typeof server.stop;
 

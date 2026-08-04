@@ -15,6 +15,7 @@ import {
 } from "./call-versions";
 import { handoffOwnedGroupsForDeletedAccount } from "./groups";
 import { purgeAccountDraftState } from "./drafts";
+import { revokeGroupCallAccountTx, revokeGroupCallDeviceTx } from "./group-calls";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
@@ -1427,6 +1428,7 @@ export async function revokeDeviceAndTerminateCalls(
   const revoked = await revokeAuthDevice(sql, accountId, deviceId, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "device", accountId, deviceId);
+      await revokeGroupCallDeviceTx(tx, accountId, deviceId);
     },
   });
   const syncPushes = await flushCallHistory(sql, ended);
@@ -1441,6 +1443,7 @@ export async function deleteAccountAndTerminateCalls(sql: SQL, accountId: string
   const deleted = await deleteAuthAccount(sql, accountId, code, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "account", accountId);
+      await revokeGroupCallAccountTx(tx, accountId);
       await handoffOwnedGroupsForDeletedAccount(tx, accountId);
       await purgeAccountDraftState(tx, accountId);
     },

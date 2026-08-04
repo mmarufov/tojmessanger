@@ -12,6 +12,12 @@ nonisolated struct CallHint: Codable, Equatable, Sendable {
     let latestEventSeq: Int64
 }
 
+nonisolated struct GroupCallSocketHint: Codable, Equatable, Sendable {
+    let type: String
+    let callId: String
+    let stateRevision: Int64
+}
+
 nonisolated struct SessionRevokedHint: Codable, Equatable, Sendable {
     let type: String
     let deviceId: String?
@@ -21,6 +27,7 @@ nonisolated struct SessionRevokedHint: Codable, Equatable, Sendable {
 nonisolated enum CloudSocketEvent: Equatable, Sendable {
     case sync(SyncHint)
     case call(CallHint)
+    case groupCall(GroupCallSocketHint)
     case sessionRevoked(SessionRevokedHint)
 }
 
@@ -156,6 +163,9 @@ actor CloudHintSocket {
             return (try? decoder.decode(SyncHint.self, from: data)).map(CloudSocketEvent.sync)
         case "call_hint":
             return (try? decoder.decode(CallHint.self, from: data)).map(CloudSocketEvent.call)
+        case "group_call_hint":
+            return (try? decoder.decode(GroupCallSocketHint.self, from: data))
+                .map(CloudSocketEvent.groupCall)
         case "session_revoked":
             return (try? decoder.decode(SessionRevokedHint.self, from: data)).map(CloudSocketEvent.sessionRevoked)
         default:

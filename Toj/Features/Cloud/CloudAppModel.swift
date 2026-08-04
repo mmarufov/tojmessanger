@@ -430,6 +430,7 @@ final class CloudAppModel {
     private var mutationTargetsBeingQueued: Set<String> = []
     private var uploadedPushRegistration: String?
     private var uploadedVoIPPushRegistration: String?
+    private var uploadedGroupCallCapabilityRegistration: String?
     private var historyHasMoreByDialog: [String: Bool] = [:]
     private var draftPersistenceGenerations: [String: UInt64] = [:]
     private var minimumObservedDraftGenerations: [String: Int64] = [:]
@@ -491,20 +492,24 @@ final class CloudAppModel {
     #endif
 
     let callCoordinator: CallCoordinator
+    let groupCallCoordinator: GroupCallCoordinator
     let callPreferences: CallPrivacyPreferences
 
     var capabilities: MessagingCapabilities {
         #if DEBUG
         if isDemoMode { return .demo.union(searchCapability) }
         #endif
-        let serverCapabilities: MessagingCapabilities
-        guard WebRTCEngineFactory.isAvailable else {
-            serverCapabilities = negotiatedCapabilities.subtracting([.calls, .videoCalls])
-            return serverCapabilities.union(searchCapability)
+        var serverCapabilities = negotiatedCapabilities
+        if !WebRTCEngineFactory.isAvailable {
+            serverCapabilities.subtract([.calls, .videoCalls])
+        } else if !WebRTCEngineFactory.supportsCameraVideoProfile {
+            serverCapabilities.remove(.videoCalls)
         }
-        serverCapabilities = WebRTCEngineFactory.supportsCameraVideoProfile
-            ? negotiatedCapabilities
-            : negotiatedCapabilities.subtracting(.videoCalls)
+        if !GroupCallEngineFactory.isAvailable {
+            serverCapabilities.subtract([.groupCalls, .groupVideoCalls, .screenSharing])
+        } else if !GroupCallEngineFactory.supportsScreenShare {
+            serverCapabilities.remove(.screenSharing)
+        }
         return serverCapabilities.union(searchCapability)
     }
 
@@ -547,6 +552,7 @@ final class CloudAppModel {
         pushCenter: PushRegistrationCenter = .shared,
         voipPushCenter: VoIPPushRegistrationCenter = .shared,
         callCoordinator: CallCoordinator = .shared,
+        groupCallCoordinator: GroupCallCoordinator = .shared,
         callPreferences: CallPrivacyPreferences = .shared,
         localStore injectedLocalStore: CloudLocalStore? = nil,
         useDefaultLocalStore: Bool = true,
@@ -558,6 +564,7 @@ final class CloudAppModel {
         self.pushCenter = pushCenter
         self.voipPushCenter = voipPushCenter
         self.callCoordinator = callCoordinator
+        self.groupCallCoordinator = groupCallCoordinator
         self.callPreferences = callPreferences
         self.mediaEngine = injectedMediaEngine ?? CloudMediaTransferEngine(config: config)
         self.opensDefaultLocalStore = useDefaultLocalStore && injectedLocalStore == nil
@@ -568,7 +575,9 @@ final class CloudAppModel {
         ) as? NSNumber
         self.negotiatedCapabilities = cached.map {
             MessagingCapabilities(rawValue: $0.uint64Value)
-                .subtracting([.videoCalls, .savedMessages])
+                .subtracting([
+                    .videoCalls, .savedMessages, .groupCalls, .groupVideoCalls, .screenSharing,
+                ])
         } ?? [.replies]
         self.localStore = injectedLocalStore
         voiceRecorder.onUnexpectedStop = { [weak self] in
@@ -1261,7 +1270,9 @@ final class CloudAppModel {
         loadingDevices = false
         uploadedPushRegistration = nil
         uploadedVoIPPushRegistration = nil
+        uploadedGroupCallCapabilityRegistration = nil
         callCoordinator.unbind()
+        groupCallCoordinator.unbind()
         pts = 0
         phone = "+992 "
         displayName = ""
@@ -1795,6 +1806,15 @@ final class CloudAppModel {
         } catch {
             presentNotice("Group details unavailable", message: error.localizedDescription)
         }
+    }
+
+    private func groupCallParticipantName(accountId: String, dialogId: String) -> String {
+        if accountId == storedSession?.session.accountId {
+            return displayName.isEmpty ? String(localized: "You") : displayName
+        }
+        return groupMembersByDialog[dialogId]?
+            .first(where: { $0.accountId == accountId })?
+            .displayName ?? shortDialogId(accountId)
     }
 
     func updateGroupTitle(dialogId: String, title: String) async -> Bool {
@@ -2954,6 +2974,10 @@ final class CloudAppModel {
             return
         }
         #endif
+        guard !groupCallCoordinator.hasActiveCall else {
+            groupCallCoordinator.isPresented = true
+            return
+        }
         guard capabilities.contains(.calls) else {
             presentNotice("Voice calls unavailable", message: "This server has not enabled encrypted calling yet.")
             return
@@ -2980,6 +3004,10 @@ final class CloudAppModel {
             return
         }
         #endif
+        guard !groupCallCoordinator.hasActiveCall else {
+            groupCallCoordinator.isPresented = true
+            return
+        }
         guard capabilities.contains(.videoCalls) else {
             presentNotice(
                 "Video calls unavailable",
@@ -3003,6 +3031,50 @@ final class CloudAppModel {
             displayName: dialogTitle(dialogId),
             initialKind: .video
         )
+    }
+
+    func startGroupCall(dialogId: String, initialKind: GroupCallInitialKind) async {
+        #if DEBUG
+        if isDemoMode {
+            presentNotice("Group calls", message: "Sign in to start an encrypted group call.")
+            return
+        }
+        #endif
+        guard !callCoordinator.state.isInProgress else {
+            callCoordinator.isPresented = true
+            return
+        }
+        guard dialogs.first(where: { $0.id == dialogId })?.type == "group" else { return }
+        let required: MessagingCapabilities = initialKind == .video ? .groupVideoCalls : .groupCalls
+        guard capabilities.contains(required) else {
+            presentNotice(
+                "Group calls unavailable",
+                message: "Encrypted group calling has not been enabled for this account and device yet."
+            )
+            return
+        }
+        await groupCallCoordinator.start(
+            dialogId: dialogId,
+            title: dialogTitle(dialogId),
+            initialKind: initialKind
+        )
+    }
+
+    func joinGroupCall(dialogId: String) async {
+        guard !callCoordinator.state.isInProgress else {
+            callCoordinator.isPresented = true
+            return
+        }
+        guard capabilities.contains(.groupCalls) else { return }
+        await groupCallCoordinator.joinAvailableCall(
+            dialogId: dialogId,
+            title: dialogTitle(dialogId)
+        )
+    }
+
+    func refreshGroupCall(dialogId: String) async {
+        guard capabilities.contains(.groupCalls) else { return }
+        await groupCallCoordinator.refreshActiveCall(dialogId: dialogId)
     }
 
     func blockPeer(dialogId: String) async -> Bool {
@@ -4459,6 +4531,10 @@ final class CloudAppModel {
             callCoordinator.configure(api: api, session: session) { [weak self] dialogId, _ in
                 self?.dialogTitle(dialogId) ?? String(localized: "Toj caller")
             }
+            groupCallCoordinator.configure(api: api, session: session) { [weak self] accountId, dialogId in
+                self?.groupCallParticipantName(accountId: accountId, dialogId: dialogId)
+                    ?? String(accountId.prefix(8))
+            }
         }
         await refreshMediaCacheUsage()
         // Bind search at local-ready time, not only when the UI happens to open the Search tab.
@@ -5169,6 +5245,17 @@ final class CloudAppModel {
             if advertised.contains("video_calls_v1"), WebRTCEngineFactory.supportsCameraVideoProfile {
                 resolved.insert(.videoCalls)
             }
+            if advertised.contains("group_calls_v1"), GroupCallEngineFactory.isAvailable {
+                resolved.insert(.groupCalls)
+            }
+            if advertised.contains("group_video_calls_v1"), resolved.contains(.groupCalls) {
+                resolved.insert(.groupVideoCalls)
+            }
+            if advertised.contains("screen_sharing_v1"),
+               resolved.contains(.groupCalls),
+               GroupCallEngineFactory.supportsScreenShare {
+                resolved.insert(.screenSharing)
+            }
             negotiatedCapabilities = resolved
             await draftSyncCoordinator.configure(
                 store: localStore,
@@ -5440,12 +5527,16 @@ final class CloudAppModel {
             return
         }
         let capabilities = WebRTCEngineFactory.deviceCapabilities
+        let groupCapabilities = GroupCallEngineFactory.deviceCapabilities
         let registration = [
             environment,
             deviceToken,
             capabilities.supportedCallProtocolVersions.map(String.init).joined(separator: ","),
             capabilities.supportedCallMediaProfileVersions.map(String.init).joined(separator: ","),
             String(capabilities.callViewVersion),
+            groupCapabilities.supportedGroupCallVersions.map(String.init).joined(separator: ","),
+            String(groupCapabilities.groupCallViewVersion),
+            String(groupCapabilities.supportsGroupScreenShare),
         ].joined(separator: ":")
         guard uploadedVoIPPushRegistration != registration else { return }
         do {
@@ -5453,7 +5544,8 @@ final class CloudAppModel {
                 deviceToken,
                 environment: environment,
                 token: token,
-                capabilities: capabilities
+                capabilities: capabilities,
+                groupCapabilities: groupCapabilities
             )
             guard storedSession?.session.token == token,
                   callCoordinator.canRegisterForIncomingCalls else {
@@ -5464,6 +5556,26 @@ final class CloudAppModel {
             uploadedVoIPPushRegistration = registration
         } catch {
             status = "Call push registration failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func syncGroupCallCapabilities() async {
+        guard let token = storedSession?.session.token else { return }
+        let capabilities = GroupCallEngineFactory.deviceCapabilities
+        let registration = [
+            capabilities.supportedGroupCallVersions.map(String.init).joined(separator: ","),
+            String(capabilities.groupCallViewVersion),
+            String(capabilities.supportsGroupScreenShare),
+        ].joined(separator: ":")
+        guard uploadedGroupCallCapabilityRegistration != registration else { return }
+        do {
+            _ = try await api.registerGroupCallCapabilities(capabilities, token: token)
+            guard storedSession?.session.token == token else { return }
+            uploadedGroupCallCapabilityRegistration = registration
+        } catch {
+            // Capability registration is retried on foreground and post-sync. Until then the
+            // backend treats this device as legacy and will not admit it to a group media room.
+            status = "Group call registration failed: \(error.localizedDescription)"
         }
     }
 
@@ -5481,6 +5593,7 @@ final class CloudAppModel {
         setReplicaSyncState(.checking)
         status = "Checking connection"
         pushCenter.refreshRegistration()
+        await syncGroupCallCapabilities()
         if capabilities.contains(.calls) {
             await syncVoIPCallingAvailability()
         }
@@ -5535,6 +5648,8 @@ final class CloudAppModel {
                             await self.replicaSyncCoordinator.trigger(.hint)
                         case .call(let hint):
                             await self.callCoordinator.handle(hint)
+                        case .groupCall(let hint):
+                            await self.groupCallCoordinator.handle(hint)
                         case .sessionRevoked(let hint):
                             guard await self.scheduleSessionClearFromRevokedHint(
                                 deviceId: hint.deviceId
@@ -5710,6 +5825,9 @@ final class CloudAppModel {
                 return
             }
             guard let self, self.storedSession?.session.token == token else { return }
+            await self.syncGroupCallCapabilities()
+            // Group-call advertisement is device-scoped. Register the upgraded binary first so
+            // this same refresh can observe the capability instead of waiting for another launch.
             await self.refreshServerCapabilities()
             if self.capabilities.contains(.calls) {
                 await self.syncVoIPCallingAvailability()

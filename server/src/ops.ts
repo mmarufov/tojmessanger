@@ -8,6 +8,7 @@ import {
 } from "./locks";
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
+import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -38,14 +39,35 @@ export function safeRoute(pathname: string): string {
     return pathname.replace(/[0-9a-f-]{36}/i, ":id");
   }
   if (/^\/v1\/calls\/[0-9a-f-]+$/i.test(pathname)) return "/v1/calls/:id";
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/participants\/[0-9a-f-]+$/i.test(pathname)) {
+    return "/v1/group-calls/:id/participants/:device";
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/screen-share\/heartbeat$/i.test(pathname)) {
+    return "/v1/group-calls/:id/screen-share/heartbeat";
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/camera\/heartbeat$/i.test(pathname)) {
+    return "/v1/group-calls/:id/camera/heartbeat";
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/camera\/release$/i.test(pathname)) {
+    return "/v1/group-calls/:id/camera/release";
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/screen-share\/release$/i.test(pathname)) {
+    return "/v1/group-calls/:id/screen-share/release";
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+\/(join|leave|end|heartbeat|credentials|epochs|camera|screen-share)$/i.test(pathname)) {
+    return pathname.replace(/[0-9a-f-]{36}/i, ":id");
+  }
+  if (/^\/v1\/group-calls\/[0-9a-f-]+$/i.test(pathname)) return "/v1/group-calls/:id";
   const known = new Set([
     "/health", "/ready", "/metrics", "/v1/capabilities", "/v1/ws", "/v1/auth/start", "/v1/auth/check",
-    "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push", "/v1/session", "/v1/account/deletion/start",
+    "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push",
+    "/v1/devices/group-call-capabilities", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
     "/v1/contacts/lookup", "/v1/dialogs/direct", "/v1/dialogs/saved", "/v1/messages/send", "/v1/messages/react",
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
+    "/v1/group-calls", "/v1/group-calls/active",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -207,8 +229,12 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const savedMessages = await savedMessagesSchemaReadiness(sql);
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
+  const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
+  const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
+  const groupCallInfrastructure = groupCallsConfigured();
   return {
     status: savedMessages.ready && preferences.ready && draftMedia.ready
+      && (!groupCallsRequested || (groupCallInfrastructure && groupCallSchema.ready))
       ? "ready"
       : "not_ready",
     database: "ready",
@@ -222,6 +248,11 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // Maintenance, bootstrap, difference sync, and send paths all touch these relations whenever
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
+    groupCalls: {
+      requested: groupCallsRequested,
+      infrastructure: groupCallInfrastructure ? "ready" : "disabled_or_incomplete",
+      schema: groupCallSchema,
+    },
     databaseLatencyMs: Math.max(0, Math.round((performance.now() - started) * 10) / 10),
   };
 }

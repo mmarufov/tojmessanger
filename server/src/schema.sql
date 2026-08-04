@@ -85,6 +85,11 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS voip_push_updated_at TIMESTAMPTZ;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_protocol_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_call_media_profile_versions INT[] NOT NULL DEFAULT ARRAY[1]::INT[];
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS call_view_version INT NOT NULL DEFAULT 1;
+-- Group media is a separate capability family because it uses an SFU and frame cryptors rather
+-- than the attested 1:1 WebRTC engine. Legacy registrations reset to no group support.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS supported_group_call_versions INT[] NOT NULL DEFAULT ARRAY[]::INT[];
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS group_call_view_version INT NOT NULL DEFAULT 0;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS supports_group_screen_share BOOLEAN NOT NULL DEFAULT FALSE;
 DO $$ BEGIN
   ALTER TABLE devices ADD CONSTRAINT devices_push_environment_check
     CHECK (push_environment IN ('sandbox','production'));
@@ -849,6 +854,242 @@ CREATE UNIQUE INDEX IF NOT EXISTS call_history_outbox_client_msg_idx
   ON call_history_outbox(caller_account_id, history_client_msg_id);
 CREATE INDEX IF NOT EXISTS call_history_outbox_ready_idx
   ON call_history_outbox(available_at, created_at) WHERE status IN ('pending','sending');
+
+-- ============ E2EE group-call control plane ============
+-- Group media is routed by an SFU, but every audio/video/screen frame is encrypted above
+-- DTLS-SRTP on the participating devices. The server stores only public join keys, commitments,
+-- and opaque per-device epoch envelopes. It never stores a media key or an SFU API secret.
+CREATE TABLE IF NOT EXISTS group_calls (
+  id                    UUID PRIMARY KEY,
+  dialog_id             UUID NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+  creator_account_id    UUID NOT NULL REFERENCES accounts(id),
+  creator_device_id     UUID NOT NULL REFERENCES devices(id),
+  initial_kind          TEXT NOT NULL CHECK (initial_kind IN ('voice','video')),
+  state                 TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','ended')),
+  sfu_room_name         TEXT NOT NULL UNIQUE
+                          CHECK (char_length(sfu_room_name) BETWEEN 16 AND 96),
+  participant_limit     SMALLINT NOT NULL DEFAULT 32
+                          CHECK (participant_limit BETWEEN 2 AND 32),
+  publisher_limit       SMALLINT NOT NULL DEFAULT 16
+                          CHECK (publisher_limit BETWEEN 1 AND 16
+                            AND publisher_limit <= participant_limit),
+  membership_revision   BIGINT NOT NULL DEFAULT 1 CHECK (membership_revision > 0),
+  state_revision        BIGINT NOT NULL DEFAULT 1 CHECK (state_revision > 0),
+  media_epoch           BIGINT NOT NULL DEFAULT 1 CHECK (media_epoch > 0),
+  key_leader_device_id  UUID NOT NULL REFERENCES devices(id),
+  epoch_key_commitment  BYTEA NOT NULL CHECK (octet_length(epoch_key_commitment) = 32),
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ended_at              TIMESTAMPTZ,
+  end_reason            TEXT,
+  CHECK (
+    (state = 'active' AND ended_at IS NULL AND end_reason IS NULL)
+    OR (state = 'ended' AND ended_at IS NOT NULL AND end_reason IS NOT NULL)
+  )
+);
+ALTER TABLE group_calls ADD COLUMN IF NOT EXISTS state_revision BIGINT NOT NULL DEFAULT 1;
+CREATE UNIQUE INDEX IF NOT EXISTS group_calls_one_active_per_dialog_idx
+  ON group_calls(dialog_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS group_calls_retention_idx
+  ON group_calls(ended_at) WHERE state = 'ended';
+
+CREATE TABLE IF NOT EXISTS group_call_participants (
+  call_id                    UUID NOT NULL REFERENCES group_calls(id) ON DELETE CASCADE,
+  device_id                  UUID NOT NULL REFERENCES devices(id),
+  account_id                 UUID NOT NULL REFERENCES accounts(id),
+  call_local_identity        UUID NOT NULL,
+  status                     TEXT NOT NULL
+                               CHECK (status IN ('pending_key','active','left','removed')),
+  join_public_key            BYTEA NOT NULL CHECK (octet_length(join_public_key) = 32),
+  join_nonce                 BYTEA NOT NULL CHECK (octet_length(join_nonce) = 32),
+  joined_membership_revision BIGINT NOT NULL CHECK (joined_membership_revision > 0),
+  ready_media_epoch          BIGINT CHECK (ready_media_epoch IS NULL OR ready_media_epoch > 0),
+  joined_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_heartbeat_at          TIMESTAMPTZ NOT NULL DEFAULT now() - interval '20 seconds',
+  left_at                    TIMESTAMPTZ,
+  PRIMARY KEY (call_id, device_id),
+  UNIQUE (call_id, call_local_identity),
+  CHECK (
+    (status IN ('pending_key','active') AND left_at IS NULL)
+    OR (status IN ('left','removed') AND left_at IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'active' AND ready_media_epoch IS NOT NULL)
+    OR status <> 'active'
+  )
+);
+ALTER TABLE group_call_participants ADD COLUMN IF NOT EXISTS last_heartbeat_at
+  TIMESTAMPTZ NOT NULL DEFAULT now() - interval '20 seconds';
+CREATE UNIQUE INDEX IF NOT EXISTS group_call_participants_one_device_per_account_idx
+  ON group_call_participants(call_id, account_id)
+  WHERE status IN ('pending_key','active');
+CREATE INDEX IF NOT EXISTS group_call_participants_device_active_idx
+  ON group_call_participants(device_id, joined_at DESC)
+  WHERE status IN ('pending_key','active');
+CREATE INDEX IF NOT EXISTS group_call_participants_stale_idx
+  ON group_call_participants(last_seen_at, call_id, device_id)
+  WHERE status IN ('pending_key','active');
+
+CREATE TABLE IF NOT EXISTS group_call_epochs (
+  call_id              UUID NOT NULL REFERENCES group_calls(id) ON DELETE CASCADE,
+  epoch                 BIGINT NOT NULL CHECK (epoch > 0),
+  membership_revision  BIGINT NOT NULL CHECK (membership_revision > 0),
+  leader_device_id     UUID NOT NULL REFERENCES devices(id),
+  key_commitment       BYTEA NOT NULL CHECK (octet_length(key_commitment) = 32),
+  participant_set_hash BYTEA NOT NULL CHECK (octet_length(participant_set_hash) = 32),
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  activated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- NULL marks the current epoch. It receives a ten-second grace deadline atomically when the
+  -- next epoch activates.
+  grace_expires_at     TIMESTAMPTZ,
+  PRIMARY KEY (call_id, epoch),
+  UNIQUE (call_id, membership_revision)
+);
+
+CREATE TABLE IF NOT EXISTS group_call_epoch_envelopes (
+  call_id                  UUID NOT NULL,
+  epoch                    BIGINT NOT NULL,
+  recipient_device_id      UUID NOT NULL REFERENCES devices(id),
+  sender_public_key        BYTEA NOT NULL CHECK (octet_length(sender_public_key) = 32),
+  recipient_public_key     BYTEA NOT NULL CHECK (octet_length(recipient_public_key) = 32),
+  ciphertext               BYTEA NOT NULL
+                             CHECK (octet_length(ciphertext) BETWEEN 48 AND 4096),
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (call_id, epoch, recipient_device_id),
+  FOREIGN KEY (call_id, epoch)
+    REFERENCES group_call_epochs(call_id, epoch) ON DELETE CASCADE
+);
+
+-- A single screen source keeps subscription priority and UX deterministic in v1. A short lease
+-- prevents a crashed broadcaster from blocking the room indefinitely.
+CREATE TABLE IF NOT EXISTS group_call_screen_share_leases (
+  call_id       UUID PRIMARY KEY REFERENCES group_calls(id) ON DELETE CASCADE,
+  device_id     UUID NOT NULL REFERENCES devices(id),
+  generation    UUID NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS group_call_screen_share_expiry_idx
+  ON group_call_screen_share_leases(expires_at);
+
+-- Cameras are opt-in after join. A bounded renewable lease makes the advertised 16-camera room
+-- limit enforceable across every API node instead of trusting a cooperative client.
+CREATE TABLE IF NOT EXISTS group_call_camera_leases (
+  call_id       UUID NOT NULL REFERENCES group_calls(id) ON DELETE CASCADE,
+  device_id     UUID NOT NULL REFERENCES devices(id),
+  generation    UUID NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (call_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS group_call_camera_lease_expiry_idx
+  ON group_call_camera_leases(expires_at);
+
+-- Desired SFU permissions are durable and monotonic. Only one worker may apply a participant's
+-- state at a time, preventing a delayed camera/screen grant from racing a later revoke. Media keys
+-- never enter this table; room and participant identifiers are random call-local values.
+CREATE TABLE IF NOT EXISTS group_call_sfu_participant_states (
+  call_id              UUID NOT NULL REFERENCES group_calls(id) ON DELETE CASCADE,
+  device_id            UUID NOT NULL REFERENCES devices(id),
+  participant_identity UUID NOT NULL,
+  desired_status       TEXT NOT NULL DEFAULT 'active'
+                         CHECK (desired_status IN ('active','removed')),
+  camera_allowed       BOOLEAN NOT NULL DEFAULT FALSE,
+  screen_share_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+  revision             BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+  applied_revision     BIGINT NOT NULL DEFAULT 1 CHECK (applied_revision >= 0),
+  applied_status       TEXT NOT NULL DEFAULT 'active',
+  applied_camera_allowed       BOOLEAN NOT NULL DEFAULT FALSE,
+  applied_screen_share_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+  claim_token          UUID,
+  claim_revision       BIGINT,
+  claim_expires_at     TIMESTAMPTZ,
+  attempt_count        INT NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  next_attempt_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_error_code      TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (call_id, participant_identity),
+  CHECK (applied_revision <= revision),
+  CHECK (
+    (claim_token IS NULL AND claim_revision IS NULL AND claim_expires_at IS NULL)
+    OR (claim_token IS NOT NULL AND claim_revision IS NOT NULL AND claim_expires_at IS NOT NULL)
+  ),
+  CHECK (desired_status = 'active' OR (NOT camera_allowed AND NOT screen_share_allowed))
+);
+ALTER TABLE group_call_sfu_participant_states
+  ADD COLUMN IF NOT EXISTS applied_status TEXT;
+ALTER TABLE group_call_sfu_participant_states
+  ADD COLUMN IF NOT EXISTS applied_camera_allowed BOOLEAN;
+ALTER TABLE group_call_sfu_participant_states
+  ADD COLUMN IF NOT EXISTS applied_screen_share_allowed BOOLEAN;
+-- Existing pending rows may represent an in-flight revoke. Backfill them conservatively as the
+-- opposite applied permission so the worker must execute that revoke before any successor grant.
+UPDATE group_call_sfu_participant_states SET
+  applied_status = CASE
+    WHEN applied_revision = revision THEN desired_status
+    ELSE 'active'
+  END,
+  applied_camera_allowed = CASE
+    WHEN applied_revision = revision THEN camera_allowed
+    ELSE NOT camera_allowed
+  END,
+  applied_screen_share_allowed = CASE
+    WHEN applied_revision = revision THEN screen_share_allowed
+    ELSE NOT screen_share_allowed
+  END
+WHERE applied_status IS NULL
+   OR applied_camera_allowed IS NULL
+   OR applied_screen_share_allowed IS NULL;
+ALTER TABLE group_call_sfu_participant_states
+  ALTER COLUMN applied_status SET DEFAULT 'active',
+  ALTER COLUMN applied_status SET NOT NULL,
+  ALTER COLUMN applied_camera_allowed SET DEFAULT FALSE,
+  ALTER COLUMN applied_camera_allowed SET NOT NULL,
+  ALTER COLUMN applied_screen_share_allowed SET DEFAULT FALSE,
+  ALTER COLUMN applied_screen_share_allowed SET NOT NULL;
+DO $$ BEGIN
+  ALTER TABLE group_call_sfu_participant_states
+    ADD CONSTRAINT group_call_sfu_applied_status_check
+    CHECK (applied_status IN ('active','removed'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE group_call_sfu_participant_states
+    ADD CONSTRAINT group_call_sfu_applied_media_check
+    CHECK (applied_status = 'active'
+      OR (NOT applied_camera_allowed AND NOT applied_screen_share_allowed));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS group_call_sfu_state_device_idx
+  ON group_call_sfu_participant_states(call_id, device_id, updated_at);
+CREATE INDEX IF NOT EXISTS group_call_sfu_state_pending_idx
+  ON group_call_sfu_participant_states(next_attempt_at, updated_at)
+  WHERE applied_revision < revision;
+INSERT INTO group_call_sfu_participant_states (
+  call_id, device_id, participant_identity, desired_status,
+  camera_allowed, screen_share_allowed, revision, applied_revision, next_attempt_at
+)
+SELECT participant.call_id, participant.device_id, participant.call_local_identity, 'active',
+       FALSE, FALSE, 1, 0, now()
+FROM group_call_participants participant
+JOIN group_calls call ON call.id = participant.call_id
+WHERE call.state = 'active' AND participant.status IN ('pending_key','active')
+ON CONFLICT (call_id, participant_identity) DO NOTHING;
+
+-- Immutable rows make start/join abuse budgets survive process restarts and cancelled rooms.
+CREATE TABLE IF NOT EXISTS group_call_action_budgets (
+  id          BIGSERIAL PRIMARY KEY,
+  account_id  UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  device_id   UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  action      TEXT NOT NULL CHECK (action IN ('start','join','camera_publish','screen_share')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS group_call_action_budgets_window_idx
+  ON group_call_action_budgets(account_id, action, created_at DESC);
+CREATE INDEX IF NOT EXISTS group_call_action_budgets_retention_idx
+  ON group_call_action_budgets(created_at, id);
 
 -- Attempts survive cancelled/expired call cleanup so repeated invite/cancel loops remain limited.
 CREATE TABLE IF NOT EXISTS call_invite_attempts (

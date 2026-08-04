@@ -27,7 +27,7 @@ nonisolated struct CallDeviceCapabilities: Codable, Equatable, Sendable {
     let callViewVersion: UInt16
 }
 
-nonisolated enum CallDataUsagePolicy: String, Codable, CaseIterable, Sendable {
+nonisolated enum CallDataUsagePolicy: String, Codable, CaseIterable, Equatable, Sendable {
     case never
     case cellularOnly = "cellular_only"
     case always
