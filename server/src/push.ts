@@ -38,6 +38,40 @@ function validateEnvironment(value: string): PushEnvironment {
   throw new PushError("invalid APNs environment");
 }
 
+function normalizeGroupCallCapabilities(
+  rawVersions: unknown,
+  rawViewVersion: unknown,
+  rawSupportsScreenShare: unknown,
+): { versions: number[]; viewVersion: number; supportsScreenShare: boolean } {
+  let versions: number[];
+  if (rawVersions == null) {
+    versions = [];
+  } else if (Array.isArray(rawVersions) && rawVersions.length === 0) {
+    // Unlike an authenticated 1:1 negotiation offer, a device capability set may be empty so a
+    // downgraded or failed runtime self-check can explicitly revoke stale server-side support.
+    versions = [];
+  } else {
+    try {
+      versions = normalizeCallVersionCapabilities(rawVersions);
+    } catch (error) {
+      if (error instanceof CallVersionCapabilityError) throw new PushError(error.message);
+      throw error;
+    }
+  }
+  const viewVersion = rawViewVersion == null ? 0 : Number(rawViewVersion);
+  if (!Number.isSafeInteger(viewVersion) || viewVersion < 0 || viewVersion > 0xffff) {
+    throw new PushError("invalid group call view version");
+  }
+  const supportsScreenShare = rawSupportsScreenShare === true;
+  if ((viewVersion > 0 || supportsScreenShare) && !versions.includes(1)) {
+    throw new PushError("group call view capabilities require group call version 1");
+  }
+  if (versions.includes(1) && viewVersion < 1) {
+    throw new PushError("group call version 1 requires group call view version 1");
+  }
+  return { versions, viewVersion, supportsScreenShare };
+}
+
 export async function registerPushToken(
   sql: SQL,
   deviceId: string,
@@ -113,8 +147,13 @@ export async function registerVoIPPushToken(
   rawSupportedCallProtocolVersions?: unknown,
   rawSupportedCallMediaProfileVersions?: unknown,
   rawCallViewVersion?: unknown,
+  rawSupportedGroupCallVersions?: unknown,
+  rawGroupCallViewVersion?: unknown,
+  rawSupportsGroupScreenShare?: unknown,
 ): Promise<{ registered: true; supportedCallProtocolVersions: number[];
-  supportedCallMediaProfileVersions: number[]; callViewVersion: number }> {
+  supportedCallMediaProfileVersions: number[]; callViewVersion: number;
+  supportedGroupCallVersions: number[]; groupCallViewVersion: number;
+  supportsGroupScreenShare: boolean }> {
   const token = normalizeDeviceToken(rawToken);
   const environment = validateEnvironment(rawEnvironment);
   const tokenHash = hashToken(`apns-voip|${environment}|${token}`);
@@ -124,6 +163,7 @@ export async function registerVoIPPushToken(
   // prevents stale video capability from surviving an app downgrade or restore.
   let supportedCallProtocolVersions: number[];
   let supportedCallMediaProfileVersions: number[];
+  let supportedGroupCallVersions: number[];
   try {
     supportedCallProtocolVersions = normalizeCallVersionCapabilities(rawSupportedCallProtocolVersions);
     supportedCallMediaProfileVersions = normalizeCallVersionCapabilities(rawSupportedCallMediaProfileVersions);
@@ -137,6 +177,14 @@ export async function registerVoIPPushToken(
   if (!Number.isSafeInteger(callViewVersion) || callViewVersion < 1 || callViewVersion > 0xffff) {
     throw new PushError("invalid call view version");
   }
+  const groupCapabilities = normalizeGroupCallCapabilities(
+    rawSupportedGroupCallVersions,
+    rawGroupCallViewVersion,
+    rawSupportsGroupScreenShare,
+  );
+  supportedGroupCallVersions = groupCapabilities.versions;
+  const groupCallViewVersion = groupCapabilities.viewVersion;
+  const supportsGroupScreenShare = groupCapabilities.supportsScreenShare;
 
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${registrationLock})`;
@@ -164,7 +212,10 @@ export async function registerVoIPPushToken(
         voip_push_environment = ${environment}, voip_push_updated_at = now(),
         supported_call_protocol_versions = ${tx.array(supportedCallProtocolVersions, "INT4")},
         supported_call_media_profile_versions = ${tx.array(supportedCallMediaProfileVersions, "INT4")},
-        call_view_version = ${callViewVersion}
+        call_view_version = ${callViewVersion},
+        supported_group_call_versions = ${tx.array(supportedGroupCallVersions, "INT4")},
+        group_call_view_version = ${groupCallViewVersion},
+        supports_group_screen_share = ${supportsGroupScreenShare}
       WHERE id = ${deviceId}`;
   });
   return {
@@ -172,6 +223,9 @@ export async function registerVoIPPushToken(
     supportedCallProtocolVersions,
     supportedCallMediaProfileVersions,
     callViewVersion,
+    supportedGroupCallVersions,
+    groupCallViewVersion,
+    supportsGroupScreenShare,
   };
 }
 
@@ -183,6 +237,44 @@ export async function unregisterVoIPPushToken(sql: SQL, deviceId: string): Promi
       voip_push_environment = NULL, voip_push_updated_at = now()
     WHERE id = ${deviceId}`;
   return { registered: false };
+}
+
+/**
+ * Group media capability is independent from PushKit and microphone permission: a member may
+ * discover a room, join muted, and grant microphone/camera access only after a foreground tap.
+ * Keeping this registration separate prevents a microphone-denied device from becoming a 1:1
+ * VoIP ring target merely to advertise group-call support.
+ */
+export async function registerGroupCallCapabilities(
+  sql: SQL,
+  deviceId: string,
+  rawSupportedVersions?: unknown,
+  rawViewVersion?: unknown,
+  rawSupportsScreenShare?: unknown,
+): Promise<{ registered: true; supportedGroupCallVersions: number[];
+  groupCallViewVersion: number; supportsGroupScreenShare: boolean }> {
+  const normalized = normalizeGroupCallCapabilities(
+    rawSupportedVersions,
+    rawViewVersion,
+    rawSupportsScreenShare,
+  );
+  const supportedGroupCallVersions = normalized.versions;
+  const groupCallViewVersion = normalized.viewVersion;
+  const supportsGroupScreenShare = normalized.supportsScreenShare;
+  const updated = await sql`
+    UPDATE devices SET
+      supported_group_call_versions = ${sql.array(supportedGroupCallVersions, "INT4")},
+      group_call_view_version = ${groupCallViewVersion},
+      supports_group_screen_share = ${supportsGroupScreenShare}
+    WHERE id = ${deviceId} AND platform = 'ios' AND revoked_at IS NULL
+    RETURNING id`;
+  if (!updated.length) throw new PushError("active iOS device required");
+  return {
+    registered: true,
+    supportedGroupCallVersions,
+    groupCallViewVersion,
+    supportsGroupScreenShare,
+  };
 }
 
 /** Called inside the message transaction, after account_events is inserted. */

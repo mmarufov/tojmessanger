@@ -1295,7 +1295,8 @@ struct CloudAPI: Sendable {
         _ deviceToken: String,
         environment: String,
         token: String,
-        capabilities: CallDeviceCapabilities = WebRTCEngineFactory.deviceCapabilities
+        capabilities: CallDeviceCapabilities = WebRTCEngineFactory.deviceCapabilities,
+        groupCapabilities: GroupCallDeviceCapabilities = GroupCallEngineFactory.deviceCapabilities
     ) async throws -> PushRegistrationResponse {
         try await put(
             "v1/devices/voip-push",
@@ -1304,7 +1305,10 @@ struct CloudAPI: Sendable {
                 environment: environment,
                 supportedCallProtocolVersions: capabilities.supportedCallProtocolVersions.map(Int.init),
                 supportedCallMediaProfileVersions: capabilities.supportedCallMediaProfileVersions.map(Int.init),
-                callViewVersion: Int(capabilities.callViewVersion)
+                callViewVersion: Int(capabilities.callViewVersion),
+                supportedGroupCallVersions: groupCapabilities.supportedGroupCallVersions.map(Int.init),
+                groupCallViewVersion: Int(groupCapabilities.groupCallViewVersion),
+                supportsGroupScreenShare: groupCapabilities.supportsGroupScreenShare
             ),
             token: token
         )
@@ -1312,6 +1316,178 @@ struct CloudAPI: Sendable {
 
     func unregisterVoIPPushToken(token: String) async throws -> PushRegistrationResponse {
         try await delete("v1/devices/voip-push", token: token)
+    }
+
+    func registerGroupCallCapabilities(
+        _ capabilities: GroupCallDeviceCapabilities = GroupCallEngineFactory.deviceCapabilities,
+        token: String
+    ) async throws -> GroupCallCapabilityRegistrationResponse {
+        try await put(
+            "v1/devices/group-call-capabilities",
+            body: GroupCallCapabilityRegistrationRequest(
+                supportedGroupCallVersions: capabilities.supportedGroupCallVersions.map(Int.init),
+                groupCallViewVersion: Int(capabilities.groupCallViewVersion),
+                supportsGroupScreenShare: capabilities.supportsGroupScreenShare
+            ),
+            token: token
+        )
+    }
+
+    func startGroupCall(
+        _ body: StartCloudGroupCallRequest,
+        token: String
+    ) async throws -> CloudGroupCallStartResponse {
+        try await post("v1/group-calls", body: body, token: token, timeoutInterval: 15)
+    }
+
+    func activeGroupCall(dialogId: String, token: String) async throws -> CloudActiveGroupCallResponse {
+        try await get(
+            "v1/group-calls/active",
+            queryItems: [URLQueryItem(name: "dialogId", value: dialogId)],
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func groupCall(id: String, token: String) async throws -> CloudGroupCallResponse {
+        try await get("v1/group-calls/\(id)", token: token, timeoutInterval: 8)
+    }
+
+    func joinGroupCall(
+        id: String,
+        body: JoinCloudGroupCallRequest,
+        token: String
+    ) async throws -> CloudGroupCallJoinResponse {
+        try await post("v1/group-calls/\(id)/join", body: body, token: token, timeoutInterval: 15)
+    }
+
+    func activateGroupCallEpoch(
+        id: String,
+        body: ActivateCloudGroupCallEpochRequest,
+        token: String
+    ) async throws -> CloudGroupCallJoinResponse {
+        try await post("v1/group-calls/\(id)/epochs", body: body, token: token, timeoutInterval: 15)
+    }
+
+    func groupCallCredentials(id: String, token: String) async throws -> CloudGroupCallCredentialsResponse {
+        try await get("v1/group-calls/\(id)/credentials", token: token, timeoutInterval: 15)
+    }
+
+    func heartbeatGroupCall(id: String, token: String) async throws -> CloudGroupCallHeartbeatResponse {
+        try await post(
+            "v1/group-calls/\(id)/heartbeat",
+            body: CloudGroupCallEmptyRequest(),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func leaveGroupCall(id: String, token: String) async throws -> CloudGroupCallJoinResponse {
+        try await post(
+            "v1/group-calls/\(id)/leave",
+            body: CloudGroupCallEmptyRequest(),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func endGroupCall(id: String, reason: String, token: String) async throws -> CloudGroupCallJoinResponse {
+        try await post(
+            "v1/group-calls/\(id)/end",
+            body: CloudGroupCallEndRequest(reason: reason),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func removeGroupCallParticipant(
+        callId: String,
+        deviceId: String,
+        token: String
+    ) async throws -> CloudGroupCallResponse {
+        try await delete(
+            "v1/group-calls/\(callId)/participants/\(deviceId)",
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func acquireGroupCamera(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallCameraLeaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/camera",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func heartbeatGroupCamera(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallCameraLeaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/camera/heartbeat",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 3
+        )
+    }
+
+    func releaseGroupCamera(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallScreenReleaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/camera/release",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func acquireGroupScreenShare(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallScreenLeaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/screen-share",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 15
+        )
+    }
+
+    func heartbeatGroupScreenShare(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallScreenLeaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/screen-share/heartbeat",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 3
+        )
+    }
+
+    func releaseGroupScreenShare(
+        callId: String,
+        generation: String,
+        token: String
+    ) async throws -> CloudGroupCallScreenReleaseResponse {
+        try await post(
+            "v1/group-calls/\(callId)/screen-share/release",
+            body: CloudGroupCallScreenLeaseRequest(generation: generation),
+            token: token,
+            timeoutInterval: 15
+        )
     }
 
     func createCall(_ body: CreateCloudCallRequest, token: String) async throws -> CloudCallCreateResponse {
@@ -1500,9 +1676,14 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
-    private func delete<Response: Decodable>(_ path: String, token: String?) async throws -> Response {
+    private func delete<Response: Decodable>(
+        _ path: String,
+        token: String?,
+        timeoutInterval: TimeInterval? = nil
+    ) async throws -> Response {
         var request = URLRequest(url: config.httpURL(path: path))
         request.httpMethod = "DELETE"
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         if let token {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }

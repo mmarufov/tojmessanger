@@ -138,6 +138,9 @@ nonisolated struct VoIPPushRegistrationRequest: Codable, Equatable, Sendable {
     let supportedCallProtocolVersions: [Int]
     let supportedCallMediaProfileVersions: [Int]
     let callViewVersion: Int
+    let supportedGroupCallVersions: [Int]
+    let groupCallViewVersion: Int
+    let supportsGroupScreenShare: Bool
 }
 
 nonisolated struct CloudCallEvent: Codable, Identifiable, Equatable, Sendable {

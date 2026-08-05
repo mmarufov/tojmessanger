@@ -114,9 +114,7 @@ jobs:
           app_dir="$(find "${DERIVED_DATA}/Build/Products/Release-iphonesimulator" \
             -type d -name 'Toj.app' -print -quit)"
           test -n "${app_dir}"
-          symbols_file="${RUNNER_TEMP}/toj-release-symbols.txt"
-          xcrun nm "${app_dir}/Toj" | xcrun swift-demangle > "${symbols_file}"
-          grep -Fq 'Toj.WebRTCCallEngine' "${symbols_file}"
+          scripts/verify-webrtc-namespace-isolation.sh "${app_dir}"
       - name: Select available iPhone simulator
         run: |
           destination_id="$(/usr/bin/python3 <<'PY'
@@ -179,9 +177,40 @@ jobs:
               Path("Toj-Info.plist"),
               Path("Toj/Toj.entitlements"),
               Path("Toj/Toj-MultitaskingCamera.entitlements"),
+              Path("TojBroadcastExtension/Info.plist"),
+              Path("TojBroadcastExtension/TojBroadcastExtension.entitlements"),
           ):
               with path.open("rb") as source:
                   plistlib.load(source)
+          PY
+      - name: Require exact group-call media SDK pins
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = {
+              "client-sdk-swift": ("f70911172031fe40042266ed3bc35171224c2ef0", None),
+              "livekit-uniffi-xcframework": ("61229f4032131311b997ddb1bc1cb8f5afbe30c8", "0.0.5"),
+              "swift-protobuf": ("55d7a1cc5666b85c13464aea1c4b4a90feccb4c8", "1.38.1"),
+              "webrtc-xcframework": ("f6017e189972b86f90e0ec406b1629828bc75748", "144.7559.3"),
+          }
+          resolved = json.loads(
+              Path("Toj.xcworkspace/xcshareddata/swiftpm/Package.resolved").read_text()
+          )
+          actual = {
+              pin["identity"]: (
+                  pin["state"]["revision"],
+                  pin["state"].get("version"),
+              )
+              for pin in resolved["pins"]
+          }
+          if actual != expected:
+              raise SystemExit(f"Unexpected SwiftPM pins: {actual!r}")
+
+          project = Path("Toj.xcodeproj/project.pbxproj").read_text()
+          if 'revision = f70911172031fe40042266ed3bc35171224c2ef0;' not in project:
+              raise SystemExit("LiveKit project dependency is not an exact reviewed revision")
           PY
       - name: Require immutable action references
         run: |

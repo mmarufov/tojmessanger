@@ -100,14 +100,17 @@ final class TelegramFastLocalFirstUITests: XCTestCase {
         XCTAssertTrue(result.label.contains("Mehrona Offline"), result.label)
         result.tap()
 
-        XCTAssertTrue(element("conversation-\(Fixture.primaryDialog)").waitForExistence(timeout: 15))
+        // Observe the short-lived accessibility contract before asking XCTest for another full
+        // hierarchy snapshot. On slower hosted runners, checking the conversation container first
+        // can consume the entire 2.8-second flash even though the app behaved correctly.
         let flash = app.descendants(matching: .any)
             .matching(NSPredicate(format: "value == %@", "Search match highlighted"))
             .firstMatch
         XCTAssertTrue(
-            flash.waitForExistence(timeout: 3),
+            flash.waitForExistence(timeout: 15),
             "Opening a global hit must visibly connect the result to its message."
         )
+        XCTAssertTrue(element("conversation-\(Fixture.primaryDialog)").waitForExistence(timeout: 15))
         XCTAssertTrue(element("message-ui-fixture-text").waitForExistence(timeout: 15))
     }
 

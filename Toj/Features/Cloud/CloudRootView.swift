@@ -64,6 +64,15 @@ struct CloudRootView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        .overlay(alignment: .top) {
+            if model.groupCallCoordinator.hasActiveCall,
+               !model.groupCallCoordinator.isPresented {
+                TojActiveGroupCallPill(coordinator: model.groupCallCoordinator)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
         .fullScreenCover(isPresented: Binding(
             get: { model.callCoordinator.isPresented },
             set: { presented in
@@ -74,6 +83,21 @@ struct CloudRootView: View {
             }
         )) {
             TojCallScreen(coordinator: model.callCoordinator)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { model.groupCallCoordinator.isPresented },
+            set: { presented in
+                if !presented {
+                    if model.groupCallCoordinator.state == .ended
+                        || model.groupCallCoordinator.state == .failed {
+                        model.groupCallCoordinator.dismissEndedCall()
+                    } else {
+                        model.groupCallCoordinator.isPresented = false
+                    }
+                }
+            }
+        )) {
+            TojGroupCallScreen(coordinator: model.groupCallCoordinator)
         }
     }
 }

@@ -15,6 +15,12 @@ import {
 } from "./call-versions";
 import { handoffOwnedGroupsForDeletedAccount } from "./groups";
 import { purgeAccountDraftState } from "./drafts";
+import {
+  requireGroupCallSFUBarrierApplied,
+  revokeGroupCallAccountTx,
+  revokeGroupCallDeviceTx,
+  type GroupCallSFUControl,
+} from "./group-calls";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CURRENT_PROTOCOL = 1;
@@ -1422,29 +1428,45 @@ export async function revokeDeviceAndTerminateCalls(
   sql: SQL,
   accountId: string,
   deviceId: string,
+  groupCallSFUControl?: GroupCallSFUControl,
 ): Promise<{ revoked: true; hints: CallHint[]; syncPushes: Push[] }> {
   let ended: CallRow[] = [];
+  let affectedGroupCallIds: string[] = [];
   const revoked = await revokeAuthDevice(sql, accountId, deviceId, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "device", accountId, deviceId);
+      affectedGroupCallIds = await revokeGroupCallDeviceTx(tx, accountId, deviceId);
     },
   });
+  if (affectedGroupCallIds.length) {
+    await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
+  }
   const syncPushes = await flushCallHistory(sql, ended);
   return { ...revoked, hints: await hintsForRows(sql, ended), syncPushes };
 }
 
 /** Account status, device revocation, and call termination commit or roll back as one unit. */
-export async function deleteAccountAndTerminateCalls(sql: SQL, accountId: string, code: string): Promise<{
+export async function deleteAccountAndTerminateCalls(
+  sql: SQL,
+  accountId: string,
+  code: string,
+  groupCallSFUControl?: GroupCallSFUControl,
+): Promise<{
   deleted: true; hints: CallHint[]; syncPushes: Push[];
 }> {
   let ended: CallRow[] = [];
+  let affectedGroupCallIds: string[] = [];
   const deleted = await deleteAuthAccount(sql, accountId, code, {
     beforeCommit: async (tx) => {
       ended = await terminateMatchingCallsTx(tx, "account", accountId);
+      affectedGroupCallIds = await revokeGroupCallAccountTx(tx, accountId);
       await handoffOwnedGroupsForDeletedAccount(tx, accountId);
       await purgeAccountDraftState(tx, accountId);
     },
   });
+  if (affectedGroupCallIds.length) {
+    await requireGroupCallSFUBarrierApplied(sql, affectedGroupCallIds, groupCallSFUControl);
+  }
   const syncPushes = await flushCallHistory(sql, ended);
   return { ...deleted, hints: await hintsForRows(sql, ended), syncPushes };
 }
