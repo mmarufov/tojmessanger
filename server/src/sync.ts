@@ -26,6 +26,9 @@ import {
   notifySyncWakeups,
   type SyncPush,
 } from "./sync-wakeup";
+import { enqueueLinkPreview, loadLinkPreviews, type LinkPreviewDTO } from "./link-previews";
+import { getChatFolders } from "./chat-folders";
+import { getScheduledDelivery } from "./scheduled-deliveries";
 
 export class SyncError extends Error {
   constructor(
@@ -57,6 +60,7 @@ export type MessageDTO = {
   media_group_index: number | null;
   media_group_count: number | null;
   service_type: string | null; service_data: Record<string, unknown> | null;
+  link_preview: LinkPreviewDTO | null;
   state: string; server_ts: string;
 };
 export type Push = SyncPush;
@@ -107,7 +111,11 @@ async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<M
 type MessageKey = { dialogId: string; msgId: number };
 
 /** Loads an arbitrary event page in two bounded queries: messages+media, then all reactions. */
-async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<string, MessageDTO>> {
+async function loadMessages(
+  sql: SQL,
+  inputKeys: MessageKey[],
+  includeLinkPreviews = true,
+): Promise<Map<string, MessageDTO>> {
   const unique = new Map<string, MessageKey>();
   for (const key of inputKeys) unique.set(`${key.dialogId}:${key.msgId}`, key);
   const keys = [...unique.values()];
@@ -179,6 +187,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       length: n(mention.length),
     })));
   }
+  const previews = includeLinkPreviews ? await loadLinkPreviews(sql, keys) : new Map();
 
   const result = new Map<string, MessageDTO>();
   for (const row of rows) {
@@ -224,6 +233,7 @@ async function loadMessages(sql: SQL, inputKeys: MessageKey[]): Promise<Map<stri
       media_group_count: row.media_group_count == null ? null : n(row.media_group_count),
       service_type: row.service_type ?? null,
       service_data: row.service_data == null ? null : eventData(row.service_data),
+      link_preview: row.state === "deleted_for_all" ? null : previews.get(key) ?? null,
       state: row.state, server_ts: iso(row.server_ts),
     });
   }
@@ -347,6 +357,11 @@ export async function sendMessage(sql: SQL, p: {
   mentions?: unknown;
   draftConsumeOperationId?: string | null;
   allowDraftConsumption?: boolean;
+  silent?: boolean;
+  /** Server-owned schedule identifier; never accepted from an HTTP client. */
+  scheduledDeliveryId?: string | null;
+  linkPreviewCandidate?: unknown;
+  linkPreviewsEnabled?: boolean;
   /** Server-only escape hatch for generated lifecycle rows such as call history. */
   internalService?: boolean;
 }): Promise<SendResult> {
@@ -516,7 +531,11 @@ export async function sendMessage(sql: SQL, p: {
       throw new SyncError("media upload required");
     }
 
-    await lockDialogForMutation(tx, p.senderAccountId, p.dialogId);
+    const access = await lockDialogForMutation(tx, p.senderAccountId, p.dialogId);
+    if (access.type === "group" && access.role === "member" && !access.membersCanSend
+      && p.internalService !== true) {
+      throw new SyncError("only administrators can send messages in this group", 403, "group_send_restricted");
+    }
     const blocked = await tx`
       SELECT 1
       FROM direct_dialog_pairs pair
@@ -556,7 +575,6 @@ export async function sendMessage(sql: SQL, p: {
         .filter((accountId) => !activeIds.has(accountId));
       if (unavailable.length) throw new SyncError("mention target is not an active member");
     }
-
     // 3) allocate per-dialog msg_id
     const dlg = await tx`UPDATE dialogs SET last_msg_id = last_msg_id + 1, updated_at = now() WHERE id = ${p.dialogId} RETURNING last_msg_id`;
     const msgId = n(dlg[0].last_msg_id);
@@ -583,6 +601,16 @@ export async function sendMessage(sql: SQL, p: {
           ${tx.array(mentions.map((mention) => mention.length), "int4")}::int[]
         ) AS mention(account_id, entity_offset, entity_length)`;
     }
+    if (p.linkPreviewsEnabled === true) {
+      await enqueueLinkPreview(tx, {
+        accountId: p.senderAccountId,
+        dialogId: p.dialogId,
+        msgId,
+        editVersion: 0,
+        body,
+        candidate: p.linkPreviewCandidate,
+      });
+    }
 
     // 6) fan out one event per active member, ascending account_id (deadlock-free)
     const pushes = await fanoutDialogEvent(tx, {
@@ -592,6 +620,10 @@ export async function sendMessage(sql: SQL, p: {
       actorAccountId: p.senderAccountId,
       sourceDeviceId: p.senderDeviceId,
       unarchiveOnIncomingMessage: true,
+      alertRecipients: p.silent !== true,
+      actorData: p.scheduledDeliveryId
+        ? { scheduled_delivery_id: p.scheduledDeliveryId }
+        : undefined,
     });
     let senderPts = pushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? 0;
     const consumed = await consumeDraftInTransaction(tx, {
@@ -708,7 +740,7 @@ function mediaGroupFingerprint(input: {
  */
 export async function sendMediaGroup(sql: SQL, p: {
   senderAccountId: string;
-  senderDeviceId: string;
+  senderDeviceId?: string | null;
   dialogId: string;
   clientGroupId: string;
   items: unknown;
@@ -717,6 +749,12 @@ export async function sendMediaGroup(sql: SQL, p: {
   mentions?: unknown;
   draftConsumeOperationId?: string | null;
   allowDraftConsumption?: boolean;
+  silent?: boolean;
+  scheduledDeliveryId?: string | null;
+  linkPreviewCandidate?: unknown;
+  linkPreviewsEnabled?: boolean;
+  /** Server-only scheduled dispatch; never accepted from HTTP. */
+  internalService?: boolean;
 }): Promise<MediaGroupSendResult> {
   const dialogId = String(p.dialogId ?? "").toLowerCase();
   const clientGroupId = String(p.clientGroupId ?? "").toLowerCase();
@@ -754,7 +792,9 @@ export async function sendMediaGroup(sql: SQL, p: {
       mediaGroupReceiptKey(p.senderAccountId, clientGroupId),
     ]);
     await requireActiveAccount(tx, p.senderAccountId);
-    await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
+    if (p.internalService !== true && p.senderDeviceId) {
+      await requireActiveDevice(tx, p.senderAccountId, p.senderDeviceId);
+    }
     try {
       await requireDialogReadAccess(tx, p.senderAccountId, dialogId);
     } catch (error) {
@@ -922,17 +962,19 @@ export async function sendMediaGroup(sql: SQL, p: {
     await lockAccountMutations(tx, directPair
       ? [directPair.account_low, directPair.account_high]
       : [p.senderAccountId]);
-    const itemBudget = (await tx`
-      SELECT COALESCE(sum(item_count), 0)::int AS count
-      FROM media_group_send_budgets
-      WHERE account_id = ${p.senderAccountId}
-        AND accepted_at > now() - interval '1 minute'`)[0];
-    if (n(itemBudget.count) + items.length > MAX_MEDIA_GROUP_ITEMS_PER_MINUTE) {
-      throw new SyncError("media group item budget exceeded", 429, "media_group_rate_limited");
+    if (p.internalService !== true) {
+      const itemBudget = (await tx`
+        SELECT COALESCE(sum(item_count), 0)::int AS count
+        FROM media_group_send_budgets
+        WHERE account_id = ${p.senderAccountId}
+          AND accepted_at > now() - interval '1 minute'`)[0];
+      if (n(itemBudget.count) + items.length > MAX_MEDIA_GROUP_ITEMS_PER_MINUTE) {
+        throw new SyncError("media group item budget exceeded", 429, "media_group_rate_limited");
+      }
+      await tx`
+        INSERT INTO media_group_send_budgets(account_id, device_id, item_count)
+        VALUES (${p.senderAccountId}, ${p.senderDeviceId}, ${items.length})`;
     }
-    await tx`
-      INSERT INTO media_group_send_budgets(account_id, device_id, item_count)
-      VALUES (${p.senderAccountId}, ${p.senderDeviceId}, ${items.length})`;
 
     const sortedMediaIds = items.map((item) => item.mediaId).sort();
     const mediaRows = await tx`
@@ -988,7 +1030,6 @@ export async function sendMediaGroup(sql: SQL, p: {
         throw new SyncError("mention target is not an active member");
       }
     }
-
     const allocation = (await tx`
       UPDATE dialogs
       SET last_msg_id = last_msg_id + ${items.length}, updated_at = now()
@@ -1009,7 +1050,7 @@ export async function sendMediaGroup(sql: SQL, p: {
           media_group_id, media_group_index, media_group_count
         )
         VALUES (
-          ${dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId},
+          ${dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null},
           ${item.clientMsgId}, ${media.kind}, ${sealed.keyId}, ${sealed.nonce},
           ${sealed.ciphertext}, ${index === 0 ? replyToMsgId : null}, ${item.mediaId},
           ${clientGroupId}, ${index}, ${items.length}
@@ -1025,6 +1066,16 @@ export async function sendMediaGroup(sql: SQL, p: {
           ${tx.array(mentions.map((mention) => mention.length), "int4")}::int[]
         ) AS mention(account_id, entity_offset, entity_length)`;
     }
+    if (p.linkPreviewsEnabled === true) {
+      await enqueueLinkPreview(tx, {
+        accountId: p.senderAccountId,
+        dialogId,
+        msgId: firstMsgId,
+        editVersion: 0,
+        body,
+        candidate: p.linkPreviewCandidate,
+      });
+    }
 
     const pushes: Push[] = [];
     let senderPts = 0;
@@ -1035,7 +1086,10 @@ export async function sendMediaGroup(sql: SQL, p: {
         msgId: firstMsgId + index,
         actorAccountId: p.senderAccountId,
         sourceDeviceId: p.senderDeviceId,
-        alertRecipients: index === 0,
+        alertRecipients: index === 0 && p.silent !== true,
+        actorData: p.scheduledDeliveryId
+          ? { scheduled_delivery_id: p.scheduledDeliveryId }
+          : undefined,
       });
       pushes.push(...eventPushes);
       senderPts = eventPushes.find((push) => push.accountId === p.senderAccountId)?.pts ?? senderPts;
@@ -1149,6 +1203,7 @@ async function mutateMessage(sql: SQL, p: {
   actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; operation: "edit" | "delete"; body?: string;
   expectedEditVersion?: number;
+  linkPreviewCandidate?: unknown; linkPreviewsEnabled?: boolean;
 }): Promise<MessageMutationResult> {
   return await sql.begin(async (tx) => {
     const msgId = optionalMessageId(p.msgId)!;
@@ -1205,6 +1260,20 @@ async function mutateMessage(sql: SQL, p: {
           body_ciphertext = ${sealed.ciphertext}, edit_version = edit_version + 1,
           edited_at = now()
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      if (p.linkPreviewsEnabled) {
+        const priorPreview = (await tx`
+          SELECT generation FROM message_link_previews
+          WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`)[0];
+        await enqueueLinkPreview(tx, {
+          accountId: p.actorAccountId,
+          dialogId: p.dialogId,
+          msgId,
+          editVersion: expected + 1,
+          body,
+          candidate: p.linkPreviewCandidate,
+          generation: n(priorPreview?.generation ?? 0) + 1,
+        });
+      }
     } else {
       // Replace the live ciphertext as well as returning a tombstone. This prevents deleted text
       // from remaining decryptable in the primary database (backups retain their normal lifecycle).
@@ -1214,6 +1283,8 @@ async function mutateMessage(sql: SQL, p: {
           body_ciphertext = ${sealed.ciphertext}, media_id = NULL,
           state = 'deleted_for_all', deleted_at = now()
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM link_preview_waiters WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_link_previews WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
       if (row.media_id) {
         // A forwarded copy owns a live reference of its own. Delete the encrypted object only when
         // this was the final visible reference, otherwise that forwarded message must keep working.
@@ -1249,6 +1320,7 @@ async function mutateMessage(sql: SQL, p: {
 export async function editMessage(sql: SQL, p: {
   actorAccountId: string; actorDeviceId: string; dialogId: string; msgId: number;
   clientMutationId: string; body: string; expectedEditVersion: number;
+  linkPreviewCandidate?: unknown; linkPreviewsEnabled?: boolean;
 }): Promise<MessageMutationResult> {
   return mutateMessage(sql, { ...p, operation: "edit" });
 }
@@ -1345,6 +1417,7 @@ export type Difference =
 
 export type ProfileDTO = {
   accountId: string;
+  username: string | null;
   firstName: string;
   lastName: string;
   displayName: string;
@@ -1374,12 +1447,13 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
   const ids = [...new Set(accountIds)].filter((id) => ACCOUNT_UUID_PATTERN.test(id)).sort();
   if (ids.length === 0) return [];
   const rows = await sql`
-    SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+    SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
     FROM accounts
     WHERE id = ANY(${sql.array(ids, "uuid")}::uuid[])
     ORDER BY id`;
   return rows.map((profile: any) => ({
     accountId: profile.id,
+    username: profile.username ?? null,
     firstName: profile.first_name,
     lastName: profile.last_name,
     displayName: profile.display_name,
@@ -1397,7 +1471,14 @@ export async function loadProfiles(sql: SQL, accountIds: Iterable<string>): Prom
 /** review B3 (pruned floor → too_long) + I3 (byte + count budget, slicing). */
 export async function getDifference(
   sql: SQL, accountId: string, sincePts: number,
-  opts: { maxEvents?: number; maxBytes?: number; cloudDraftsEnabled?: boolean } = {},
+  opts: {
+    maxEvents?: number;
+    maxBytes?: number;
+    cloudDraftsEnabled?: boolean;
+    chatFoldersEnabled?: boolean;
+    scheduledDeliveryEnabled?: boolean;
+    linkPreviewsEnabled?: boolean;
+  } = {},
 ): Promise<Difference> {
   const maxEvents = boundedInteger(opts.maxEvents, 200, 1, 200);
   const maxBytes = boundedInteger(opts.maxBytes, 256 * 1024, 1, 512 * 1024);
@@ -1446,6 +1527,7 @@ export async function getDifference(
     ), profile_payload AS (
       SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'accountId', profile.id,
+        'username', profile.username,
         'firstName', profile.first_name,
         'lastName', profile.last_name,
         'displayName', profile.display_name,
@@ -1527,11 +1609,12 @@ export async function getDifference(
   const messageKeys: MessageKey[] = rows.flatMap((event, index) =>
     event.msg_id != null && [
       "message.new", "message.edited", "message.deleted", "reaction.updated",
+      "message.preview_updated",
     ].includes(event.type) && !accessDecisions[index].replaceWithRevocation
       ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
       : []
   );
-  const messages = await loadMessages(sql, messageKeys);
+  const messages = await loadMessages(sql, messageKeys, opts.linkPreviewsEnabled === true);
   const draftDialogIds = rows
     .filter((event: any, index: number) =>
       event.type === "draft.updated" && !accessDecisions[index].replaceWithRevocation
@@ -1540,6 +1623,20 @@ export async function getDifference(
   const drafts = opts.cloudDraftsEnabled === false
     ? new Map<string, DraftDTO>()
     : await loadDrafts(sql, accountId, draftDialogIds);
+  const folderSnapshot = rows.some((event: any) => event.type === "chat_folders.updated")
+    && opts.chatFoldersEnabled !== false
+    ? await getChatFolders(sql, accountId)
+    : null;
+  const scheduledDeliveries = new Map<string, Awaited<ReturnType<typeof getScheduledDelivery>>>();
+  if (opts.scheduledDeliveryEnabled !== false) {
+    const ids = [...new Set(rows
+      .filter((event: any) => String(event.type).startsWith("scheduled."))
+      .map((event: any) => String(eventData(event.data).scheduled_delivery_id ?? ""))
+      .filter(Boolean))];
+    for (const id of ids) {
+      scheduledDeliveries.set(id, await getScheduledDelivery(sql, accountId, id));
+    }
+  }
 
   const updates: any[] = [];
   let bytes = 0, lastPts = sincePts, truncated = false;
@@ -1554,7 +1651,20 @@ export async function getDifference(
         dialog_id: ev.dialog_id,
         dialog_type: ev.dialog_type ?? ev.data?.dialog_type ?? "group",
       };
-    } else if (ev.type === "message.new" || ev.type === "message.edited" || ev.type === "message.deleted" || ev.type === "reaction.updated") {
+    } else if (
+      ev.type === "message.new" || ev.type === "message.edited"
+      || ev.type === "message.deleted" || ev.type === "reaction.updated"
+      || ev.type === "message.preview_updated"
+    ) {
+      if (ev.type === "message.preview_updated" && opts.linkPreviewsEnabled === false) {
+        update = { pts, ptsCount: 1, type: "capability.skipped" };
+        const updateBytes = Buffer.byteLength(JSON.stringify(update));
+        if (bytes + updateBytes > maxBytes && updates.length >= 1) { truncated = true; break; }
+        updates.push(update);
+        bytes += updateBytes;
+        lastPts = pts;
+        continue;
+      }
       const message = messages.get(`${ev.dialog_id}:${n(ev.msg_id)}`) ?? null;
       if (!message) {
         update = {
@@ -1587,6 +1697,28 @@ export async function getDifference(
         dialog_title: ev.dialog_title ?? undefined,
         peer_account_id: ev.peer_account_id ?? undefined,
         draft: drafts.get(String(ev.dialog_id)) ?? null,
+      };
+    } else if (ev.type === "chat_folders.updated" && opts.chatFoldersEnabled === false) {
+      update = { pts, ptsCount: 1, type: "capability.skipped" };
+    } else if (ev.type === "chat_folders.updated") {
+      update = {
+        pts,
+        ptsCount: 1,
+        type: ev.type,
+        chat_folders: folderSnapshot,
+        ...eventData(ev.data),
+      };
+    } else if (String(ev.type).startsWith("scheduled.") && opts.scheduledDeliveryEnabled === false) {
+      update = { pts, ptsCount: 1, type: "capability.skipped" };
+    } else if (String(ev.type).startsWith("scheduled.")) {
+      const data = eventData(ev.data);
+      const deliveryId = String(data.scheduled_delivery_id ?? "");
+      update = {
+        pts,
+        ptsCount: 1,
+        type: ev.type,
+        scheduled_delivery: scheduledDeliveries.get(deliveryId) ?? null,
+        ...data,
       };
     } else {
       update = {

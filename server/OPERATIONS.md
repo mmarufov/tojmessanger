@@ -95,8 +95,8 @@ and thumbnails are AEAD-encrypted before PostgreSQL persistence. Deploy the sche
 clients that send media. These optional server settings are byte counts and are bounded to safe ranges:
 
 - `TOJ_MEDIA_CHUNK_BYTES` (legacy offset-v1 only; default 1048576)
-- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 26214400)
-- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000)
+- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default and current hard maximum 26214400 / 25 MB)
+- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000 / 250 MB)
 - `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
 - `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
 
@@ -317,6 +317,76 @@ boundary, reconciles any deleted-account residue in bounded batches, and only th
 unauthenticated capability responses before admitting traffic. Rollback is by clearing the two
 feature switches; do not remove the database cleanup function or status trigger while any binary
 can create draft, album, Saved, or preference state.
+
+## Cloud folders, scheduled delivery, and link-preview rollout
+
+These three features share the cloud-productivity schema migration but have independent account
+rollouts and kill switches. Run `bun run migrate` before deploying the compatible binary. Keep every
+switch at zero until `/ready` is healthy and the contract marker
+`cloud-productivity-contract-v1` exists.
+
+- Chat folders: `TOJ_CHAT_FOLDERS_V1_ENABLED=1`, `TOJ_CHAT_FOLDERS_ROLLOUT_PERCENT=0..100`,
+  and optional `TOJ_CHAT_FOLDERS_ALLOWLIST` account UUIDs.
+- Scheduled delivery: `TOJ_SCHEDULED_DELIVERY_V1_ENABLED=1` (or
+  `TOJ_SCHEDULED_DELIVERY_V1_ACCEPTING=1`), `TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT`, and
+  optional `TOJ_SCHEDULED_DELIVERY_ALLOWLIST`.
+- Link previews: `TOJ_LINK_PREVIEWS_V1_ENABLED=1`, `TOJ_LINK_PREVIEWS_ROLLOUT_PERCENT`, and
+  optional `TOJ_LINK_PREVIEWS_ALLOWLIST`.
+
+Run the durable workers independently from the HTTP process in production:
+
+```bash
+bun run worker:scheduled-delivery
+bun run worker:link-preview
+```
+
+The HTTP process also starts both workers for local development and single-process test deployments.
+Set `TOJ_PRODUCTIVITY_WORKERS_DISABLED=1` there when dedicated worker services are active. A
+scheduled-delivery or link-preview capability is advertised only when its schema is complete, the
+account is in rollout, and a matching worker heartbeat is fresher than 30 seconds. This deliberately
+fails closed if a worker fleet is dead. Folder capability does not require a worker.
+
+Deploy in this order: expand/validate/contract migration; compatible HTTP nodes with all feature
+switches off; both worker services; iOS build; internal allowlists; 1%, 10%, 50%, then 100% account
+rollout. Before each increase, verify no account PTS gaps, no growing `processing` leases older than
+30 seconds, no stale worker heartbeats, stable dispatch lag, bounded preview failures, and flat 5xx
+rates. The migration, route families, account events, maintenance cleanup, and encrypted columns
+must remain installed during an application rollback.
+
+Scheduled delivery is server-owned only after the create response is committed. The iOS client does
+not place future messages in its ordinary local-send outbox and restores the text to the composer if
+server ownership was not confirmed. Workers use `FOR UPDATE SKIP LOCKED`, expiring leases, stable
+client message IDs, and the existing send idempotency ledger. Dispatch revalidates dialog access,
+media ownership, replies, and mentions; a missing reply or stale mention is safely dropped while a
+lost dialog becomes a permanent sanitized failure. Terminal rows erase message ciphertext and
+release scheduled media references. Cancel and worker claim serialize on the schedule row: cancel
+wins before claim, while a processing response means dispatch already owns the linearization point.
+
+Link preview fetching never runs in the request transaction. The request stores only encrypted URLs
+and a keyed lookup digest, then a worker resolves every DNS result, rejects private/loopback/link-local
+and mapped addresses, pins the selected address, rechecks the connected peer, repeats the policy on
+every redirect, permits only HTTP/HTTPS standard ports without credentials, and enforces byte,
+time, redirect, image-pixel, and output limits. JavaScript is never executed. Metadata, URLs, and
+normalized JPEG assets remain encrypted at rest. Asset downloads require current dialog membership.
+Turning the preview switch off stops new jobs and payload sync without affecting text delivery.
+
+Immediate rollback is account percentage zero (and empty allowlists), followed by clearing the
+feature switch. Do not stop the scheduled worker while accepted schedules remain: first close
+acceptance/capability, wait until `scheduled` and `processing` rows drain or explicitly retain the
+worker service, then roll back HTTP/iOS. The preview worker can be stopped after closing preview
+acceptance; pending previews degrade to ordinary links. Folder rows and all local SQLCipher copies
+remain for later re-enable.
+
+Useful aggregate checks (never select encrypted payload columns into logs):
+
+```sql
+SELECT state, count(*), max(now() - deliver_at) AS max_lag
+FROM scheduled_deliveries GROUP BY state;
+SELECT worker_kind, max(last_seen_at) AS freshest
+FROM worker_heartbeats GROUP BY worker_kind;
+SELECT state, count(*) FROM link_preview_cache_entries GROUP BY state;
+```
+
 
 ## Voice calls and TURN readiness
 

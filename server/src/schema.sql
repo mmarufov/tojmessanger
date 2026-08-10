@@ -31,6 +31,7 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_name TEXT NOT NULL DEFAULT ''
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS birthday DATE;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS profile_color INT NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS username TEXT;
 DO $$ BEGIN
   ALTER TABLE accounts ADD CONSTRAINT accounts_profile_color_check
     CHECK (profile_color BETWEEN 0 AND 7);
@@ -160,6 +161,9 @@ CREATE TABLE IF NOT EXISTS dialogs (
 );
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS members_can_send BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS members_can_add_members BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS members_can_edit_info BOOLEAN NOT NULL DEFAULT FALSE;
 -- Existing deployments expand/validate/short-swap the dialog constraints after this transaction;
 -- see schema-dialogs-expand.sql and schema-dialogs-swap.sql.
 
@@ -638,7 +642,8 @@ CREATE TABLE IF NOT EXISTS group_mutation_requests (
   client_mutation_id UUID NOT NULL,
   dialog_id UUID NOT NULL,
   operation TEXT NOT NULL CHECK (operation IN (
-    'add_members','remove_member','change_role','update_profile','transfer_owner','leave','notifications'
+    'add_members','remove_member','change_role','update_profile','update_permissions',
+    'transfer_owner','leave','notifications'
   )),
   fingerprint BYTEA NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
@@ -646,6 +651,16 @@ CREATE TABLE IF NOT EXISTS group_mutation_requests (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (actor_account_id, client_mutation_id)
 );
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'group-mutation-operation-v2')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'group_mutation_requests_operation_check_v2') THEN
+    ALTER TABLE group_mutation_requests ADD CONSTRAINT group_mutation_requests_operation_check_v2
+      CHECK (operation IN (
+        'add_members','remove_member','change_role','update_profile','update_permissions',
+        'transfer_owner','leave','notifications'
+      )) NOT VALID;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS group_action_budgets (
   id BIGSERIAL PRIMARY KEY,

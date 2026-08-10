@@ -98,3 +98,5 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_account_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS group_action_budgets_target_idx
   ON group_action_budgets(target_account_id, action, created_at DESC)
   WHERE target_account_id IS NOT NULL;
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS accounts_username_active_unique_idx
+  ON accounts (lower(username)) WHERE username IS NOT NULL AND status IN ('active','limited');

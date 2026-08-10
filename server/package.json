@@ -5,6 +5,8 @@
   "scripts": {
     "start": "bun run server.ts",
     "cloud": "bun run src/cloud.ts",
+    "worker:scheduled-delivery": "bun run src/scheduled-delivery-worker.ts",
+    "worker:link-preview": "bun run src/link-preview-worker.ts",
     "migrate": "bun run src/migrate.ts",
     "test:migration:forward": "bun run scripts/test-message-forward-migration.ts",
     "benchmark:sync-lifecycle": "bun run scripts/benchmark-sync-lifecycle-index.ts",
@@ -15,7 +17,9 @@
     "test": "bun test"
   },
   "dependencies": {
-    "pg": "^8.16.3"
+    "ipaddr.js": "^2.4.0",
+    "pg": "^8.16.3",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

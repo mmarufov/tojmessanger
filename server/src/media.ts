@@ -67,7 +67,7 @@ function boundedEnv(name: string, fallback: number, lower: number, upper: number
 export function mediaLimits() {
   return {
     chunkBytes: boundedEnv("TOJ_MEDIA_CHUNK_BYTES", DEFAULT_MEDIA_CHUNK_BYTES, 64 * 1024, 1024 * 1024),
-    maxObjectBytes: boundedEnv("TOJ_MEDIA_MAX_OBJECT_BYTES", DEFAULT_MAX_OBJECT_BYTES, 1024, 100 * 1024 * 1024),
+    maxObjectBytes: boundedEnv("TOJ_MEDIA_MAX_OBJECT_BYTES", DEFAULT_MAX_OBJECT_BYTES, 1024, DEFAULT_MAX_OBJECT_BYTES),
     accountQuotaBytes: boundedEnv("TOJ_MEDIA_ACCOUNT_QUOTA_BYTES", DEFAULT_ACCOUNT_QUOTA_BYTES, 1024, 10 * 1024 * 1024 * 1024),
     maxActiveUploads: boundedEnv("TOJ_MEDIA_MAX_ACTIVE_UPLOADS", DEFAULT_MAX_ACTIVE_UPLOADS, 1, 100),
     maxDailyUploads: boundedEnv("TOJ_MEDIA_MAX_DAILY_UPLOADS", DEFAULT_MAX_DAILY_UPLOADS, 1, 10_000),

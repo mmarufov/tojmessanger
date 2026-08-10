@@ -13,6 +13,7 @@ import {
   removeGroupMember,
   transferGroupOwner,
   updateGroupNotifications,
+  updateGroupPermissions,
   updateGroupProfile,
 } from "./groups";
 import { getDifference, getHistory, sendMessage } from "./sync";
@@ -558,6 +559,54 @@ describe("Groups v1", () => {
       FROM dialog_preferences
       WHERE dialog_id = ${groupId} AND account_id = ${alice.accountId}`)[0].is_archived)
       .toBe(true);
+  });
+
+  test("granular member permissions are server-enforced and update atomically", async () => {
+    const { owner, alice, bob } = await threeAccounts();
+    const groupId = crypto.randomUUID();
+    await createGroup(db, {
+      creatorAccountId: owner.accountId,
+      creatorDeviceId: owner.deviceId,
+      groupId,
+      title: "Permissions",
+      memberIds: [alice.accountId],
+    });
+    const locked = await updateGroupPermissions(db, {
+      actorAccountId: owner.accountId,
+      actorDeviceId: owner.deviceId,
+      dialogId: groupId,
+      membersCanSend: false,
+      membersCanAddMembers: false,
+      membersCanEditInfo: false,
+      clientMutationId: crypto.randomUUID(),
+    });
+    expect(locked.group).toMatchObject({
+      membersCanSend: false, membersCanAddMembers: false, membersCanEditInfo: false,
+    });
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId: groupId, clientMsgId: crypto.randomUUID(), body: "blocked",
+    })).rejects.toMatchObject({ status: 403, code: "group_send_restricted" });
+    await expect(addGroupMembers(db, {
+      actorAccountId: alice.accountId, dialogId: groupId, memberIds: [bob.accountId],
+      clientMutationId: crypto.randomUUID(),
+    })).rejects.toMatchObject({ status: 403 });
+    await updateGroupPermissions(db, {
+      actorAccountId: owner.accountId,
+      dialogId: groupId,
+      membersCanSend: true,
+      membersCanAddMembers: true,
+      membersCanEditInfo: true,
+      clientMutationId: crypto.randomUUID(),
+    });
+    await expect(sendMessage(db, {
+      senderAccountId: alice.accountId, senderDeviceId: alice.deviceId,
+      dialogId: groupId, clientMsgId: crypto.randomUUID(), body: "allowed",
+    })).resolves.toMatchObject({ duplicate: false });
+    await expect(addGroupMembers(db, {
+      actorAccountId: alice.accountId, dialogId: groupId, memberIds: [bob.accountId],
+      clientMutationId: crypto.randomUUID(),
+    })).resolves.toMatchObject({ group: expect.objectContaining({ memberCount: 3 }) });
   });
 
   test("the route family hard-404s and stays unadvertised while the flag is off", async () => {

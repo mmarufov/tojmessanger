@@ -2,10 +2,14 @@ import SwiftUI
 import AVFoundation
 import AVKit
 import Combine
+import Contacts
+import ContactsUI
+import CoreLocation
 import Network
 import PhotosUI
 import Photos
 import UniformTypeIdentifiers
+import UserNotifications
 import UIKit
 
 nonisolated enum VoiceGestureIntent: Equatable {
@@ -88,6 +92,7 @@ struct TojConversationExperience: View {
     @State private var voiceStartTask: Task<Void, Never>?
     @State private var autoplayCoordinator = VideoAutoplayCoordinator()
     @State private var networkMonitor = MediaNetworkMonitor()
+    @State private var showingSchedulePicker = false
 
     let dialogId: String
 
@@ -111,7 +116,7 @@ struct TojConversationExperience: View {
 
     var body: some View {
         messageTimeline
-            .background(TojTheme.canvas)
+            .background { TojChatWallpaper() }
             .overlay(alignment: .top) {
                 VStack(spacing: 8) {
                     header
@@ -214,6 +219,14 @@ struct TojConversationExperience: View {
                 showingForwarding = false
             }
             .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showingSchedulePicker) {
+            ScheduleMessageSheet(isReminder: isSavedMessages) { date in
+                showingSchedulePicker = false
+                send(deliverAfter: date)
+            }
+            .presentationDetents([.height(390)])
             .presentationDragIndicator(.visible)
         }
         .alert("Delete message?", isPresented: Binding(
@@ -821,7 +834,7 @@ struct TojConversationExperience: View {
                 messageField
 
                 if canSend {
-                    Button(action: send) {
+                    Button { send() } label: {
                         Image(systemName: model.composerMode.isEditing ? "checkmark" : "paperplane.fill")
                             .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(TojTheme.onAccent)
@@ -831,6 +844,22 @@ struct TojConversationExperience: View {
                     .buttonStyle(.tojPressable)
                     .transition(reduceMotion ? .opacity : .scale(scale: 0.6).combined(with: .opacity))
                     .accessibilityLabel(model.composerMode.isEditing ? "Save edited message" : "Send")
+                    .contextMenu {
+                        if !model.composerMode.isEditing,
+                           model.currentDraft?.attachments.isEmpty != false {
+                            if !isSavedMessages {
+                                Button("Send Without Sound", systemImage: "speaker.slash.fill") {
+                                    send(silent: true)
+                                }
+                            }
+                            Button(
+                                isSavedMessages ? "Set Reminder" : "Schedule Message",
+                                systemImage: isSavedMessages ? "bell.badge.fill" : "calendar.badge.clock"
+                            ) {
+                                showingSchedulePicker = true
+                            }
+                        }
+                    }
                 } else if model.capabilities.contains(.voiceNotes) {
                     voiceRecordControl
                 } else {
@@ -889,18 +918,39 @@ struct TojConversationExperience: View {
                 draftAttachmentStrip(attachments)
             }
 
-            TextField("Message", text: $model.draft, axis: .vertical)
-                .focused($composerFocused)
-                .lineLimit(1...8)
-                .font(.body)
-                .foregroundStyle(TojTheme.text)
-                .tint(TojTheme.gold)
-                .padding(.horizontal, 15)
-                .padding(.vertical, 12)
-                .submitLabel(.send)
-                .onSubmit { if canSend { send() } }
-                .accessibilityLabel("Message")
-                .disabled(model.composerMode.isRecording)
+            HStack(alignment: .bottom, spacing: 4) {
+                TextField("Message", text: $model.draft, axis: .vertical)
+                    .focused($composerFocused)
+                    .lineLimit(1...8)
+                    .font(.body)
+                    .foregroundStyle(TojTheme.text)
+                    .tint(TojTheme.gold)
+                    .submitLabel(.send)
+                    .onSubmit { if canSend { send() } }
+                    .accessibilityLabel("Message")
+                    .disabled(model.composerMode.isRecording)
+
+                if !model.draft.isEmpty, !model.composerMode.isRecording {
+                    Menu {
+                        Button("Bold", systemImage: "bold") { wrapDraft(prefix: "**", suffix: "**") }
+                        Button("Italic", systemImage: "italic") { wrapDraft(prefix: "_", suffix: "_") }
+                        Button("Spoiler", systemImage: "eye.slash") { wrapDraft(prefix: "||", suffix: "||") }
+                        Button("Monospace", systemImage: "chevron.left.forwardslash.chevron.right") {
+                            wrapDraft(prefix: "`", suffix: "`")
+                        }
+                    } label: {
+                        Image(systemName: "textformat")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(TojTheme.secondaryText)
+                            .frame(width: 34, height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Format message")
+                }
+            }
+            .padding(.leading, 15)
+            .padding(.trailing, 7)
+            .padding(.vertical, 8)
 
             #if DEBUG
             if TelegramFastUITestFixture.enabled {
@@ -921,6 +971,19 @@ struct TojConversationExperience: View {
             #endif
         }
         .tojGlass(in: RoundedRectangle(cornerRadius: 23, style: .continuous), interactive: true)
+    }
+
+    private func wrapDraft(prefix: String, suffix: String) {
+        guard !model.draft.isEmpty else { return }
+        if model.draft.hasPrefix(prefix), model.draft.hasSuffix(suffix),
+           model.draft.count >= prefix.count + suffix.count {
+            model.draft.removeFirst(prefix.count)
+            model.draft.removeLast(suffix.count)
+        } else {
+            model.draft = prefix + model.draft + suffix
+        }
+        composerFocused = true
+        TojFeedback.selection()
     }
 
     private func draftAttachmentStrip(_ attachments: [LocalDraftAttachment]) -> some View {
@@ -1094,13 +1157,13 @@ struct TojConversationExperience: View {
         }
     }
 
-    private func send() {
+    private func send(silent: Bool = false, deliverAfter: Date? = nil) {
         guard canSend else { return }
         TojFeedback.sent()
         let shouldFollowSend = !model.composerMode.isEditing
         if shouldFollowSend { shouldFollowLatest = true }
         Task {
-            await model.sendDraft()
+            await model.sendDraft(silent: silent, deliverAfter: deliverAfter)
             if shouldFollowSend { scrollToLatest() }
         }
     }
@@ -1457,8 +1520,10 @@ private struct TojMessageBubble: View {
     let actions: [MessageAction]
     let onAction: (MessageAction) -> Void
     let onSwipeReply: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var replyOffset: CGFloat = 0
     @State private var showingMedia = false
+    @State private var spoilersRevealed = false
     @Namespace private var mediaZoom
 
     var body: some View {
@@ -1534,6 +1599,13 @@ private struct TojMessageBubble: View {
                 if hasCaptionText {
                     captionText
                         .padding(.horizontal, isVisualMedia ? 8 : 0)
+                }
+
+                if line.media == nil,
+                   line.attachment == nil,
+                   let url = RichMessageText.firstWebURL(in: line.text) {
+                    SafeLinkPreviewCard(url: url, preview: line.linkPreview)
+                        .padding(.top, 2)
                 }
 
                 if line.media == nil, let progress = line.transferProgress, progress < 1 {
@@ -1722,10 +1794,21 @@ private struct TojMessageBubble: View {
                 metaRow
             }
         }
+        .onTapGesture {
+            guard RichMessageText.containsSpoiler(line.text) else { return }
+            withAnimation(reduceMotion ? nil : TojTheme.microAnimation) {
+                spoilersRevealed.toggle()
+            }
+        }
+        .accessibilityHint(
+            RichMessageText.containsSpoiler(line.text) && !spoilersRevealed
+                ? "Contains hidden spoiler. Double tap to reveal."
+                : ""
+        )
     }
 
     private var messageText: Text {
-        Text(line.text)
+        Text(RichMessageText.attributed(line.text, revealsSpoilers: spoilersRevealed))
             .font(.body)
             .foregroundStyle(TojTheme.text)
     }
@@ -3308,6 +3391,93 @@ private extension ComposerMode {
     }
 }
 
+private struct ScheduleMessageSheet: View {
+    let isReminder: Bool
+    let completion: (Date) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var date = Date().addingTimeInterval(60 * 60)
+
+    private var range: ClosedRange<Date> {
+        let minimum = Date().addingTimeInterval(60)
+        let maximum = Calendar.current.date(byAdding: .year, value: 1, to: minimum)
+            ?? minimum.addingTimeInterval(365 * 24 * 60 * 60)
+        return minimum...maximum
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                Image(systemName: isReminder ? "bell.badge.fill" : "calendar.badge.clock")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(TojTheme.accent)
+                    .frame(width: 66, height: 66)
+                    .background(TojTheme.raised, in: Circle())
+
+                DatePicker(
+                    isReminder ? "Remind me" : "Send on",
+                    selection: $date,
+                    in: range,
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .datePickerStyle(.compact)
+                .tint(TojTheme.accent)
+
+                Button {
+                    completion(max(date, range.lowerBound))
+                } label: {
+                    Text(isReminder ? "Set Reminder" : "Schedule Message")
+                        .font(.headline)
+                        .foregroundStyle(TojTheme.onAccent)
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .background(TojTheme.accent, in: Capsule())
+                }
+                .buttonStyle(.tojPressable)
+
+                Text("The message stays in the encrypted outbox and sends when its time arrives. It will retry automatically if the network is unavailable.")
+                    .font(.footnote)
+                    .foregroundStyle(TojTheme.secondaryText)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(TojTheme.canvas)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+nonisolated private enum ScheduledReminderCenter {
+    static func schedule(at date: Date, fallbackBody: String) async {
+        guard date > Date() else { return }
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        guard settings.authorizationStatus == .authorized
+                || settings.authorizationStatus == .provisional else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = String(localized: "Toj Reminder")
+        // Avoid copying private message text onto the lock screen. The original remains in the
+        // encrypted Saved Messages timeline; the notification opens Toj to read it.
+        content.body = fallbackBody.isEmpty
+            ? String(localized: "Open Saved Messages to view your reminder.")
+            : String(localized: "You have a reminder in Saved Messages.")
+        content.sound = .default
+        let trigger = UNTimeIntervalNotificationTrigger(
+            timeInterval: max(1, date.timeIntervalSinceNow),
+            repeats: false
+        )
+        try? await center.add(UNNotificationRequest(
+            identifier: "toj.reminder.\(UUID().uuidString.lowercased())",
+            content: content,
+            trigger: trigger
+        ))
+    }
+}
+
 private struct ProductionAttachmentPicker: View {
     let model: CloudAppModel
     let onDone: () -> Void
@@ -3319,6 +3489,9 @@ private struct ProductionAttachmentPicker: View {
     @State private var selectedAsset: PHAsset?
     @State private var selectedFile: PreparedFileSelection?
     @State private var importingFile = false
+    @State private var showingCamera = false
+    @State private var showingContactPicker = false
+    @State private var locationProvider = OneShotLocationProvider()
     @State private var working = false
     @State private var error: String?
 
@@ -3358,6 +3531,25 @@ private struct ProductionAttachmentPicker: View {
         .fileImporter(isPresented: $importingFile, allowedContentTypes: [.data, .item]) { result in
             selectionTask?.cancel()
             selectionTask = Task { await loadFile(result) }
+        }
+        .fullScreenCover(isPresented: $showingCamera) {
+            CameraCapturePicker { result in
+                showingCamera = false
+                guard let result else { return }
+                selectionTask?.cancel()
+                selectionTask = Task { await loadCapture(result) }
+            }
+            .ignoresSafeArea()
+        }
+        .sheet(isPresented: $showingContactPicker) {
+            ContactAttachmentPicker { selection in
+                showingContactPicker = false
+                guard let selection else { return }
+                selectedAsset = nil
+                selectedFile = selection
+                error = nil
+                TojFeedback.selection()
+            }
         }
         .onDisappear {
             selectionTask?.cancel()
@@ -3580,7 +3772,14 @@ private struct ProductionAttachmentPicker: View {
                     .padding(.horizontal, 16)
             }
 
-            HStack(spacing: 3) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 3) {
+                Button { showingCamera = true } label: {
+                    AttachmentActionLabel(title: "Camera", icon: "camera.fill")
+                }
+                .buttonStyle(.tojPressable)
+                .disabled(!UIImagePickerController.isSourceTypeAvailable(.camera))
+
                 Button {
                     selectedAsset = nil
                     selectedFile = nil
@@ -3614,6 +3813,20 @@ private struct ProductionAttachmentPicker: View {
                     AttachmentActionLabel(title: "File", icon: "doc.fill", selected: selectedFile != nil)
                 }
                 .buttonStyle(.tojPressable)
+
+                Button { showingContactPicker = true } label: {
+                    AttachmentActionLabel(title: "Contact", icon: "person.crop.circle.fill")
+                }
+                .buttonStyle(.tojPressable)
+
+                Button {
+                    selectionTask?.cancel()
+                    selectionTask = Task { await addCurrentLocation() }
+                } label: {
+                    AttachmentActionLabel(title: "Location", icon: "location.fill")
+                }
+                .buttonStyle(.tojPressable)
+                }
             }
             .disabled(working)
             .padding(8)
@@ -3679,6 +3892,45 @@ private struct ProductionAttachmentPicker: View {
             }
             try Task.checkCancellation()
             try await prepareAndStagePhoto(data)
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func loadCapture(_ capture: CameraCaptureResult) async {
+        working = true
+        defer { working = false }
+        do {
+            switch capture {
+            case let .photo(data):
+                try await prepareAndStagePhoto(data)
+            case let .video(data):
+                let fitted = try await MediaAssetDataLoader.fittedVideoData(data)
+                try Task.checkCancellation()
+                try await prepareAndStageVideo(fitted)
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func addCurrentLocation() async {
+        working = true
+        defer { working = false }
+        do {
+            let location = try await locationProvider.request()
+            try Task.checkCancellation()
+            let latitude = String(format: "%.6f", location.coordinate.latitude)
+            let longitude = String(format: "%.6f", location.coordinate.longitude)
+            let link = "https://maps.apple.com/?ll=\(latitude),\(longitude)"
+            model.draft = model.draft.isEmpty
+                ? "📍 \(String(localized: "Location"))\n\(link)"
+                : model.draft + "\n\n📍 \(String(localized: "Location"))\n\(link)"
+            onDone()
         } catch is CancellationError {
             return
         } catch {
@@ -3759,7 +4011,7 @@ private struct ProductionAttachmentPicker: View {
         _ data: Data,
         finishSelection: Bool = true
     ) async throws {
-        guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
+        guard data.count <= TojMediaLimits.maximumMessageBytesInt else { throw PickerError.tooLarge }
         guard let container = SafeMediaVideoInspector.container(for: data) else {
             throw PickerError.unsupportedVideo
         }
@@ -3830,12 +4082,12 @@ private struct ProductionAttachmentPicker: View {
                     .contentTypeKey, .fileSizeKey, .isDirectoryKey, .isRegularFileKey,
                 ])
                 guard values.isDirectory != true else { throw PickerError.unreadable }
-                if let fileSize = values.fileSize, fileSize > 25 * 1024 * 1024 {
+                if let fileSize = values.fileSize, fileSize > TojMediaLimits.maximumMessageBytesInt {
                     throw PickerError.tooLarge
                 }
                 let data = try Data(contentsOf: url, options: .mappedIfSafe)
                 guard !data.isEmpty else { throw PickerError.emptyFile }
-                guard data.count <= 25 * 1024 * 1024 else { throw PickerError.tooLarge }
+                guard data.count <= TojMediaLimits.maximumMessageBytesInt else { throw PickerError.tooLarge }
                 guard let fileName = SafeMediaFileMetadata.sanitizedFileName(url.lastPathComponent) else {
                     throw PickerError.invalidFileName
                 }
@@ -4170,7 +4422,7 @@ private struct RecentMediaTile: View {
 }
 
 nonisolated private enum MediaAssetDataLoader {
-    private static let maxBytes = 25 * 1024 * 1024
+    private static let maxBytes = TojMediaLimits.maximumMessageBytesInt
 
     static func imageData(for asset: PHAsset) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
@@ -4348,6 +4600,208 @@ nonisolated private final class VideoAssetReference: @unchecked Sendable {
 
     init(asset: AVAsset) {
         self.asset = asset
+    }
+}
+
+private struct ContactAttachmentPicker: UIViewControllerRepresentable {
+    let completion: @MainActor (PreparedFileSelection?) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+
+    func makeUIViewController(context: Context) -> CNContactPickerViewController {
+        let picker = CNContactPickerViewController()
+        picker.delegate = context.coordinator
+        picker.displayedPropertyKeys = [CNContactPhoneNumbersKey, CNContactEmailAddressesKey]
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: CNContactPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, CNContactPickerDelegate {
+        let completion: @MainActor (PreparedFileSelection?) -> Void
+
+        init(completion: @escaping @MainActor (PreparedFileSelection?) -> Void) {
+            self.completion = completion
+        }
+
+        func contactPickerDidCancel(_ picker: CNContactPickerViewController) {
+            completion(nil)
+        }
+
+        func contactPicker(_ picker: CNContactPickerViewController, didSelect contact: CNContact) {
+            do {
+                let data = try CNContactVCardSerialization.data(with: [contact])
+                guard !data.isEmpty, data.count <= TojMediaLimits.maximumMessageBytesInt else {
+                    completion(nil)
+                    return
+                }
+                let displayName = CNContactFormatter.string(from: contact, style: .fullName)
+                    ?? String(localized: "Contact")
+                let safeName = SafeMediaFileMetadata.sanitizedFileName(displayName + ".vcf")
+                    ?? "Contact.vcf"
+                completion(PreparedFileSelection(
+                    data: data,
+                    fileName: safeName,
+                    contentType: UTType.vCard.preferredMIMEType ?? "text/vcard"
+                ))
+            } catch {
+                completion(nil)
+            }
+        }
+    }
+}
+
+@MainActor
+private final class OneShotLocationProvider: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private var continuation: CheckedContinuation<CLLocation, any Error>?
+    private var timeoutTask: Task<Void, Never>?
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+    }
+
+    func request() async throws -> CLLocation {
+        guard CLLocationManager.locationServicesEnabled() else {
+            throw LocationShareError.servicesDisabled
+        }
+        guard continuation == nil else { throw LocationShareError.requestInProgress }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                timeoutTask = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(15))
+                    guard !Task.isCancelled else { return }
+                    self?.finish(.failure(LocationShareError.timedOut))
+                }
+                beginRequest(for: manager.authorizationStatus)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.finish(.failure(CancellationError()))
+            }
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard continuation != nil else { return }
+        beginRequest(for: manager.authorizationStatus)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last, location.horizontalAccuracy >= 0 else {
+            finish(.failure(LocationShareError.unavailable))
+            return
+        }
+        finish(.success(location))
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        finish(.failure(error))
+    }
+
+    private func beginRequest(for status: CLAuthorizationStatus) {
+        switch status {
+        case .notDetermined:
+            manager.requestWhenInUseAuthorization()
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.requestLocation()
+        case .denied, .restricted:
+            finish(.failure(LocationShareError.permissionDenied))
+        @unknown default:
+            finish(.failure(LocationShareError.unavailable))
+        }
+    }
+
+    private func finish(_ result: Result<CLLocation, any Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        manager.stopUpdatingLocation()
+        continuation.resume(with: result)
+    }
+}
+
+nonisolated private enum LocationShareError: LocalizedError, Sendable {
+    case servicesDisabled
+    case permissionDenied
+    case requestInProgress
+    case timedOut
+    case unavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .servicesDisabled: String(localized: "Location Services are turned off")
+        case .permissionDenied: String(localized: "Location access is required to share your position")
+        case .requestInProgress: String(localized: "A location request is already in progress")
+        case .timedOut: String(localized: "Your location could not be found in time")
+        case .unavailable: String(localized: "Your current location is unavailable")
+        }
+    }
+}
+
+nonisolated private enum CameraCaptureResult: Sendable {
+    case photo(Data)
+    case video(Data)
+}
+
+private struct CameraCapturePicker: UIViewControllerRepresentable {
+    let completion: @MainActor (CameraCaptureResult?) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.delegate = context.coordinator
+        picker.sourceType = .camera
+        picker.mediaTypes = [UTType.image.identifier, UTType.movie.identifier]
+        picker.cameraCaptureMode = .photo
+        picker.videoQuality = .typeHigh
+        picker.videoMaximumDuration = 180
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let completion: @MainActor (CameraCaptureResult?) -> Void
+
+        init(completion: @escaping @MainActor (CameraCaptureResult?) -> Void) {
+            self.completion = completion
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            completion(nil)
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage,
+               let data = image.jpegData(compressionQuality: 0.92) {
+                completion(.photo(data))
+                return
+            }
+            guard let url = info[.mediaURL] as? URL else {
+                completion(nil)
+                return
+            }
+            Task {
+                let result = await Task.detached(priority: .userInitiated) {
+                    try? Data(contentsOf: url, options: .mappedIfSafe)
+                }.value
+                guard let result, !result.isEmpty,
+                      result.count <= TojMediaLimits.maximumMessageBytesInt else {
+                    completion(nil)
+                    return
+                }
+                completion(.video(result))
+            }
+        }
     }
 }
 

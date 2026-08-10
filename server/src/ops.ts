@@ -35,6 +35,15 @@ export function safeRoute(pathname: string): string {
   if (/^\/v1\/dialogs\/[0-9a-f-]+\/preferences$/i.test(pathname)) {
     return "/v1/dialogs/:id/preferences";
   }
+  if (/^\/v1\/chat-folders\/[0-9a-f-]+\/move$/i.test(pathname)) return "/v1/chat-folders/:id/move";
+  if (/^\/v1\/chat-folders\/[0-9a-f-]+$/i.test(pathname)) return "/v1/chat-folders/:id";
+  if (/^\/v1\/scheduled-messages\/[0-9a-f-]+\/reschedule$/i.test(pathname)) {
+    return "/v1/scheduled-messages/:id/reschedule";
+  }
+  if (/^\/v1\/scheduled-messages\/[0-9a-f-]+$/i.test(pathname)) return "/v1/scheduled-messages/:id";
+  if (/^\/v1\/link-previews\/assets\/[0-9a-f-]+$/i.test(pathname)) {
+    return "/v1/link-previews/assets/:id";
+  }
   if (/^\/v1\/calls\/[0-9a-f-]+\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i.test(pathname)) {
     return pathname.replace(/[0-9a-f-]{36}/i, ":id");
   }
@@ -68,6 +77,7 @@ export function safeRoute(pathname: string): string {
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
     "/v1/group-calls", "/v1/group-calls/active",
+    "/v1/chat-folders", "/v1/scheduled-messages",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -385,6 +395,11 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
         AND NOT EXISTS (
+          SELECT 1 FROM scheduled_delivery_items item
+          JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
+          WHERE item.media_id = mo.id AND delivery.state IN ('scheduled','processing')
+        )
+        AND NOT EXISTS (
           SELECT 1
           FROM draft_attachments attachment
           JOIN account_dialog_drafts draft
@@ -406,6 +421,11 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
       AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+      AND NOT EXISTS (
+        SELECT 1 FROM scheduled_delivery_items item
+        JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
+        WHERE item.media_id = mo.id AND delivery.state IN ('scheduled','processing')
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM draft_attachments attachment
@@ -605,6 +625,97 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE budget.account_id = doomed.account_id
       AND budget.bucket_started = doomed.bucket_started
     RETURNING budget.account_id`;
+  const scheduledDeliveries = await sql`
+    WITH doomed AS (
+      SELECT id FROM scheduled_deliveries
+      WHERE state IN ('delivered','failed','canceled')
+        AND completed_at < now() - interval '30 days'
+      ORDER BY completed_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM scheduled_deliveries delivery
+    WHERE delivery.id IN (SELECT id FROM doomed)
+    RETURNING delivery.id`;
+  const scheduledBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, action, bucket_started FROM scheduled_delivery_action_budgets
+      WHERE updated_at < now() - interval '24 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM scheduled_delivery_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.action = doomed.action
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
+  const folderBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, bucket_started FROM chat_folder_action_budgets
+      WHERE updated_at < now() - interval '24 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM chat_folder_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
+  const previewBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, bucket_started FROM link_preview_action_budgets
+      WHERE updated_at < now() - interval '24 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM link_preview_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
+  const previewCache = await sql`
+    WITH doomed AS (
+      SELECT entry.url_lookup_hmac
+      FROM link_preview_cache_entries entry
+      WHERE entry.expires_at < now()
+        AND NOT EXISTS (
+          SELECT 1 FROM link_preview_waiters waiter
+          WHERE waiter.url_lookup_hmac = entry.url_lookup_hmac
+        )
+      ORDER BY entry.expires_at LIMIT ${batchSize}
+      FOR UPDATE OF entry SKIP LOCKED
+    )
+    DELETE FROM link_preview_cache_entries entry
+    WHERE entry.url_lookup_hmac IN (SELECT url_lookup_hmac FROM doomed)
+    RETURNING entry.url_lookup_hmac`;
+  const previewSnapshots = await sql`
+    WITH doomed AS (
+      SELECT snapshot.id
+      FROM link_preview_snapshots snapshot
+      WHERE snapshot.expires_at < now()
+        AND NOT EXISTS (
+          SELECT 1 FROM message_link_previews relation WHERE relation.snapshot_id = snapshot.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM link_preview_cache_entries entry
+          WHERE entry.current_snapshot_id = snapshot.id
+        )
+      ORDER BY snapshot.expires_at LIMIT ${batchSize}
+      FOR UPDATE OF snapshot SKIP LOCKED
+    )
+    DELETE FROM link_preview_snapshots snapshot
+    WHERE snapshot.id IN (SELECT id FROM doomed)
+    RETURNING snapshot.id`;
+  const previewAssets = await sql`
+    WITH doomed AS (
+      SELECT asset.id FROM link_preview_assets asset
+      WHERE asset.created_at < now() - interval '24 hours'
+        AND NOT EXISTS (
+          SELECT 1 FROM link_preview_snapshots snapshot WHERE snapshot.asset_id = asset.id
+        )
+      ORDER BY asset.created_at LIMIT ${batchSize}
+      FOR UPDATE OF asset SKIP LOCKED
+    )
+    DELETE FROM link_preview_assets asset
+    WHERE asset.id IN (SELECT id FROM doomed)
+    RETURNING asset.id`;
   const events = await sql.begin(async (tx) => {
     const doomed = await tx`
       SELECT account_id, pts
@@ -662,6 +773,13 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     groupMutations: groupMutations.length,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
     dialogPreferenceBudgets: dialogPreferenceBudgets.length,
+    scheduledDeliveries: scheduledDeliveries.length,
+    scheduledBudgets: scheduledBudgets.length,
+    folderBudgets: folderBudgets.length,
+    previewBudgets: previewBudgets.length,
+    previewCache: previewCache.length,
+    previewSnapshots: previewSnapshots.length,
+    previewAssets: previewAssets.length,
     accountEvents: events.length,
     callData,
   };
@@ -673,6 +791,8 @@ function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): nu
     + value.messageMutations + value.draftMutations + value.draftBudgets
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
+    + value.scheduledDeliveries + value.scheduledBudgets + value.folderBudgets
+    + value.previewBudgets + value.previewCache + value.previewSnapshots + value.previewAssets
     + Object.values(value.callData).reduce((sum, count) => sum + count, 0);
 }
 

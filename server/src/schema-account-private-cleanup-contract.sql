@@ -59,9 +59,40 @@ BEGIN
           WHERE reconciliation.account_id = account.id
         )
         OR EXISTS (
+          SELECT 1 FROM public.chat_folders AS folder
+          WHERE folder.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.chat_folder_mutation_requests AS request
+          WHERE request.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.chat_folder_action_budgets AS budget
+          WHERE budget.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.scheduled_deliveries AS delivery
+          WHERE delivery.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.scheduled_delivery_mutation_requests AS request
+          WHERE request.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.scheduled_delivery_action_budgets AS budget
+          WHERE budget.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.link_preview_action_budgets AS budget
+          WHERE budget.account_id = account.id
+        )
+        OR EXISTS (
           SELECT 1 FROM public.account_events AS event
           WHERE event.account_id = account.id
-            AND event.type IN ('draft.updated', 'dialog.preferences_updated')
+            AND event.type IN (
+              'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
+              'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+            )
         )
         OR EXISTS (
           SELECT 1 FROM public.bootstrap_snapshots AS snapshot
@@ -94,6 +125,9 @@ $$;
 
 INSERT INTO public.schema_migrations(name)
 VALUES ('account-private-cleanup-v1')
+ON CONFLICT (name) DO NOTHING;
+INSERT INTO public.schema_migrations(name)
+VALUES ('account-private-cleanup-v2')
 ON CONFLICT (name) DO NOTHING;
 
 COMMIT;

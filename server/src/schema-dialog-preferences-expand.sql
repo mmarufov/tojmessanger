@@ -103,7 +103,10 @@ BEGIN
       AND conname = 'account_events_type_check'
       AND contype = 'c'
       AND convalidated
-      AND pg_get_expr(conbin, conrelid, TRUE) = $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text])$constraint$
+      AND pg_get_expr(conbin, conrelid, TRUE) = ANY(ARRAY[
+        $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text])$constraint$,
+        $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])$constraint$
+      ])
   ) THEN
     RETURN;
   END IF;
