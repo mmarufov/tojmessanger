@@ -69,6 +69,8 @@ export function safeRoute(pathname: string): string {
   if (/^\/v1\/group-calls\/[0-9a-f-]+$/i.test(pathname)) return "/v1/group-calls/:id";
   const known = new Set([
     "/health", "/ready", "/metrics", "/v1/capabilities", "/v1/ws", "/v1/auth/start", "/v1/auth/check",
+    "/v1/auth/two-factor/check", "/v1/session/refresh", "/v1/session/upgrade",
+    "/v1/security/two-factor", "/v1/security/step-up/start", "/v1/security/step-up/check",
     "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push",
     "/v1/devices/group-call-capabilities", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
@@ -102,6 +104,7 @@ export class OperationalMetrics {
   private scheduledCancellationsDuringOutage = 0;
   private cleanupDeleted = 0;
   private cleanupBacklog = 0;
+  private readonly authSecurityEvents = new Map<string, number>();
 
   recordCleanup(deleted: number, backlog: number): void {
     this.cleanupDeleted += deleted;
@@ -116,6 +119,10 @@ export class OperationalMetrics {
     duration.count += 1;
     duration.sumSeconds += durationMs / 1_000;
     this.durations.set(durationKey, duration);
+  }
+
+  recordAuthSecurity(event: AuthSecurityMetricEvent): void {
+    this.authSecurityEvents.set(event, (this.authSecurityEvents.get(event) ?? 0) + 1);
   }
 
   recordSavedMessagesEnsure(
@@ -195,10 +202,28 @@ export class OperationalMetrics {
       "# HELP toj_allowed_mutation_ingress_per_minute Maximum draft mutations plus album items.",
       "# TYPE toj_allowed_mutation_ingress_per_minute gauge",
       `toj_allowed_mutation_ingress_per_minute ${ALLOWED_MUTATION_INGRESS_PER_MINUTE}`,
+      "# HELP toj_auth_security_events_total Authentication and two-step outcomes by bounded event.",
+      "# TYPE toj_auth_security_events_total counter",
     );
+    for (const event of AUTH_SECURITY_METRIC_EVENTS) {
+      lines.push(`toj_auth_security_events_total{event="${event}"} ${this.authSecurityEvents.get(event) ?? 0}`);
+    }
     return `${lines.join("\n")}\n`;
   }
 }
+
+const AUTH_SECURITY_METRIC_EVENTS = [
+  "refresh_success",
+  "refresh_failure",
+  "refresh_replay_revocation",
+  "session_expired",
+  "second_factor_failure",
+  "second_factor_locked",
+  "recovery_used",
+  "two_factor_configured",
+  "two_factor_disabled",
+] as const;
+export type AuthSecurityMetricEvent = typeof AUTH_SECURITY_METRIC_EVENTS[number];
 
 export async function dialogPreferenceBacklogMetrics(sql: SQL): Promise<string> {
   const schema = (await sql`
@@ -313,6 +338,21 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
+  const authSecurityRow = (await sql`
+    SELECT
+      to_regclass('public.device_sessions') IS NOT NULL
+        AND to_regclass('public.session_access_tokens') IS NOT NULL
+        AND to_regclass('public.session_refresh_token_history') IS NOT NULL
+        AND to_regclass('public.session_rotation_receipts') IS NOT NULL
+        AND to_regclass('public.account_two_factor') IS NOT NULL
+        AND to_regclass('public.two_factor_recovery_codes') IS NOT NULL
+        AND to_regclass('public.two_factor_login_challenges') IS NOT NULL
+        AND to_regclass('public.security_step_up_tickets') IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'devices' AND column_name = 'auth_scheme'
+        ) AS ready`)[0];
+  const authSecurityReady = Boolean(authSecurityRow?.ready);
   const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
   const groupCallInfrastructure = groupCallsConfigured();
   return {
@@ -320,7 +360,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // PushKit, membership, and account-deletion paths even while admission is dark. Schema is an
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
-      && groupCallSchema.ready
+      && groupCallSchema.ready && authSecurityReady
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -335,6 +375,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // Maintenance, bootstrap, difference sync, and send paths all touch these relations whenever
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
+    authSecuritySchema: authSecurityReady ? "ready" : "incomplete",
     groupCalls: {
       requested: groupCallsRequested,
       infrastructure: groupCallInfrastructure ? "ready" : "disabled_or_incomplete",
@@ -354,6 +395,43 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       FOR UPDATE SKIP LOCKED
     )
     DELETE FROM otp_challenges WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const accessTokens = await sql`
+    WITH doomed AS (
+      SELECT id FROM session_access_tokens
+      WHERE expires_at < now() - interval '24 hours'
+      ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM session_access_tokens WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const rotationReceipts = await sql`
+    WITH doomed AS (
+      SELECT session_id, rotation_id FROM session_rotation_receipts
+      WHERE expires_at < now()
+      ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM session_rotation_receipts receipt USING doomed
+    WHERE receipt.session_id = doomed.session_id AND receipt.rotation_id = doomed.rotation_id
+    RETURNING receipt.rotation_id`;
+  const authChallenges = await sql`
+    WITH doomed AS (
+      SELECT id FROM two_factor_login_challenges
+      WHERE expires_at < now() - interval '24 hours'
+      ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM two_factor_login_challenges WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const stepUpTickets = await sql`
+    WITH doomed AS (
+      SELECT id FROM security_step_up_tickets
+      WHERE expires_at < now() - interval '24 hours'
+      ORDER BY expires_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM security_step_up_tickets WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
   const snapshots = await sql`
     WITH doomed AS (
@@ -773,6 +851,10 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   });
   return {
     otp: otp.length,
+    accessTokens: accessTokens.length,
+    rotationReceipts: rotationReceipts.length,
+    authChallenges: authChallenges.length,
+    stepUpTickets: stepUpTickets.length,
     snapshots: snapshots.length,
     pushDeliveries: deliveries.length,
     contactLookups: contactLookups.length,
@@ -802,7 +884,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 }
 
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
-  return value.otp + value.snapshots + value.pushDeliveries + value.contactLookups
+  return value.otp + value.accessTokens + value.rotationReceipts + value.authChallenges
+    + value.stepUpTickets + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
     + value.messageMutations + value.draftMutations + value.draftBudgets
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations

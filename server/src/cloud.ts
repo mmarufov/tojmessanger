@@ -3,6 +3,13 @@ import { sql as defaultSql } from "./db";
 import {
   startVerification,
   checkVerification,
+  checkVerificationV2,
+  completeTwoFactorLogin,
+  twoFactorStatus,
+  startSecurityChange,
+  completeSecurityStepUp,
+  configureTwoFactor,
+  disableTwoFactor,
   resolveDevice,
   lookupAccountByPhone,
   lookupAccountByUsername,
@@ -15,6 +22,11 @@ import {
   AuthError,
   type OTPDelivery,
 } from "./auth";
+import {
+  refreshV2Session,
+  startSessionRevocationListener,
+  upgradeLegacySession,
+} from "./session-security";
 import {
   APNsClient,
   PushError,
@@ -185,7 +197,7 @@ import {
   workerHeartbeatFresh,
 } from "./cloud-productivity-readiness";
 
-type SocketData = { accountId: string; deviceId: string };
+type SocketData = { accountId: string; deviceId: string; accessExpiresAt?: string };
 type Db = typeof defaultSql;
 
 export type CloudServerOptions = {
@@ -198,7 +210,7 @@ const jsonHeaders = { "content-type": "application/json", "cache-control": "no-s
 const MAX_JSON_BYTES = 64 * 1024;
 
 export const CLOUD_CAPABILITIES = {
-  api_version: 5,
+  api_version: 6,
   capabilities: [
     "core_text",
     "replies",
@@ -211,6 +223,14 @@ export const CLOUD_CAPABILITIES = {
     "profiles",
   ],
 } as const;
+
+function authSessionsV2Configured(): boolean {
+  return process.env.TOJ_AUTH_SESSIONS_V2_ENABLED === "1";
+}
+
+function twoFactorConfigured(): boolean {
+  return authSessionsV2Configured() && process.env.TOJ_TWO_FACTOR_ENABLED === "1";
+}
 
 function cloudCapabilities(
   voiceCalls: boolean,
@@ -227,6 +247,8 @@ function cloudCapabilities(
   linkPreviews: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
+  if (authSessionsV2Configured()) capabilities.push("auth_sessions_v2");
+  if (twoFactorConfigured()) capabilities.push("two_factor_v1");
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
   if (groups) capabilities.push("groups_v1");
@@ -448,6 +470,10 @@ export function startCloudServer(
       pushGroupCallHints(sockets, hints);
     },
   ) : () => {};
+  const stopSessionRevocations = backgroundWorkers ? startSessionRevocationListener(
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
+    (wakeup) => disconnectDevice(sockets, wakeup.accountId, wakeup.deviceId),
+  ) : () => {};
 
   const server = Bun.serve<SocketData>({
     port,
@@ -562,7 +588,45 @@ export function startCloudServer(
         else if (url.pathname === "/v1/auth/check" && req.method === "POST") {
           const body = await readJson(req);
           if (!body.phone || !body.code) throw new AuthError("phone and code required", 400);
-          response = json(await checkVerification(db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName));
+          if (Number(body.authProtocolVersion ?? 1) >= 2) {
+            if (!authSessionsV2Configured()) {
+              throw new AuthError("auth protocol v2 unavailable", 409, undefined, "capability_unavailable");
+            }
+            response = json(await checkVerificationV2(
+              db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
+            ));
+          } else {
+            response = json(await checkVerification(
+              db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
+            ));
+          }
+        }
+
+        else if (url.pathname === "/v1/auth/two-factor/check" && req.method === "POST") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else {
+            const body = await readJson(req);
+            const result = await completeTwoFactorLogin(db, {
+              challengeId: body.challengeId,
+              password: body.password,
+              recoveryCode: body.recoveryCode,
+              newPassword: body.newPassword,
+            });
+            if (result.recoveryCodes) metrics.recordAuthSecurity("recovery_used");
+            response = json(result);
+          }
+        }
+
+        else if (url.pathname === "/v1/session/refresh" && req.method === "POST") {
+          if (!authSessionsV2Configured()) response = new Response("not found", { status: 404 });
+          else {
+            const body = await readJson(req);
+            if (!body.refreshToken || !body.rotationId) {
+              throw new AuthError("refreshToken and rotationId required", 400);
+            }
+            response = json(await refreshV2Session(db, body.refreshToken, body.rotationId));
+            metrics.recordAuthSecurity("refresh_success");
+          }
         }
 
         else if (
@@ -1321,6 +1385,63 @@ export function startCloudServer(
           }), 202);
         }
 
+        if (url.pathname === "/v1/session/upgrade" && req.method === "POST") {
+          if (!authSessionsV2Configured()) response = new Response("not found", { status: 404 });
+          else response = json({ session: await upgradeLegacySession(db, session.accountId, session.deviceId) });
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "GET") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else response = json(await twoFactorStatus(db, session.accountId));
+        }
+
+        if (url.pathname === "/v1/security/step-up/start" && req.method === "POST") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else response = json(await startSecurityChange(db, session.accountId, {
+            networkKey: networkKey(req, server), delivery: otpDelivery,
+          }));
+        }
+
+        if (url.pathname === "/v1/security/step-up/check" && req.method === "POST") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else response = json(await completeSecurityStepUp(db, session.accountId, String(body.code ?? "")));
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "PUT") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else {
+            const result = await configureTwoFactor(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              password: body.password,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            metrics.recordAuthSecurity("two_factor_configured");
+            response = json(result);
+          }
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "DELETE") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else {
+            const result = await disableTwoFactor(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            metrics.recordAuthSecurity("two_factor_disabled");
+            response = json(result);
+          }
+        }
+
         if (url.pathname === "/v1/session" && req.method === "DELETE") {
           const result = await revokeDeviceAndTerminateCalls(
             db,
@@ -1627,6 +1748,18 @@ export function startCloudServer(
           }
         }
       } catch (err) {
+        if (err instanceof AuthError) {
+          if (route === "/v1/session/refresh") metrics.recordAuthSecurity("refresh_failure");
+          if (err.code === "refresh_reuse_detected") {
+            metrics.recordAuthSecurity("refresh_replay_revocation");
+          } else if (err.code === "session_expired") {
+            metrics.recordAuthSecurity("session_expired");
+          } else if (err.code === "challenge_locked") {
+            metrics.recordAuthSecurity("second_factor_locked");
+          } else if (err.code === "incorrect_second_factor") {
+            metrics.recordAuthSecurity("second_factor_failure");
+          }
+        }
         const status = err instanceof AuthError
           ? err.status
           : err instanceof MediaError ? err.status
@@ -1666,6 +1799,7 @@ export function startCloudServer(
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
+          ...(err instanceof AuthError && err.code ? { code: err.code } : {}),
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupCallError ? { code: err.code, ...err.details } : {}),
@@ -1702,6 +1836,12 @@ export function startCloudServer(
           })
           .catch(() => {});
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
+        if (ws.data.accessExpiresAt) {
+          const delay = Math.max(0, new Date(ws.data.accessExpiresAt).getTime() - Date.now());
+          setTimeout(() => {
+            if (ws.readyState === 1) ws.close(4003, "access token expired");
+          }, Math.min(delay, 2_147_000_000));
+        }
       },
       close(ws) {
         const set = sockets.get(ws.data.accountId);
@@ -1729,6 +1869,7 @@ export function startCloudServer(
     stopSyncNotifications();
     stopCallNotifications();
     stopGroupCallNotifications();
+    stopSessionRevocations();
     return originalStop(closeActiveConnections);
   }) as typeof server.stop;
 

@@ -99,6 +99,11 @@ export function voipPushTokenAAD(deviceId: string): Buffer {
   return Buffer.from(`toj/apns-voip-token|${deviceId}`, "utf8");
 }
 
+/** Binds a crash-safe refresh receipt to one device session and rotation request. */
+export function sessionRotationAAD(sessionId: string, rotationId: string): Buffer {
+  return Buffer.from(`toj/session-rotation|${sessionId}|${rotationId}`, "utf8");
+}
+
 /** Binds an encrypted media chunk to its upload and exact plaintext offset. */
 export function mediaChunkAAD(mediaId: string, offset: number | bigint): Buffer {
   return Buffer.from(`toj/media|${mediaId}|${offset}`, "utf8");
