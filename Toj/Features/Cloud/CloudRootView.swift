@@ -99,6 +99,7 @@ struct CloudRootView: View {
         )) {
             TojGroupCallScreen(coordinator: model.groupCallCoordinator)
         }
+        .onOpenURL { model.handleDeepLink($0) }
     }
 }
 
@@ -416,6 +417,17 @@ private struct CloudMainView: View {
         .onChange(of: selection) { _, _ in
             TojFeedback.selection()
         }
+        .onChange(of: model.pendingDeepLinkDialogId) { _, dialogId in
+            guard let dialogId else { return }
+            selection = .chats
+            model.prepareConversationOpen(dialogId: dialogId)
+            if horizontalSizeClass == .regular {
+                splitDialogId = dialogId
+            } else {
+                chatPath = [dialogId]
+            }
+            model.consumePendingDeepLink()
+        }
         #if DEBUG
         .task {
             if ProcessInfo.processInfo.environment["TOJ_DEMO_SEARCH"] == "1" {
@@ -532,6 +544,372 @@ nonisolated enum ChatSearchDrawerBehavior {
     }
 }
 
+nonisolated enum ChatFolderFilter: String, CaseIterable, Hashable, Sendable {
+    case all
+    case unread
+    case personal
+    case groups
+    case muted
+
+    var title: String {
+        switch self {
+        case .all: String(localized: "All")
+        case .unread: String(localized: "Unread")
+        case .personal: String(localized: "Personal")
+        case .groups: String(localized: "Groups")
+        case .muted: String(localized: "Muted")
+        }
+    }
+
+    func includes(_ dialog: CloudAppModel.Dialog) -> Bool {
+        guard !dialog.isArchived else { return false }
+        return switch self {
+        case .all: true
+        case .unread: dialog.unreadCount > 0
+        case .personal: dialog.type == "direct" || dialog.type == "saved"
+        case .groups: dialog.type == "group"
+        case .muted: dialog.isMuted
+        }
+    }
+}
+
+private struct ChatFolderManagerView: View {
+    @Bindable var model: CloudAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingCreate = false
+    @State private var editingFolder: CloudChatFolder?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        List {
+            if model.chatFolders.isEmpty {
+                ContentUnavailableView(
+                    "No Custom Folders",
+                    systemImage: "folder",
+                    description: Text("Create a folder that stays in sync on every device.")
+                )
+            } else {
+                ForEach(model.chatFolders) { folder in
+                    Button {
+                        editingFolder = folder
+                    } label: {
+                        HStack {
+                            Label(folder.title, systemImage: folder.icon)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(TojTheme.tertiaryText)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                        .swipeActions {
+                            Button("Delete", role: .destructive) {
+                                Task {
+                                    do { try await model.deleteChatFolder(folder) }
+                                    catch { errorMessage = error.localizedDescription }
+                                }
+                            }
+                        }
+                }
+                .onMove { source, destination in
+                    guard source.count == 1, let sourceIndex = source.first else { return }
+                    let moving = model.chatFolders[sourceIndex]
+                    var reordered = model.chatFolders
+                    reordered.move(fromOffsets: source, toOffset: destination)
+                    guard let movedIndex = reordered.firstIndex(where: { $0.id == moving.id }) else { return }
+                    let before = movedIndex + 1 < reordered.count ? reordered[movedIndex + 1] : nil
+                    let after = movedIndex > 0 ? reordered[movedIndex - 1] : nil
+                    guard before != nil || after != nil else { return }
+                    Task {
+                        do {
+                            if let before {
+                                try await model.moveChatFolder(moving, before: before)
+                            } else {
+                                try await model.moveChatFolder(moving, after: after)
+                            }
+                        }
+                        catch { errorMessage = error.localizedDescription }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Chat Folders")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+            ToolbarItem(placement: .primaryAction) {
+                Button("New", systemImage: "plus") { showingCreate = true }
+            }
+        }
+        .sheet(isPresented: $showingCreate) { ChatFolderEditorView(model: model, folder: nil) }
+        .sheet(item: $editingFolder) { folder in
+            ChatFolderEditorView(model: model, folder: folder)
+        }
+        .alert("Folder could not be changed", isPresented: Binding(
+            get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
+        )) { Button("OK") { errorMessage = nil } } message: { Text(errorMessage ?? "") }
+    }
+}
+
+private struct ChatFolderEditorView: View {
+    @Bindable var model: CloudAppModel
+    let folder: CloudChatFolder?
+    @Environment(\.dismiss) private var dismiss
+    @State private var title = ""
+    @State private var icon = "folder"
+    @State private var includeDirect = true
+    @State private var includeGroups = true
+    @State private var includeSaved = false
+    @State private var excludeRead = false
+    @State private var excludeMuted = false
+    @State private var excludeArchived = true
+    @State private var ruleSelections: [String: String] = [:]
+    @State private var initialized = false
+    @State private var saving = false
+    @State private var errorMessage: String?
+
+    private var folderRules: [CloudChatFolderRule] {
+        ruleSelections
+            .filter { $0.value == "include" || $0.value == "exclude" }
+            .sorted { $0.key < $1.key }
+            .map { CloudChatFolderRule(dialogId: $0.key, rule: $0.value) }
+    }
+
+    private func ruleBinding(for dialogId: String) -> Binding<String> {
+        Binding(
+            get: { ruleSelections[dialogId] ?? "automatic" },
+            set: { choice in
+                if choice == "automatic" {
+                    ruleSelections.removeValue(forKey: dialogId)
+                } else {
+                    ruleSelections[dialogId] = choice
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Folder name", text: $title)
+                Picker("Icon", selection: $icon) {
+                    Label("Folder", systemImage: "folder").tag("folder")
+                    Label("People", systemImage: "person.2").tag("person.2")
+                    Label("Unread", systemImage: "message.badge").tag("message.badge")
+                    Label("Work", systemImage: "briefcase").tag("briefcase")
+                    Label("Favorite", systemImage: "star").tag("star")
+                }
+                Section("Include") {
+                    Toggle("Personal chats", isOn: $includeDirect)
+                    Toggle("Groups", isOn: $includeGroups)
+                    Toggle("Saved Messages", isOn: $includeSaved)
+                }
+                Section("Exclude") {
+                    Toggle("Read chats", isOn: $excludeRead)
+                    Toggle("Muted chats", isOn: $excludeMuted)
+                    Toggle("Archived chats", isOn: $excludeArchived)
+                }
+                if !model.dialogs.isEmpty {
+                    Section {
+                        ForEach(model.dialogs) { dialog in
+                            Picker(dialog.title, selection: ruleBinding(for: dialog.id)) {
+                                Text("Automatic").tag("automatic")
+                                Text("Always Include").tag("include")
+                                Text("Always Exclude").tag("exclude")
+                            }
+                        }
+                    } header: {
+                        Text("Specific Chats")
+                    } footer: {
+                        Text("Specific choices override the folder's automatic rules and sync to every device.")
+                    }
+                }
+            }
+            .navigationTitle(folder == nil ? "New Folder" : "Edit Folder")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(folder == nil ? "Create" : "Save") {
+                        saving = true
+                        Task {
+                            do {
+                                if let folder {
+                                    try await model.updateChatFolder(
+                                        folder,
+                                        title: title,
+                                        icon: icon,
+                                        includeDirect: includeDirect,
+                                        includeGroups: includeGroups,
+                                        includeSaved: includeSaved,
+                                        excludeRead: excludeRead,
+                                        excludeMuted: excludeMuted,
+                                        excludeArchived: excludeArchived,
+                                        rules: folderRules
+                                    )
+                                } else {
+                                    try await model.createChatFolder(
+                                        title: title,
+                                        icon: icon,
+                                        includeDirect: includeDirect,
+                                        includeGroups: includeGroups,
+                                        includeSaved: includeSaved,
+                                        excludeRead: excludeRead,
+                                        excludeMuted: excludeMuted,
+                                        excludeArchived: excludeArchived,
+                                        rules: folderRules
+                                    )
+                                }
+                                dismiss()
+                            } catch {
+                                errorMessage = error.localizedDescription
+                                saving = false
+                            }
+                        }
+                    }
+                    .disabled(saving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .alert("Folder was not created", isPresented: Binding(
+                get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
+            )) { Button("OK") { errorMessage = nil } } message: { Text(errorMessage ?? "") }
+            .task {
+                guard !initialized else { return }
+                initialized = true
+                guard let folder else { return }
+                title = folder.title
+                icon = folder.icon
+                includeDirect = folder.includeDirect
+                includeGroups = folder.includeGroups
+                includeSaved = folder.includeSaved
+                excludeRead = folder.excludeRead
+                excludeMuted = folder.excludeMuted
+                excludeArchived = folder.excludeArchived
+                ruleSelections = Dictionary(uniqueKeysWithValues: folder.rules.map {
+                    ($0.dialogId, $0.rule)
+                })
+            }
+        }
+    }
+}
+
+private struct ScheduledMessagesView: View {
+    @Bindable var model: CloudAppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var reschedulingDelivery: CloudScheduledDelivery?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        List {
+            if model.scheduledDeliveries.filter({
+                $0.state == "scheduled" || $0.state == "processing" || $0.state == "local_pending"
+            }).isEmpty {
+                ContentUnavailableView(
+                    "No Scheduled Messages",
+                    systemImage: "clock",
+                    description: Text("Messages scheduled on the server will appear here on every device.")
+                )
+            }
+            ForEach(model.scheduledDeliveries.filter {
+                $0.state == "scheduled" || $0.state == "processing" || $0.state == "local_pending"
+            }) { delivery in
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(delivery.items.first?.body ?? "Attachment")
+                        .lineLimit(2)
+                    Text(ISO8601DateFormatter().date(from: delivery.deliverAt) ?? Date(), style: .date)
+                        .font(.caption)
+                        .foregroundStyle(TojTheme.secondaryText)
+                    Text(ISO8601DateFormatter().date(from: delivery.deliverAt) ?? Date(), style: .time)
+                        .font(.caption)
+                        .foregroundStyle(TojTheme.secondaryText)
+                    if delivery.state == "local_pending" {
+                        Label("Waiting for connection — not scheduled yet", systemImage: "wifi.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(TojTheme.secondaryText)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { reschedulingDelivery = delivery }
+                .swipeActions {
+                    Button("Cancel", role: .destructive) {
+                        Task {
+                            do { try await model.cancelScheduledDelivery(delivery) }
+                            catch { errorMessage = error.localizedDescription }
+                        }
+                    }
+                    .disabled(delivery.state == "processing")
+                    Button("Reschedule", systemImage: "calendar") {
+                        reschedulingDelivery = delivery
+                    }
+                    .tint(TojTheme.gold)
+                    .disabled(delivery.state == "processing" || delivery.revision == 0)
+                }
+            }
+        }
+        .navigationTitle("Scheduled Messages")
+        .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+        .task { await model.refreshCloudProductivity() }
+        .refreshable { await model.refreshCloudProductivity() }
+        .sheet(item: $reschedulingDelivery) { delivery in
+            RescheduleDeliveryView(model: model, delivery: delivery)
+        }
+        .alert("Scheduled message could not be changed", isPresented: Binding(
+            get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
+        )) { Button("OK") { errorMessage = nil } } message: { Text(errorMessage ?? "") }
+    }
+}
+
+private struct RescheduleDeliveryView: View {
+    @Bindable var model: CloudAppModel
+    let delivery: CloudScheduledDelivery
+    @Environment(\.dismiss) private var dismiss
+    @State private var date = Date().addingTimeInterval(300)
+    @State private var initialized = false
+    @State private var saving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                DatePicker(
+                    "Deliver at",
+                    selection: $date,
+                    in: Date().addingTimeInterval(60)...,
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+            }
+            .navigationTitle("Reschedule")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saving = true
+                        Task {
+                            do {
+                                try await model.rescheduleDelivery(delivery, to: date)
+                                dismiss()
+                            } catch {
+                                errorMessage = error.localizedDescription
+                                saving = false
+                            }
+                        }
+                    }
+                    .disabled(saving || date < Date().addingTimeInterval(60))
+                }
+            }
+            .task {
+                guard !initialized else { return }
+                initialized = true
+                if let parsed = ISO8601DateFormatter().date(from: delivery.deliverAt),
+                   parsed >= Date().addingTimeInterval(60) {
+                    date = parsed
+                }
+            }
+            .alert("Message was not rescheduled", isPresented: Binding(
+                get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }
+            )) { Button("OK") { errorMessage = nil } } message: { Text(errorMessage ?? "") }
+        }
+    }
+}
+
 private struct CloudChatsView: View {
     @Bindable var model: CloudAppModel
     @Binding var query: String
@@ -541,10 +919,15 @@ private struct CloudChatsView: View {
     var onOpen: ((String) -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isEditing = false
+    @State private var selectedDialogIds: Set<String> = []
+    @State private var bulkActionInFlight = false
     @State private var isSearchDrawerOpen = false
     @State private var searchScrollOffset = ChatSearchDrawerBehavior.height
     @State private var searchRevealWasArmed = true
     @State private var showingArchivedChats = false
+    @State private var showingFolderManager = false
+    @State private var showingScheduledMessages = false
+    @AppStorage("toj.chat-folder.selection") private var folderRawValue = ChatFolderFilter.all.rawValue
     @FocusState private var searchFocused: Bool
 
     private var isSearching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -554,7 +937,24 @@ private struct CloudChatsView: View {
     @State private var searchController: MessageSearchController?
 
     private var filteredDialogs: [CloudAppModel.Dialog] {
-        model.dialogs(matching: query, scope: searchScope)
+        let matches = model.dialogs(matching: query, scope: searchScope)
+        guard !isSearching, !searchScope.browsesWithoutQuery else { return matches }
+        if folderRawValue.hasPrefix("custom:"),
+           let folder = model.chatFolders.first(where: {
+               "custom:\($0.folderId)" == folderRawValue
+           }) {
+            return matches.filter { model.dialog($0, isIncludedIn: folder) }
+        }
+        return matches.filter(selectedFolder.includes)
+    }
+
+    private var selectedFolder: ChatFolderFilter {
+        get { ChatFolderFilter(rawValue: folderRawValue) ?? .all }
+        nonmutating set { folderRawValue = newValue.rawValue }
+    }
+
+    private var folderBinding: Binding<ChatFolderFilter> {
+        Binding(get: { selectedFolder }, set: { selectedFolder = $0 })
     }
 
     private var archivedDialogs: [CloudAppModel.Dialog] {
@@ -578,6 +978,31 @@ private struct CloudChatsView: View {
                         Color.clear
                             .frame(height: 0)
                             .id("chat-list-top")
+
+                        if !isSearching, !searchScope.browsesWithoutQuery {
+                            TojPillFilter(
+                                items: ChatFolderFilter.allCases,
+                                selection: folderBinding,
+                                title: { $0.title }
+                            )
+                            .padding(.bottom, 7)
+                            .accessibilityLabel("Chat folders")
+                            if model.capabilities.contains(.chatFolders), !model.chatFolders.isEmpty {
+                                ScrollView(.horizontal) {
+                                    HStack(spacing: 8) {
+                                        ForEach(model.chatFolders) { folder in
+                                            let value = "custom:\(folder.folderId)"
+                                            Button(folder.title) { folderRawValue = value }
+                                                .buttonStyle(.bordered)
+                                                .tint(folderRawValue == value ? TojTheme.accent : TojTheme.secondaryText)
+                                                .accessibilityAddTraits(folderRawValue == value ? .isSelected : [])
+                                        }
+                                    }
+                                }
+                                .scrollIndicators(.hidden)
+                                .padding(.bottom, 7)
+                            }
+                        }
 
                         if isSearching || searchScope.browsesWithoutQuery,
                            model.capabilities.contains(.localSearch) || model.capabilities.contains(.richSearch) {
@@ -725,6 +1150,7 @@ private struct CloudChatsView: View {
                 Button(isEditing ? "Done" : "Edit") {
                     withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
                         isEditing.toggle()
+                        if !isEditing { selectedDialogIds.removeAll() }
                     }
                     TojFeedback.selection()
                 }
@@ -737,12 +1163,31 @@ private struct CloudChatsView: View {
                     .foregroundStyle(TojTheme.text)
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button(action: onCompose) {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: 17, weight: .semibold))
+                HStack(spacing: 10) {
+                    if model.capabilities.contains(.chatFolders)
+                        || model.capabilities.contains(.scheduledDelivery) {
+                        Menu {
+                            if model.capabilities.contains(.chatFolders) {
+                                Button("Manage Folders", systemImage: "folder") {
+                                    showingFolderManager = true
+                                }
+                            }
+                            if model.capabilities.contains(.scheduledDelivery) {
+                                Button("Scheduled Messages", systemImage: "clock") {
+                                    showingScheduledMessages = true
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                    }
+                    Button(action: onCompose) {
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 17, weight: .semibold))
+                    }
+                    .accessibilityLabel("New chat")
                 }
                 .buttonStyle(.glass)
-                .accessibilityLabel("New chat")
             }
         }
         .toolbarBackgroundVisibility(.hidden, for: .navigationBar)
@@ -753,6 +1198,12 @@ private struct CloudChatsView: View {
                 }
                 .padding(.horizontal, 16)
                 .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if isEditing {
+                bulkActionBar
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(
@@ -766,6 +1217,12 @@ private struct CloudChatsView: View {
                     showingArchivedChats = false
                 }
             }
+        }
+        .sheet(isPresented: $showingFolderManager) {
+            NavigationStack { ChatFolderManagerView(model: model) }
+        }
+        .sheet(isPresented: $showingScheduledMessages) {
+            NavigationStack { ScheduledMessagesView(model: model) }
         }
     }
 
@@ -900,26 +1357,28 @@ private struct CloudChatsView: View {
     private func dialogLink(_ dialog: CloudAppModel.Dialog) -> some View {
         Group {
             if isEditing, model.capabilities.contains(.chatOrganization) {
-                HStack(spacing: 0) {
-                    CloudDialogRow(dialog: dialog)
-                    if dialog.type != "saved" {
-                        Button {
-                            withAnimation(reduceMotion ? .easeOut(duration: 0.14) : TojTheme.stateAnimation) {
-                                dialog.isArchived
-                                    ? model.unarchive(dialog.id)
-                                    : model.archive(dialog.id)
-                            }
-                        } label: {
-                            Image(systemName: dialog.isArchived ? "tray.and.arrow.up.fill" : "archivebox.fill")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(TojTheme.gold)
-                                .frame(width: 44, height: 44)
-                                .background(TojTheme.raised, in: Circle())
-                        }
-                        .buttonStyle(.tojPressable)
-                        .accessibilityLabel(dialog.isArchived ? "Unarchive" : "Archive")
+                Button {
+                    if selectedDialogIds.contains(dialog.id) {
+                        selectedDialogIds.remove(dialog.id)
+                    } else {
+                        selectedDialogIds.insert(dialog.id)
+                    }
+                    TojFeedback.selection()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: selectedDialogIds.contains(dialog.id) ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 23, weight: .semibold))
+                            .foregroundStyle(selectedDialogIds.contains(dialog.id) ? TojTheme.gold : TojTheme.secondaryText)
+                        CloudDialogRow(dialog: dialog)
                     }
                 }
+                .buttonStyle(.plain)
+                .disabled(bulkActionInFlight)
+                .accessibilityLabel(
+                    selectedDialogIds.contains(dialog.id)
+                        ? "Deselect \(dialog.title)"
+                        : "Select \(dialog.title)"
+                )
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             } else if let onOpen {
                 Button { onOpen(dialog.id) } label: { CloudDialogRow(dialog: dialog) }
@@ -929,6 +1388,80 @@ private struct CloudChatsView: View {
         }
         .buttonStyle(.tojPressable)
         .accessibilityIdentifier("chat-row-\(dialog.id)")
+    }
+
+    private var bulkActionBar: some View {
+        HStack(spacing: 4) {
+            bulkActionButton("Read", icon: "envelope.open.fill", action: .markRead)
+            Menu {
+                Button("Pin", systemImage: "pin.fill") { runBulkAction(.pin(true)) }
+                Button("Unpin", systemImage: "pin.slash") { runBulkAction(.pin(false)) }
+            } label: {
+                bulkActionLabel("Pin", icon: "pin.fill")
+            }
+            .disabled(selectedDialogIds.isEmpty || bulkActionInFlight)
+
+            Menu {
+                Button("Mute", systemImage: "speaker.slash.fill") { runBulkAction(.mute(true)) }
+                Button("Unmute", systemImage: "speaker.wave.2.fill") { runBulkAction(.mute(false)) }
+            } label: {
+                bulkActionLabel("Mute", icon: "speaker.slash.fill")
+            }
+            .disabled(selectedDialogIds.isEmpty || bulkActionInFlight)
+
+            Menu {
+                Button("Archive", systemImage: "archivebox.fill") { runBulkAction(.archive(true)) }
+                Button("Unarchive", systemImage: "tray.and.arrow.up.fill") { runBulkAction(.archive(false)) }
+            } label: {
+                bulkActionLabel("Archive", icon: "archivebox.fill")
+            }
+            .disabled(selectedDialogIds.isEmpty || bulkActionInFlight)
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 9)
+        .padding(.bottom, 7)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(TojTheme.hairlineStrong).frame(height: 0.5)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Bulk chat actions, \(selectedDialogIds.count) selected")
+    }
+
+    private func bulkActionButton(
+        _ title: LocalizedStringKey,
+        icon: String,
+        action: CloudAppModel.BulkDialogAction
+    ) -> some View {
+        Button { runBulkAction(action) } label: { bulkActionLabel(title, icon: icon) }
+            .buttonStyle(.plain)
+            .disabled(selectedDialogIds.isEmpty || bulkActionInFlight)
+    }
+
+    private func bulkActionLabel(_ title: LocalizedStringKey, icon: String) -> some View {
+        VStack(spacing: 3) {
+            if bulkActionInFlight {
+                ProgressView().controlSize(.small).tint(TojTheme.gold)
+            } else {
+                Image(systemName: icon).font(.system(size: 16, weight: .semibold))
+            }
+            Text(title).font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(selectedDialogIds.isEmpty ? TojTheme.tertiaryText : TojTheme.text)
+        .frame(maxWidth: .infinity, minHeight: 45)
+        .contentShape(Rectangle())
+    }
+
+    private func runBulkAction(_ action: CloudAppModel.BulkDialogAction) {
+        guard !selectedDialogIds.isEmpty, !bulkActionInFlight else { return }
+        let selection = selectedDialogIds
+        bulkActionInFlight = true
+        Task {
+            _ = await model.performBulkDialogAction(action, dialogIds: selection)
+            guard !Task.isCancelled else { return }
+            selectedDialogIds.removeAll()
+            bulkActionInFlight = false
+        }
     }
 
     private var emptyState: some View {
@@ -1348,6 +1881,7 @@ private struct ComingSoonView: View {
 
 private struct CloudSettingsView: View {
     @Bindable var model: CloudAppModel
+    @Environment(TojAppearancePreferences.self) private var appearance
     @State private var showingSignOut = false
     @State private var pendingLogoutItemCount = 0
     @State private var showingDeletionWarning = false
@@ -1466,13 +2000,18 @@ private struct CloudSettingsView: View {
                             )
                         }
                         .buttonStyle(.tojPressable(scale: 0.985))
-                        settingsLink(
-                            title: "Appearance",
-                            icon: "circle.lefthalf.filled",
-                            colors: [Color(hex: 0x61CCFF), Color(hex: 0x299DDA)],
-                            divider: true,
-                            detail: "Themes, chat backgrounds and text sizing are coming soon."
-                        )
+                        NavigationLink {
+                            AppearanceSettingsView()
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Appearance",
+                                icon: "circle.lefthalf.filled",
+                                colors: [Color(hex: 0x61CCFF), Color(hex: 0x299DDA)],
+                                value: appearance.wallpaper.title,
+                                showsDivider: true
+                            )
+                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
                         settingsLink(
                             title: "Power Saving",
                             icon: "battery.25percent",
@@ -1481,14 +2020,18 @@ private struct CloudSettingsView: View {
                             divider: true,
                             detail: "Power-saving controls will help Toj use less energy."
                         )
-                        settingsLink(
-                            title: "Language",
-                            icon: "globe",
-                            colors: [Color(hex: 0xCE70F4), Color(hex: 0x9D43D7)],
-                            value: "English",
-                            divider: false,
-                            detail: "More interface languages are being prepared."
-                        )
+                        NavigationLink {
+                            LanguageSettingsView()
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Language",
+                                icon: "globe",
+                                colors: [Color(hex: 0xCE70F4), Color(hex: 0x9D43D7)],
+                                value: LocalizedStringKey(appearance.language.title),
+                                showsDivider: false
+                            )
+                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
                     }
 
                     TojSectionCard("Call privacy") {

@@ -25,6 +25,7 @@ struct ProfileEditView: View {
     private let photoAccountId: String?
 
     private enum Field: Hashable {
+        case username
         case firstName
         case lastName
         case bio
@@ -47,7 +48,12 @@ struct ProfileEditView: View {
     }
 
     private var canSave: Bool {
-        !trimmedFirstName.isEmpty && !isSaving && !isPreparingPhoto
+        !trimmedFirstName.isEmpty && usernameIsValid && !isSaving && !isPreparingPhoto
+    }
+
+    private var usernameIsValid: Bool {
+        guard let username = details.username, !username.isEmpty else { return true }
+        return username.range(of: "^[a-z][a-z0-9_]{4,31}$", options: .regularExpression) != nil
     }
 
     private var displayName: String {
@@ -63,6 +69,8 @@ struct ProfileEditView: View {
                 nameFields
 
                 profileTextField
+
+                usernameField
 
                 VStack(alignment: .leading, spacing: 8) {
                     Button {
@@ -336,6 +344,46 @@ struct ProfileEditView: View {
             .font(.footnote)
             .foregroundStyle(TojTheme.secondaryText)
             .padding(.horizontal, 18)
+        }
+    }
+
+    private var usernameField: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 4) {
+                Text("@")
+                    .foregroundStyle(TojTheme.secondaryText)
+                TextField("username", text: Binding(
+                    get: { details.username ?? "" },
+                    set: { details.username = $0.lowercased().filter { $0.isLetter || $0.isNumber || $0 == "_" } }
+                ))
+                .focused($focusedField, equals: .username)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.username)
+            }
+            .profileFieldStyle()
+            .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: TojRadius.card, style: .continuous))
+
+            Text(usernameIsValid
+                 ? "Your profile link works across Toj without exposing your phone number."
+                 : "Use 5–32 letters, numbers, or underscores, starting with a letter.")
+                .font(.footnote)
+                .foregroundStyle(usernameIsValid ? TojTheme.secondaryText : TojTheme.danger)
+                .padding(.horizontal, 18)
+
+            if let username = details.username, usernameIsValid {
+                let link = URL(string: "toj://user/\(username)")!
+                HStack {
+                    ShareLink(item: link) {
+                        Label("Share Profile Link", systemImage: "square.and.arrow.up")
+                    }
+                    Spacer()
+                    TojQRCode(value: link.absoluteString, size: 82)
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(TojTheme.accent)
+                .padding(.horizontal, 18)
+            }
         }
     }
 

@@ -319,7 +319,7 @@ struct CloudMediaAPI: Sendable {
         else { throw CloudAPIError(status: -1, message: "Invalid media response", retryAfter: nil) }
         guard
             !data.isEmpty, data.count <= 1024 * 1024,
-            total > 0, total <= 25 * 1024 * 1024,
+            total > 0, total <= TojMediaLimits.maximumMessageBytes,
             next == offset + Int64(data.count), next <= total
         else { throw CloudAPIError(status: -1, message: "Invalid media response", retryAfter: nil) }
         return MediaDownloadChunk(data: data, nextOffset: next, totalSize: total)
@@ -442,7 +442,7 @@ nonisolated struct MediaDownloadDirective: Equatable, Sendable {
 /// Durable, user-customizable auto-download rules. A zero byte limit disables automatic full-media
 /// downloads for that media kind while still allowing its thumbnail to be prefetched.
 nonisolated struct MediaAutoDownloadPolicy: Codable, Equatable, Sendable {
-    static let maximumSupportedMediaBytes: Int64 = 25 * 1024 * 1024
+    static let maximumSupportedMediaBytes = TojMediaLimits.maximumMessageBytes
 
     var privateChats: MediaAutoDownloadNetworkPolicy
     var groupChats: MediaAutoDownloadNetworkPolicy
@@ -780,7 +780,7 @@ actor EncryptedMediaCache {
         durationMs: Int64? = nil, width: Int? = nil, height: Int? = nil,
         thumbnail: Data? = nil
     ) throws -> PreparedMediaUpload {
-        guard !data.isEmpty, data.count <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
+        guard !data.isEmpty, data.count <= TojMediaLimits.maximumMessageBytesInt else { throw MediaCacheError.unsupportedSize }
         guard (thumbnail?.count ?? 0) <= 256 * 1024 else { throw MediaCacheError.thumbnailTooLarge }
         try loadIndexIfNeeded()
         let reservation = Int64(data.count + 128) + Int64((thumbnail?.count ?? 0) + (thumbnail == nil ? 0 : 128))
@@ -1459,7 +1459,7 @@ actor EncryptedMediaCache {
     }
 
     func createTemporaryPreview(_ data: Data, fileExtension: String?) throws -> URL {
-        guard !data.isEmpty, data.count <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
+        guard !data.isEmpty, data.count <= TojMediaLimits.maximumMessageBytesInt else { throw MediaCacheError.unsupportedSize }
         let candidate = (fileExtension ?? "").lowercased()
         let safeExtension = candidate.range(of: "^[a-z0-9]{1,10}$", options: .regularExpression) == nil
             ? "bin" : candidate
@@ -2764,7 +2764,7 @@ actor CloudMediaTransferEngine {
         if let transferId = Self.pendingTransferId(media.id) {
             return try await cache.preparedData(transferId: transferId)
         }
-        guard media.byteSize > 0, media.byteSize <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
+        guard media.byteSize > 0, media.byteSize <= TojMediaLimits.maximumMessageBytes else { throw MediaCacheError.unsupportedSize }
         if priority == .userInitiated { try await installBackgroundDownloadsIfNeeded() }
         try await cache.beginAccess(mediaId: media.id)
         do {
@@ -2837,7 +2837,7 @@ actor CloudMediaTransferEngine {
             return Self.slice(full, offset: offset, length: length)
         }
         let total = media.byteSize
-        guard total > 0, total <= 25 * 1024 * 1024 else { throw MediaCacheError.unsupportedSize }
+        guard total > 0, total <= TojMediaLimits.maximumMessageBytes else { throw MediaCacheError.unsupportedSize }
         let start = max(0, offset)
         let end = min(total, start + max(0, length))
         guard end > start else { return Data() }

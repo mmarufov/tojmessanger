@@ -1,0 +1,716 @@
+import type { SQL } from "bun";
+import sharp from "sharp";
+import {
+  linkPreviewAssetAAD,
+  linkPreviewAssetDigestHMAC,
+  linkPreviewLookupHMAC,
+  linkPreviewMetadataAAD,
+  linkPreviewURLAAD,
+  open,
+  seal,
+} from "./crypto";
+import { fanoutDialogEvent } from "./fanout";
+import { fetchPublicResource, SafeHTTPError, validatePublicURL } from "./safe-http-client";
+import { notifySyncWakeups } from "./sync-wakeup";
+import { touchWorkerHeartbeat } from "./cloud-productivity-readiness";
+
+const MAX_HTML_BYTES = 1 * 1_024 * 1_024;
+const MAX_IMAGE_BYTES = 5 * 1_024 * 1_024;
+const MAX_PREVIEW_IMAGE_BYTES = 512 * 1_024;
+const MAX_IMAGE_PIXELS = 20_000_000;
+const MAX_FETCH_ATTEMPTS = 3;
+
+export class LinkPreviewError extends Error {
+  constructor(message: string, readonly code = "invalid_link_preview", readonly status = 400) {
+    super(message);
+    this.name = "LinkPreviewError";
+  }
+}
+
+export type LinkPreviewCandidate = {
+  url: string;
+  utf16Offset: number;
+  utf16Length: number;
+  disabled: boolean;
+};
+
+export type LinkPreviewDTO = {
+  state: "pending" | "ready" | "unavailable" | "disabled";
+  originalUrl: string | null;
+  finalUrl: string | null;
+  destinationHost: string | null;
+  title: string | null;
+  description: string | null;
+  siteName: string | null;
+  assetId: string | null;
+  fetchedAt: string | null;
+};
+
+type PreviewMetadata = {
+  title: string;
+  description: string | null;
+  siteName: string | null;
+  destinationHost: string;
+};
+
+type ClaimedPreview = { lookup: Buffer; leaseToken: string };
+
+const n = (value: unknown) => Number(value as any);
+const iso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
+
+function normalizeCandidate(value: unknown, body: string): LinkPreviewCandidate | null {
+  if (value == null) return null;
+  const raw = value as any;
+  const disabled = Boolean(raw.disabled);
+  if (disabled) return { url: "", utf16Offset: 0, utf16Length: 0, disabled: true };
+  const url = String(raw.url ?? "");
+  const utf16Offset = Number(raw.utf16Offset ?? raw.utf16_offset);
+  const utf16Length = Number(raw.utf16Length ?? raw.utf16_length);
+  if (
+    !Number.isSafeInteger(utf16Offset) || utf16Offset < 0
+    || !Number.isSafeInteger(utf16Length) || utf16Length <= 0
+    || utf16Offset + utf16Length > body.length
+    || body.slice(utf16Offset, utf16Offset + utf16Length) !== url
+  ) {
+    return null;
+  }
+  try {
+    const parsed = validatePublicURL(url);
+    return {
+      url: parsed.toString(),
+      utf16Offset,
+      utf16Length,
+      disabled: false,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Called inside the message transaction. It never performs remote I/O. */
+export async function enqueueLinkPreview(
+  sql: SQL,
+  input: {
+    accountId: string;
+    dialogId: string;
+    msgId: number;
+    editVersion: number;
+    body: string;
+    candidate: unknown;
+    generation?: number;
+  },
+): Promise<void> {
+  const candidate = normalizeCandidate(input.candidate, input.body);
+  const generation = Math.max(1, input.generation ?? 1);
+  await sql`
+    DELETE FROM link_preview_waiters
+    WHERE dialog_id = ${input.dialogId} AND msg_id = ${input.msgId}`;
+  await sql`
+    DELETE FROM message_link_previews
+    WHERE dialog_id = ${input.dialogId} AND msg_id = ${input.msgId}`;
+  if (!candidate) return;
+  if (candidate.disabled) {
+    await sql`
+      INSERT INTO message_link_previews(
+        dialog_id, msg_id, generation, expected_edit_version, state
+      ) VALUES (
+        ${input.dialogId}, ${input.msgId}, ${generation}, ${input.editVersion}, 'disabled'
+      )`;
+    return;
+  }
+
+  const lookup = linkPreviewLookupHMAC(candidate.url);
+  const existing = (await sql`
+    SELECT state, current_snapshot_id, expires_at
+    FROM link_preview_cache_entries
+    WHERE url_lookup_hmac = ${lookup}
+    FOR UPDATE`)[0];
+  let state: LinkPreviewDTO["state"] = "pending";
+  let snapshotId: string | null = null;
+  if (existing?.state === "ready" && existing.expires_at && new Date(existing.expires_at) > new Date()) {
+    state = "ready";
+    snapshotId = String(existing.current_snapshot_id);
+  } else if (
+    existing?.state === "negative"
+    && existing.expires_at
+    && new Date(existing.expires_at) > new Date()
+  ) {
+    state = "unavailable";
+  } else {
+    if (!existing) {
+      const budget = await sql`
+        INSERT INTO link_preview_action_budgets(account_id, bucket_started, accepted_count)
+        VALUES (${input.accountId}, date_trunc('hour', now()), 1)
+        ON CONFLICT (account_id, bucket_started) DO UPDATE SET
+          accepted_count = link_preview_action_budgets.accepted_count + 1,
+          updated_at = now()
+        WHERE link_preview_action_budgets.accepted_count < 60
+        RETURNING accepted_count`;
+      if (!budget.length) state = "unavailable";
+    }
+    if (state === "pending") {
+      const cacheURL = seal(candidate.url, linkPreviewURLAAD("cache", lookup.toString("hex")));
+      await sql`
+        INSERT INTO link_preview_cache_entries(
+          url_lookup_hmac, url_key_id, url_nonce, url_ciphertext, state, available_at
+        ) VALUES (
+          ${lookup}, ${cacheURL.keyId}, ${cacheURL.nonce}, ${cacheURL.ciphertext}, 'pending', now()
+        )
+        ON CONFLICT (url_lookup_hmac) DO UPDATE SET
+          state = CASE
+            WHEN link_preview_cache_entries.state = 'fetching'
+              AND link_preview_cache_entries.lease_expires_at > now()
+            THEN link_preview_cache_entries.state
+            ELSE 'pending'
+          END,
+          available_at = CASE
+            WHEN link_preview_cache_entries.state = 'fetching'
+              AND link_preview_cache_entries.lease_expires_at > now()
+            THEN link_preview_cache_entries.available_at
+            ELSE now()
+          END,
+          expires_at = NULL,
+          last_error_code = NULL,
+          updated_at = now()`;
+    }
+  }
+
+  const messageURL = seal(
+    candidate.url,
+    linkPreviewURLAAD("message", `${input.dialogId}:${input.msgId}:${generation}`),
+  );
+  await sql`
+    INSERT INTO message_link_previews(
+      dialog_id, msg_id, generation, expected_edit_version, url_lookup_hmac,
+      original_url_key_id, original_url_nonce, original_url_ciphertext, state, snapshot_id
+    ) VALUES (
+      ${input.dialogId}, ${input.msgId}, ${generation}, ${input.editVersion}, ${lookup},
+      ${messageURL.keyId}, ${messageURL.nonce}, ${messageURL.ciphertext}, ${state}, ${snapshotId}
+    )`;
+  if (state === "pending") {
+    await sql`
+      INSERT INTO link_preview_waiters(
+        url_lookup_hmac, dialog_id, msg_id, expected_edit_version, generation
+      ) VALUES (
+        ${lookup}, ${input.dialogId}, ${input.msgId}, ${input.editVersion}, ${generation}
+      )
+      ON CONFLICT (url_lookup_hmac, dialog_id, msg_id) DO UPDATE SET
+        expected_edit_version = excluded.expected_edit_version,
+        generation = excluded.generation`;
+  }
+}
+
+function decodeEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  };
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, entity: string) => {
+    if (entity.startsWith("#x")) {
+      const code = Number.parseInt(entity.slice(2), 16);
+      return Number.isSafeInteger(code) ? String.fromCodePoint(code) : "";
+    }
+    if (entity.startsWith("#")) {
+      const code = Number.parseInt(entity.slice(1), 10);
+      return Number.isSafeInteger(code) ? String.fromCodePoint(code) : "";
+    }
+    return named[entity.toLowerCase()] ?? match;
+  });
+}
+
+function cleanText(value: string | null | undefined, maxScalars: number): string | null {
+  if (!value) return null;
+  const normalized = decodeEntities(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (!normalized) return null;
+  return [...normalized].slice(0, maxScalars).join("");
+}
+
+function attributes(fragment: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const regex = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+  for (const match of fragment.matchAll(regex)) {
+    result[match[1].toLowerCase()] = match[2] ?? match[3] ?? match[4] ?? "";
+  }
+  return result;
+}
+
+function parseMetadata(html: string, finalURL: URL): {
+  metadata: PreviewMetadata;
+  imageURL: string | null;
+} {
+  const tags = new Map<string, string>();
+  for (const match of html.matchAll(/<meta\s+([^>]{0,4096})>/gi)) {
+    const attr = attributes(match[1]);
+    const key = String(attr.property ?? attr.name ?? "").toLowerCase();
+    if (key && attr.content != null && !tags.has(key)) tags.set(key, attr.content);
+  }
+  const robots = String(tags.get("robots") ?? "").toLowerCase();
+  if (robots.split(/[\s,]+/).includes("nosnippet")) {
+    throw new LinkPreviewError("origin disabled snippets", "origin_no_snippet");
+  }
+  const titleMatch = html.match(/<title(?:\s[^>]*)?>([\s\S]{0,2048}?)<\/title>/i);
+  const title = cleanText(
+    tags.get("og:title") ?? titleMatch?.[1] ?? tags.get("twitter:title") ?? finalURL.hostname,
+    200,
+  ) ?? finalURL.hostname;
+  const description = cleanText(
+    tags.get("og:description") ?? tags.get("description") ?? tags.get("twitter:description"),
+    500,
+  );
+  const siteName = cleanText(tags.get("og:site_name"), 100);
+  const image = tags.get("og:image") ?? tags.get("twitter:image") ?? null;
+  let imageURL: string | null = null;
+  if (image && !image.trim().toLowerCase().startsWith("data:")) {
+    try {
+      const parsed = validatePublicURL(new URL(image, finalURL).toString());
+      if (!parsed.pathname.toLowerCase().endsWith(".svg")) imageURL = parsed.toString();
+    } catch {
+      imageURL = null;
+    }
+  }
+  return {
+    metadata: {
+      title,
+      description,
+      siteName,
+      destinationHost: finalURL.hostname.toLowerCase(),
+    },
+    imageURL,
+  };
+}
+
+export function parseLinkPreviewMetadata(
+  html: string,
+  finalURL: URL,
+): { title: string; description: string | null; siteName: string | null; imageURL: string | null } {
+  const parsed = parseMetadata(html, finalURL);
+  return {
+    title: parsed.metadata.title,
+    description: parsed.metadata.description,
+    siteName: parsed.metadata.siteName,
+    imageURL: parsed.imageURL,
+  };
+}
+
+async function fetchImage(url: string | null): Promise<Buffer | null> {
+  if (!url) return null;
+  try {
+    const response = await fetchPublicResource(url, {
+      maxBytes: MAX_IMAGE_BYTES,
+      accept: "image/jpeg,image/png,image/webp,image/avif",
+    });
+    if (response.status < 200 || response.status >= 300) return null;
+    const type = String(response.headers["content-type"] ?? "").split(";", 1)[0].trim();
+    if (!["image/jpeg", "image/png", "image/webp", "image/avif"].includes(type)) return null;
+    const source = sharp(response.body, {
+      limitInputPixels: MAX_IMAGE_PIXELS,
+      failOn: "warning",
+      sequentialRead: true,
+    }).rotate().flatten({ background: "#ffffff" }).resize({
+      width: 1_200,
+      height: 630,
+      fit: "inside",
+      withoutEnlargement: true,
+    });
+    for (const quality of [82, 72, 62, 52, 42]) {
+      const encoded = await source.clone().jpeg({ quality, progressive: false, mozjpeg: true }).toBuffer();
+      if (encoded.length <= MAX_PREVIEW_IMAGE_BYTES) return encoded;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function claimPreviewJobs(sql: SQL, limit: number): Promise<ClaimedPreview[]> {
+  return await sql.begin(async (tx) => {
+    const rows = await tx`
+      WITH candidates AS (
+        SELECT url_lookup_hmac
+        FROM link_preview_cache_entries
+        WHERE (
+          state = 'pending' AND available_at <= now()
+        ) OR (
+          state = 'fetching' AND lease_expires_at <= now()
+        )
+        ORDER BY available_at, created_at
+        LIMIT ${limit}
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE link_preview_cache_entries entry SET
+        state = 'fetching', attempts = entry.attempts + 1, claimed_at = now(),
+        lease_expires_at = now() + interval '30 seconds', lease_token = gen_random_uuid(),
+        updated_at = now()
+      FROM candidates
+      WHERE entry.url_lookup_hmac = candidates.url_lookup_hmac
+      RETURNING entry.url_lookup_hmac, entry.lease_token`;
+    return rows.map((row: any) => ({
+      lookup: Buffer.from(row.url_lookup_hmac),
+      leaseToken: String(row.lease_token),
+    }));
+  });
+}
+
+async function publishPreview(
+  sql: SQL,
+  claim: ClaimedPreview,
+  result: {
+    originalURL: string;
+    finalURL: string;
+    metadata: PreviewMetadata;
+    image: Buffer | null;
+  },
+): Promise<void> {
+  await sql.begin(async (tx) => {
+    const cache = (await tx`
+      SELECT 1 FROM link_preview_cache_entries
+      WHERE url_lookup_hmac = ${claim.lookup}
+        AND state = 'fetching' AND lease_token = ${claim.leaseToken}
+      FOR UPDATE`)[0];
+    if (!cache) return;
+    let assetId: string | null = null;
+    if (result.image) {
+      assetId = crypto.randomUUID();
+      const sealed = seal(result.image, linkPreviewAssetAAD(assetId));
+      const imageInfo = await sharp(result.image).metadata();
+      await tx`
+        INSERT INTO link_preview_assets(
+          id, key_id, nonce, ciphertext, content_type, byte_size, width, height, digest_hmac
+        ) VALUES (
+          ${assetId}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, 'image/jpeg',
+          ${result.image.length}, ${imageInfo.width ?? 1}, ${imageInfo.height ?? 1},
+          ${linkPreviewAssetDigestHMAC(result.image)}
+        )`;
+    }
+    const snapshotId = crypto.randomUUID();
+    const sealedURL = seal(
+      JSON.stringify({ originalURL: result.originalURL, finalURL: result.finalURL }),
+      linkPreviewURLAAD("snapshot", snapshotId),
+    );
+    const sealedMetadata = seal(
+      JSON.stringify(result.metadata),
+      linkPreviewMetadataAAD(snapshotId),
+    );
+    await tx`
+      INSERT INTO link_preview_snapshots(
+        id, url_key_id, url_nonce, url_ciphertext,
+        metadata_key_id, metadata_nonce, metadata_ciphertext,
+        asset_id, fetched_at, expires_at
+      ) VALUES (
+        ${snapshotId}, ${sealedURL.keyId}, ${sealedURL.nonce}, ${sealedURL.ciphertext},
+        ${sealedMetadata.keyId}, ${sealedMetadata.nonce}, ${sealedMetadata.ciphertext},
+        ${assetId}, now(), now() + interval '24 hours'
+      )`;
+    await tx`
+      UPDATE link_preview_cache_entries SET
+        state = 'ready', current_snapshot_id = ${snapshotId}, fetched_at = now(),
+        expires_at = now() + interval '24 hours', claimed_at = NULL,
+        lease_expires_at = NULL, lease_token = NULL, last_error_code = NULL, updated_at = now()
+      WHERE url_lookup_hmac = ${claim.lookup}`;
+
+    const waiters = await tx`
+      SELECT waiter.dialog_id, waiter.msg_id, waiter.expected_edit_version, waiter.generation,
+             message.sender_account_id
+      FROM link_preview_waiters waiter
+      JOIN messages message
+        ON message.dialog_id = waiter.dialog_id AND message.msg_id = waiter.msg_id
+      JOIN message_link_previews relation
+        ON relation.dialog_id = waiter.dialog_id AND relation.msg_id = waiter.msg_id
+      WHERE waiter.url_lookup_hmac = ${claim.lookup}
+        AND message.state = 'visible'
+        AND message.edit_version = waiter.expected_edit_version
+        AND relation.expected_edit_version = waiter.expected_edit_version
+        AND relation.generation = waiter.generation
+        AND relation.url_lookup_hmac = waiter.url_lookup_hmac
+      ORDER BY waiter.dialog_id, waiter.msg_id`;
+    const pushes = [];
+    for (const waiter of waiters) {
+      await tx`
+        UPDATE message_link_previews SET
+          state = 'ready', snapshot_id = ${snapshotId}, updated_at = now()
+        WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
+          AND generation = ${waiter.generation}
+          AND expected_edit_version = ${waiter.expected_edit_version}`;
+      pushes.push(...await fanoutDialogEvent(tx, {
+        dialogId: String(waiter.dialog_id),
+        type: "message.preview_updated",
+        msgId: n(waiter.msg_id),
+        actorAccountId: String(waiter.sender_account_id),
+        alertRecipients: false,
+      }));
+    }
+    await tx`DELETE FROM link_preview_waiters WHERE url_lookup_hmac = ${claim.lookup}`;
+    await notifySyncWakeups(tx, pushes);
+  });
+}
+
+async function publishUnavailable(
+  sql: SQL,
+  claim: ClaimedPreview,
+  code: string,
+): Promise<void> {
+  await sql.begin(async (tx) => {
+    const cache = (await tx`
+      SELECT attempts FROM link_preview_cache_entries
+      WHERE url_lookup_hmac = ${claim.lookup}
+        AND state = 'fetching' AND lease_token = ${claim.leaseToken}
+      FOR UPDATE`)[0];
+    if (!cache) return;
+    await tx`
+      UPDATE link_preview_cache_entries SET
+        state = 'negative', expires_at = now() + interval '1 hour', fetched_at = now(),
+        claimed_at = NULL, lease_expires_at = NULL, lease_token = NULL,
+        last_error_code = ${code}, updated_at = now()
+      WHERE url_lookup_hmac = ${claim.lookup}`;
+    const waiters = await tx`
+      SELECT waiter.dialog_id, waiter.msg_id, waiter.expected_edit_version, waiter.generation,
+             message.sender_account_id
+      FROM link_preview_waiters waiter
+      JOIN messages message
+        ON message.dialog_id = waiter.dialog_id AND message.msg_id = waiter.msg_id
+      JOIN message_link_previews relation
+        ON relation.dialog_id = waiter.dialog_id AND relation.msg_id = waiter.msg_id
+      WHERE waiter.url_lookup_hmac = ${claim.lookup}
+        AND message.state = 'visible'
+        AND message.edit_version = waiter.expected_edit_version
+        AND relation.generation = waiter.generation
+      ORDER BY waiter.dialog_id, waiter.msg_id`;
+    const pushes = [];
+    for (const waiter of waiters) {
+      await tx`
+        UPDATE message_link_previews SET state = 'unavailable', snapshot_id = NULL, updated_at = now()
+        WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
+          AND generation = ${waiter.generation}
+          AND expected_edit_version = ${waiter.expected_edit_version}`;
+      pushes.push(...await fanoutDialogEvent(tx, {
+        dialogId: String(waiter.dialog_id),
+        type: "message.preview_updated",
+        msgId: n(waiter.msg_id),
+        actorAccountId: String(waiter.sender_account_id),
+        alertRecipients: false,
+      }));
+    }
+    await tx`DELETE FROM link_preview_waiters WHERE url_lookup_hmac = ${claim.lookup}`;
+    await notifySyncWakeups(tx, pushes);
+  });
+}
+
+async function returnPreviewForRetry(
+  sql: SQL,
+  claim: ClaimedPreview,
+  attempts: number,
+  code: string,
+): Promise<void> {
+  const delay = Math.min(300, 2 ** Math.min(8, attempts));
+  await sql`
+    UPDATE link_preview_cache_entries SET
+      state = 'pending', available_at = now() + (${delay}::text || ' seconds')::interval,
+      claimed_at = NULL, lease_expires_at = NULL, lease_token = NULL,
+      last_error_code = ${code}, updated_at = now()
+    WHERE url_lookup_hmac = ${claim.lookup}
+      AND state = 'fetching' AND lease_token = ${claim.leaseToken}`;
+}
+
+async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
+  const row = (await sql`
+    SELECT url_key_id, url_nonce, url_ciphertext, attempts
+    FROM link_preview_cache_entries
+    WHERE url_lookup_hmac = ${claim.lookup}
+      AND state = 'fetching' AND lease_token = ${claim.leaseToken}`)[0];
+  if (!row) return;
+  const originalURL = open(
+    {
+      keyId: String(row.url_key_id),
+      nonce: Buffer.from(row.url_nonce),
+      ciphertext: Buffer.from(row.url_ciphertext),
+    },
+    linkPreviewURLAAD("cache", claim.lookup.toString("hex")),
+  ).toString("utf8");
+  try {
+    const response = await fetchPublicResource(originalURL, {
+      maxBytes: MAX_HTML_BYTES,
+      accept: "text/html,application/xhtml+xml",
+    });
+    if (response.status < 200 || response.status >= 300) {
+      throw new SafeHTTPError("origin status is unavailable", "origin_status", response.status >= 500);
+    }
+    const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
+    if (!contentType.startsWith("text/html") && !contentType.startsWith("application/xhtml+xml")) {
+      throw new SafeHTTPError("origin is not HTML", "not_html");
+    }
+    const html = response.body.toString("utf8");
+    const { metadata, imageURL } = parseMetadata(html, response.url);
+    const image = await fetchImage(imageURL);
+    await publishPreview(sql, claim, {
+      originalURL,
+      finalURL: response.url.toString(),
+      metadata,
+      image,
+    });
+  } catch (error) {
+    const attempts = n(row.attempts);
+    if (error instanceof SafeHTTPError && error.transient && attempts < MAX_FETCH_ATTEMPTS) {
+      await returnPreviewForRetry(sql, claim, attempts, error.code);
+    } else {
+      await publishUnavailable(
+        sql,
+        claim,
+        error instanceof SafeHTTPError || error instanceof LinkPreviewError
+          ? error.code
+          : "preview_parse_failed",
+      );
+    }
+  }
+}
+
+export async function drainLinkPreviews(sql: SQL, limit = 20): Promise<number> {
+  const claims = await claimPreviewJobs(sql, Math.max(1, Math.min(20, limit)));
+  for (const claim of claims) await processPreview(sql, claim);
+  return claims.length;
+}
+
+export function startLinkPreviewWorker(
+  sql: SQL,
+  options: { pollMilliseconds?: number; workerId?: string } = {},
+): () => void {
+  const workerId = options.workerId ?? crypto.randomUUID();
+  const pollMilliseconds = Math.max(500, options.pollMilliseconds ?? 2_000);
+  let running = false;
+  let stopped = false;
+  const tick = async () => {
+    if (running || stopped) return;
+    running = true;
+    try {
+      await touchWorkerHeartbeat(sql, "link_preview", workerId);
+      await drainLinkPreviews(sql);
+    } catch {
+      // Queue depth and heartbeat age carry operational state without logging URLs or hostnames.
+    } finally {
+      running = false;
+    }
+  };
+  void tick();
+  const timer = setInterval(() => void tick(), pollMilliseconds);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
+export async function loadLinkPreviews(
+  sql: SQL,
+  keys: Array<{ dialogId: string; msgId: number }>,
+): Promise<Map<string, LinkPreviewDTO>> {
+  if (keys.length === 0) return new Map();
+  const rows = await sql`
+    WITH wanted AS (
+      SELECT * FROM unnest(
+        ${sql.array(keys.map((key) => key.dialogId), "uuid")}::uuid[],
+        ${sql.array(keys.map((key) => key.msgId), "int8")}::bigint[]
+      ) key(dialog_id, msg_id)
+    )
+    SELECT relation.dialog_id, relation.msg_id, relation.generation, relation.state,
+           relation.original_url_key_id, relation.original_url_nonce,
+           relation.original_url_ciphertext, relation.snapshot_id,
+           snapshot.url_key_id AS snapshot_url_key_id,
+           snapshot.url_nonce AS snapshot_url_nonce,
+           snapshot.url_ciphertext AS snapshot_url_ciphertext,
+           snapshot.metadata_key_id, snapshot.metadata_nonce, snapshot.metadata_ciphertext,
+           snapshot.asset_id, snapshot.fetched_at
+    FROM wanted
+    JOIN message_link_previews relation
+      ON relation.dialog_id = wanted.dialog_id AND relation.msg_id = wanted.msg_id
+    LEFT JOIN link_preview_snapshots snapshot ON snapshot.id = relation.snapshot_id`;
+  const result = new Map<string, LinkPreviewDTO>();
+  for (const row of rows) {
+    const dialogId = String(row.dialog_id);
+    const msgId = n(row.msg_id);
+    const state = String(row.state) as LinkPreviewDTO["state"];
+    let originalUrl: string | null = null;
+    if (row.original_url_key_id) {
+      originalUrl = open(
+        {
+          keyId: String(row.original_url_key_id),
+          nonce: Buffer.from(row.original_url_nonce),
+          ciphertext: Buffer.from(row.original_url_ciphertext),
+        },
+        linkPreviewURLAAD("message", `${dialogId}:${msgId}:${n(row.generation)}`),
+      ).toString("utf8");
+    }
+    let finalUrl: string | null = null;
+    let metadata: PreviewMetadata | null = null;
+    if (state === "ready" && row.snapshot_id) {
+      const urls = JSON.parse(open(
+        {
+          keyId: String(row.snapshot_url_key_id),
+          nonce: Buffer.from(row.snapshot_url_nonce),
+          ciphertext: Buffer.from(row.snapshot_url_ciphertext),
+        },
+        linkPreviewURLAAD("snapshot", String(row.snapshot_id)),
+      ).toString("utf8"));
+      finalUrl = String(urls.finalURL);
+      metadata = JSON.parse(open(
+        {
+          keyId: String(row.metadata_key_id),
+          nonce: Buffer.from(row.metadata_nonce),
+          ciphertext: Buffer.from(row.metadata_ciphertext),
+        },
+        linkPreviewMetadataAAD(String(row.snapshot_id)),
+      ).toString("utf8"));
+    }
+    result.set(`${dialogId}:${msgId}`, {
+      state,
+      originalUrl,
+      finalUrl,
+      destinationHost: metadata?.destinationHost ?? (() => {
+        try { return originalUrl ? new URL(originalUrl).hostname.toLowerCase() : null; } catch { return null; }
+      })(),
+      title: metadata?.title ?? null,
+      description: metadata?.description ?? null,
+      siteName: metadata?.siteName ?? null,
+      assetId: row.asset_id == null ? null : String(row.asset_id),
+      fetchedAt: row.fetched_at == null ? null : iso(row.fetched_at),
+    });
+  }
+  return result;
+}
+
+export async function downloadLinkPreviewAsset(
+  sql: SQL,
+  accountId: string,
+  assetId: string,
+): Promise<{ bytes: Buffer; contentType: string }> {
+  const row = (await sql`
+    SELECT asset.key_id, asset.nonce, asset.ciphertext, asset.content_type
+    FROM link_preview_assets asset
+    WHERE asset.id = ${assetId}
+      AND EXISTS (
+        SELECT 1
+        FROM link_preview_snapshots snapshot
+        JOIN message_link_previews relation ON relation.snapshot_id = snapshot.id
+        JOIN dialog_members member ON member.dialog_id = relation.dialog_id
+        JOIN dialogs dialog ON dialog.id = relation.dialog_id
+        WHERE snapshot.asset_id = asset.id
+          AND member.account_id = ${accountId}
+          AND member.left_at IS NULL
+          AND dialog.closed_at IS NULL
+          AND (
+            dialog.type <> 'saved'
+            OR (dialog.created_by = ${accountId} AND member.role = 'owner')
+          )
+      )`)[0];
+  if (!row) throw new LinkPreviewError("preview asset not found", "preview_asset_not_found", 404);
+  return {
+    bytes: open(
+      {
+        keyId: String(row.key_id),
+        nonce: Buffer.from(row.nonce),
+        ciphertext: Buffer.from(row.ciphertext),
+      },
+      linkPreviewAssetAAD(assetId),
+    ),
+    contentType: String(row.content_type),
+  };
+}

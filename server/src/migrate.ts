@@ -47,6 +47,18 @@ const accountPrivateCleanupContract = new URL(
   "./schema-account-private-cleanup-contract.sql",
   import.meta.url,
 ).pathname;
+const cloudProductivityExpand = new URL(
+  "./schema-cloud-productivity-expand.sql",
+  import.meta.url,
+).pathname;
+const cloudProductivityConcurrent = new URL(
+  "./schema-cloud-productivity-concurrent.sql",
+  import.meta.url,
+).pathname;
+const cloudProductivityContract = new URL(
+  "./schema-cloud-productivity-contract.sql",
+  import.meta.url,
+).pathname;
 const callMediaBackfillBatchSize = 1_000;
 const preferenceBackfillBatchSize = Math.max(
   1,
@@ -184,6 +196,11 @@ await completeConstraintMigration(
   "message-mutation-operation-v2",
   "message_mutation_requests",
   ["message_mutation_requests_operation_check"],
+);
+await completeConstraintMigration(
+  "group-mutation-operation-v2",
+  "group_mutation_requests",
+  ["group_mutation_requests_operation_check"],
 );
 
 async function dropLegacyConstraintOnce(
@@ -399,6 +416,25 @@ while (true) {
   legacyPreferenceReconciliations += reconciled;
   if (reconciled === 0) break;
 }
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityExpand}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityConcurrent}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
+  SET lock_timeout = '2s';
+  SET statement_timeout = '30min';
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'account_events'::regclass
+        AND conname = 'account_events_type_check_v6'
+        AND NOT convalidated
+    ) THEN
+      ALTER TABLE account_events VALIDATE CONSTRAINT account_events_type_check_v6;
+    END IF;
+  END;
+  $$;
+`}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityContract}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${accountPrivateCleanupExpand}`.quiet();
 let accountPrivateCleanupReconciliations = 0;
 const cleanupMigrationSql = makeSql(url);
@@ -459,9 +495,40 @@ try {
             WHERE reconciliation.account_id = account.id
           )
           OR EXISTS (
+            SELECT 1 FROM public.chat_folders AS folder
+            WHERE folder.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.chat_folder_mutation_requests AS request
+            WHERE request.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.chat_folder_action_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.scheduled_deliveries AS delivery
+            WHERE delivery.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.scheduled_delivery_mutation_requests AS request
+            WHERE request.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.scheduled_delivery_action_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.link_preview_action_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
             SELECT 1 FROM public.account_events AS event
             WHERE event.account_id = account.id
-              AND event.type IN ('draft.updated', 'dialog.preferences_updated')
+              AND event.type IN (
+                'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
+                'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+              )
           )
           OR EXISTS (
             SELECT 1 FROM public.bootstrap_snapshots AS snapshot

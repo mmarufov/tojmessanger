@@ -48,11 +48,36 @@ BEGIN
   DELETE FROM public.dialog_preference_action_budgets
   WHERE account_id = target_account_id;
 
+  DELETE FROM public.chat_folder_mutation_requests
+  WHERE account_id = target_account_id;
+  DELETE FROM public.chat_folder_action_budgets
+  WHERE account_id = target_account_id;
+  DELETE FROM public.chat_folders
+  WHERE account_id = target_account_id;
+  DELETE FROM public.account_chat_folder_states
+  WHERE account_id = target_account_id;
+
+  -- Accepted schedules belong to the account rather than the originating device. Account deletion
+  -- is the explicit terminal boundary: erase ciphertext and all replay receipts before anonymizing.
+  DELETE FROM public.scheduled_delivery_mutation_requests
+  WHERE account_id = target_account_id;
+  DELETE FROM public.scheduled_delivery_action_budgets
+  WHERE account_id = target_account_id;
+  DELETE FROM public.scheduled_deliveries
+  WHERE account_id = target_account_id;
+  DELETE FROM public.account_scheduled_delivery_states
+  WHERE account_id = target_account_id;
+  DELETE FROM public.link_preview_action_budgets
+  WHERE account_id = target_account_id;
+
   -- Push rows cascade from these private sync events. Message/group lifecycle history belonging to
   -- peers remains intact; only draft and preference presentation state is removed.
   DELETE FROM public.account_events
   WHERE account_id = target_account_id
-    AND type IN ('draft.updated', 'dialog.preferences_updated');
+    AND type IN (
+      'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
+      'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+    );
   DELETE FROM public.bootstrap_snapshots
   WHERE account_id = target_account_id;
 

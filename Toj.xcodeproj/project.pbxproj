@@ -31,6 +31,7 @@
 		7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */; };
 		A5C8ADF333DBDBB31543D6D5 /* Pods_TojTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3DD0437071A3938BAE23617C /* Pods_TojTests.framework */; };
 		ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */; };
+		E1386D7B7B1904084BB6F00C /* CloudProductivityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC91D31BEC84FB5D9661A8A9 /* CloudProductivityTests.swift */; };
 		CE7C17E0B10F15FC34F6684A /* CryptoSpikeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8319E883199BE34EC1B496D6 /* CryptoSpikeTests.swift */; };
 		DAE6D5DFCCA9A3125DC90412 /* TelegramFastLocalFirstUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5184B66A88DA7930C719B5DD /* TelegramFastLocalFirstUITests.swift */; };
 		DAF0BE9F58109F5B51592FC6 /* BackgroundMediaTransferSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C0D845DDFBB65499382A67B /* BackgroundMediaTransferSessionTests.swift */; };
@@ -95,6 +96,7 @@
 		9E0369E739F60C67D16AAAFC /* MessagingPresentationTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MessagingPresentationTests.swift; sourceTree = "<group>"; };
 		A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SavedMessagesTests.swift; sourceTree = "<group>"; };
 		A6A7237A13A5A375D4580965 /* TojTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TojTests.swift; sourceTree = "<group>"; };
+		AC91D31BEC84FB5D9661A8A9 /* CloudProductivityTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudProductivityTests.swift; sourceTree = "<group>"; };
 		B25F5658A25CAAE3AF9003A9 /* Pods-Toj.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Toj.release.xcconfig"; path = "Target Support Files/Pods-Toj/Pods-Toj.release.xcconfig"; sourceTree = "<group>"; };
 		C048F3408BB36DD8BA4FDBCB /* CloudLocalStoreTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CloudLocalStoreTests.swift; sourceTree = "<group>"; };
 		C09D87EE18E83A016DCEBFBD /* Pods_Toj.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Toj.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -200,6 +202,7 @@
 				A3793781004947FEB1AFCE06 /* SavedMessagesTests.swift */,
 				55B6D3510501ECD1FF1D719F /* CloudDraftsV1Tests.swift */,
 				A9C013000000000000000002 /* GroupCallTests.swift */,
+				AC91D31BEC84FB5D9661A8A9 /* CloudProductivityTests.swift */,
 			);
 			path = TojTests;
 			sourceTree = "<group>";
@@ -541,6 +544,7 @@
 				7ED0F00CB5A83854C6B11C83 /* SavedMessagesTests.swift in Sources */,
 				ACCE60CCA1CBD10D2149967E /* CloudDraftsV1Tests.swift in Sources */,
 				A9C013000000000000000001 /* GroupCallTests.swift in Sources */,
+				E1386D7B7B1904084BB6F00C /* CloudProductivityTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

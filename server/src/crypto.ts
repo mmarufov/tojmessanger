@@ -56,6 +56,37 @@ export function draftBodyAAD(accountId: string, dialogId: string, revision: numb
 export function draftResponseAAD(accountId: string, operationId: string): Buffer {
   return Buffer.from(`toj/draft-response|${accountId}|${operationId}`, "utf8");
 }
+
+/** Account-private folder titles remain encrypted even though matching flags are queryable. */
+export function chatFolderTitleAAD(accountId: string, folderId: string): Buffer {
+  return Buffer.from(`toj/chat-folder-title|${accountId}|${folderId}`, "utf8");
+}
+
+/** One sealed scheduled item contains body, reply, mentions, and preview intent. */
+export function scheduledItemAAD(
+  accountId: string,
+  deliveryId: string,
+  itemIndex: number,
+  clientMsgId: string,
+): Buffer {
+  return Buffer.from(
+    `toj/scheduled-item|${accountId}|${deliveryId}|${itemIndex}|${clientMsgId}`,
+    "utf8",
+  );
+}
+
+/** Link-preview URL and metadata namespaces cannot be swapped between cache/message rows. */
+export function linkPreviewURLAAD(scope: "cache" | "message" | "snapshot", id: string): Buffer {
+  return Buffer.from(`toj/link-preview-url|${scope}|${id}`, "utf8");
+}
+
+export function linkPreviewMetadataAAD(snapshotId: string): Buffer {
+  return Buffer.from(`toj/link-preview-metadata|${snapshotId}`, "utf8");
+}
+
+export function linkPreviewAssetAAD(assetId: string): Buffer {
+  return Buffer.from(`toj/link-preview-asset|${assetId}`, "utf8");
+}
 export const PHONE_AAD = Buffer.from("toj/phone", "utf8");
 
 /** Binds an APNs device token to the exact authenticated device row. */
@@ -93,12 +124,32 @@ export function mediaDigestHMAC(digest: Uint8Array): Buffer {
 
 /** Opaque, domain-separated idempotency fingerprint. Database readers cannot test plaintext. */
 export function requestFingerprintHMAC(
-  domain: "draft-mutation" | "media-group-send",
+  domain:
+    | "draft-mutation"
+    | "media-group-send"
+    | "media-group-client-message-id"
+    | "chat-folder-mutation"
+    | "scheduled-delivery-mutation",
   canonicalPayload: Uint8Array | string,
 ): Buffer {
   return createHmac("sha256", HMAC_KEY)
     .update(`toj/request-fingerprint/${domain}/v1|`)
     .update(canonicalPayload)
+    .digest();
+}
+
+/** A keyed lookup lets the queue coalesce URLs without indexing their plaintext. */
+export function linkPreviewLookupHMAC(normalizedURL: string): Buffer {
+  return createHmac("sha256", HMAC_KEY)
+    .update("toj/link-preview-url/v1|")
+    .update(normalizedURL)
+    .digest();
+}
+
+export function linkPreviewAssetDigestHMAC(bytes: Uint8Array): Buffer {
+  return createHmac("sha256", HMAC_KEY)
+    .update("toj/link-preview-asset/v1|")
+    .update(bytes)
     .digest();
 }
 

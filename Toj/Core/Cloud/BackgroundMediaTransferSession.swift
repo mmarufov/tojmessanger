@@ -43,7 +43,7 @@ nonisolated struct BackgroundMediaDownloadJobMetadata: Codable, Equatable, Senda
 
 nonisolated enum BackgroundMediaChunkValidator {
     static let maximumChunkBytes = 1024 * 1024
-    static let maximumMediaBytes: Int64 = 25 * 1024 * 1024
+    static let maximumMediaBytes = TojMediaLimits.maximumMessageBytes
 
     static func validate(
         mediaId: String,

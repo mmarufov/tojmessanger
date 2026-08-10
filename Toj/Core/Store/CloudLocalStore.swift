@@ -26,6 +26,7 @@ nonisolated struct LocalMessage: Identifiable, Equatable, Sendable {
     var mediaGroupCount: Int? = nil
     let serviceType: String?
     let serviceData: CloudServiceData?
+    var linkPreview: CloudLinkPreview? = nil
     let editVersion: Int
     let state: String
     let serverTs: String?
@@ -224,6 +225,7 @@ nonisolated struct PendingOutboxItem: Identifiable, Equatable, Sendable {
     let forwardedFromMsgId: Int64?
     var mentions: [CloudMention] = []
     var draftConsumeOperationId: String? = nil
+    var silent = false
     let retryCount: Int
     let nextRetryAt: String?
 }
@@ -769,6 +771,9 @@ actor CloudLocalStore {
         try dbQueue.write { db in
             try db.execute(sql: "DELETE FROM sync_state WHERE account_id = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM replica_state WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM cloud_chat_folder_state WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM cloud_scheduled_deliveries WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM pending_scheduled_delivery_creates WHERE account_id = ?", arguments: [accountId])
             try deleteReplicaData(db, includeMediaTransfers: true)
         }
     }
@@ -3628,7 +3633,9 @@ actor CloudLocalStore {
         forwardedFromDialogId: String? = nil,
         forwardedFromMsgId: Int64? = nil,
         kind: String = "text",
-        media: CloudMedia? = nil
+        media: CloudMedia? = nil,
+        silent: Bool = false,
+        deliverAfter: Date? = nil
     ) throws -> LocalMessage {
         let localId = "pending:\(clientMsgId)"
         let mentionsJSON = try String(
@@ -3684,9 +3691,9 @@ actor CloudLocalStore {
                 INSERT INTO pending_outbox (
                   client_msg_id, dialog_id, body, reply_to_msg_id,
                   forwarded_from_dialog_id, forwarded_from_msg_id, mentions_json,
-                  draft_consume_operation_id, created_at
+                  draft_consume_operation_id, silent, next_retry_at, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(client_msg_id) DO UPDATE SET
                   body = excluded.body,
                   reply_to_msg_id = excluded.reply_to_msg_id,
@@ -3694,12 +3701,14 @@ actor CloudLocalStore {
                   forwarded_from_msg_id = excluded.forwarded_from_msg_id,
                   mentions_json = excluded.mentions_json,
                   draft_consume_operation_id = excluded.draft_consume_operation_id,
-                  next_retry_at = NULL
+                  silent = excluded.silent,
+                  next_retry_at = excluded.next_retry_at
                 """,
                 arguments: [
                     clientMsgId, dialogId, text, replyToMsgId,
                     forwardedFromDialogId, forwardedFromMsgId, mentionsJSON,
-                    draftConsumeOperationId
+                    draftConsumeOperationId, silent,
+                    deliverAfter.map(Self.sqliteTimestamp)
                 ]
             )
             if let draftConsumeOperationId {
@@ -4562,7 +4571,8 @@ actor CloudLocalStore {
                         )
                     }
                     switch update.type {
-                    case "message.new", "message.edited", "message.deleted", "reaction.updated":
+                    case "message.new", "message.edited", "message.deleted", "reaction.updated",
+                         "message.preview_updated":
                         guard let message = update.message else { continue }
                         let previousMessage = try Row.fetchOne(
                             db,
@@ -4623,6 +4633,12 @@ actor CloudLocalStore {
                             sql: "DELETE FROM pending_outbox WHERE client_msg_id = ?",
                             arguments: [message.clientMsgId]
                         )
+                        if let scheduledDeliveryId = update.scheduledDeliveryId {
+                            try db.execute(
+                                sql: "DELETE FROM cloud_scheduled_deliveries WHERE schedule_id = ?",
+                                arguments: [scheduledDeliveryId]
+                            )
+                        }
                         let isUnread = message.state == "visible"
                             && message.senderAccountId != accountId
                             && message.msgId > currentRead
@@ -4726,6 +4742,59 @@ actor CloudLocalStore {
                             maxReadMsgId: maxReadMsgId,
                             exactUnreadCount: update.unreadCount
                         )
+                    case "chat_folders.updated":
+                        guard let snapshot = update.chatFolders else { continue }
+                        let snapshotJSON = String(
+                            data: try JSONEncoder().encode(snapshot), encoding: .utf8
+                        )!
+                        let current = try Int64.fetchOne(
+                            db,
+                            sql: "SELECT collection_revision FROM cloud_chat_folder_state WHERE account_id = ?",
+                            arguments: [accountId]
+                        ) ?? -1
+                        if snapshot.collectionRevision >= current {
+                            try db.execute(
+                                sql: """
+                                INSERT INTO cloud_chat_folder_state(
+                                  account_id, collection_revision, snapshot_json, updated_at
+                                ) VALUES (?, ?, ?, datetime('now'))
+                                ON CONFLICT(account_id) DO UPDATE SET
+                                  collection_revision = excluded.collection_revision,
+                                  snapshot_json = excluded.snapshot_json,
+                                  updated_at = excluded.updated_at
+                                """,
+                                arguments: [accountId, snapshot.collectionRevision, snapshotJSON]
+                            )
+                        }
+                    case "scheduled.created", "scheduled.updated", "scheduled.canceled",
+                         "scheduled.failed":
+                        guard let delivery = update.scheduledDelivery else { continue }
+                        try db.execute(
+                            sql: "DELETE FROM pending_scheduled_delivery_creates WHERE schedule_id = ? AND account_id = ?",
+                            arguments: [delivery.scheduleId, accountId]
+                        )
+                        let payload = String(
+                            data: try JSONEncoder().encode(delivery), encoding: .utf8
+                        )!
+                        try db.execute(
+                            sql: """
+                            INSERT INTO cloud_scheduled_deliveries(
+                              schedule_id, account_id, dialog_id, state, deliver_at,
+                              revision, payload_json, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(schedule_id) DO UPDATE SET
+                              state = excluded.state,
+                              deliver_at = excluded.deliver_at,
+                              revision = excluded.revision,
+                              payload_json = excluded.payload_json,
+                              updated_at = excluded.updated_at
+                            WHERE excluded.revision >= cloud_scheduled_deliveries.revision
+                            """,
+                            arguments: [
+                                delivery.scheduleId, accountId, delivery.dialogId, delivery.state,
+                                delivery.deliverAt, delivery.revision, payload, delivery.updatedAt
+                            ]
+                        )
                     case "draft.updated":
                         guard let draft = update.draft else { continue }
                         let pending = try String.fetchOne(
@@ -4756,6 +4825,7 @@ actor CloudLocalStore {
                             db,
                             profile: CloudProfile(
                                 accountId: subjectAccountId,
+                                username: update.username,
                                 firstName: firstName,
                                 lastName: lastName,
                                 displayName: displayName,
@@ -5548,6 +5618,7 @@ actor CloudLocalStore {
                        pending_outbox.reply_to_msg_id, pending_outbox.forwarded_from_dialog_id,
                        pending_outbox.forwarded_from_msg_id, pending_outbox.mentions_json,
                        pending_outbox.draft_consume_operation_id,
+                       pending_outbox.silent,
                        pending_outbox.retry_count,
                        pending_outbox.next_retry_at
                 FROM pending_outbox
@@ -6967,6 +7038,56 @@ actor CloudLocalStore {
             """)
         }
 
+        migrator.registerMigration("v12-silent-message-outbox") { db in
+            let columns = try db.columns(in: "pending_outbox").map(\.name)
+            if !columns.contains("silent") {
+                try db.execute(
+                    sql: "ALTER TABLE pending_outbox ADD COLUMN silent INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
+        migrator.registerMigration("v13-cloud-productivity") { db in
+            let columns = try db.columns(in: "messages").map(\.name)
+            if !columns.contains("link_preview_json") {
+                try db.execute(sql: "ALTER TABLE messages ADD COLUMN link_preview_json TEXT")
+            }
+            try db.execute(sql: """
+            CREATE TABLE cloud_chat_folder_state (
+              account_id TEXT PRIMARY KEY,
+              collection_revision INTEGER NOT NULL,
+              snapshot_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE cloud_scheduled_deliveries (
+              schedule_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              state TEXT NOT NULL,
+              deliver_at TEXT NOT NULL,
+              revision INTEGER NOT NULL,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX cloud_scheduled_deliveries_account_time_idx
+              ON cloud_scheduled_deliveries(account_id, deliver_at, schedule_id);
+            CREATE TABLE pending_scheduled_delivery_creates (
+              schedule_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              dialog_id TEXT NOT NULL,
+              request_json TEXT NOT NULL,
+              draft_operation_id TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX pending_scheduled_delivery_creates_ready_idx
+              ON pending_scheduled_delivery_creates(account_id, terminal, next_retry_at, created_at);
+            """)
+        }
+
         SearchIndexSchema.registerMigration(in: &migrator)
 
         try migrator.migrate(dbPool)
@@ -6976,7 +7097,7 @@ actor CloudLocalStore {
     SELECT local_id, dialog_id, msg_id, client_msg_id, sender_account_id, kind, text,
            reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
            forwarded_from_msg_id, is_forwarded, mentions_json,
-           media_json, service_type, service_data_json,
+           media_json, service_type, service_data_json, link_preview_json,
            media_group_id, media_group_index, media_group_count,
            edit_version, state,
            server_ts, local_state,
@@ -9617,9 +9738,9 @@ actor CloudLocalStore {
               reply_to_msg_id, forwarded_from_account_id, forwarded_from_dialog_id,
               forwarded_from_msg_id, is_forwarded, edit_version, state, server_ts, local_state,
               mentions_json, media_json, service_type, service_data_json,
-              media_group_id, media_group_index, media_group_count
+              media_group_id, media_group_index, media_group_count, link_preview_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(client_msg_id) DO UPDATE SET
               local_id = excluded.local_id,
               dialog_id = excluded.dialog_id,
@@ -9639,6 +9760,7 @@ actor CloudLocalStore {
               media_group_id = excluded.media_group_id,
               media_group_index = excluded.media_group_index,
               media_group_count = excluded.media_group_count,
+              link_preview_json = excluded.link_preview_json,
               edit_version = excluded.edit_version,
               state = excluded.state,
               server_ts = excluded.server_ts,
@@ -9669,7 +9791,9 @@ actor CloudLocalStore {
                 message.serviceData.flatMap { try? JSONEncoder().encode($0) }.flatMap { String(data: $0, encoding: .utf8) },
                 message.mediaGroupId,
                 message.mediaGroupIndex,
-                message.mediaGroupCount
+                message.mediaGroupCount,
+                message.linkPreview.flatMap { try? JSONEncoder().encode($0) }
+                    .flatMap { String(data: $0, encoding: .utf8) }
             ]
         )
         if let previousLocalId, previousLocalId != message.id {
@@ -9747,6 +9871,9 @@ actor CloudLocalStore {
             serviceData: (row["service_data_json"] as String?)
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode(CloudServiceData.self, from: $0) },
+            linkPreview: (row["link_preview_json"] as String?)
+                .flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode(CloudLinkPreview.self, from: $0) },
             editVersion: row["edit_version"],
             state: row["state"],
             serverTs: row["server_ts"],
@@ -9887,6 +10014,7 @@ actor CloudLocalStore {
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
             draftConsumeOperationId: row["draft_consume_operation_id"],
+            silent: (row["silent"] as Int? ?? 0) != 0,
             retryCount: row["retry_count"],
             nextRetryAt: row["next_retry_at"]
         )

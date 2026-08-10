@@ -1,4 +1,5 @@
 import type { SQL } from "bun";
+import { scrubDialogFromChatFoldersInTransaction } from "./chat-folders";
 import { createHash } from "node:crypto";
 import { bodyAAD, seal } from "./crypto";
 import {
@@ -11,6 +12,7 @@ import {
 import { appendAccessRevokedEvent, fanoutDialogEvent, type FanoutPush } from "./fanout";
 import { loadMediaDTO, type MediaDTO } from "./media";
 import { loadProfiles, type ProfileDTO } from "./sync";
+import { failScheduledDeliveriesForRevokedDialogInTransaction } from "./scheduled-deliveries";
 import { purgeRevokedDialogDraftState } from "./drafts";
 import { updateDialogPreferences } from "./dialog-preferences";
 import {
@@ -53,6 +55,9 @@ export type GroupDTO = {
   createdBy: string;
   createdAt: string;
   closedAt: string | null;
+  membersCanSend: boolean;
+  membersCanAddMembers: boolean;
+  membersCanEditInfo: boolean;
 };
 
 export type GroupMemberDTO = {
@@ -134,6 +139,7 @@ async function lockAccounts(sql: SQL, accountIds: string[]): Promise<void> {
 async function groupRow(sql: SQL, accountId: string, dialogId: string): Promise<any> {
   const row = (await sql`
     SELECT d.id, d.type, d.title, d.photo_media_id, d.revision, d.created_by,
+           d.members_can_send, d.members_can_add_members, d.members_can_edit_info,
            d.created_at, d.closed_at, dm.role AS self_role, dm.notification_mode,
            dm.left_at,
            (SELECT count(*)::int FROM dialog_members active
@@ -164,6 +170,9 @@ async function dtoFromRow(row: any): Promise<GroupDTO> {
     createdBy: row.created_by,
     createdAt: iso(row.created_at),
     closedAt: row.closed_at == null ? null : iso(row.closed_at),
+    membersCanSend: row.members_can_send ?? true,
+    membersCanAddMembers: row.members_can_add_members ?? false,
+    membersCanEditInfo: row.members_can_edit_info ?? false,
   };
 }
 
@@ -602,6 +611,24 @@ async function mutationAccess(
   }
 }
 
+async function permissionAccess(
+  sql: SQL,
+  actorId: string,
+  dialogId: string,
+  memberPermission: "membersCanAddMembers" | "membersCanEditInfo",
+): Promise<DialogAccess> {
+  try {
+    const access = await lockDialogForMutation(sql, actorId, dialogId);
+    requireGroupRole(access, ["owner", "admin", "member"]);
+    if (access.role === "member" && !access[memberPermission]) {
+      throw new GroupError("this action is restricted to administrators", "insufficient_group_role", 403);
+    }
+    return access;
+  } catch (error) {
+    return mapAccessError(error);
+  }
+}
+
 export async function addGroupMembers(sql: SQL, input: {
   actorAccountId: string;
   actorDeviceId?: string | null;
@@ -617,7 +644,7 @@ export async function addGroupMembers(sql: SQL, input: {
     if (claim.duplicate) return envelope(tx, input.actorAccountId, input.dialogId, { duplicate: true });
     await lockAccounts(tx, [input.actorAccountId, ...ids]);
     const modes = await enforceAddBudgets(tx, input.actorAccountId, ids);
-    await mutationAccess(tx, input.actorAccountId, input.dialogId, ["owner", "admin"]);
+    await permissionAccess(tx, input.actorAccountId, input.dialogId, "membersCanAddMembers");
     const activeCount = n((await tx`
       SELECT count(*)::int AS count FROM dialog_members
       WHERE dialog_id = ${input.dialogId} AND left_at IS NULL`)[0].count);
@@ -714,6 +741,8 @@ export async function removeGroupMember(sql: SQL, input: {
     // commit, so it can never remain an SFU-authorized member after group access is revoked.
     affectedGroupCallIds = await revokeGroupCallAccountInLockedDialog(tx, input.dialogId, targetId);
     await purgeRevokedDialogDraftState(tx, targetId, input.dialogId);
+    await scrubDialogFromChatFoldersInTransaction(tx, targetId, input.dialogId);
+    await failScheduledDeliveriesForRevokedDialogInTransaction(tx, targetId, input.dialogId);
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = await emitLifecycle(
       tx, input.actorAccountId, input.dialogId, "member.removed", "member.removed",
@@ -802,7 +831,7 @@ export async function updateGroupProfile(sql: SQL, input: {
         throw new GroupError("group photo upload is unavailable", "member_unavailable", 404);
       }
     }
-    await mutationAccess(tx, input.actorAccountId, input.dialogId, ["owner", "admin"]);
+    await permissionAccess(tx, input.actorAccountId, input.dialogId, "membersCanEditInfo");
     await tx`
       UPDATE dialogs SET
         title = COALESCE(${title ?? null}, title),
@@ -819,6 +848,54 @@ export async function updateGroupProfile(sql: SQL, input: {
       { actor_account_id: input.actorAccountId, ...(title !== undefined ? { title } : {}) },
       input.actorDeviceId,
     );
+    await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
+    return envelope(tx, input.actorAccountId, input.dialogId, { pushes });
+  });
+}
+
+export async function updateGroupPermissions(sql: SQL, input: {
+  actorAccountId: string;
+  actorDeviceId?: string | null;
+  dialogId: string;
+  membersCanSend: unknown;
+  membersCanAddMembers: unknown;
+  membersCanEditInfo: unknown;
+  clientMutationId: unknown;
+}): Promise<GroupEnvelope> {
+  const values = [input.membersCanSend, input.membersCanAddMembers, input.membersCanEditInfo];
+  if (values.some((value) => typeof value !== "boolean")) {
+    throw new GroupError("all permission values are required", "invalid_request");
+  }
+  const permissions = {
+    membersCanSend: input.membersCanSend as boolean,
+    membersCanAddMembers: input.membersCanAddMembers as boolean,
+    membersCanEditInfo: input.membersCanEditInfo as boolean,
+  };
+  return sql.begin(async (tx) => {
+    const claim = await claimMutation(
+      tx, input.actorAccountId, input.clientMutationId, input.dialogId,
+      "update_permissions", permissions,
+    );
+    if (claim.duplicate) return envelope(tx, input.actorAccountId, input.dialogId, { duplicate: true });
+    await mutationAccess(tx, input.actorAccountId, input.dialogId, ["owner", "admin"]);
+    await tx`
+      UPDATE dialogs SET members_can_send = ${permissions.membersCanSend},
+        members_can_add_members = ${permissions.membersCanAddMembers},
+        members_can_edit_info = ${permissions.membersCanEditInfo}
+      WHERE id = ${input.dialogId}`;
+    const revision = await bumpRevision(tx, input.dialogId);
+    const pushes = await fanoutDialogEvent(tx, {
+      dialogId: input.dialogId,
+      type: "dialog.profile_updated",
+      actorAccountId: input.actorAccountId,
+      sourceDeviceId: input.actorDeviceId,
+      data: {
+        group_revision: revision,
+        members_can_send: permissions.membersCanSend,
+        members_can_add_members: permissions.membersCanAddMembers,
+        members_can_edit_info: permissions.membersCanEditInfo,
+      },
+    });
     await completeMutation(tx, input.actorAccountId, claim.mutationId, revision);
     return envelope(tx, input.actorAccountId, input.dialogId, { pushes });
   });
@@ -918,6 +995,10 @@ export async function leaveGroup(sql: SQL, input: {
       input.actorAccountId,
     );
     await purgeRevokedDialogDraftState(tx, input.actorAccountId, input.dialogId);
+    await scrubDialogFromChatFoldersInTransaction(tx, input.actorAccountId, input.dialogId);
+    await failScheduledDeliveriesForRevokedDialogInTransaction(
+      tx, input.actorAccountId, input.dialogId,
+    );
     const revision = await bumpRevision(tx, input.dialogId);
     const pushes = closed
       ? []

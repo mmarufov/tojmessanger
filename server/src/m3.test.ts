@@ -4,6 +4,7 @@ import {
   startVerification,
   checkVerification,
   lookupAccountByPhone,
+  lookupAccountByUsername,
   getProfile,
   updateProfile,
   startAccountDeletion,
@@ -316,6 +317,7 @@ describe("M3 cloud sync", () => {
     const phone = testPhone(133);
     const alice = await makeAccount(phone, "Alice Personal Name");
     const bob = await makeAccount(testPhone(134), "Bob");
+    await db`UPDATE accounts SET username = 'alice_delete' WHERE id = ${alice.accountId}`;
     const secondDevice = await addIOSDevice(alice.accountId);
     await registerPushToken(db, secondDevice.deviceId, "88".repeat(32), "sandbox");
     const dialog = await getOrCreateDirectDialog(db, alice.accountId, bob.accountId);
@@ -352,9 +354,10 @@ describe("M3 cloud sync", () => {
     const result = await deleteAccount(db, alice.accountId, deletion.code!);
     expect(result).toEqual({ deleted: true });
     const deleted = (await db`
-      SELECT phone_lookup_hash, phone_e164_ciphertext, display_name, status
+      SELECT username, phone_lookup_hash, phone_e164_ciphertext, display_name, status
       FROM accounts WHERE id = ${alice.accountId}`)[0];
     expect(deleted.status).toBe("deleted");
+    expect(deleted.username).toBeNull();
     expect(deleted.display_name).toBe("Deleted Account");
     expect(Buffer.from(deleted.phone_lookup_hash).equals(Buffer.from(original.phone_lookup_hash))).toBe(false);
     expect(Buffer.from(deleted.phone_e164_ciphertext).includes(Buffer.from(phone))).toBe(false);
@@ -2588,23 +2591,31 @@ describe("M3 cloud sync", () => {
     const requesterPts = Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${requester.accountId}`)[0].pts);
     const result = await updateProfile(db, owner.accountId, owner.deviceId, {
+      username: "new_name",
       firstName: "New", lastName: "Name", bio: "Building Toj",
       birthday: "1995-04-18", colorIndex: 4,
     });
     expect(result.profile).toMatchObject({
-      accountId: owner.accountId, firstName: "New", lastName: "Name",
+      accountId: owner.accountId, username: "new_name", firstName: "New", lastName: "Name",
       displayName: "New Name", bio: "Building Toj", birthday: "1995-04-18", colorIndex: 4,
     });
     expect(await getProfile(db, owner.accountId)).toEqual(result.profile);
     expect((await lookupAccountByPhone(db, requester.accountId, testPhone(145)))?.displayName)
       .toBe("New Name");
+    expect((await lookupAccountByUsername(db, requester.accountId, "@NEW_NAME"))?.accountId)
+      .toBe(owner.accountId);
+    const publicLookup = await lookupAccountByUsername(db, requester.accountId, "@NEW_NAME");
+    expect(Object.keys(publicLookup!).sort()).toEqual([
+      "accountId", "colorIndex", "displayName", "firstName", "lastName", "updatedAt", "username",
+    ]);
 
     const difference = await getDifference(db, requester.accountId, requesterPts);
     expect(difference.kind).toBe("difference");
     if (difference.kind === "difference") {
       expect(difference.updates).toContainEqual(expect.objectContaining({
         type: "profile.updated", subject_account_id: owner.accountId,
-        display_name: "New Name", bio: "Building Toj", birthday: "1995-04-18", color_index: 4,
+        username: "new_name", display_name: "New Name", bio: "Building Toj",
+        birthday: "1995-04-18", color_index: 4,
         shared_dialog_ids: [direct.dialogId],
       }));
     }
@@ -2619,6 +2630,22 @@ describe("M3 cloud sync", () => {
       firstName: "Another", lastName: "Name", bio: "", birthday: null, colorIndex: 0,
     }))
       .rejects.toMatchObject({ status: 401 });
+  });
+
+  test("usernames are normalized, unique under concurrency, and invalid lookups are non-oracular", async () => {
+    const first = await makeAccount(testPhone(147), "First");
+    const second = await makeAccount(testPhone(148), "Second");
+    const profile = { username: "unique_name", firstName: "Name", lastName: "", bio: "", birthday: null, colorIndex: 0 };
+    const attempts = await Promise.allSettled([
+      updateProfile(db, first.accountId, first.deviceId, profile),
+      updateProfile(db, second.accountId, second.deviceId, profile),
+    ]);
+    expect(attempts.filter((item) => item.status === "fulfilled")).toHaveLength(1);
+    expect(attempts.filter((item) => item.status === "rejected")[0])
+      .toMatchObject({ reason: expect.objectContaining({ status: 409 }) });
+    expect(await lookupAccountByUsername(db, first.accountId, "not_valid!")).toBeNull();
+    await expect(updateProfile(db, first.accountId, first.deviceId, { ...profile, username: "admin" }))
+      .rejects.toMatchObject({ status: 400 });
   });
 
   test("contact discovery is persistently bounded per authenticated account", async () => {

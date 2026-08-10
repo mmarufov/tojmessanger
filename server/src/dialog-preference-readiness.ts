@@ -92,13 +92,21 @@ const REQUIRED_UNIQUE_CONSTRAINTS = [
   { table: "push_deliveries", columns: ["account_id", "pts", "device_id"] },
 ] as const;
 
-const EXPECTED_EVENT_CONSTRAINT =
+const LEGACY_EVENT_CONSTRAINT =
   "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
   "'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
   "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
   "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
   "'draft.updated'::text])";
+const CURRENT_EVENT_CONSTRAINT =
+  "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
+  "'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
+  "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
+  "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
+  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
+  "'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, " +
+  "'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])";
 const FINAL_TRIGGER_FUNCTION = "mirror_dialog_notification_mode_to_preferences_v1_final";
 const STAGING_TRIGGER_FUNCTION =
   "mirror_dialog_notification_mode_to_preferences_v1_staging";
@@ -242,7 +250,7 @@ export async function dialogPreferenceSchemaState(
                    constraint_row.conrelid,
                    TRUE
                  )
-                 = ${EXPECTED_EVENT_CONSTRAINT}
+                 = ANY(${sql.array([LEGACY_EVENT_CONSTRAINT, CURRENT_EVENT_CONSTRAINT], "text")}::text[])
           FROM pg_catalog.pg_constraint constraint_row
           WHERE constraint_row.conrelid = 'public.account_events'::pg_catalog.regclass
             AND constraint_row.conname = 'account_events_type_check'

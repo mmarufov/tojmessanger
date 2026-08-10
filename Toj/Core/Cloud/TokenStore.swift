@@ -149,6 +149,7 @@ actor TokenStore {
 }
 
 nonisolated struct StoredProfileDetails: Codable, Equatable, Sendable {
+    var username: String? = nil
     var firstName: String
     var lastName: String
     var bio: String
@@ -158,6 +159,7 @@ nonisolated struct StoredProfileDetails: Codable, Equatable, Sendable {
     var pendingSync: Bool? = nil
 
     static let empty = StoredProfileDetails(
+        username: nil,
         firstName: "",
         lastName: "",
         bio: "",

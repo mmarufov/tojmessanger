@@ -200,13 +200,21 @@ const REQUIRED_MIGRATIONS = [
   "account-private-cleanup-v1",
 ] as const;
 
-const EXPECTED_EVENT_CONSTRAINT =
+const LEGACY_EVENT_CONSTRAINT =
   "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
   "'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
   "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
   "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
   "'draft.updated'::text])";
+const CURRENT_EVENT_CONSTRAINT =
+  "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
+  "'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
+  "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
+  "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
+  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
+  "'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, " +
+  "'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])";
 const LOCKED_SEARCH_PATH = "search_path=pg_catalog, public, pg_temp";
 const EXPECTED_CLEANUP_TRIGGER =
   "CREATE TRIGGER accounts_cleanup_saved_messages BEFORE UPDATE OF status ON accounts " +
@@ -407,7 +415,8 @@ export async function draftMediaSchemaState(
         AND constraint_row.conname = 'account_events_type_check'
         AND constraint_row.contype = 'c'`)[0];
     accountEventConstraintReady = Boolean(eventConstraint?.convalidated)
-      && normalized(eventConstraint?.expression) === normalized(EXPECTED_EVENT_CONSTRAINT);
+      && [LEGACY_EVENT_CONSTRAINT, CURRENT_EVENT_CONSTRAINT]
+        .some((expected) => normalized(eventConstraint?.expression) === normalized(expected));
   }
 
   let accountCleanupReady = false;

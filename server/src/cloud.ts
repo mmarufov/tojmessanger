@@ -5,6 +5,7 @@ import {
   checkVerification,
   resolveDevice,
   lookupAccountByPhone,
+  lookupAccountByUsername,
   getProfile,
   updateProfile,
   otpDeliveryFromEnvironment,
@@ -105,6 +106,7 @@ import {
   removeGroupMember,
   transferGroupOwner,
   updateGroupNotifications,
+  updateGroupPermissions,
   updateGroupProfile,
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
@@ -152,6 +154,35 @@ import {
   type GroupCallHint,
   type GroupCallSFUControl,
 } from "./group-calls";
+import {
+  ChatFolderError,
+  createChatFolder,
+  deleteChatFolder,
+  getChatFolders,
+  moveChatFolder,
+  updateChatFolder,
+} from "./chat-folders";
+import {
+  ScheduledDeliveryError,
+  cancelScheduledDelivery,
+  createScheduledDelivery,
+  getScheduledDelivery,
+  listScheduledDeliveries,
+  startScheduledDeliveryWorker,
+  updateScheduledDelivery,
+} from "./scheduled-deliveries";
+import {
+  LinkPreviewError,
+  downloadLinkPreviewAsset,
+  startLinkPreviewWorker,
+} from "./link-previews";
+import {
+  chatFoldersEnabledForAccount,
+  cloudProductivitySchemaState,
+  linkPreviewsEnabledForAccount,
+  scheduledDeliveryEnabledForAccount,
+  workerHeartbeatFresh,
+} from "./cloud-productivity-readiness";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -190,6 +221,9 @@ function cloudCapabilities(
   dialogPreferences: boolean,
   groupCalls: boolean,
   groupScreenSharing: boolean,
+  chatFolders: boolean,
+  scheduledDelivery: boolean,
+  linkPreviews: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -201,6 +235,9 @@ function cloudCapabilities(
   if (dialogPreferences) capabilities.push("dialog_preferences_v1");
   if (groupCalls) capabilities.push("group_calls_v1", "group_video_calls_v1");
   if (groupScreenSharing) capabilities.push("screen_sharing_v1");
+  if (chatFolders) capabilities.push("chat_folders_v1");
+  if (scheduledDelivery) capabilities.push("scheduled_delivery_v1");
+  if (linkPreviews) capabilities.push("link_previews_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -344,6 +381,7 @@ export function startCloudServer(
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
+  const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
   const draftMediaAvailability = async () => {
     const schema = await draftMediaSchemaState(db);
     return {
@@ -360,6 +398,12 @@ export function startCloudServer(
     ? startGroupCallCleanupWorker(db) : () => {};
   const stopGroupCallSFUWorker = backgroundWorkers && groupCallSFUControlConfigured()
     ? startGroupCallSFUWorker(db, 2_000, options.groupCallSFUControl)
+    : () => {};
+  const stopScheduledDeliveryWorker = backgroundWorkers && productivityWorkersEnabled
+    ? startScheduledDeliveryWorker(db)
+    : () => {};
+  const stopLinkPreviewWorker = backgroundWorkers && productivityWorkersEnabled
+    ? startLinkPreviewWorker(db)
     : () => {};
   const stopSyncNotifications = backgroundWorkers ? startSyncNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
@@ -432,6 +476,18 @@ export function startCloudServer(
               groupCallInfrastructureAvailable,
             );
           const draftMedia = await draftMediaAvailability();
+          const productivitySchema = await cloudProductivitySchemaState(db);
+          const chatFolders = Boolean(capabilitySession)
+            && productivitySchema.ready
+            && chatFoldersEnabledForAccount(capabilitySession!.accountId);
+          const scheduledDelivery = Boolean(capabilitySession)
+            && productivitySchema.ready
+            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId)
+            && await workerHeartbeatFresh(db, "scheduled_delivery");
+          const linkPreviews = Boolean(capabilitySession)
+            && productivitySchema.ready
+            && linkPreviewsEnabledForAccount(capabilitySession!.accountId)
+            && await workerHeartbeatFresh(db, "link_preview");
           response = json(cloudCapabilities(
             callsAvailable,
             accountVideoAvailable,
@@ -444,6 +500,9 @@ export function startCloudServer(
             accountGroupCallsAvailable
               && Boolean(groupCallDevice?.supports_group_screen_share)
               && groupScreenSharingConfigured(groupCallInfrastructureAvailable),
+            chatFolders,
+            scheduledDelivery,
+            linkPreviews,
           ));
         }
 
@@ -542,6 +601,16 @@ export function startCloudServer(
           const uploadThumbnailMatch = url.pathname.match(/^\/v1\/media\/uploads\/([0-9a-f-]+)\/thumbnail$/i);
           const downloadChunkMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/chunks$/i);
           const downloadThumbnailMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/thumbnail$/i);
+          const previewAssetMatch = url.pathname.match(/^\/v1\/link-previews\/assets\/([0-9a-f-]+)$/i);
+          const productivitySchema = await cloudProductivitySchemaState(db);
+          const chatFoldersAvailable = productivitySchema.ready
+            && chatFoldersEnabledForAccount(session.accountId);
+          const scheduledDeliveryAvailable = productivitySchema.ready
+            && scheduledDeliveryEnabledForAccount(session.accountId)
+            && await workerHeartbeatFresh(db, "scheduled_delivery");
+          const linkPreviewsAvailable = productivitySchema.ready
+            && linkPreviewsEnabledForAccount(session.accountId)
+            && await workerHeartbeatFresh(db, "link_preview");
 
           if (uploadPartMatch && req.method === "PUT") {
             const bytes = await readBinary(req, LARGE_MEDIA_PART_SIZE);
@@ -584,12 +653,26 @@ export function startCloudServer(
             response = new Response(result.bytes, {
               headers: { "content-type": result.contentType, "cache-control": "private, no-store" },
             });
+          } else if (previewAssetMatch && req.method === "GET" && linkPreviewsAvailable) {
+            const result = await downloadLinkPreviewAsset(db, session.accountId, previewAssetMatch[1]);
+            response = new Response(result.bytes, {
+              headers: {
+                "content-type": result.contentType,
+                "content-length": String(result.bytes.length),
+                "cache-control": "private, max-age=86400",
+              },
+            });
           } else {
           const body = await readJson(
             req,
-            /^\/v1\/calls\/[0-9a-f-]+\/events$/i.test(url.pathname) ? 96 * 1024
-              : /^\/v1\/group-calls\/[0-9a-f-]+\/epochs$/i.test(url.pathname) ? 160 * 1024
-              : MAX_JSON_BYTES,
+            url.pathname === "/v1/scheduled-messages"
+              || url.pathname.startsWith("/v1/scheduled-messages/")
+              ? 256 * 1024
+              : /^\/v1\/calls\/[0-9a-f-]+\/events$/i.test(url.pathname)
+                ? 96 * 1024
+                : /^\/v1\/group-calls\/[0-9a-f-]+\/epochs$/i.test(url.pathname)
+                  ? 160 * 1024
+                  : MAX_JSON_BYTES,
           );
           const callActionMatch = url.pathname.match(
             /^\/v1\/calls\/([0-9a-f-]+)\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i,
@@ -603,6 +686,7 @@ export function startCloudServer(
           const groupTransferMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/transfer-owner$/i);
           const groupLeaveMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/leave$/i);
           const groupNotificationsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/notifications$/i);
+          const groupPermissionsMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)\/permissions$/i);
           const groupMatch = url.pathname.match(/^\/v1\/groups\/([0-9a-f-]+)$/i);
           const groupCallMatch = url.pathname.match(/^\/v1\/group-calls\/([0-9a-f-]+)$/i);
           const groupCallActionMatch = url.pathname.match(
@@ -626,6 +710,86 @@ export function startCloudServer(
           const dialogPreferencesMatch = url.pathname.match(
             /^\/v1\/dialogs\/([0-9a-f-]+)\/preferences$/i,
           );
+          const folderMatch = url.pathname.match(/^\/v1\/chat-folders\/([0-9a-f-]+)$/i);
+          const folderMoveMatch = url.pathname.match(/^\/v1\/chat-folders\/([0-9a-f-]+)\/move$/i);
+          const scheduleMatch = url.pathname.match(/^\/v1\/scheduled-messages\/([0-9a-f-]+)$/i);
+          const scheduleRescheduleMatch = url.pathname.match(
+            /^\/v1\/scheduled-messages\/([0-9a-f-]+)\/reschedule$/i,
+          );
+
+        if (
+          (url.pathname === "/v1/chat-folders" || url.pathname.startsWith("/v1/chat-folders/"))
+          && !chatFoldersAvailable
+        ) response = new Response("not found", { status: 404 });
+
+        if (
+          (url.pathname === "/v1/scheduled-messages" || url.pathname.startsWith("/v1/scheduled-messages/"))
+          && !scheduledDeliveryAvailable
+        ) response = new Response("not found", { status: 404 });
+
+        if (url.pathname === "/v1/chat-folders" && req.method === "GET" && chatFoldersAvailable) {
+          response = json(await getChatFolders(db, session.accountId));
+        }
+        if (url.pathname === "/v1/chat-folders" && req.method === "POST" && chatFoldersAvailable) {
+          const result = await createChatFolder(db, {
+            accountId: session.accountId, deviceId: session.deviceId, body,
+          });
+          response = json(result, result.duplicate ? 200 : 201);
+        }
+        if (folderMatch && req.method === "PATCH" && chatFoldersAvailable) {
+          response = json(await updateChatFolder(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            folderId: folderMatch[1], body,
+          }));
+        }
+        if (folderMoveMatch && req.method === "POST" && chatFoldersAvailable) {
+          response = json(await moveChatFolder(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            folderId: folderMoveMatch[1], body,
+          }));
+        }
+        if (folderMatch && req.method === "DELETE" && chatFoldersAvailable) {
+          response = json(await deleteChatFolder(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            folderId: folderMatch[1], body,
+          }));
+        }
+
+        if (url.pathname === "/v1/scheduled-messages" && req.method === "GET" && scheduledDeliveryAvailable) {
+          response = json(await listScheduledDeliveries(db, session.accountId, {
+            dialogId: url.searchParams.get("dialogId"),
+            cursor: url.searchParams.get("cursor"),
+            limit: Number(url.searchParams.get("limit") ?? 50),
+          }));
+        }
+        if (url.pathname === "/v1/scheduled-messages" && req.method === "POST" && scheduledDeliveryAvailable) {
+          const result = await createScheduledDelivery(db, {
+            accountId: session.accountId, deviceId: session.deviceId, body,
+          });
+          response = json(result, result.duplicate ? 200 : 201);
+        }
+        if (scheduleMatch && req.method === "GET" && scheduledDeliveryAvailable) {
+          const result = await getScheduledDelivery(db, session.accountId, scheduleMatch[1]);
+          response = result ? json({ scheduledDelivery: result }) : new Response("not found", { status: 404 });
+        }
+        if (scheduleMatch && req.method === "PATCH" && scheduledDeliveryAvailable) {
+          response = json(await updateScheduledDelivery(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            deliveryId: scheduleMatch[1], body,
+          }));
+        }
+        if (scheduleRescheduleMatch && req.method === "POST" && scheduledDeliveryAvailable) {
+          response = json(await updateScheduledDelivery(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            deliveryId: scheduleRescheduleMatch[1], body, operation: "reschedule",
+          }));
+        }
+        if (scheduleMatch && req.method === "DELETE" && scheduledDeliveryAvailable) {
+          response = json(await cancelScheduledDelivery(db, {
+            accountId: session.accountId, deviceId: session.deviceId,
+            deliveryId: scheduleMatch[1], body,
+          }));
+        }
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
           const result = await createGroup(db, {
@@ -700,6 +864,20 @@ export function startCloudServer(
             title: body.title,
             photoMediaId: body.photoMediaId,
             clearPhoto: body.clearPhoto,
+            clientMutationId: body.clientMutationId,
+          });
+          pushHints(sockets, result.pushes ?? []);
+          response = json(result);
+        }
+
+        if (groupPermissionsMatch && req.method === "PUT") {
+          const result = await updateGroupPermissions(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            dialogId: groupPermissionsMatch[1],
+            membersCanSend: body.membersCanSend,
+            membersCanAddMembers: body.membersCanAddMembers,
+            membersCanEditInfo: body.membersCanEditInfo,
             clientMutationId: body.clientMutationId,
           });
           pushHints(sockets, result.pushes ?? []);
@@ -1174,6 +1352,9 @@ export function startCloudServer(
             maxEvents: body.maxEvents,
             maxBytes: body.maxBytes,
             cloudDraftsEnabled: draftMedia.cloudDrafts,
+            chatFoldersEnabled: chatFoldersAvailable,
+            scheduledDeliveryEnabled: scheduledDeliveryAvailable,
+            linkPreviewsEnabled: linkPreviewsAvailable,
           }));
         }
 
@@ -1194,6 +1375,12 @@ export function startCloudServer(
         if (url.pathname === "/v1/contacts/lookup" && req.method === "POST") {
           if (!body.phone) throw new SyncError("phone required");
           const found = await lookupAccountByPhone(db, session.accountId, body.phone);
+          response = json(found ?? { found: false });
+        }
+
+        if (url.pathname.startsWith("/v1/usernames/") && req.method === "GET") {
+          const username = decodeURIComponent(url.pathname.slice("/v1/usernames/".length));
+          const found = await lookupAccountByUsername(db, session.accountId, username);
           response = json(found ?? { found: false });
         }
 
@@ -1256,6 +1443,9 @@ export function startCloudServer(
             draftConsumeOperationId:
               body.draftConsumeOperationId ?? body.draft_consume_operation_id,
             allowDraftConsumption: draftMedia.cloudDrafts,
+            silent: body.silent === true,
+            linkPreviewCandidate: body.linkPreviewCandidate ?? body.link_preview_candidate,
+            linkPreviewsEnabled: linkPreviewsAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -1310,6 +1500,8 @@ export function startCloudServer(
             draftConsumeOperationId:
               body.draft_consume_operation_id ?? body.draftConsumeOperationId,
             allowDraftConsumption: draftMedia.cloudDrafts,
+            linkPreviewCandidate: body.linkPreviewCandidate ?? body.link_preview_candidate,
+            linkPreviewsEnabled: linkPreviewsAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -1339,6 +1531,8 @@ export function startCloudServer(
             clientMutationId: body.clientMutationId,
             body: body.body,
             expectedEditVersion: Number(body.expectedEditVersion),
+            linkPreviewCandidate: body.linkPreviewCandidate ?? body.link_preview_candidate,
+            linkPreviewsEnabled: linkPreviewsAvailable,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -1408,6 +1602,9 @@ export function startCloudServer(
           : err instanceof DialogPreferenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof DraftError ? err.status
+          : err instanceof ChatFolderError ? err.status
+          : err instanceof ScheduledDeliveryError ? err.status
+          : err instanceof LinkPreviewError ? err.status
           : err instanceof SyncError ? err.status
           : err instanceof PushError ? 400 : 500;
         if (status === 500) {
@@ -1429,6 +1626,8 @@ export function startCloudServer(
         if (err instanceof DialogPreferenceError && err.retryAfter) {
           headers["retry-after"] = String(err.retryAfter);
         }
+        if (err instanceof ChatFolderError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof ScheduledDeliveryError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
@@ -1440,6 +1639,9 @@ export function startCloudServer(
           ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
           ...(err instanceof DraftError ? { code: err.code } : {}),
+          ...(err instanceof ChatFolderError ? { code: err.code } : {}),
+          ...(err instanceof ScheduledDeliveryError ? { code: err.code, ...err.details } : {}),
+          ...(err instanceof LinkPreviewError ? { code: err.code } : {}),
           ...(err instanceof SyncError ? { code: err.code, ...err.details } : {}),
         }, status, headers);
       }
@@ -1487,6 +1689,8 @@ export function startCloudServer(
     stopCallCleanupWorker();
     stopGroupCallCleanupWorker();
     stopGroupCallSFUWorker();
+    stopScheduledDeliveryWorker();
+    stopLinkPreviewWorker();
     stopSyncNotifications();
     stopCallNotifications();
     stopGroupCallNotifications();

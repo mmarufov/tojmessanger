@@ -183,6 +183,7 @@ struct GroupProfileView: View {
     @State private var title = ""
     @State private var confirmingLeave = false
     @State private var showingAddMembers = false
+    @State private var showingPermissions = false
     @State private var photoItem: PhotosPickerItem?
     @State private var selectedPhotoData: Data?
 
@@ -267,6 +268,9 @@ struct GroupProfileView: View {
                         title = dialog?.title ?? ""
                         editingTitle = true
                     }
+                    Button("Group permissions") {
+                        showingPermissions = true
+                    }
                 }
             }
 
@@ -313,6 +317,13 @@ struct GroupProfileView: View {
                 showingAddMembers = false
             }
         }
+        .sheet(isPresented: $showingPermissions) {
+            GroupPermissionsView(
+                model: model,
+                dialogId: dialogId,
+                initial: model.groupPermissionsByDialog[dialogId] ?? .init()
+            )
+        }
     }
 
     @ViewBuilder
@@ -346,6 +357,52 @@ struct GroupProfileView: View {
                         dialogId: dialogId,
                         accountId: member.accountId
                     )
+                }
+            }
+        }
+    }
+}
+
+private struct GroupPermissionsView: View {
+    @Bindable var model: CloudAppModel
+    let dialogId: String
+    @State var initial: CloudAppModel.GroupPermissions
+    @Environment(\.dismiss) private var dismiss
+    @State private var saving = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Members can") {
+                    Toggle("Send messages", isOn: $initial.membersCanSend)
+                    Toggle("Add members", isOn: $initial.membersCanAddMembers)
+                    Toggle("Change group info", isOn: $initial.membersCanEditInfo)
+                }
+                Section {
+                    Text("Owners and administrators always keep these permissions. Changes are enforced by the server on every device.")
+                        .font(.footnote)
+                        .foregroundStyle(TojTheme.secondaryText)
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(TojTheme.canvas)
+            .navigationTitle("Permissions")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }.disabled(saving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        saving = true
+                        Task {
+                            if await model.updateGroupPermissions(dialogId: dialogId, permissions: initial) {
+                                dismiss()
+                            }
+                            saving = false
+                        }
+                    }
+                    .disabled(saving)
                 }
             }
         }

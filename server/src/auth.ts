@@ -189,11 +189,22 @@ export type Session = { accountId: string; deviceId: string; token: string };
 
 export type ProfileDTO = {
   accountId: string;
+  username: string | null;
   firstName: string;
   lastName: string;
   displayName: string;
   bio: string;
   birthday: string | null;
+  colorIndex: number;
+  updatedAt: string;
+};
+
+export type UsernameLookupDTO = {
+  accountId: string;
+  username: string;
+  firstName: string;
+  lastName: string;
+  displayName: string;
   colorIndex: number;
   updatedAt: string;
 };
@@ -222,6 +233,7 @@ function profileDTO(row: any): ProfileDTO {
   const birthday = birthdayString(row.birthday);
   return {
     accountId: row.id,
+    username: row.username ?? null,
     firstName: row.first_name,
     lastName: row.last_name,
     displayName: row.display_name,
@@ -334,7 +346,7 @@ export async function lookupAccountByPhone(
     }
 
     const row = (await tx`
-      SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at FROM accounts
+      SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at FROM accounts
       WHERE phone_lookup_hash = ${targetHash} AND status IN ('active','limited')`)[0];
     if (!repeated.length) {
       await tx`
@@ -348,7 +360,7 @@ export async function lookupAccountByPhone(
 /** Return the canonical account profile for this authenticated account. */
 export async function getProfile(sql: SQL, accountId: string): Promise<ProfileDTO> {
   const row = (await sql`
-    SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+    SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
     FROM accounts WHERE id = ${accountId} AND status IN ('active','limited')`)[0];
   if (!row) throw new AuthError("account unavailable", 403);
   return profileDTO(row);
@@ -359,8 +371,14 @@ export async function updateProfile(
   sql: SQL,
   accountId: string,
   deviceId: string,
-  input: { firstName?: unknown; lastName?: unknown; bio?: unknown; birthday?: unknown; colorIndex?: unknown },
+  input: { username?: unknown; firstName?: unknown; lastName?: unknown; bio?: unknown; birthday?: unknown; colorIndex?: unknown },
 ): Promise<{ profile: ProfileDTO; pushes: ProfilePush[] }> {
+  const rawUsername = typeof input.username === "string" ? input.username.trim().toLowerCase() : "";
+  const username = rawUsername || null;
+  if (username && (!/^[a-z][a-z0-9_]{4,31}$/.test(username)
+    || new Set(["admin", "support", "settings", "login", "tojapp"]).has(username))) {
+    throw new AuthError("username must start with a letter and contain 5-32 letters, numbers, or underscores", 400);
+  }
   const firstName = typeof input.firstName === "string" ? input.firstName.trim().slice(0, 48) : "";
   const lastName = typeof input.lastName === "string" ? input.lastName.trim().slice(0, 48) : "";
   const bio = typeof input.bio === "string" ? input.bio.trim().slice(0, 120) : "";
@@ -371,23 +389,25 @@ export async function updateProfile(
     throw new AuthError("invalid profile color", 400);
   }
   const displayName = [firstName, lastName].filter(Boolean).join(" ");
-  return await sql.begin(async (tx) => {
+  try {
+    return await sql.begin(async (tx) => {
     const current = (await tx`
-      SELECT id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
+      SELECT id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at
       FROM accounts WHERE id = ${accountId} AND status IN ('active','limited') FOR UPDATE`)[0];
     if (!current) throw new AuthError("account unavailable", 403);
     await requireActiveDevice(tx, accountId, deviceId);
     const currentBirthday = birthdayString(current.birthday);
-    const changed = current.first_name !== firstName || current.last_name !== lastName
+    const changed = (current.username ?? null) !== username
+      || current.first_name !== firstName || current.last_name !== lastName
       || current.bio !== bio || currentBirthday !== birthday || Number(current.profile_color) !== colorIndex;
     if (!changed) return { profile: profileDTO(current), pushes: [] };
 
     const updated = (await tx`
-      UPDATE accounts SET first_name = ${firstName}, last_name = ${lastName},
+      UPDATE accounts SET username = ${username}, first_name = ${firstName}, last_name = ${lastName},
         display_name = ${displayName}, bio = ${bio}, birthday = ${birthday}::date,
         profile_color = ${colorIndex}, updated_at = now()
       WHERE id = ${accountId}
-      RETURNING id, first_name, last_name, display_name, bio, birthday, profile_color, updated_at`)[0];
+      RETURNING id, username, first_name, last_name, display_name, bio, birthday, profile_color, updated_at`)[0];
 
     const recipientRows = await tx`
       SELECT DISTINCT peer.account_id
@@ -399,6 +419,7 @@ export async function updateProfile(
     const profile = profileDTO(updated);
     const baseData = {
       subject_account_id: profile.accountId,
+      username: profile.username,
       first_name: profile.firstName,
       last_name: profile.lastName,
       display_name: profile.displayName,
@@ -435,6 +456,54 @@ export async function updateProfile(
       pushes.push({ accountId: recipient, pts, ptsCount: 1 });
     }
     return { profile, pushes };
+    });
+  } catch (error: any) {
+    const duplicateCode = error?.code === "23505" || error?.errno === "23505";
+    const duplicateUsername = `${error?.constraint ?? ""} ${error?.message ?? ""}`.includes("username");
+    if (duplicateCode && duplicateUsername) {
+      throw new AuthError("username is already taken", 409);
+    }
+    throw error;
+  }
+}
+
+/** Public-handle lookup with the same abuse budget as contact discovery. */
+export async function lookupAccountByUsername(
+  sql: SQL, requesterAccountId: string, value: unknown,
+): Promise<UsernameLookupDTO | null> {
+  const username = typeof value === "string" ? value.trim().toLowerCase().replace(/^@/, "") : "";
+  if (!/^[a-z][a-z0-9_]{4,31}$/.test(username)) return null;
+  const targetHash = hashToken(`username:${username}`);
+  return await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended(${`contact-lookup:${requesterAccountId}`}, 0))`;
+    const repeated = await tx`
+      SELECT 1 FROM contact_lookup_attempts
+      WHERE requester_account_id = ${requesterAccountId} AND target_phone_hash = ${targetHash}
+        AND created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute') LIMIT 1`;
+    if (!repeated.length) {
+      const counts = (await tx`
+        SELECT count(*) FILTER (WHERE created_at > now() - (${CONTACT_LOOKUP_WINDOW_MINUTES} * interval '1 minute')) AS recent,
+          count(*) FILTER (WHERE created_at > now() - interval '24 hours') AS daily
+        FROM contact_lookup_attempts WHERE requester_account_id = ${requesterAccountId}`)[0];
+      if (Number(counts.recent) >= CONTACT_LOOKUP_WINDOW_LIMIT || Number(counts.daily) >= CONTACT_LOOKUP_DAILY_LIMIT) {
+        throw new AuthError("contact discovery limit reached; try again later", 429, CONTACT_LOOKUP_WINDOW_MINUTES * 60);
+      }
+      await tx`INSERT INTO contact_lookup_attempts (requester_account_id, target_phone_hash)
+        VALUES (${requesterAccountId}, ${targetHash})`;
+    }
+    const row = (await tx`
+      SELECT id, username, first_name, last_name, display_name, profile_color, updated_at
+      FROM accounts WHERE lower(username) = ${username} AND status IN ('active','limited')`)[0];
+    if (!row) return null;
+    return {
+      accountId: row.id,
+      username: row.username,
+      firstName: row.first_name,
+      lastName: row.last_name,
+      displayName: row.display_name,
+      colorIndex: Number(row.profile_color),
+      updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at),
+    };
   });
 }
 
@@ -582,6 +651,7 @@ export async function deleteAccount(
     const anonymizedLookup = randomBytes(32);
     await tx`
       UPDATE accounts SET
+        username = NULL,
         phone_lookup_hash = ${anonymizedLookup},
         phone_e164_ciphertext = ${anonymizedPhone.ciphertext},
         phone_nonce = ${anonymizedPhone.nonce},

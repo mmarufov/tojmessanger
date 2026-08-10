@@ -8,12 +8,15 @@ enum TojTheme {
     static let strong = Color(hex: 0x191C21)
     static let text = Color(hex: 0xF4F5F7)
     static let secondaryText = Color(hex: 0x9096A1)
-    static let gold = Color(hex: 0xD6A936)
+    static var gold: Color {
+        let raw = UserDefaults.standard.string(forKey: "toj.appearance.accent") ?? "gold"
+        return (TojAccentPreset(rawValue: raw) ?? .gold).color
+    }
     static let secure = Color(hex: 0x38C991)
 
     /// Signature interactive accent. Toj uses gold the way Telegram uses blue: send button,
     /// primary CTAs, active unread badges, selected pills — precise, high-intent moments.
-    static let accent = gold
+    static var accent: Color { gold }
     /// Foreground on top of `accent` fills (black on gold).
     static let onAccent = canvas
     static let danger = Color.red

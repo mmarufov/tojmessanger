@@ -10,6 +10,8 @@ type FanoutOptions = {
   sourceDeviceId?: string | null;
   msgId?: number | null;
   data?: Record<string, unknown>;
+  /** Extra account-private fields attached only to the actor's copy of the event. */
+  actorData?: Record<string, unknown>;
   alertRecipients?: boolean;
   recipientAccountIds?: string[];
   unarchiveOnIncomingMessage?: boolean;
@@ -101,6 +103,11 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     SELECT bumped.account_id, bumped.pts, ${options.type}, ${options.dialogId},
            ${options.msgId ?? null}, ${options.actorAccountId},
            ${JSON.stringify(options.data ?? {})}::text::jsonb ||
+           CASE
+             WHEN bumped.account_id = ${options.actorAccountId}
+             THEN ${JSON.stringify(options.actorData ?? {})}::text::jsonb
+             ELSE '{}'::jsonb
+           END ||
            CASE
              WHEN ${options.type === "dialog.created"} THEN jsonb_build_object(
                'preferences',

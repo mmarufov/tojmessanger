@@ -42,6 +42,7 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
     let mediaGroupCount: Int?
     let serviceType: String?
     let serviceData: CloudServiceData?
+    let linkPreview: CloudLinkPreview?
     let editVersion: Int
     let state: String
     let serverTs: String
@@ -66,6 +67,7 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         mediaGroupCount: Int? = nil,
         serviceType: String? = nil,
         serviceData: CloudServiceData? = nil,
+        linkPreview: CloudLinkPreview? = nil,
         editVersion: Int,
         state: String,
         serverTs: String
@@ -89,6 +91,7 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         self.mediaGroupCount = mediaGroupCount
         self.serviceType = serviceType
         self.serviceData = serviceData
+        self.linkPreview = linkPreview
         self.editVersion = editVersion
         self.state = state
         self.serverTs = serverTs
@@ -114,6 +117,7 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         case mediaGroupCount = "media_group_count"
         case serviceType = "service_type"
         case serviceData = "service_data"
+        case linkPreview = "link_preview"
         case editVersion = "edit_version"
         case state
         case serverTs = "server_ts"
@@ -140,6 +144,7 @@ nonisolated struct CloudMessage: Codable, Identifiable, Equatable, Sendable {
         mediaGroupCount = try values.decodeIfPresent(Int.self, forKey: .mediaGroupCount)
         serviceType = try values.decodeIfPresent(String.self, forKey: .serviceType)
         serviceData = try values.decodeIfPresent(CloudServiceData.self, forKey: .serviceData)
+        linkPreview = try values.decodeIfPresent(CloudLinkPreview.self, forKey: .linkPreview)
         editVersion = try values.decode(Int.self, forKey: .editVersion)
         state = try values.decode(String.self, forKey: .state)
         serverTs = try values.decode(String.self, forKey: .serverTs)
@@ -210,6 +215,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let maxReadMsgId: Int64?
     let unreadCount: Int?
     let subjectAccountId: String?
+    let username: String?
     let firstName: String?
     let lastName: String?
     let displayName: String?
@@ -222,6 +228,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let preferences: CloudDialogPreferences?
     let clientMutationId: String?
     let changedFields: [String]?
+    let chatFolders: CloudChatFolderSnapshot?
+    let scheduledDelivery: CloudScheduledDelivery?
+    let scheduledDeliveryId: String?
 
     init(
         pts: Int64,
@@ -238,6 +247,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         maxReadMsgId: Int64?,
         unreadCount: Int? = nil,
         subjectAccountId: String? = nil,
+        username: String? = nil,
         firstName: String? = nil,
         lastName: String? = nil,
         displayName: String? = nil,
@@ -249,7 +259,10 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         sharedDialogIds: [String]? = nil,
         preferences: CloudDialogPreferences? = nil,
         clientMutationId: String? = nil,
-        changedFields: [String]? = nil
+        changedFields: [String]? = nil,
+        chatFolders: CloudChatFolderSnapshot? = nil,
+        scheduledDelivery: CloudScheduledDelivery? = nil,
+        scheduledDeliveryId: String? = nil
     ) {
         self.pts = pts
         self.ptsCount = ptsCount
@@ -265,6 +278,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.maxReadMsgId = maxReadMsgId
         self.unreadCount = unreadCount
         self.subjectAccountId = subjectAccountId
+        self.username = username
         self.firstName = firstName
         self.lastName = lastName
         self.displayName = displayName
@@ -277,6 +291,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.preferences = preferences
         self.clientMutationId = clientMutationId
         self.changedFields = changedFields
+        self.chatFolders = chatFolders
+        self.scheduledDelivery = scheduledDelivery
+        self.scheduledDeliveryId = scheduledDeliveryId
     }
 
     enum CodingKeys: String, CodingKey {
@@ -294,6 +311,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case maxReadMsgId = "max_read_msg_id"
         case unreadCount = "unread_count"
         case subjectAccountId = "subject_account_id"
+        case username
         case firstName = "first_name"
         case lastName = "last_name"
         case displayName = "display_name"
@@ -306,6 +324,9 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case preferences
         case clientMutationId = "client_mutation_id"
         case changedFields = "changed_fields"
+        case chatFolders = "chat_folders"
+        case scheduledDelivery = "scheduled_delivery"
+        case scheduledDeliveryId = "scheduled_delivery_id"
     }
 }
 
@@ -336,6 +357,7 @@ nonisolated struct ContactLookupResponse: Codable, Sendable {
     let accountId: String?
     let displayName: String?
     let found: Bool?
+    let username: String?
     let firstName: String?
     let lastName: String?
     let bio: String?
@@ -346,6 +368,7 @@ nonisolated struct ContactLookupResponse: Codable, Sendable {
 
 nonisolated struct CloudProfile: Codable, Equatable, Sendable {
     let accountId: String
+    var username: String? = nil
     let firstName: String
     let lastName: String
     let displayName: String
@@ -400,6 +423,9 @@ nonisolated struct CloudGroup: Codable, Equatable, Sendable {
     let createdBy: String
     let createdAt: String
     let closedAt: String?
+    var membersCanSend: Bool? = nil
+    var membersCanAddMembers: Bool? = nil
+    var membersCanEditInfo: Bool? = nil
 }
 
 nonisolated struct CloudGroupMember: Codable, Equatable, Sendable {
@@ -430,6 +456,7 @@ nonisolated struct CloudGroupLeaveResponse: Codable, Sendable {
 }
 
 private struct ProfileUpdateRequest: Codable, Sendable {
+    let username: String?
     let firstName: String
     let lastName: String
     let bio: String
@@ -848,6 +875,15 @@ struct CloudAPI: Sendable {
         try await post("v1/contacts/lookup", body: ["phone": phone], token: token)
     }
 
+    func lookupUsername(_ username: String, token: String) async throws -> ContactLookupResponse {
+        let value = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+        guard let encoded = value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            throw CloudAPIError(status: 400, message: "Invalid username", retryAfter: nil)
+        }
+        return try await get("v1/usernames/\(encoded)", token: token)
+    }
+
     func getProfile(token: String) async throws -> CloudProfile {
         try await get("v1/profile", token: token)
     }
@@ -856,6 +892,7 @@ struct CloudAPI: Sendable {
         try await put(
             "v1/profile",
             body: ProfileUpdateRequest(
+                username: profile.username,
                 firstName: profile.firstName,
                 lastName: profile.lastName,
                 bio: profile.bio,
@@ -1008,6 +1045,26 @@ struct CloudAPI: Sendable {
         )
     }
 
+    func updateGroupPermissions(
+        id: String,
+        membersCanSend: Bool,
+        membersCanAddMembers: Bool,
+        membersCanEditInfo: Bool,
+        clientMutationId: String,
+        token: String
+    ) async throws -> CloudGroupEnvelope {
+        try await put(
+            "v1/groups/\(id)/permissions",
+            body: GroupPermissionsRequest(
+                membersCanSend: membersCanSend,
+                membersCanAddMembers: membersCanAddMembers,
+                membersCanEditInfo: membersCanEditInfo,
+                clientMutationId: clientMutationId
+            ),
+            token: token
+        )
+    }
+
     func updateDialogPreferences(
         dialogId: String,
         clientMutationId: String,
@@ -1030,6 +1087,75 @@ struct CloudAPI: Sendable {
 
     func getState(token: String) async throws -> SyncStateResponse {
         try await get("v1/sync/state", token: token)
+    }
+
+    func chatFolders(token: String) async throws -> CloudChatFolderSnapshot {
+        try await get("v1/chat-folders", token: token)
+    }
+
+    func createChatFolder(
+        _ request: CloudFolderMutationRequest,
+        token: String
+    ) async throws -> CloudChatFolderSnapshot {
+        try await post("v1/chat-folders", body: request, token: token)
+    }
+
+    func updateChatFolder(
+        id: String,
+        request: CloudFolderMutationRequest,
+        token: String
+    ) async throws -> CloudChatFolderSnapshot {
+        try await patch("v1/chat-folders/\(id)", body: request, token: token)
+    }
+
+    func moveChatFolder(
+        id: String,
+        request: CloudFolderMutationRequest,
+        token: String
+    ) async throws -> CloudChatFolderSnapshot {
+        try await post("v1/chat-folders/\(id)/move", body: request, token: token)
+    }
+
+    func deleteChatFolder(
+        id: String,
+        request: CloudFolderMutationRequest,
+        token: String
+    ) async throws -> CloudChatFolderSnapshot {
+        try await delete("v1/chat-folders/\(id)", body: request, token: token)
+    }
+
+    func scheduledDeliveries(
+        dialogId: String? = nil,
+        cursor: String? = nil,
+        token: String
+    ) async throws -> CloudScheduledListResponse {
+        var query: [URLQueryItem] = []
+        if let dialogId { query.append(URLQueryItem(name: "dialogId", value: dialogId)) }
+        if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        return try await get("v1/scheduled-messages", queryItems: query, token: token)
+    }
+
+    func createScheduledDelivery(
+        _ request: CloudScheduledCreateRequest,
+        token: String
+    ) async throws -> CloudScheduledMutationResponse {
+        try await post("v1/scheduled-messages", body: request, token: token)
+    }
+
+    func updateScheduledDelivery(
+        id: String,
+        request: CloudScheduledMutationRequest,
+        token: String
+    ) async throws -> CloudScheduledMutationResponse {
+        try await patch("v1/scheduled-messages/\(id)", body: request, token: token)
+    }
+
+    func cancelScheduledDelivery(
+        id: String,
+        request: CloudScheduledMutationRequest,
+        token: String
+    ) async throws -> CloudScheduledMutationResponse {
+        try await delete("v1/scheduled-messages/\(id)", body: request, token: token)
     }
 
     func getDifference(
@@ -1080,6 +1206,7 @@ struct CloudAPI: Sendable {
         replyToMsgId: Int64? = nil,
         mentions: [CloudMention] = [],
         draftConsumeOperationId: String? = nil,
+        silent: Bool = false,
         token: String
     ) async throws -> SendMessageResponse {
         try await post(
@@ -1093,7 +1220,9 @@ struct CloudAPI: Sendable {
                 mediaId: nil,
                 forwardedFrom: nil,
                 mentions: mentions,
-                draftConsumeOperationId: draftConsumeOperationId
+                draftConsumeOperationId: draftConsumeOperationId,
+                silent: silent,
+                linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: body)
             ),
             token: token
         )
@@ -1115,7 +1244,9 @@ struct CloudAPI: Sendable {
                 dialogId: dialogId, clientMsgId: clientMsgId, kind: nil,
                 body: body, replyToMsgId: replyToMsgId, mediaId: mediaId,
                 forwardedFrom: nil, mentions: mentions,
-                draftConsumeOperationId: draftConsumeOperationId
+                draftConsumeOperationId: draftConsumeOperationId,
+                silent: false,
+                linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: body)
             ),
             token: token
         )
@@ -1139,7 +1270,9 @@ struct CloudAPI: Sendable {
                 mediaId: nil,
                 forwardedFrom: ForwardedFromRequest(dialogId: sourceDialogId, msgId: sourceMsgId),
                 mentions: [],
-                draftConsumeOperationId: nil
+                draftConsumeOperationId: nil,
+                silent: false,
+                linkPreviewCandidate: nil
             ),
             token: token
         )
@@ -1188,7 +1321,8 @@ struct CloudAPI: Sendable {
                 body: caption,
                 replyToMsgId: replyToMsgId,
                 mentions: mentions,
-                draftConsumeOperationId: draftConsumeOperationId
+                draftConsumeOperationId: draftConsumeOperationId,
+                linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: caption)
             ),
             token: token
         )
@@ -1209,7 +1343,8 @@ struct CloudAPI: Sendable {
                 msgId: msgId,
                 clientMutationId: clientMutationId,
                 expectedEditVersion: expectedEditVersion,
-                body: body
+                body: body,
+                linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: body)
             ),
             token: token
         )
@@ -1784,6 +1919,13 @@ private struct GroupNotificationsRequest: Encodable {
     let clientMutationId: String
 }
 
+private struct GroupPermissionsRequest: Encodable {
+    let membersCanSend: Bool
+    let membersCanAddMembers: Bool
+    let membersCanEditInfo: Bool
+    let clientMutationId: String
+}
+
 private struct DialogPreferencesRequest: Encodable {
     let clientMutationId: String
     let pinned: Bool?
@@ -1852,6 +1994,7 @@ private struct MediaGroupSendRequest: Encodable {
     let replyToMsgId: Int64?
     let mentions: [CloudMention]
     let draftConsumeOperationId: String?
+    let linkPreviewCandidate: CloudLinkPreviewCandidate?
 
     enum CodingKeys: String, CodingKey {
         case clientGroupId = "client_group_id"
@@ -1860,6 +2003,7 @@ private struct MediaGroupSendRequest: Encodable {
         case replyToMsgId = "reply_to_msg_id"
         case mentions
         case draftConsumeOperationId = "draft_consume_operation_id"
+        case linkPreviewCandidate = "link_preview_candidate"
     }
 }
 
@@ -1873,6 +2017,8 @@ private struct SendMessageRequest: Encodable {
     let forwardedFrom: ForwardedFromRequest?
     let mentions: [CloudMention]
     let draftConsumeOperationId: String?
+    let silent: Bool
+    let linkPreviewCandidate: CloudLinkPreviewCandidate?
 }
 
 private struct ForwardedFromRequest: Encodable {
@@ -1886,6 +2032,7 @@ private struct EditMessageRequest: Encodable {
     let clientMutationId: String
     let expectedEditVersion: Int
     let body: String
+    let linkPreviewCandidate: CloudLinkPreviewCandidate?
 }
 
 private struct DeleteMessageRequest: Encodable {

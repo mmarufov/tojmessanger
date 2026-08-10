@@ -19,6 +19,9 @@ export type DialogAccess = {
   closed: boolean;
   role: "owner" | "admin" | "member";
   notificationMode: "all" | "muted";
+  membersCanSend: boolean;
+  membersCanAddMembers: boolean;
+  membersCanEditInfo: boolean;
 };
 
 const n = (value: unknown) => Number(value as any);
@@ -32,6 +35,9 @@ function accessFromRow(row: any): DialogAccess {
     closed: row.closed_at != null,
     role: row.role,
     notificationMode: row.notification_mode,
+    membersCanSend: row.members_can_send ?? true,
+    membersCanAddMembers: row.members_can_add_members ?? false,
+    membersCanEditInfo: row.members_can_edit_info ?? false,
   };
 }
 
@@ -53,6 +59,7 @@ export async function requireDialogReadAccess(
 ): Promise<DialogAccess> {
   const row = (await sql`
     SELECT d.id, d.type, d.created_by, d.revision, d.last_msg_id, d.closed_at,
+           d.members_can_send, d.members_can_add_members, d.members_can_edit_info,
            dm.role, dm.notification_mode, dm.left_at
     FROM dialogs d
     LEFT JOIN dialog_members dm
@@ -80,7 +87,8 @@ export async function lockDialogForMutation(
   dialogId: string,
 ): Promise<DialogAccess> {
   const dialog = (await sql`
-    SELECT id, type, created_by, revision, last_msg_id, closed_at
+    SELECT id, type, created_by, revision, last_msg_id, closed_at,
+           members_can_send, members_can_add_members, members_can_edit_info
     FROM dialogs WHERE id = ${dialogId}
     FOR UPDATE`)[0];
   if (!dialog) throw new DialogAccessError("dialog not found", "group_not_found", 404);

@@ -189,6 +189,25 @@ final class CloudAppModel {
         var selfRole: String? = nil
         var notificationMode = "all"
         var accessState = "active"
+        var lastMsgId: Int64 = 0
+    }
+
+    enum BulkDialogAction: Sendable {
+        case markRead
+        case pin(Bool)
+        case mute(Bool)
+        case archive(Bool)
+    }
+
+    struct BulkDialogActionResult: Equatable, Sendable {
+        let changed: Int
+        let skipped: Int
+    }
+
+    struct GroupPermissions: Equatable, Sendable {
+        var membersCanSend = true
+        var membersCanAddMembers = false
+        var membersCanEditInfo = false
     }
 
     struct Line: Identifiable, Equatable, Sendable {
@@ -216,6 +235,7 @@ final class CloudAppModel {
         var kind: String = "text"
         var serviceType: String? = nil
         var serviceData: CloudServiceData? = nil
+        var linkPreview: CloudLinkPreview? = nil
         var mine: Bool
         var delivery: Delivery
         var timestamp: String?
@@ -273,13 +293,18 @@ final class CloudAppModel {
     private(set) var authVerifyInFlight = false
     private(set) var resendSeconds = 0
     private(set) var activeDialogId: String?
+    private(set) var pendingDeepLinkDialogId: String?
     private(set) var conversationOpenState: ConversationOpenState = .loadingLocal
     private(set) var dialogs: [Dialog] = []
+    private(set) var chatFolders: [CloudChatFolder] = []
+    private(set) var chatFolderCollectionRevision: Int64 = 0
+    private(set) var scheduledDeliveries: [CloudScheduledDelivery] = []
     private(set) var savedMessagesDialogId: String?
     private(set) var savedMessagesSetupInFlight = false
     private(set) var savedMessagesSetupFailure: String?
     private(set) var savedMessagesCapabilityState: SavedMessagesCapabilityState = .unknown
     private(set) var groupMembersByDialog: [String: [GroupMember]] = [:]
+    private(set) var groupPermissionsByDialog: [String: GroupPermissions] = [:]
     private(set) var lines: [Line] = []
     private(set) var openingTimelineAnchor: TimelineAnchor = .bottom
     private(set) var canLoadEarlier = false
@@ -545,6 +570,32 @@ final class CloudAppModel {
             && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    func handleDeepLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "toj" else { return }
+        let components = [url.host].compactMap { $0 } + url.pathComponents.filter { $0 != "/" }
+        guard components.count == 2 else { return }
+        if components[0].lowercased() == "user" {
+            let username = components[1]
+            Task { [weak self] in _ = await self?.openUsername(username) }
+            return
+        }
+        guard components[0].lowercased() == "chat" else { return }
+        let dialogId = components[1].lowercased()
+        guard UUID(uuidString: dialogId) != nil || dialogId.hasPrefix("demo-") else { return }
+        guard dialogs.contains(where: { $0.id.lowercased() == dialogId }) else {
+            presentNotice(
+                String(localized: "Chat unavailable"),
+                message: String(localized: "This chat is not available for the current account.")
+            )
+            return
+        }
+        pendingDeepLinkDialogId = dialogs.first { $0.id.lowercased() == dialogId }?.id
+    }
+
+    func consumePendingDeepLink() {
+        pendingDeepLinkDialogId = nil
+    }
+
     init(
         config: CloudConfig = .current,
         api injectedAPI: CloudAPI? = nil,
@@ -576,7 +627,9 @@ final class CloudAppModel {
         self.negotiatedCapabilities = cached.map {
             MessagingCapabilities(rawValue: $0.uint64Value)
                 .subtracting([
-                    .videoCalls, .savedMessages, .groupCalls, .groupVideoCalls, .screenSharing,
+                    .videoCalls, .savedMessages,
+                    .groupCalls, .groupVideoCalls, .screenSharing,
+                    .chatFolders, .scheduledDelivery, .linkPreviews,
                 ])
         } ?? [.replies]
         self.localStore = injectedLocalStore
@@ -800,7 +853,13 @@ final class CloudAppModel {
     @discardableResult
     func saveProfileDetails(_ candidate: StoredProfileDetails) async -> Bool {
         guard let saved = storedSession, !profileSaveInFlight else { return false }
+        if let username = Self.cleanedUsername(candidate.username),
+           username.range(of: "^[a-z][a-z0-9_]{4,31}$", options: .regularExpression) == nil {
+            status = "Username must start with a letter and contain 5–32 letters, numbers, or underscores"
+            return false
+        }
         let cleaned = StoredProfileDetails(
+            username: Self.cleanedUsername(candidate.username),
             firstName: Self.cleanedProfileText(candidate.firstName, limit: 48),
             lastName: Self.cleanedProfileText(candidate.lastName, limit: 48),
             bio: Self.cleanedProfileText(candidate.bio, limit: 120, preservesNewlines: true),
@@ -1241,6 +1300,9 @@ final class CloudAppModel {
         storedSession = nil
         activeDialogId = nil
         dialogs = []
+        chatFolders = []
+        chatFolderCollectionRevision = 0
+        scheduledDeliveries = []
         savedMessagesDialogId = nil
         savedMessagesSetupInFlight = false
         savedMessagesSetupFailure = nil
@@ -1668,6 +1730,41 @@ final class CloudAppModel {
         return await openPeer()
     }
 
+    @discardableResult
+    func openUsername(_ value: String) async -> String? {
+        guard let token = storedSession?.session.token else { return nil }
+        do {
+            status = "Looking up username"
+            let found = try await api.lookupUsername(value, token: token)
+            guard let peerAccountId = found.accountId else {
+                presentNotice("Username unavailable", message: "No active account uses that username.")
+                return nil
+            }
+            if peerAccountId == storedSession?.session.accountId {
+                presentNotice("This is your profile", message: "Share this link so other people can find you.")
+                return nil
+            }
+            let dialog = try await api.createDirectDialog(peerAccountId: peerAccountId, token: token)
+            let title = displayTitle(found.displayName, fallback: "@\(value)")
+            try await localStore?.upsertDialog(dialogId: dialog.dialogId, title: title)
+            if let accountId = storedSession?.session.accountId {
+                try await localStore?.saveMembers(dialogId: dialog.dialogId, members: [
+                    BootstrapDialogMember(accountId: accountId, role: "member", lastReadMsgId: 0),
+                    BootstrapDialogMember(accountId: peerAccountId, role: "member", lastReadMsgId: 0)
+                ])
+            }
+            if let profile = Self.cloudProfile(from: found) { try await localStore?.saveProfile(profile) }
+            await refreshDialogs()
+            await selectDialog(dialog.dialogId)
+            pendingDeepLinkDialogId = dialog.dialogId
+            scheduleSync()
+            return dialog.dialogId
+        } catch {
+            presentNotice("Could not open profile", message: error.localizedDescription)
+            return nil
+        }
+    }
+
     func createGroup(title: String, memberIds: [String], photoData: Data? = nil) async -> String? {
         guard capabilities.contains(.groups),
               let accountId = storedSession?.session.accountId,
@@ -1778,6 +1875,11 @@ final class CloudAppModel {
               let localStore else { return }
         do {
             let envelope = try await api.group(id: dialogId, token: token)
+            groupPermissionsByDialog[dialogId] = GroupPermissions(
+                membersCanSend: envelope.group.membersCanSend ?? true,
+                membersCanAddMembers: envelope.group.membersCanAddMembers ?? false,
+                membersCanEditInfo: envelope.group.membersCanEditInfo ?? false
+            )
             try await localStore.applyGroupEnvelope(envelope)
             var cursor: String?
             var collected: [CloudGroupMember] = []
@@ -1839,6 +1941,31 @@ final class CloudAppModel {
             )
         } else if capabilities.contains(.groups) {
             launchLegacyGroupMute(dialogId: dialogId, muted: muted)
+        }
+    }
+
+    func updateGroupPermissions(dialogId: String, permissions: GroupPermissions) async -> Bool {
+        guard let token = storedSession?.session.token else { return false }
+        do {
+            let envelope = try await api.updateGroupPermissions(
+                id: dialogId,
+                membersCanSend: permissions.membersCanSend,
+                membersCanAddMembers: permissions.membersCanAddMembers,
+                membersCanEditInfo: permissions.membersCanEditInfo,
+                clientMutationId: UUID().uuidString.lowercased(),
+                token: token
+            )
+            try await localStore?.applyGroupEnvelope(envelope)
+            groupPermissionsByDialog[dialogId] = GroupPermissions(
+                membersCanSend: envelope.group.membersCanSend ?? permissions.membersCanSend,
+                membersCanAddMembers: envelope.group.membersCanAddMembers ?? permissions.membersCanAddMembers,
+                membersCanEditInfo: envelope.group.membersCanEditInfo ?? permissions.membersCanEditInfo
+            )
+            await refreshDialogs()
+            return true
+        } catch {
+            presentNotice("Permissions were not changed", message: error.localizedDescription)
+            return false
         }
     }
 
@@ -3095,7 +3222,7 @@ final class CloudAppModel {
         }
     }
 
-    func sendDraft() async {
+    func sendDraft(silent: Bool = false, deliverAfter: Date? = nil) async {
         let rawText = draft
         let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         if case let .editing(messageId, _) = composerMode {
@@ -3115,6 +3242,10 @@ final class CloudAppModel {
             return
         }
         if currentDraft?.attachments.isEmpty == false {
+            if let deliverAfter {
+                await scheduleStagedDraft(deliverAt: deliverAfter, silent: silent)
+                return
+            }
             await sendStagedDraft()
             return
         }
@@ -3150,7 +3281,218 @@ final class CloudAppModel {
             return
         }
         #endif
-        await send(rawText, replyToMsgId: replyToMsgId, mentions: mentions)
+        await send(
+            rawText,
+            replyToMsgId: replyToMsgId,
+            mentions: mentions,
+            silent: silent,
+            deliverAfter: deliverAfter
+        )
+    }
+
+    func refreshCloudProductivity() async {
+        guard let session = storedSession?.session, let localStore else { return }
+        let generation = accountSessionGeneration
+        if let cachedFolders = try? await localStore.chatFolderSnapshot(accountId: session.accountId) {
+            chatFolders = cachedFolders.folders.sorted { $0.position < $1.position }
+            chatFolderCollectionRevision = cachedFolders.collectionRevision
+        }
+        if let cachedSchedules = try? await localStore.scheduledDeliveries(accountId: session.accountId) {
+            scheduledDeliveries = cachedSchedules.sorted { $0.deliverAt < $1.deliverAt }
+        }
+        if capabilities.contains(.chatFolders),
+           let snapshot = try? await api.chatFolders(token: session.token),
+           generation == accountSessionGeneration,
+           session.accountId == storedSession?.session.accountId {
+            try? await localStore.saveChatFolderSnapshot(snapshot, accountId: session.accountId)
+            chatFolders = snapshot.folders.sorted { $0.position < $1.position }
+            chatFolderCollectionRevision = snapshot.collectionRevision
+        }
+        if capabilities.contains(.scheduledDelivery) {
+            var remote: [CloudScheduledDelivery] = []
+            var cursor: String?
+            var loadedAllPages = true
+            repeat {
+                guard let page = try? await api.scheduledDeliveries(
+                    cursor: cursor, token: session.token
+                ) else {
+                    loadedAllPages = false
+                    break
+                }
+                remote.append(contentsOf: page.deliveries)
+                cursor = page.nextCursor
+            } while cursor != nil && remote.count <= 100
+            if loadedAllPages,
+               generation == accountSessionGeneration,
+               session.accountId == storedSession?.session.accountId {
+                try? await localStore.replaceScheduledDeliveries(remote, accountId: session.accountId)
+                let merged = (try? await localStore.scheduledDeliveries(accountId: session.accountId))
+                    ?? remote
+                scheduledDeliveries = merged.sorted { $0.deliverAt < $1.deliverAt }
+            }
+        }
+    }
+
+    func dialog(_ dialog: Dialog, isIncludedIn folder: CloudChatFolder) -> Bool {
+        let explicit = folder.rules.first { $0.dialogId == dialog.id }?.rule
+        if explicit == "exclude" { return false }
+        if explicit == "include" { return true }
+        guard !dialog.isArchived || !folder.excludeArchived else { return false }
+        if folder.excludeRead && dialog.unreadCount == 0 { return false }
+        if folder.excludeMuted && dialog.isMuted { return false }
+        return switch dialog.type {
+        case "direct": folder.includeDirect
+        case "group": folder.includeGroups
+        case "saved": folder.includeSaved
+        default: false
+        }
+    }
+
+    func createChatFolder(
+        title: String,
+        icon: String = "folder",
+        includeDirect: Bool = true,
+        includeGroups: Bool = true,
+        includeSaved: Bool = false,
+        excludeRead: Bool = false,
+        excludeMuted: Bool = false,
+        excludeArchived: Bool = true,
+        rules: [CloudChatFolderRule] = []
+    ) async throws {
+        guard let session = storedSession?.session, capabilities.contains(.chatFolders) else {
+            throw CloudAPIError(status: 404, message: "Chat folders are unavailable", retryAfter: nil)
+        }
+        let result = try await api.createChatFolder(
+            CloudFolderMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                folderId: UUID().uuidString.lowercased(),
+                title: title,
+                icon: icon,
+                includeDirect: includeDirect,
+                includeGroups: includeGroups,
+                includeSaved: includeSaved,
+                excludeRead: excludeRead,
+                excludeMuted: excludeMuted,
+                excludeArchived: excludeArchived,
+                rules: rules
+            ),
+            token: session.token
+        )
+        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        chatFolders = result.folders.sorted { $0.position < $1.position }
+        chatFolderCollectionRevision = result.collectionRevision
+    }
+
+    func updateChatFolder(
+        _ folder: CloudChatFolder,
+        title: String,
+        icon: String,
+        includeDirect: Bool,
+        includeGroups: Bool,
+        includeSaved: Bool,
+        excludeRead: Bool,
+        excludeMuted: Bool,
+        excludeArchived: Bool,
+        rules: [CloudChatFolderRule]
+    ) async throws {
+        guard let session = storedSession?.session else { return }
+        let result = try await api.updateChatFolder(
+            id: folder.folderId,
+            request: CloudFolderMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                title: title,
+                icon: icon,
+                includeDirect: includeDirect,
+                includeGroups: includeGroups,
+                includeSaved: includeSaved,
+                excludeRead: excludeRead,
+                excludeMuted: excludeMuted,
+                excludeArchived: excludeArchived,
+                rules: rules,
+                expectedRevision: chatFolderCollectionRevision
+            ),
+            token: session.token
+        )
+        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        chatFolders = result.folders.sorted { $0.position < $1.position }
+        chatFolderCollectionRevision = result.collectionRevision
+    }
+
+    func deleteChatFolder(_ folder: CloudChatFolder) async throws {
+        guard let session = storedSession?.session else { return }
+        let result = try await api.deleteChatFolder(
+            id: folder.folderId,
+            request: CloudFolderMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                expectedRevision: chatFolderCollectionRevision
+            ),
+            token: session.token
+        )
+        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        chatFolders = result.folders.sorted { $0.position < $1.position }
+        chatFolderCollectionRevision = result.collectionRevision
+    }
+
+    func moveChatFolder(
+        _ folder: CloudChatFolder,
+        before: CloudChatFolder? = nil,
+        after: CloudChatFolder? = nil
+    ) async throws {
+        guard let session = storedSession?.session else { return }
+        let result = try await api.moveChatFolder(
+            id: folder.folderId,
+            request: CloudFolderMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                expectedRevision: chatFolderCollectionRevision,
+                beforeFolderId: before?.folderId,
+                afterFolderId: after?.folderId
+            ),
+            token: session.token
+        )
+        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        chatFolders = result.folders.sorted { $0.position < $1.position }
+        chatFolderCollectionRevision = result.collectionRevision
+    }
+
+    func cancelScheduledDelivery(_ delivery: CloudScheduledDelivery) async throws {
+        guard let session = storedSession?.session else { return }
+        if delivery.revision == 0 {
+            try await localStore?.discardPendingScheduledCreate(
+                scheduleId: delivery.scheduleId,
+                accountId: session.accountId
+            )
+            scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
+            return
+        }
+        let response = try await api.cancelScheduledDelivery(
+            id: delivery.scheduleId,
+            request: CloudScheduledMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                expectedRevision: delivery.revision
+            ),
+            token: session.token
+        )
+        try await localStore?.upsertScheduledDelivery(response.scheduledDelivery, accountId: session.accountId)
+        scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
+        scheduledDeliveries.append(response.scheduledDelivery)
+        scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+    }
+
+    func rescheduleDelivery(_ delivery: CloudScheduledDelivery, to date: Date) async throws {
+        guard let session = storedSession?.session else { return }
+        let response = try await api.updateScheduledDelivery(
+            id: delivery.scheduleId,
+            request: CloudScheduledMutationRequest(
+                clientMutationId: UUID().uuidString.lowercased(),
+                expectedRevision: delivery.revision,
+                deliverAt: ISO8601DateFormatter().string(from: date)
+            ),
+            token: session.token
+        )
+        try await localStore?.upsertScheduledDelivery(response.scheduledDelivery, accountId: session.accountId)
+        scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
+        scheduledDeliveries.append(response.scheduledDelivery)
+        scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
     }
 
     private func sendStagedDraft() async {
@@ -3221,6 +3563,123 @@ final class CloudAppModel {
             status = "Local send failed: \(error.localizedDescription)"
             presentNotice("Could not queue attachments", message: error.localizedDescription)
         }
+    }
+
+    private func scheduleStagedDraft(deliverAt: Date, silent: Bool) async {
+        guard capabilities.contains(.scheduledDelivery) else {
+            presentNotice(
+                "Scheduled sending is unavailable",
+                message: "Your attachment draft is still saved on this device."
+            )
+            return
+        }
+        guard deliverAt >= Date().addingTimeInterval(60) else {
+            presentNotice("Choose a later time", message: "Scheduled delivery must be at least one minute away.")
+            return
+        }
+        guard let dialogId = activeDialogId,
+              let session = storedSession?.session,
+              let localStore else { return }
+        await draftPersistenceTasks[dialogId]?.value
+        guard let stored = try? await localStore.loadDraft(
+            accountId: session.accountId,
+            dialogId: dialogId
+        ), stored.state == "active", !stored.attachments.isEmpty else { return }
+        let attachments = stored.attachments.sorted { $0.position < $1.position }
+        guard attachments.allSatisfy({
+            $0.state == "ready" && $0.mediaId != nil && $0.media != nil
+        }) else {
+            presentNotice(
+                "Attachments are still preparing",
+                message: "Wait for every attachment to finish before scheduling."
+            )
+            return
+        }
+        if attachments.count > 1,
+           attachments.contains(where: { $0.media?.kind == "voice" }) {
+            presentNotice(
+                "Voice messages cannot be grouped",
+                message: "Schedule the voice message by itself."
+            )
+            return
+        }
+        let items = attachments.enumerated().map { index, attachment in
+            let body = index == 0 ? stored.text : ""
+            return CloudScheduledItem(
+                clientMsgId: UUID().uuidString.lowercased(),
+                kind: attachment.media!.kind,
+                body: body,
+                replyToMsgId: index == 0 ? stored.replyToMsgId : nil,
+                mediaId: attachment.mediaId,
+                mentions: index == 0 ? stored.mentions : [],
+                linkPreviewCandidate: index == 0 && capabilities.contains(.linkPreviews)
+                    ? CloudLinkPreviewCandidate.first(in: body)
+                    : nil
+            )
+        }
+        let request = CloudScheduledCreateRequest(
+            scheduleId: UUID().uuidString.lowercased(),
+            clientMutationId: UUID().uuidString.lowercased(),
+            dialogId: dialogId,
+            deliverAt: ISO8601DateFormatter().string(from: deliverAt),
+            silent: silent,
+            reminder: dialogs.first(where: { $0.id == dialogId })?.type == "saved",
+            items: items
+        )
+        do {
+            let local = try await localStore.stageScheduledCreate(
+                request,
+                accountId: session.accountId,
+                draftOperationId: stored.operationId
+            )
+            suppressDraftPersistence = true
+            draft = ""
+            suppressDraftPersistence = false
+            composerMode = .text
+            scheduledDeliveries.removeAll { $0.scheduleId == local.scheduleId }
+            scheduledDeliveries.append(local)
+            scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+            status = String(localized: "Waiting for connection — not scheduled yet")
+            await retryPendingScheduledCreates(token: session.token, localStore: localStore)
+            scheduleOutboxRetry()
+        } catch {
+            presentNotice("Attachments were not scheduled", message: error.localizedDescription)
+        }
+    }
+
+    private func clearDraftAfterScheduledAcknowledgement(
+        dialogId: String,
+        operationId: String?,
+        accountId: String,
+        localStore: CloudLocalStore
+    ) async {
+        guard let operationId,
+              let current = try? await localStore.loadDraft(accountId: accountId, dialogId: dialogId),
+              current.operationId == operationId else { return }
+        for attachment in current.attachments {
+            let transfer: MediaTransferRecord?
+            if let transferId = attachment.transferId {
+                transfer = try? await localStore.mediaTransfer(id: transferId)
+            } else {
+                transfer = nil
+            }
+            if let transferId = try? await localStore.removeDraftAttachment(
+                accountId: accountId,
+                dialogId: dialogId,
+                attachmentId: attachment.attachmentId
+            ) {
+                mediaTransferTasks[transferId]?.cancel()
+            }
+            if let transfer { await mediaEngine.discardTransfer(transfer) }
+        }
+        _ = try? await draftSyncCoordinator.mutate(
+            dialogId: dialogId,
+            text: "",
+            replyToMsgId: nil,
+            replyPreview: nil,
+            mentions: [],
+            reason: .attachmentChanged
+        )
     }
 
     func insertMention(_ member: GroupMember) {
@@ -3494,6 +3953,137 @@ final class CloudAppModel {
         )
     }
 
+    /// Applies a chat-list action through the same durable local-first queues as a single-row
+    /// action. The loop is serialized to keep preference ordering deterministic and to bound
+    /// SQLCipher/network pressure when a user selects many chats.
+    func performBulkDialogAction(
+        _ action: BulkDialogAction,
+        dialogIds: Set<String>
+    ) async -> BulkDialogActionResult {
+        guard !dialogIds.isEmpty, !isSessionTeardownInProgress else {
+            return BulkDialogActionResult(changed: 0, skipped: dialogIds.count)
+        }
+        let selected = dialogs.filter { dialogIds.contains($0.id) }
+        let missingCount = max(0, dialogIds.count - selected.count)
+
+        #if DEBUG
+        if isDemoMode {
+            var changed = 0
+            var skipped = missingCount
+            for dialog in selected {
+                if applyDemoBulkAction(action, dialogId: dialog.id) { changed += 1 }
+                else { skipped += 1 }
+            }
+            sortDialogsForPresentation()
+            return BulkDialogActionResult(changed: changed, skipped: skipped)
+        }
+        #endif
+
+        guard
+            let localStore,
+            let accountId = storedSession?.session.accountId
+        else {
+            return BulkDialogActionResult(changed: 0, skipped: dialogIds.count)
+        }
+        let generation = accountSessionGeneration
+        var changed = 0
+        var skipped = missingCount
+        var processed = 0
+
+        for dialog in selected {
+            guard
+                !Task.isCancelled,
+                !isSessionTeardownInProgress,
+                generation == accountSessionGeneration,
+                storedSession?.session.accountId == accountId
+            else {
+                skipped += selected.count - processed
+                break
+            }
+            processed += 1
+
+            switch action {
+            case .markRead:
+                guard dialog.type != "saved", dialog.unreadCount > 0, dialog.lastMsgId > 0 else {
+                    skipped += 1
+                    continue
+                }
+                do {
+                    try await localStore.queueReadReceipt(
+                        dialogId: dialog.id,
+                        accountId: accountId,
+                        maxReadMsgId: dialog.lastMsgId
+                    )
+                    changed += 1
+                } catch {
+                    skipped += 1
+                }
+            case let .pin(value):
+                guard dialog.isPinned != value else { skipped += 1; continue }
+                if await setDialogPreference(
+                    dialogId: dialog.id,
+                    field: .pinned,
+                    desiredValue: value,
+                    expectedAccountId: accountId,
+                    sessionGeneration: generation
+                ) { changed += 1 } else { skipped += 1 }
+            case let .mute(value):
+                guard dialog.type != "saved", dialog.isMuted != value else {
+                    skipped += 1
+                    continue
+                }
+                if await setDialogPreference(
+                    dialogId: dialog.id,
+                    field: .muted,
+                    desiredValue: value,
+                    expectedAccountId: accountId,
+                    sessionGeneration: generation
+                ) { changed += 1 } else { skipped += 1 }
+            case let .archive(value):
+                guard dialog.type != "saved", dialog.isArchived != value else {
+                    skipped += 1
+                    continue
+                }
+                if await setDialogPreference(
+                    dialogId: dialog.id,
+                    field: .archived,
+                    desiredValue: value,
+                    expectedAccountId: accountId,
+                    sessionGeneration: generation
+                ) { changed += 1 } else { skipped += 1 }
+            }
+        }
+
+        if case .markRead = action, changed > 0 {
+            await refreshDialogs()
+            scheduleReadReceiptRetry()
+        }
+        return BulkDialogActionResult(changed: changed, skipped: skipped)
+    }
+
+    #if DEBUG
+    private func applyDemoBulkAction(_ action: BulkDialogAction, dialogId: String) -> Bool {
+        guard let index = dialogs.firstIndex(where: { $0.id == dialogId }) else { return false }
+        switch action {
+        case .markRead:
+            guard dialogs[index].type != "saved", dialogs[index].unreadCount > 0 else { return false }
+            dialogs[index].unreadCount = 0
+        case let .pin(value):
+            guard dialogs[index].isPinned != value else { return false }
+            dialogs[index].isPinned = value
+            dialogs[index].pinnedAt = value ? CloudLocalStore.sqliteTimestamp(Date()) : nil
+        case let .mute(value):
+            guard dialogs[index].type != "saved", dialogs[index].isMuted != value else { return false }
+            dialogs[index].isMuted = value
+            dialogs[index].notificationMode = value ? "muted" : "all"
+        case let .archive(value):
+            guard dialogs[index].type != "saved", dialogs[index].isArchived != value else { return false }
+            dialogs[index].isArchived = value
+        }
+        return true
+    }
+    #endif
+
     private func launchDialogPreferenceMutation(
         dialogId: String,
         field: DialogPreferenceField,
@@ -3709,7 +4299,9 @@ final class CloudAppModel {
     private func send(
         _ text: String,
         replyToMsgId: Int64? = nil,
-        mentions: [CloudMention] = []
+        mentions: [CloudMention] = [],
+        silent: Bool = false,
+        deliverAfter: Date? = nil
     ) async {
         guard let token = storedSession?.session.token, let dialogId = activeDialogId else { return }
         openingTimelineAnchor = .bottom
@@ -3721,6 +4313,63 @@ final class CloudAppModel {
         let draftConsumeOperationId = attemptedDraft?.state == "active"
             ? attemptedDraft?.operationId
             : nil
+        if let deliverAfter, deliverAfter > Date() {
+            guard capabilities.contains(.scheduledDelivery) else {
+                suppressDraftPersistence = true
+                draft = text
+                suppressDraftPersistence = false
+                presentNotice(
+                    "Scheduled sending is unavailable",
+                    message: "Your message was restored to the composer and was not queued locally."
+                )
+                return
+            }
+            guard let localStore, let accountId = storedSession?.session.accountId else {
+                suppressDraftPersistence = true
+                draft = text
+                suppressDraftPersistence = false
+                presentNotice("Message was not scheduled", message: "Encrypted local storage is unavailable.")
+                return
+            }
+            let request = CloudScheduledCreateRequest(
+                scheduleId: UUID().uuidString.lowercased(),
+                clientMutationId: UUID().uuidString.lowercased(),
+                dialogId: dialogId,
+                deliverAt: ISO8601DateFormatter().string(from: deliverAfter),
+                silent: silent,
+                reminder: dialogs.first(where: { $0.id == dialogId })?.type == "saved",
+                items: [CloudScheduledItem(
+                    clientMsgId: clientMsgId,
+                    kind: "text",
+                    body: text,
+                    replyToMsgId: replyToMsgId,
+                    mediaId: nil,
+                    mentions: mentions,
+                    linkPreviewCandidate: capabilities.contains(.linkPreviews)
+                        ? CloudLinkPreviewCandidate.first(in: text)
+                        : nil
+                )]
+            )
+            do {
+                let local = try await localStore.stageScheduledCreate(
+                    request,
+                    accountId: accountId,
+                    draftOperationId: attemptedDraft?.operationId
+                )
+                scheduledDeliveries.removeAll { $0.scheduleId == local.scheduleId }
+                scheduledDeliveries.append(local)
+                scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+                status = String(localized: "Waiting for connection — not scheduled yet")
+                await retryPendingScheduledCreates(token: token, localStore: localStore)
+                scheduleOutboxRetry()
+            } catch {
+                suppressDraftPersistence = true
+                draft = text
+                suppressDraftPersistence = false
+                presentNotice("Message was not scheduled", message: error.localizedDescription)
+            }
+            return
+        }
         do {
             if let localStore, let accountId = storedSession?.session.accountId {
                 _ = try await localStore.insertSending(
@@ -3731,7 +4380,9 @@ final class CloudAppModel {
                     replyToMsgId: replyToMsgId,
                     mentions: mentions,
                     draftConsumeOperationId: draftConsumeOperationId,
-                    requiresCloudDraftSync: consumesCloudDraft
+                    requiresCloudDraftSync: consumesCloudDraft,
+                    silent: silent,
+                    deliverAfter: deliverAfter
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -3772,6 +4423,7 @@ final class CloudAppModel {
                     forwardedFromDialogId: nil,
                     forwardedFromMsgId: nil,
                     draftConsumeOperationId: consumesCloudDraft ? draftConsumeOperationId : nil,
+                    silent: silent,
                     retryCount: 0,
                     nextRetryAt: nil
                 ),
@@ -5246,6 +5898,9 @@ final class CloudAppModel {
             if advertised.contains("dialog_preferences_v1") {
                 resolved.formUnion([.chatOrganization, .dialogPreferences])
             }
+            if advertised.contains("chat_folders_v1") { resolved.insert(.chatFolders) }
+            if advertised.contains("scheduled_delivery_v1") { resolved.insert(.scheduledDelivery) }
+            if advertised.contains("link_previews_v1") { resolved.insert(.linkPreviews) }
             if advertised.contains("voice_calls_v1"), WebRTCEngineFactory.isAvailable {
                 resolved.insert(.calls)
             }
@@ -5283,12 +5938,15 @@ final class CloudAppModel {
             // Account-scoped rollout bits must not leak between sign-ins through the server-wide
             // capability cache. A locally materialized Saved Messages row still opens offline.
             capabilityDefaults.set(
-                Int(resolved.subtracting([.videoCalls, .savedMessages]).rawValue),
+                Int(resolved.subtracting([
+                    .videoCalls, .savedMessages, .chatFolders, .scheduledDelivery, .linkPreviews,
+                ]).rawValue),
                 forKey: capabilityCacheKey
             )
             if resolved.contains(.savedMessages) {
                 _ = await ensureSavedMessages(presentsFailure: false)
             }
+            await refreshCloudProductivity()
             if let localStore, let accountId = storedSession?.session.accountId {
                 if resolved.contains(.chatOrganization) {
                     let reactivated = (try? await localStore
@@ -5986,7 +6644,37 @@ final class CloudAppModel {
         }
 
         if let localStore, let accountId = storedSession?.session.accountId {
+            var scheduleAcknowledgements: [PendingScheduledCreate] = []
+            for update in difference.updates ?? [] {
+                guard update.type.hasPrefix("scheduled."),
+                      let scheduleId = update.scheduledDelivery?.scheduleId,
+                      let pending = try? await localStore.pendingScheduledCreate(
+                        scheduleId: scheduleId,
+                        accountId: accountId
+                      ) else { continue }
+                scheduleAcknowledgements.append(pending)
+            }
             try await localStore.applyDifference(difference, accountId: accountId)
+            for pending in scheduleAcknowledgements {
+                await clearDraftAfterScheduledAcknowledgement(
+                    dialogId: pending.request.dialogId,
+                    operationId: pending.draftOperationId,
+                    accountId: accountId,
+                    localStore: localStore
+                )
+            }
+            let updateTypes = Set((difference.updates ?? []).map(\.type))
+            if updateTypes.contains("chat_folders.updated"),
+               let snapshot = try await localStore.chatFolderSnapshot(accountId: accountId) {
+                chatFolders = snapshot.folders.sorted { $0.position < $1.position }
+                chatFolderCollectionRevision = snapshot.collectionRevision
+            }
+            if !updateTypes.isDisjoint(with: [
+                "scheduled.created", "scheduled.updated", "scheduled.canceled", "scheduled.failed",
+            ]) {
+                scheduledDeliveries = try await localStore.scheduledDeliveries(accountId: accountId)
+                    .sorted { $0.deliverAt < $1.deliverAt }
+            }
             let revokedDialogIds = Set(
                 (difference.updates ?? []).compactMap { update in
                     update.type == "dialog.access_revoked" ? update.dialogId : nil
@@ -6389,6 +7077,7 @@ final class CloudAppModel {
             kind: message.kind,
             serviceType: message.serviceType,
             serviceData: message.serviceData,
+            linkPreview: message.linkPreview,
             mine: mine,
             delivery: deliveryState,
             timestamp: message.serverTs,
@@ -6465,7 +7154,8 @@ final class CloudAppModel {
             memberCount: local.memberCount,
             selfRole: local.selfRole,
             notificationMode: isSavedMessages ? "all" : local.notificationMode,
-            accessState: local.accessState
+            accessState: local.accessState,
+            lastMsgId: local.lastMsgId
         )
     }
 
@@ -6480,6 +7170,7 @@ final class CloudAppModel {
             .split(whereSeparator: \.isWhitespace)
             .map(String.init)
         return StoredProfileDetails(
+            username: nil,
             firstName: parts.first ?? "",
             lastName: parts.dropFirst().joined(separator: " "),
             bio: "",
@@ -6493,6 +7184,7 @@ final class CloudAppModel {
         pendingSync: Bool
     ) -> StoredProfileDetails {
         StoredProfileDetails(
+            username: profile.username,
             firstName: profile.firstName,
             lastName: profile.lastName,
             bio: profile.bio,
@@ -6523,7 +7215,7 @@ final class CloudAppModel {
             let updatedAt = contact.updatedAt
         else { return nil }
         return CloudProfile(
-            accountId: accountId, firstName: firstName, lastName: lastName,
+            accountId: accountId, username: contact.username, firstName: firstName, lastName: lastName,
             displayName: displayName, bio: bio, birthday: contact.birthday,
             colorIndex: colorIndex, updatedAt: updatedAt
         )
@@ -6541,7 +7233,7 @@ final class CloudAppModel {
             let updatedAt = update.profileUpdatedAt
         else { return nil }
         return CloudProfile(
-            accountId: ownAccountId, firstName: firstName, lastName: lastName,
+            accountId: ownAccountId, username: update.username, firstName: firstName, lastName: lastName,
             displayName: displayName, bio: bio, birthday: update.birthday,
             colorIndex: colorIndex, updatedAt: updatedAt
         )
@@ -6556,6 +7248,12 @@ final class CloudAppModel {
             ? value.replacingOccurrences(of: "\r\n", with: "\n")
             : value.replacingOccurrences(of: "\n", with: " ")
         return String(normalized.prefix(limit)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func cleanedUsername(_ value: String?) -> String? {
+        let cleaned = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(32))
     }
 
     private func shortDialogId(_ dialogId: String) -> String {
@@ -6687,6 +7385,8 @@ final class CloudAppModel {
         defer { retryInFlight = false }
 
         do {
+            await retryPendingScheduledCreates(token: token, localStore: localStore)
+            guard !outboxDrainHalted else { return }
             await retryPendingGroupCreations(token: token, localStore: localStore)
             guard !outboxDrainHalted else { return }
             await retryPendingGroupMutations()
@@ -6752,6 +7452,87 @@ final class CloudAppModel {
         await retryMediaTransfers()
         guard !outboxDrainHalted else { return }
         await retryPendingMediaGroups()
+    }
+
+    private func retryPendingScheduledCreates(
+        token: String,
+        localStore: CloudLocalStore
+    ) async {
+        guard capabilities.contains(.scheduledDelivery),
+              let accountId = storedSession?.session.accountId else { return }
+        let generation = accountSessionGeneration
+        let pending: [PendingScheduledCreate]
+        do {
+            pending = try await localStore.pendingScheduledCreatesReady(accountId: accountId)
+        } catch {
+            status = "Scheduled messages paused: \(error.localizedDescription)"
+            return
+        }
+        for item in pending {
+            guard !Task.isCancelled,
+                  generation == accountSessionGeneration,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.token == token else { return }
+            do {
+                let response = try await api.createScheduledDelivery(item.request, token: token)
+                guard generation == accountSessionGeneration,
+                      storedSession?.session.accountId == accountId else { return }
+                try await localStore.acknowledgeScheduledCreate(response, accountId: accountId)
+                await clearDraftAfterScheduledAcknowledgement(
+                    dialogId: item.request.dialogId,
+                    operationId: item.draftOperationId,
+                    accountId: accountId,
+                    localStore: localStore
+                )
+                scheduledDeliveries.removeAll {
+                    $0.scheduleId == response.scheduledDelivery.scheduleId
+                }
+                scheduledDeliveries.append(response.scheduledDelivery)
+                scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+                status = String(localized: "Message scheduled on server")
+            } catch is CancellationError {
+                return
+            } catch {
+                let disposition = cloudOperationFailureDisposition(
+                    error,
+                    serverAdvertisesFeature: capabilities.contains(.scheduledDelivery)
+                )
+                switch disposition {
+                case let .transient(retryAfter):
+                    outboxDrainHalted = true
+                    let delay = retryAfter ?? retryDelay(forRetryCount: item.retryCount + 1)
+                    try? await localStore.deferScheduledCreate(
+                        scheduleId: item.request.scheduleId,
+                        accountId: accountId,
+                        after: delay,
+                        error: error.localizedDescription
+                    )
+                    status = String(localized: "Waiting for connection — not scheduled yet")
+                    publishTransportFailure(error)
+                case .authenticationRequired:
+                    outboxDrainHalted = true
+                    try? await localStore.deferScheduledCreate(
+                        scheduleId: item.request.scheduleId,
+                        accountId: accountId,
+                        after: 30,
+                        error: "Sign in required"
+                    )
+                case .unsupportedServer, .permanent:
+                    try? await localStore.deferScheduledCreate(
+                        scheduleId: item.request.scheduleId,
+                        accountId: accountId,
+                        after: 0,
+                        error: error.localizedDescription,
+                        terminal: true
+                    )
+                    presentNotice(
+                        "Message was not scheduled",
+                        message: "The saved draft was kept. \(error.localizedDescription)"
+                    )
+                }
+                if outboxDrainHalted { return }
+            }
+        }
     }
 
     private func retryPendingGroupCreations(token: String, localStore: CloudLocalStore) async {
@@ -7599,6 +8380,7 @@ final class CloudAppModel {
                 draftConsumeOperationId: capabilities.contains(.cloudDrafts)
                     ? item.draftConsumeOperationId
                     : nil,
+                silent: item.silent,
                 token: token
             )
         }
@@ -7633,6 +8415,14 @@ final class CloudAppModel {
             : nil
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
         let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
+        let scheduledCreateDelay: TimeInterval?
+        if let accountId = storedSession?.session.accountId {
+            scheduledCreateDelay = try? await localStore.nextScheduledCreateRetryDelay(
+                accountId: accountId
+            )
+        } else {
+            scheduledCreateDelay = nil
+        }
         var preferenceDelay: TimeInterval?
         if capabilities.contains(.chatOrganization),
            let accountId = storedSession?.session.accountId {
@@ -7650,7 +8440,7 @@ final class CloudAppModel {
         }
         return [
             groupDelay, groupMutationDelay, preferenceDelay,
-            textDelay, mediaDelay, mediaGroupDelay, mutationDelay,
+            scheduledCreateDelay, textDelay, mediaDelay, mediaGroupDelay, mutationDelay,
         ].compactMap { $0 }.min()
     }
 
