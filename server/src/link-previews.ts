@@ -58,7 +58,10 @@ type ClaimedPreview = { lookup: Buffer; leaseToken: string };
 const n = (value: unknown) => Number(value as any);
 const iso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
 
-function normalizeCandidate(value: unknown, body: string): LinkPreviewCandidate | null {
+export function normalizeLinkPreviewCandidate(
+  value: unknown,
+  body: string,
+): LinkPreviewCandidate | null {
   if (value == null) return null;
   const raw = value as any;
   const disabled = Boolean(raw.disabled);
@@ -100,7 +103,7 @@ export async function enqueueLinkPreview(
     generation?: number;
   },
 ): Promise<void> {
-  const candidate = normalizeCandidate(input.candidate, input.body);
+  const candidate = normalizeLinkPreviewCandidate(input.candidate, input.body);
   const generation = Math.max(1, input.generation ?? 1);
   await sql`
     DELETE FROM link_preview_waiters

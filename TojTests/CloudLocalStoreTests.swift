@@ -1145,6 +1145,39 @@ final class CloudLocalStoreTests: XCTestCase {
             cloudOperationFailureDisposition(missing, serverAdvertisesFeature: true),
             .permanent
         )
+        let routeSkew = CloudAPIError(
+            status: 404,
+            message: "Not Found",
+            retryAfter: nil,
+            code: nil
+        )
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(routeSkew, serverAdvertisesFeature: true),
+            .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(routeSkew, serverAdvertisesFeature: false),
+            .unsupportedServer
+        )
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(
+                CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil),
+                serverAdvertisesFeature: true
+            ),
+            .transient(retryAfter: nil)
+        )
+        let undecodable = DecodingError.dataCorrupted(
+            .init(codingPath: [], debugDescription: "newer response shape")
+        )
+        XCTAssertEqual(
+            cloudOperationFailureDisposition(undecodable, serverAdvertisesFeature: true),
+            .transient(retryAfter: nil)
+        )
+        XCTAssertNil(cloudScheduledCreateRetryDelay(0, serverAdvertisesFeature: false))
+        XCTAssertEqual(
+            cloudScheduledCreateRetryDelay(12, serverAdvertisesFeature: true),
+            12
+        )
     }
 
     func testPendingMutationsPersistAndTerminalFailuresDoNotLoop() async throws {
@@ -1346,6 +1379,8 @@ final class CloudLocalStoreTests: XCTestCase {
             XCTAssertEqual(json["bio"] as? String, "Hello")
             XCTAssertEqual(json["birthday"] as? String, "1995-04-18")
             XCTAssertEqual(json["colorIndex"] as? Int, 4)
+            XCTAssertTrue(json.keys.contains("username"))
+            XCTAssertTrue(json["username"] is NSNull)
             return (
                 try XCTUnwrap(HTTPURLResponse(
                     url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",

@@ -98,6 +98,8 @@ export class OperationalMetrics {
   private savedMessageEnsureCount = 0;
   private savedMessageEnsureSumSeconds = 0;
   private savedMessageInvariantViolations = 0;
+  private scheduledWorkerUnavailable = 0;
+  private scheduledCancellationsDuringOutage = 0;
   private cleanupDeleted = 0;
   private cleanupBacklog = 0;
 
@@ -124,6 +126,14 @@ export class OperationalMetrics {
     this.savedMessageEnsureCount += 1;
     this.savedMessageEnsureSumSeconds += durationMs / 1_000;
     if (result === "repaired") this.savedMessageInvariantViolations += 1;
+  }
+
+  recordScheduledWorkerUnavailable(): void {
+    this.scheduledWorkerUnavailable += 1;
+  }
+
+  recordScheduledCancellationDuringOutage(): void {
+    this.scheduledCancellationsDuringOutage += 1;
   }
 
   render(): string {
@@ -167,6 +177,12 @@ export class OperationalMetrics {
       "# HELP toj_saved_messages_invariant_violation_total Saved Messages rows repaired during ensure.",
       "# TYPE toj_saved_messages_invariant_violation_total counter",
       `toj_saved_messages_invariant_violation_total ${this.savedMessageInvariantViolations}`,
+      "# HELP toj_scheduled_worker_unavailable_total Create or reschedule requests rejected because the delivery worker heartbeat was stale.",
+      "# TYPE toj_scheduled_worker_unavailable_total counter",
+      `toj_scheduled_worker_unavailable_total ${this.scheduledWorkerUnavailable}`,
+      "# HELP toj_scheduled_cancellations_during_worker_outage_total Cancellations accepted while the delivery worker heartbeat was stale.",
+      "# TYPE toj_scheduled_cancellations_during_worker_outage_total counter",
+      `toj_scheduled_cancellations_during_worker_outage_total ${this.scheduledCancellationsDuringOutage}`,
       "# HELP toj_cleanup_deleted_total Rows deleted by maintenance cleanup.",
       "# TYPE toj_cleanup_deleted_total counter",
       `toj_cleanup_deleted_total ${this.cleanupDeleted}`,

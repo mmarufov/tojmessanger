@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS chat_folder_mutation_requests (
   folder_id UUID NOT NULL,
   operation TEXT NOT NULL CHECK (operation IN ('create','update','move','delete')),
   fingerprint BYTEA NOT NULL CHECK (octet_length(fingerprint) = 32),
+  request_fingerprint BYTEA,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
   result_revision BIGINT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -62,7 +63,6 @@ CREATE TABLE IF NOT EXISTS chat_folder_mutation_requests (
     OR (status = 'completed' AND result_revision IS NOT NULL)
   )
 );
-
 CREATE TABLE IF NOT EXISTS chat_folder_action_budgets (
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   bucket_started TIMESTAMPTZ NOT NULL,
@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS scheduled_delivery_mutation_requests (
   operation TEXT NOT NULL CHECK (operation IN ('create','update','reschedule','cancel')),
   expected_revision BIGINT,
   fingerprint BYTEA NOT NULL CHECK (octet_length(fingerprint) = 32),
+  request_fingerprint BYTEA,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','completed')),
   result_revision BIGINT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -141,6 +142,19 @@ CREATE TABLE IF NOT EXISTS scheduled_delivery_mutation_requests (
     OR (status = 'completed' AND result_revision IS NOT NULL)
   )
 );
+ALTER TABLE scheduled_delivery_mutation_requests
+  ADD COLUMN IF NOT EXISTS request_fingerprint BYTEA;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'scheduled_delivery_request_fingerprint_size_check'
+  ) THEN
+    ALTER TABLE scheduled_delivery_mutation_requests
+      ADD CONSTRAINT scheduled_delivery_request_fingerprint_size_check
+      CHECK (request_fingerprint IS NULL OR octet_length(request_fingerprint) = 32) NOT VALID;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS scheduled_delivery_action_budgets (
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

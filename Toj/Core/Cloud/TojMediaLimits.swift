@@ -2,11 +2,11 @@ import Foundation
 
 /// One source of truth for message-media limits on iOS.
 ///
-/// The transfer engine is offset/part based, but picker and encryption paths still materialize
-/// complete objects. Keep the public ceiling at 25 MB until those paths stream from files and the
-/// server moves media payloads out of PostgreSQL.
+/// The transfer engine is offset/part based, so a 100 MB object remains resumable on hostile
+/// networks. Keeping this below the server's configurable hard ceiling also bounds temporary disk
+/// use and the few picker paths that still need to inspect an asset before it is encrypted.
 nonisolated enum TojMediaLimits {
-    static let maximumMessageBytes: Int64 = 25 * 1024 * 1024
+    static let maximumMessageBytes: Int64 = 100 * 1024 * 1024
     static let maximumMessageBytesInt = Int(maximumMessageBytes)
-    static let displayMaximum = "25 MB"
+    static let displayMaximum = "100 MB"
 }

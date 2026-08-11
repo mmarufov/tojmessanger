@@ -224,11 +224,13 @@ final class CloudDraftsV1Tests: XCTestCase {
         let group = try await store.consumeDraftAsMediaGroup(
             accountId: "account-a",
             dialogId: "dialog-a",
-            operationId: ready.operationId
+            operationId: ready.operationId,
+            silent: true
         )
         XCTAssertEqual(group.payload.items.count, 3)
         XCTAssertEqual(group.payload.caption, "album caption")
         XCTAssertEqual(group.payload.replyToMsgId, 17)
+        XCTAssertTrue(group.payload.silent)
         let pendingGroupIds = try await store.pendingMediaGroupSendsReady().map(\.clientGroupId)
         XCTAssertEqual(pendingGroupIds, [
             group.clientGroupId,
@@ -399,9 +401,11 @@ final class CloudDraftsV1Tests: XCTestCase {
         let transfer = try await store.consumeDraftAsSingleMedia(
             accountId: "account-a",
             dialogId: "dialog-a",
-            operationId: draft.operationId
+            operationId: draft.operationId,
+            silent: true
         )
         XCTAssertEqual(transfer.mentions, mentions)
+        XCTAssertTrue(transfer.silent)
 
         let restored = try await store.restoreSingleMediaAsDraftWithoutReply(
             transfer,
@@ -697,7 +701,8 @@ final class CloudDraftsV1Tests: XCTestCase {
             let group = try await store.consumeDraftAsMediaGroup(
                 accountId: "account-a",
                 dialogId: "dialog-a",
-                operationId: operationId
+                operationId: operationId,
+                silent: true
             )
             clientGroupId = group.clientGroupId
         }
@@ -705,6 +710,7 @@ final class CloudDraftsV1Tests: XCTestCase {
         let groups = try await reopened.pendingMediaGroupSendsReady()
         XCTAssertEqual(groups.map(\.clientGroupId), [clientGroupId])
         XCTAssertEqual(groups.first?.draftConsumeOperationId, operationId)
+        XCTAssertTrue(groups.first?.payload.silent ?? false)
         let dependency = try await reopened.pendingDraftDependency(operationId: operationId)
         XCTAssertEqual(dependency?.text, "offline album")
         let snapshot = try await reopened.conversationSnapshot(dialogId: "dialog-a", window: .initial)

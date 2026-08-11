@@ -95,8 +95,8 @@ and thumbnails are AEAD-encrypted before PostgreSQL persistence. Deploy the sche
 clients that send media. These optional server settings are byte counts and are bounded to safe ranges:
 
 - `TOJ_MEDIA_CHUNK_BYTES` (legacy offset-v1 only; default 1048576)
-- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default and current hard maximum 26214400 / 25 MB)
-- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 262144000 / 250 MB)
+- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 104857600 / 100 MB; configurable up to 2 GB)
+- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 5368709120 / 5 GB)
 - `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
 - `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
 
@@ -157,6 +157,10 @@ comma-separated server-secret list of the exact international phone numbers perm
 code in the response. All other numbers fail closed without an SMS adapter. Readiness labels this
 mode `development` without exposing the allowlist. Remove both variables as soon as real SMS delivery
 is configured.
+
+Profile updates are mixed-version safe: an omitted `username` key preserves the current handle,
+while explicit JSON `null` or an empty string clears it. New clients send an explicit null when the
+user removes a handle. Reject non-string, non-null values rather than interpreting them as clears.
 
 ## Account deletion
 
@@ -341,10 +345,13 @@ bun run worker:link-preview
 ```
 
 The HTTP process also starts both workers for local development and single-process test deployments.
-Set `TOJ_PRODUCTIVITY_WORKERS_DISABLED=1` there when dedicated worker services are active. A
-scheduled-delivery or link-preview capability is advertised only when its schema is complete, the
-account is in rollout, and a matching worker heartbeat is fresher than 30 seconds. This deliberately
-fails closed if a worker fleet is dead. Folder capability does not require a worker.
+Set `TOJ_PRODUCTIVITY_WORKERS_DISABLED=1` there when dedicated worker services are active.
+The scheduled-delivery management capability is advertised whenever its schema is complete and the
+account is in rollout. A stale scheduled-worker heartbeat does not hide previously accepted rows,
+sync updates, or cancellation: reads and cancellation remain available. Only create and reschedule
+fail closed with `503 scheduled_worker_unavailable` and `Retry-After` until a heartbeat is fresher
+than 30 seconds. Link-preview advertisement still requires its worker heartbeat. Folder capability
+does not require a worker.
 
 Deploy in this order: expand/validate/contract migration; compatible HTTP nodes with all feature
 switches off; both worker services; iOS build; internal allowlists; 1%, 10%, 50%, then 100% account
@@ -353,9 +360,11 @@ rollout. Before each increase, verify no account PTS gaps, no growing `processin
 rates. The migration, route families, account events, maintenance cleanup, and encrypted columns
 must remain installed during an application rollback.
 
-Scheduled delivery is server-owned only after the create response is committed. The iOS client does
-not place future messages in its ordinary local-send outbox and restores the text to the composer if
-server ownership was not confirmed. Workers use `FOR UPDATE SKIP LOCKED`, expiring leases, stable
+Scheduled delivery is server-owned after an idempotent create is accepted, even if the response is
+lost. The iOS client durably stages creates and records the attempt before the HTTP commit point; an
+uncertain create is resolved with the same key before cancellation, so it cannot become an orphaned
+server schedule. Cancel and reschedule intents are also stored locally before networking. Workers
+use `FOR UPDATE SKIP LOCKED`, expiring leases, stable
 client message IDs, and the existing send idempotency ledger. Dispatch revalidates dialog access,
 media ownership, replies, and mentions; a missing reply or stale mention is safely dropped while a
 lost dialog becomes a permanent sanitized failure. Terminal rows erase message ciphertext and
@@ -371,9 +380,11 @@ normalized JPEG assets remain encrypted at rest. Asset downloads require current
 Turning the preview switch off stops new jobs and payload sync without affecting text delivery.
 
 Immediate rollback is account percentage zero (and empty allowlists), followed by clearing the
-feature switch. Do not stop the scheduled worker while accepted schedules remain: first close
-acceptance/capability, wait until `scheduled` and `processing` rows drain or explicitly retain the
-worker service, then roll back HTTP/iOS. The preview worker can be stopped after closing preview
+feature switch. To pause only new scheduled acceptance while preserving management, leave the
+account rollout enabled and stop the worker: clients retain read/cancel access while create and
+reschedule receive retryable `503`s. Do not remove the management route or schema while accepted
+schedules remain; wait until `scheduled` and `processing` rows drain or retain the worker service.
+The preview worker can be stopped after closing preview
 acceptance; pending previews degrade to ordinary links. Folder rows and all local SQLCipher copies
 remain for later re-enable.
 

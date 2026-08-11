@@ -126,6 +126,7 @@ export function mediaDigestHMAC(digest: Uint8Array): Buffer {
 export function requestFingerprintHMAC(
   domain:
     | "draft-mutation"
+    | "message-send"
     | "media-group-send"
     | "media-group-client-message-id"
     | "chat-folder-mutation"

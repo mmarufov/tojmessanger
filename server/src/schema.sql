@@ -310,6 +310,7 @@ CREATE TABLE IF NOT EXISTS messages (
   media_group_id    UUID,
   media_group_index SMALLINT,
   media_group_count SMALLINT,
+  send_fingerprint  BYTEA,
   service_type      TEXT,
   service_data      JSONB,
   edit_version      INT NOT NULL DEFAULT 0,
@@ -330,6 +331,16 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_id UUID REFERENCES media_obj
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_index SMALLINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_group_count SMALLINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS send_fingerprint BYTEA;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'messages_send_fingerprint_size_check'
+  ) THEN
+    ALTER TABLE messages ADD CONSTRAINT messages_send_fingerprint_size_check
+      CHECK (send_fingerprint IS NULL OR octet_length(send_fingerprint) = 32) NOT VALID;
+  END IF;
+END $$;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS draft_consume_operation_id UUID;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS draft_cleared_revision BIGINT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS service_type TEXT;
@@ -445,11 +456,22 @@ CREATE TABLE IF NOT EXISTS send_requests (
   sender_pts        BIGINT,                            -- filled on completion (retry must echo this)
   draft_consume_operation_id UUID,
   cleared_draft_revision BIGINT,
+  fingerprint       BYTEA,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (sender_account_id, client_msg_id)
 );
 ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS draft_consume_operation_id UUID;
 ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS cleared_draft_revision BIGINT;
+ALTER TABLE send_requests ADD COLUMN IF NOT EXISTS fingerprint BYTEA;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'send_requests_fingerprint_size_check'
+  ) THEN
+    ALTER TABLE send_requests ADD CONSTRAINT send_requests_fingerprint_size_check
+      CHECK (fingerprint IS NULL OR octet_length(fingerprint) = 32) NOT VALID;
+  END IF;
+END $$;
 
 -- ============ account-private cloud drafts ============
 -- Draft bodies use the same server-side AEAD model as cloud message bodies. A cleared row remains

@@ -594,7 +594,7 @@ private struct ChatFolderManagerView: View {
                         editingFolder = folder
                     } label: {
                         HStack {
-                            Label(folder.title, systemImage: folder.icon)
+                            Label(folder.title, systemImage: folder.systemImageName)
                             Spacer()
                             Image(systemName: "chevron.right")
                                 .font(.caption.weight(.semibold))
@@ -693,10 +693,10 @@ private struct ChatFolderEditorView: View {
                 TextField("Folder name", text: $title)
                 Picker("Icon", selection: $icon) {
                     Label("Folder", systemImage: "folder").tag("folder")
-                    Label("People", systemImage: "person.2").tag("person.2")
-                    Label("Unread", systemImage: "message.badge").tag("message.badge")
-                    Label("Work", systemImage: "briefcase").tag("briefcase")
-                    Label("Favorite", systemImage: "star").tag("star")
+                    Label("People", systemImage: "person.2").tag("personal")
+                    Label("Unread", systemImage: "message.badge").tag("unread")
+                    Label("Work", systemImage: "briefcase").tag("work")
+                    Label("Favorite", systemImage: "star").tag("favorite")
                 }
                 Section("Include") {
                     Toggle("Personal chats", isOn: $includeDirect)
@@ -800,7 +800,8 @@ private struct ScheduledMessagesView: View {
     var body: some View {
         List {
             if model.scheduledDeliveries.filter({
-                $0.state == "scheduled" || $0.state == "processing" || $0.state == "local_pending"
+                ["scheduled", "processing", "local_pending", "local_error", "cancel_pending", "reschedule_pending"]
+                    .contains($0.state)
             }).isEmpty {
                 ContentUnavailableView(
                     "No Scheduled Messages",
@@ -809,7 +810,8 @@ private struct ScheduledMessagesView: View {
                 )
             }
             ForEach(model.scheduledDeliveries.filter {
-                $0.state == "scheduled" || $0.state == "processing" || $0.state == "local_pending"
+                ["scheduled", "processing", "local_pending", "local_error", "cancel_pending", "reschedule_pending"]
+                    .contains($0.state)
             }) { delivery in
                 VStack(alignment: .leading, spacing: 5) {
                     Text(delivery.items.first?.body ?? "Attachment")
@@ -825,9 +827,30 @@ private struct ScheduledMessagesView: View {
                             .font(.caption)
                             .foregroundStyle(TojTheme.secondaryText)
                     }
+                    if delivery.state == "cancel_pending" {
+                        Label("Cancellation pending — it may still send until confirmed", systemImage: "clock.badge.exclamationmark")
+                            .font(.caption)
+                            .foregroundStyle(TojTheme.secondaryText)
+                    }
+                    if delivery.state == "reschedule_pending" {
+                        Label("New time saved — waiting to sync", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                            .foregroundStyle(TojTheme.secondaryText)
+                    }
+                    if delivery.state == "local_error" {
+                        Label("Scheduling failed — cancel to remove", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { reschedulingDelivery = delivery }
+                .onTapGesture {
+                    if delivery.state != "processing"
+                        && delivery.state != "cancel_pending"
+                        && delivery.state != "local_error" {
+                        reschedulingDelivery = delivery
+                    }
+                }
                 .swipeActions {
                     Button("Cancel", role: .destructive) {
                         Task {
@@ -835,12 +858,16 @@ private struct ScheduledMessagesView: View {
                             catch { errorMessage = error.localizedDescription }
                         }
                     }
-                    .disabled(delivery.state == "processing")
+                    .disabled(delivery.state == "processing" || delivery.state == "cancel_pending")
                     Button("Reschedule", systemImage: "calendar") {
                         reschedulingDelivery = delivery
                     }
                     .tint(TojTheme.gold)
-                    .disabled(delivery.state == "processing" || delivery.revision == 0)
+                    .disabled(
+                        delivery.state == "processing"
+                            || delivery.state == "cancel_pending"
+                            || delivery.state == "local_error"
+                    )
                 }
             }
         }

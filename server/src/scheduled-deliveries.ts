@@ -190,12 +190,12 @@ function normalizeItems(value: unknown): ScheduledDeliveryItemDTO[] {
   return items;
 }
 
-function normalizedInstant(value: unknown, now = Date.now()): Date {
+function normalizedInstant(value: unknown, now = Date.now(), allowHistorical = false): Date {
   const parsed = new Date(String(value ?? ""));
   if (Number.isNaN(parsed.getTime())) {
     throw new ScheduledDeliveryError("delivery time is invalid");
   }
-  if (parsed.getTime() < now + 60_000) {
+  if (!allowHistorical && parsed.getTime() < now + 60_000) {
     throw new ScheduledDeliveryError("delivery time must be at least 60 seconds away");
   }
   if (parsed.getTime() > now + 365 * 24 * 60 * 60 * 1_000) {
@@ -286,24 +286,12 @@ function sameBuffer(left: unknown, right: Buffer): boolean {
   return Buffer.from(left as Uint8Array).equals(right);
 }
 
-async function loadDelivery(
-  sql: SQL,
+function deliveryDTO(
   accountId: string,
-  deliveryId: string,
-): Promise<ScheduledDeliveryDTO | null> {
-  const row = (await sql`
-    SELECT id, account_id, dialog_id, deliver_at, state, silent, reminder, revision,
-           attempts, last_error_code, delivered_first_msg_id, delivered_last_msg_id,
-           created_at, updated_at, completed_at
-    FROM scheduled_deliveries
-    WHERE id = ${deliveryId} AND account_id = ${accountId}`)[0];
-  if (!row) return null;
-  const itemRows = await sql`
-    SELECT item_index, client_msg_id, kind, payload_key_id, payload_nonce,
-           payload_ciphertext, media_id
-    FROM scheduled_delivery_items
-    WHERE delivery_id = ${deliveryId}
-    ORDER BY item_index`;
+  row: any,
+  itemRows: any[],
+): ScheduledDeliveryDTO {
+  const deliveryId = String(row.id);
   const items = itemRows.flatMap((item: any): ScheduledDeliveryItemDTO[] => {
     if (!item.payload_key_id || !item.payload_nonce || !item.payload_ciphertext) return [];
     const payload = JSON.parse(open(
@@ -343,6 +331,27 @@ async function loadDelivery(
   };
 }
 
+async function loadDelivery(
+  sql: SQL,
+  accountId: string,
+  deliveryId: string,
+): Promise<ScheduledDeliveryDTO | null> {
+  const row = (await sql`
+    SELECT id, account_id, dialog_id, deliver_at, state, silent, reminder, revision,
+           attempts, last_error_code, delivered_first_msg_id, delivered_last_msg_id,
+           created_at, updated_at, completed_at
+    FROM scheduled_deliveries
+    WHERE id = ${deliveryId} AND account_id = ${accountId}`)[0];
+  if (!row) return null;
+  const itemRows = await sql`
+    SELECT item_index, client_msg_id, kind, payload_key_id, payload_nonce,
+           payload_ciphertext, media_id
+    FROM scheduled_delivery_items
+    WHERE delivery_id = ${deliveryId}
+    ORDER BY item_index`;
+  return deliveryDTO(accountId, row, itemRows);
+}
+
 export async function getScheduledDelivery(
   sql: SQL,
   accountId: string,
@@ -370,37 +379,57 @@ export async function listScheduledDeliveries(
       throw new ScheduledDeliveryError("cursor is invalid");
     }
   }
-  const rows = await sql`
-    SELECT id, deliver_at
-    FROM scheduled_deliveries
-    WHERE account_id = ${accountId}
-      AND (${dialogId}::uuid IS NULL OR dialog_id = ${dialogId}::uuid)
-      AND (
-        state IN ('scheduled','processing')
-        OR completed_at >= now() - interval '30 days'
-      )
-      AND (
-        ${cursorDate}::timestamptz IS NULL
-        OR (deliver_at, id) > (${cursorDate}::timestamptz, ${cursorId}::uuid)
-      )
-    ORDER BY deliver_at, id
-    LIMIT ${limit + 1}`;
-  const selected = rows.slice(0, limit);
-  const deliveries: ScheduledDeliveryDTO[] = [];
-  for (const row of selected) {
-    const loaded = await loadDelivery(sql, accountId, String(row.id));
-    if (loaded) deliveries.push(loaded);
-  }
-  const state = (await sql`
-    SELECT revision FROM account_scheduled_delivery_states WHERE account_id = ${accountId}`)[0];
-  const last = selected.at(-1);
-  return {
-    collectionRevision: n(state?.revision ?? 0),
-    deliveries,
-    nextCursor: rows.length > limit && last
-      ? Buffer.from(JSON.stringify({ deliverAt: iso(last.deliver_at), id: last.id })).toString("base64url")
-      : null,
-  };
+  return await sql.begin(async (tx) => {
+    // Every scheduled mutation and worker state transition takes this account lock. Holding it
+    // while assembling one page makes the attached collection revision describe these exact rows,
+    // rather than a newer revision sampled after an older row query.
+    await lockAccountMutations(tx, [accountId]);
+    const state = (await tx`
+      SELECT revision FROM account_scheduled_delivery_states WHERE account_id = ${accountId}`)[0];
+    const rows = await tx`
+      SELECT id, account_id, dialog_id, deliver_at, state, silent, reminder, revision,
+             attempts, last_error_code, delivered_first_msg_id, delivered_last_msg_id,
+             created_at, updated_at, completed_at
+      FROM scheduled_deliveries
+      WHERE account_id = ${accountId}
+        AND (${dialogId}::uuid IS NULL OR dialog_id = ${dialogId}::uuid)
+        AND (
+          state IN ('scheduled','processing')
+          OR completed_at >= now() - interval '30 days'
+        )
+        AND (
+          ${cursorDate}::timestamptz IS NULL
+          OR (deliver_at, id) > (${cursorDate}::timestamptz, ${cursorId}::uuid)
+        )
+      ORDER BY deliver_at, id
+      LIMIT ${limit + 1}`;
+    const selected = rows.slice(0, limit);
+    const selectedIds = selected.map((row: any) => String(row.id));
+    const itemRows = selectedIds.length === 0 ? [] : await tx`
+      SELECT delivery_id, item_index, client_msg_id, kind, payload_key_id, payload_nonce,
+             payload_ciphertext, media_id
+      FROM scheduled_delivery_items
+      WHERE delivery_id = ANY(${tx.array(selectedIds, "uuid")}::uuid[])
+      ORDER BY delivery_id, item_index`;
+    const itemsByDelivery = new Map<string, any[]>();
+    for (const item of itemRows) {
+      const deliveryId = String(item.delivery_id);
+      const grouped = itemsByDelivery.get(deliveryId) ?? [];
+      grouped.push(item);
+      itemsByDelivery.set(deliveryId, grouped);
+    }
+    const deliveries = selected.map((row: any) =>
+      deliveryDTO(accountId, row, itemsByDelivery.get(String(row.id)) ?? [])
+    );
+    const last = selected.at(-1);
+    return {
+      collectionRevision: n(state?.revision ?? 0),
+      deliveries,
+      nextCursor: rows.length > limit && last
+        ? Buffer.from(JSON.stringify({ deliverAt: iso(last.deliver_at), id: last.id })).toString("base64url")
+        : null,
+    };
+  });
 }
 
 async function appendScheduleEvent(
@@ -454,20 +483,23 @@ async function claimMutation(
     operation: "create" | "update" | "reschedule" | "cancel";
     expectedRevision: number | null;
     fingerprint: Buffer;
+    requestFingerprint: Buffer;
   },
 ): Promise<{ duplicate: boolean; receiptRevision: number | null }> {
   const inserted = await sql`
     INSERT INTO scheduled_delivery_mutation_requests (
-      account_id, client_mutation_id, delivery_id, operation, expected_revision, fingerprint
+      account_id, client_mutation_id, delivery_id, operation, expected_revision, fingerprint,
+      request_fingerprint
     ) VALUES (
       ${input.accountId}, ${input.clientMutationId}, ${input.deliveryId}, ${input.operation},
-      ${input.expectedRevision}, ${input.fingerprint}
+      ${input.expectedRevision}, ${input.fingerprint}, ${input.requestFingerprint}
     )
     ON CONFLICT (account_id, client_mutation_id) DO NOTHING
     RETURNING status`;
   if (inserted.length) return { duplicate: false, receiptRevision: null };
   const row = (await sql`
-    SELECT delivery_id, operation, expected_revision, fingerprint, status, result_revision
+    SELECT delivery_id, operation, expected_revision, fingerprint, request_fingerprint,
+           status, result_revision
     FROM scheduled_delivery_mutation_requests
     WHERE account_id = ${input.accountId} AND client_mutation_id = ${input.clientMutationId}
     FOR UPDATE`)[0];
@@ -475,7 +507,9 @@ async function claimMutation(
     String(row.delivery_id) !== input.deliveryId
     || row.operation !== input.operation
     || (row.expected_revision == null ? null : n(row.expected_revision)) !== input.expectedRevision
-    || !sameBuffer(row.fingerprint, input.fingerprint)
+    || (row.request_fingerprint == null
+      ? !sameBuffer(row.fingerprint, input.fingerprint)
+      : !sameBuffer(row.request_fingerprint, input.requestFingerprint))
   ) {
     throw new ScheduledDeliveryError(
       "mutation id was reused with different input",
@@ -487,6 +521,30 @@ async function claimMutation(
     throw new ScheduledDeliveryError("schedule mutation is in progress", "mutation_in_progress", 409);
   }
   return { duplicate: true, receiptRevision: n(row.result_revision) };
+}
+
+/**
+ * Worker-health gating must not strand a mutation whose commit response was lost.
+ * This read-only probe allows only an already-completed, same-operation receipt
+ * through the unhealthy-worker gate; the normal mutation path still verifies the
+ * delivery id, expected revision, and request fingerprint byte-for-byte.
+ */
+export async function completedScheduledMutationExists(
+  sql: SQL,
+  accountId: string,
+  rawMutationId: unknown,
+  operation: "create" | "update" | "reschedule",
+): Promise<boolean> {
+  const mutationId = requireUUID(rawMutationId, "client mutation id");
+  const row = (await sql`
+    SELECT 1
+    FROM scheduled_delivery_mutation_requests
+    WHERE account_id = ${accountId}
+      AND client_mutation_id = ${mutationId}
+      AND operation = ${operation}
+      AND status = 'completed'
+    LIMIT 1`)[0];
+  return Boolean(row);
 }
 
 async function consumeMutationBudget(
@@ -538,8 +596,11 @@ export async function createScheduledDelivery(
 ): Promise<ScheduledDeliveryMutationResult> {
   const deliveryId = requireUUID(input.body?.scheduleId ?? input.body?.id, "schedule id");
   const mutationId = requireUUID(input.body?.clientMutationId, "client mutation id");
+  const completedReplay = await completedScheduledMutationExists(
+    sql, input.accountId, mutationId, "create",
+  );
   const dialogId = requireUUID(input.body?.dialogId, "dialog id");
-  const deliverAt = normalizedInstant(input.body?.deliverAt);
+  const deliverAt = normalizedInstant(input.body?.deliverAt, Date.now(), completedReplay);
   const items = normalizeItems(input.body?.items);
   const canonical = {
     dialogId,
@@ -549,6 +610,7 @@ export async function createScheduledDelivery(
     items,
   };
   const digest = fingerprint("create", deliveryId, canonical);
+  const requestDigest = fingerprint("create-request", deliveryId, canonical);
   return await sql.begin(async (tx) => {
     await lockMutationKeys(tx, [`scheduled-receipt:${input.accountId}:${mutationId}`]);
     await lockAccountMutations(tx, [input.accountId]);
@@ -560,6 +622,7 @@ export async function createScheduledDelivery(
       operation: "create",
       expectedRevision: null,
       fingerprint: digest,
+      requestFingerprint: requestDigest,
     });
     if (claim.duplicate) {
       const scheduledDelivery = await loadDelivery(tx, input.accountId, deliveryId);
@@ -649,6 +712,9 @@ export async function updateScheduledDelivery(
     throw new ScheduledDeliveryError("expected revision is invalid");
   }
   const operation = input.operation ?? "update";
+  const completedReplay = await completedScheduledMutationExists(
+    sql, input.accountId, mutationId, operation,
+  );
   return await sql.begin(async (tx) => {
     await lockMutationKeys(tx, [`scheduled-receipt:${input.accountId}:${mutationId}`]);
     await lockAccountMutations(tx, [input.accountId]);
@@ -657,7 +723,7 @@ export async function updateScheduledDelivery(
     if (!existing) throw new ScheduledDeliveryError("schedule not found", "schedule_not_found", 404);
     const deliverAt = input.body?.deliverAt == null
       ? new Date(existing.deliverAt)
-      : normalizedInstant(input.body.deliverAt);
+      : normalizedInstant(input.body.deliverAt, Date.now(), completedReplay);
     const items = input.body?.items == null ? existing.items : normalizeItems(input.body.items);
     const canonical = {
       deliverAt: deliverAt.toISOString(),
@@ -666,6 +732,13 @@ export async function updateScheduledDelivery(
       items,
     };
     const digest = fingerprint(operation, deliveryId, canonical);
+    const requestDigest = fingerprint(`${operation}-request`, deliveryId, {
+      expectedRevision,
+      ...(input.body?.deliverAt == null ? {} : { deliverAt: deliverAt.toISOString() }),
+      ...(input.body?.silent == null ? {} : { silent: Boolean(input.body.silent) }),
+      ...(input.body?.reminder == null ? {} : { reminder: Boolean(input.body.reminder) }),
+      ...(input.body?.items == null ? {} : { items }),
+    });
     const claim = await claimMutation(tx, {
       accountId: input.accountId,
       clientMutationId: mutationId,
@@ -673,6 +746,7 @@ export async function updateScheduledDelivery(
       operation,
       expectedRevision,
       fingerprint: digest,
+      requestFingerprint: requestDigest,
     });
     if (claim.duplicate) {
       return {
@@ -752,6 +826,7 @@ export async function cancelScheduledDelivery(
     throw new ScheduledDeliveryError("expected revision is invalid");
   }
   const digest = fingerprint("cancel", deliveryId, { expectedRevision });
+  const requestDigest = fingerprint("cancel-request", deliveryId, { expectedRevision });
   return await sql.begin(async (tx) => {
     await lockMutationKeys(tx, [`scheduled-receipt:${input.accountId}:${mutationId}`]);
     await lockAccountMutations(tx, [input.accountId]);
@@ -763,6 +838,7 @@ export async function cancelScheduledDelivery(
       operation: "cancel",
       expectedRevision,
       fingerprint: digest,
+      requestFingerprint: requestDigest,
     });
     const existing = await loadDelivery(tx, input.accountId, deliveryId);
     if (!existing) throw new ScheduledDeliveryError("schedule not found", "schedule_not_found", 404);
