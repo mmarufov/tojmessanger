@@ -1497,6 +1497,32 @@ final class CloudAppModel {
         }
     }
 
+    func regenerateTwoFactorRecoveryCodes(currentCredential: String) async -> Bool {
+        guard let token = storedSession?.session.token,
+              let stepUpToken = securityStepUpToken,
+              !securityChangeInFlight
+        else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.regenerateTwoFactorRecoveryCodes(
+                stepUpToken: stepUpToken,
+                currentCredential: currentCredential,
+                token: token
+            )
+            await applySecuritySession(response.session)
+            recoveredTwoFactorCodes = response.recoveryCodes ?? []
+            twoFactorRecoveryCodesRemaining = recoveredTwoFactorCodes.count
+            securityStepUpToken = nil
+            securityCode = ""
+            status = "Recovery codes replaced"
+            return true
+        } catch {
+            status = "Could not replace recovery codes: \(error.localizedDescription)"
+            return false
+        }
+    }
+
     private func applySecuritySession(_ session: CloudSession) async {
         guard let saved = storedSession else { return }
         let replacement = StoredCloudSession(

@@ -224,6 +224,10 @@ nonisolated enum AppLockTimeout: Int, Codable, CaseIterable, Identifiable, Senda
         case .oneHour: "After 1 hour"
         }
     }
+
+    func shouldLock(after elapsed: TimeInterval) -> Bool {
+        elapsed >= TimeInterval(rawValue)
+    }
 }
 
 private struct AppLockPolicy: Codable {
@@ -310,7 +314,7 @@ final class AppLockController {
             return
         }
         if let leftForegroundAt,
-           Date().timeIntervalSince(leftForegroundAt) >= TimeInterval(policy.timeout.rawValue) {
+           policy.timeout.shouldLock(after: Date().timeIntervalSince(leftForegroundAt)) {
             isLocked = true
         }
         self.leftForegroundAt = nil

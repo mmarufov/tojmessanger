@@ -220,6 +220,7 @@ const AUTH_SECURITY_METRIC_EVENTS = [
   "second_factor_failure",
   "second_factor_locked",
   "recovery_used",
+  "recovery_codes_regenerated",
   "two_factor_configured",
   "two_factor_disabled",
 ] as const;
@@ -347,6 +348,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
         AND to_regclass('public.account_two_factor') IS NOT NULL
         AND to_regclass('public.two_factor_recovery_codes') IS NOT NULL
         AND to_regclass('public.two_factor_login_challenges') IS NOT NULL
+        AND to_regclass('public.two_factor_attempt_budgets') IS NOT NULL
         AND to_regclass('public.security_step_up_tickets') IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM information_schema.columns
@@ -432,6 +434,15 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       FOR UPDATE SKIP LOCKED
     )
     DELETE FROM security_step_up_tickets WHERE id IN (SELECT id FROM doomed)
+    RETURNING id`;
+  const twoFactorBudgets = await sql`
+    WITH doomed AS (
+      SELECT id FROM two_factor_attempt_budgets
+      WHERE accepted_at < now() - interval '15 minutes'
+      ORDER BY accepted_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM two_factor_attempt_budgets WHERE id IN (SELECT id FROM doomed)
     RETURNING id`;
   const snapshots = await sql`
     WITH doomed AS (
@@ -855,6 +866,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     rotationReceipts: rotationReceipts.length,
     authChallenges: authChallenges.length,
     stepUpTickets: stepUpTickets.length,
+    twoFactorBudgets: twoFactorBudgets.length,
     snapshots: snapshots.length,
     pushDeliveries: deliveries.length,
     contactLookups: contactLookups.length,
@@ -885,7 +897,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
   return value.otp + value.accessTokens + value.rotationReceipts + value.authChallenges
-    + value.stepUpTickets + value.snapshots + value.pushDeliveries + value.contactLookups
+    + value.stepUpTickets + value.twoFactorBudgets
+    + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
     + value.messageMutations + value.draftMutations + value.draftBudgets
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations

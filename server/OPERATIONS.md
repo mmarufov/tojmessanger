@@ -38,6 +38,41 @@ account deletion because an offline client can retry a lost response after any f
 Pending records are also never aged out. Message history and attached media are not deleted by this
 worker; account events follow the separately configured synchronization retention floor.
 
+## Session security and two-step verification rollout
+
+Authentication v2 and two-step verification are additive and dark by default. Run the migration and
+deploy the dual-stack server before shipping the compatible iOS client. The readiness probe requires
+the v2 session, access-token, rotation-receipt, two-step, recovery-code, challenge, and throttle tables
+even while admission is disabled.
+
+- `TOJ_AUTH_SESSIONS_V2_ENABLED=1` advertises `auth_sessions_v2`, enables legacy in-place upgrade,
+  and accepts rotating refresh credentials. Access tokens last 15 minutes, refresh activity lasts 30
+  days, and the device session has a non-extendable 180-day lifetime.
+- `TOJ_TWO_FACTOR_ENABLED=1` advertises `two_factor_v1`. It is ignored unless auth v2 is also enabled.
+  Do not set it until production SMS delivery, the migrated catalog, and v2 refresh metrics are healthy.
+- `TOJ_SECURITY_ALERT_SMS_WEBHOOK` is the optional provider adapter for non-secret security alerts.
+  Keep its authorization value in `TOJ_SECURITY_ALERT_SMS_TOKEN` in the deployment secret store.
+
+Roll out auth v2 to internal accounts first, then increase compatible-client admission through 1%,
+5%, 25%, 50%, and 100% release cohorts. Keep legacy authentication available for at least 30 days and
+until 95% of recently active eligible devices have upgraded. Announce a further 30-day deadline before
+rejecting legacy tokens. Enable two-step enrollment only after the v2 ramp is stable. Roll back by
+disabling enrollment first and then auth-v2 advertisement; retain the additive database objects and
+continue accepting credentials already issued to upgraded clients.
+
+Alert on sustained increases in `refresh_failure`, `refresh_replay_revocation`, or `session_expired`
+within `toj_auth_security_events_total`. Track `second_factor_failure`, `second_factor_locked`,
+`recovery_used`, `recovery_codes_regenerated`, `two_factor_configured`, and
+`two_factor_disabled` as aggregate counters only. No
+metric or log label may contain an account, phone number, token, recovery code, password, challenge,
+rotation ID, or network identifier.
+
+Ordinary idle or absolute expiry requires authentication but preserves the encrypted local replica and
+pending outbox. Explicit device revocation and refresh-token replay remain destructive client security
+events. Before broad release, verify signed-simulator Keychain and LocalAuthentication tests, then use
+physical devices to cover Face ID/passcode fallback, background refresh, push and VoIP notifications,
+CallKit answering, weak-network rotation response loss, and remote-device socket revocation.
+
 Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
 a device retrying after days can recover the canonical `client_msg_id`.
 

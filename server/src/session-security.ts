@@ -108,6 +108,7 @@ export async function upgradeLegacySession(
 export async function resolveV2Access(
   sql: SQL,
   accessToken: string,
+  now = new Date(),
 ): Promise<{ accountId: string; deviceId: string; accessExpiresAt: Date } | null> {
   const digest = hashToken(accessToken);
   const result = await sql.begin(async (tx) => {
@@ -124,7 +125,6 @@ export async function resolveV2Access(
       WHERE access.token_digest = ${digest}
       FOR UPDATE OF session, device`)[0];
     if (!row) return null;
-    const now = new Date();
     if (row.revoked_at || row.device_revoked_at) {
       throw new AuthError(
         "device is no longer active", 401, undefined,
@@ -159,6 +159,7 @@ export async function refreshV2Session(
   sql: SQL,
   refreshToken: string,
   rotationId: string,
+  now = new Date(),
 ): Promise<AuthV2Session> {
   if (!/^[0-9a-f-]{36}$/i.test(rotationId)) {
     throw new AuthError("valid rotationId required", 400, undefined, "invalid_rotation_id");
@@ -181,7 +182,7 @@ export async function refreshV2Session(
         SELECT response_ciphertext, response_nonce, response_key_id
         FROM session_rotation_receipts
         WHERE session_id = ${used.session_id} AND rotation_id = ${rotationId}
-          AND request_token_digest = ${requestDigest} AND expires_at > now()`)[0];
+          AND request_token_digest = ${requestDigest} AND expires_at > ${now}`)[0];
       if (receipt) {
         const plaintext = open({
           ciphertext: Buffer.from(receipt.response_ciphertext),
@@ -193,13 +194,12 @@ export async function refreshV2Session(
       const session = (await tx`SELECT device_id FROM device_sessions WHERE id = ${used.session_id} FOR UPDATE`)[0];
       if (session) {
         await revokeSessionRows(
-          tx, String(used.session_id), String(session.device_id), "refresh_reuse_detected", new Date(),
+          tx, String(used.session_id), String(session.device_id), "refresh_reuse_detected", now,
         );
       }
       return new AuthError("refresh token reuse detected", 401, undefined, "refresh_reuse_detected");
     }
 
-    const now = new Date();
     if (current.revoked_at || current.device_revoked_at) {
       return new AuthError("device is no longer active", 401, undefined, "device_revoked");
     }
@@ -284,16 +284,12 @@ async function revokeSessionRows(
       voip_push_environment = NULL, voip_push_updated_at = ${now}
     WHERE id = ${deviceId}
     RETURNING account_id`;
-  if (devices[0]?.account_id) {
-    const payload = JSON.stringify({
-      accountId: String(devices[0].account_id),
-      deviceId,
-      reason,
-    });
-    // PostgreSQL delivers NOTIFY only if this transaction commits, so a remote process can
-    // never close a socket for a revocation that later rolls back.
-    await sql`SELECT pg_notify(${SESSION_REVOCATION_CHANNEL}, ${payload})`;
-  }
+  if (devices[0]?.account_id) await notifySessionRevocation(
+    sql,
+    String(devices[0].account_id),
+    deviceId,
+    reason,
+  );
 }
 
 export type SessionRevocationWakeup = {
@@ -301,6 +297,18 @@ export type SessionRevocationWakeup = {
   deviceId: string;
   reason: string;
 };
+
+export async function notifySessionRevocation(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  reason: string,
+): Promise<void> {
+  const payload = JSON.stringify({ accountId, deviceId, reason });
+  // PostgreSQL delivers NOTIFY only if this transaction commits, so a remote process can
+  // never close a socket for a revocation that later rolls back.
+  await sql`SELECT pg_notify(${SESSION_REVOCATION_CHANNEL}, ${payload})`;
+}
 
 /** Reconnectable, hint-only listener used to close revoked device sockets across instances. */
 export function startSessionRevocationListener(

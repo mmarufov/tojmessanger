@@ -4,6 +4,214 @@ import Security
 @testable import Toj
 
 final class CloudLocalStoreTests: XCTestCase {
+    func testAppLockTimeoutBoundaries() {
+        XCTAssertTrue(AppLockTimeout.immediate.shouldLock(after: 0))
+        XCTAssertFalse(AppLockTimeout.oneMinute.shouldLock(after: 59.999))
+        XCTAssertTrue(AppLockTimeout.oneMinute.shouldLock(after: 60))
+        XCTAssertFalse(AppLockTimeout.fiveMinutes.shouldLock(after: 299.999))
+        XCTAssertTrue(AppLockTimeout.fiveMinutes.shouldLock(after: 300))
+        XCTAssertFalse(AppLockTimeout.oneHour.shouldLock(after: 3_599.999))
+        XCTAssertTrue(AppLockTimeout.oneHour.shouldLock(after: 3_600))
+    }
+
+    func testCloudSessionDecodesLegacyAndV2Credentials() throws {
+        let legacy = try JSONDecoder().decode(
+            CloudSession.self,
+            from: Data(#"{"accountId":"a","deviceId":"d","token":"legacy"}"#.utf8)
+        )
+        XCTAssertEqual(legacy.token, "legacy")
+        XCTAssertEqual(legacy.tokenVersion, 1)
+        XCTAssertNil(legacy.refreshToken)
+
+        let v2 = try JSONDecoder().decode(
+            CloudSession.self,
+            from: Data(#"{"accountId":"a","deviceId":"d","accessToken":"access","refreshToken":"refresh","accessTokenExpiresAt":"2026-08-11T00:15:00.000Z","sessionExpiresAt":"2027-02-07T00:00:00.000Z","tokenVersion":2}"#.utf8)
+        )
+        XCTAssertEqual(v2.token, "access")
+        XCTAssertEqual(v2.refreshToken, "refresh")
+        XCTAssertEqual(v2.tokenVersion, 2)
+        let encoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(v2)) as? [String: Any]
+        )
+        XCTAssertEqual(encoded["accessToken"] as? String, "access")
+        XCTAssertNil(encoded["token"])
+    }
+
+    func testCredentialRefreshIsSingleFlightAndPersistsTheRotatedSession() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let networkSession = URLSession(configuration: configuration)
+        let counter = LockedCounter()
+        CloudAPIMockURLProtocol.deferHandlerExecution = true
+        CloudAPIMockURLProtocol.handler = { request in
+            counter.increment()
+            Thread.sleep(forTimeInterval: 0.05)
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"accountId":"account","deviceId":"device","accessToken":"next-access","refreshToken":"next-refresh","accessTokenExpiresAt":"2099-01-01T00:15:00.000Z","sessionExpiresAt":"2099-06-01T00:00:00.000Z","tokenVersion":2}"#.utf8)
+            )
+        }
+        defer {
+            CloudAPIMockURLProtocol.handler = nil
+            CloudAPIMockURLProtocol.deferHandlerExecution = false
+        }
+        let store = TokenStore(service: "com.toj.refresh-single-flight.\(UUID().uuidString)")
+        let saved = StoredCloudSession(
+            session: CloudSession(
+                accountId: "account", deviceId: "device", token: "old-access",
+                refreshToken: "old-refresh", accessTokenExpiresAt: "2020-01-01T00:00:00.000Z",
+                sessionExpiresAt: "2099-06-01T00:00:00.000Z", tokenVersion: 2
+            ),
+            phone: "+16505550100",
+            displayName: "Alice"
+        )
+        try await store.save(saved)
+        let coordinator = SessionCredentialCoordinator(networkSession: networkSession)
+        await coordinator.install(
+            saved,
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            tokenStore: store
+        )
+
+        let tokens = try await withThrowingTaskGroup(of: String?.self) { group in
+            for _ in 0..<12 {
+                group.addTask {
+                    try await coordinator.refreshIfNeeded(matching: "old-access", force: true)
+                }
+            }
+            var values: [String?] = []
+            for try await value in group { values.append(value) }
+            return values
+        }
+
+        XCTAssertEqual(counter.value, 1)
+        XCTAssertEqual(Set(tokens.compactMap { $0 }), ["next-access"])
+        let persisted = try await store.load()
+        XCTAssertEqual(persisted?.session.refreshToken, "next-refresh")
+        try await store.clear()
+    }
+
+    func testLogoutFencePreventsLateRefreshFromResurrectingKeychainSession() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let gate = LockedGate()
+        CloudAPIMockURLProtocol.deferHandlerExecution = true
+        CloudAPIMockURLProtocol.handler = { request in
+            gate.signalStarted()
+            gate.waitForRelease()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data(#"{"accountId":"account","deviceId":"device","accessToken":"late-access","refreshToken":"late-refresh","accessTokenExpiresAt":"2099-01-01T00:15:00.000Z","sessionExpiresAt":"2099-06-01T00:00:00.000Z","tokenVersion":2}"#.utf8)
+            )
+        }
+        defer {
+            gate.release()
+            CloudAPIMockURLProtocol.handler = nil
+            CloudAPIMockURLProtocol.deferHandlerExecution = false
+        }
+        let store = TokenStore(service: "com.toj.refresh-logout-race.\(UUID().uuidString)")
+        let saved = StoredCloudSession(
+            session: CloudSession(
+                accountId: "account", deviceId: "device", token: "old-access",
+                refreshToken: "old-refresh", accessTokenExpiresAt: "2020-01-01T00:00:00.000Z",
+                sessionExpiresAt: "2099-06-01T00:00:00.000Z", tokenVersion: 2
+            ),
+            phone: "+16505550101",
+            displayName: "Alice"
+        )
+        try await store.save(saved)
+        let coordinator = SessionCredentialCoordinator(networkSession: URLSession(configuration: configuration))
+        await coordinator.install(
+            saved,
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            tokenStore: store
+        )
+        let refresh = Task {
+            try await coordinator.refreshIfNeeded(matching: "old-access", force: true)
+        }
+        XCTAssertTrue(gate.waitUntilStarted())
+        await coordinator.clear()
+        try await store.clear()
+        gate.release()
+        do {
+            _ = try await refresh.value
+            XCTFail("A refresh crossing logout must not succeed")
+        } catch is CancellationError {
+            // Expected generation fence.
+        } catch let error as URLError where error.code == .cancelled {
+            // URLSession surfaces cancellation this way when the request was already in flight.
+        }
+        let resurrected = try await store.load()
+        XCTAssertNil(resurrected)
+    }
+
+    func testAccessTokenExpiryRefreshesAndRetriesTheRequestExactlyOnce() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
+        let originalRequests = LockedCounter()
+        let refreshRequests = LockedCounter()
+        CloudAPIMockURLProtocol.handler = { request in
+            let response: (Int, Data)
+            if request.url?.path == "/cloud/v1/session/refresh" {
+                refreshRequests.increment()
+                response = (
+                    200,
+                    Data(#"{"accountId":"account","deviceId":"device","accessToken":"next-access","refreshToken":"next-refresh","accessTokenExpiresAt":"2099-01-01T00:15:00.000Z","sessionExpiresAt":"2099-06-01T00:00:00.000Z","tokenVersion":2}"#.utf8)
+                )
+            } else {
+                originalRequests.increment()
+                response = (401, Data(#"{"error":"expired","code":"access_token_expired"}"#.utf8))
+            }
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: response.0, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                response.1
+            )
+        }
+        defer { CloudAPIMockURLProtocol.handler = nil }
+
+        let store = TokenStore(service: "com.toj.refresh-exact-retry.\(UUID().uuidString)")
+        let saved = StoredCloudSession(
+            session: CloudSession(
+                accountId: "account", deviceId: "device", token: "old-access",
+                refreshToken: "old-refresh", accessTokenExpiresAt: "2020-01-01T00:00:00.000Z",
+                sessionExpiresAt: "2099-06-01T00:00:00.000Z", tokenVersion: 2
+            ),
+            phone: "+16505550102",
+            displayName: "Alice"
+        )
+        try await store.save(saved)
+        let coordinator = SessionCredentialCoordinator(networkSession: URLSession(configuration: configuration))
+        await coordinator.install(
+            saved,
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            tokenStore: store
+        )
+        let api = CloudAPI(
+            config: CloudConfig(baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))),
+            session: URLSession(configuration: configuration),
+            credentialCoordinator: coordinator
+        )
+
+        do {
+            _ = try await api.getState(token: "old-access")
+            XCTFail("The retried 401 must be returned to the caller")
+        } catch let error as CloudAPIError {
+            XCTAssertEqual(error.code, "access_token_expired")
+        }
+        XCTAssertEqual(originalRequests.value, 2)
+        XCTAssertEqual(refreshRequests.value, 1)
+        try await store.clear()
+    }
+
     func testCapabilitiesEndpointIsPublicAndDecodesContract() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]

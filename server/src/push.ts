@@ -284,11 +284,13 @@ export async function enqueuePushDeliveries(sql: SQL, p: {
   senderAccountId: string;
   sourceDeviceId?: string | null;
   alertRecipients?: boolean;
+  forceAlert?: boolean;
 }): Promise<void> {
   await sql`
     INSERT INTO push_deliveries (account_id, pts, device_id, alert)
     SELECT ${p.accountId}, ${p.pts}, d.id,
-           ${p.alertRecipients !== false && p.accountId !== p.senderAccountId}
+           ${p.forceAlert === true
+             || (p.alertRecipients !== false && p.accountId !== p.senderAccountId)}
     FROM devices d
     WHERE d.account_id = ${p.accountId}
       AND d.platform = 'ios'

@@ -220,14 +220,27 @@ CREATE TABLE IF NOT EXISTS two_factor_login_challenges (
 CREATE INDEX IF NOT EXISTS two_factor_login_active_idx
   ON two_factor_login_challenges(account_id, expires_at) WHERE consumed_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS two_factor_attempt_budgets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  network_hash BYTEA,
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS two_factor_attempt_account_idx
+  ON two_factor_attempt_budgets(account_id, accepted_at DESC);
+CREATE INDEX IF NOT EXISTS two_factor_attempt_network_idx
+  ON two_factor_attempt_budgets(network_hash, accepted_at DESC) WHERE network_hash IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS security_step_up_tickets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash BYTEA NOT NULL UNIQUE,
+  attempts INT NOT NULL DEFAULT 0,
   expires_at TIMESTAMPTZ NOT NULL,
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
 
 -- Persisted, per-account discovery budget. This makes phone enumeration expensive even across
 -- server restarts and multiple app processes; repeated lookups of the same contact are idempotent
@@ -512,7 +525,8 @@ CREATE TABLE IF NOT EXISTS account_events (
   type              TEXT   NOT NULL CHECK (type IN
                        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
                         'dialog.created','member.added','member.removed','member.role_changed','member.left',
-                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated')),
+                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
+                        'security.changed')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -538,6 +552,16 @@ DO $$ BEGIN
        'dialog.created','member.added','member.removed','member.role_changed','member.left',
        'dialog.profile_updated','dialog.closed','dialog.access_revoked',
        'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v4')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v4') THEN
+    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v4 CHECK (type IN
+      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
+       'dialog.created','member.added','member.removed','member.role_changed','member.left',
+       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
+       'dialog.preferences_updated','profile.updated','draft.updated','security.changed')) NOT VALID;
   END IF;
 END $$;
 

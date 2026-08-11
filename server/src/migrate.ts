@@ -193,6 +193,12 @@ await completeNamedConstraintMigration(
   "account_events_type_check",
   "account_events_type_check_v3",
 );
+await completeNamedConstraintMigration(
+  "account-events-type-v4",
+  "account_events",
+  "account_events_type_check",
+  "account_events_type_check_v4",
+);
 await completeConstraintMigration(
   "message-mutation-operation-v2",
   "message_mutation_requests",

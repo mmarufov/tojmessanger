@@ -996,10 +996,12 @@ actor SessionCredentialCoordinator {
     private var acceptedAccessTokens: Set<String> = []
     private var refreshTask: Task<CloudSession, Error>?
     private var generation: UInt64 = 0
+    private let networkSession: URLSession
     private let updatesContinuation: AsyncStream<SessionCredentialEvent>.Continuation
     nonisolated let updates: AsyncStream<SessionCredentialEvent>
 
-    init() {
+    init(networkSession: URLSession = .shared) {
+        self.networkSession = networkSession
         (updates, updatesContinuation) = AsyncStream.makeStream(of: SessionCredentialEvent.self)
     }
 
@@ -1060,7 +1062,7 @@ actor SessionCredentialCoordinator {
             if pending == nil { try await tokenStore.savePendingRefreshRotation(rotationId) }
             return try await CloudAPI(
                 config: config,
-                session: .shared,
+                session: networkSession,
                 credentialCoordinator: nil
             ).refreshSession(refreshToken: refreshToken, rotationId: rotationId)
         }
@@ -1273,6 +1275,18 @@ struct CloudAPI: Sendable {
     ) async throws -> TwoFactorConfigurationResponse {
         try await delete(
             "v1/security/two-factor",
+            body: ["stepUpToken": stepUpToken, "currentCredential": currentCredential],
+            token: token
+        )
+    }
+
+    func regenerateTwoFactorRecoveryCodes(
+        stepUpToken: String,
+        currentCredential: String,
+        token: String
+    ) async throws -> TwoFactorConfigurationResponse {
+        try await post(
+            "v1/security/two-factor/recovery-codes",
             body: ["stepUpToken": stepUpToken, "currentCredential": currentCredential],
             token: token
         )

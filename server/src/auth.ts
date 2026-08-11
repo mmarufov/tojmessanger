@@ -4,10 +4,13 @@ import {
   seal, open, PHONE_AAD, phoneLookupHash, codeHash, hashToken, normalizePhone, constantTimeEqual,
 } from "./crypto";
 import { enqueuePushDeliveries } from "./push";
+import { notifySyncWakeups } from "./sync-wakeup";
+import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
 export { AuthError } from "./auth-error";
 import {
   issueV2Session,
+  notifySessionRevocation,
   resolveV2Access,
   type AuthV2Session,
 } from "./session-security";
@@ -23,9 +26,11 @@ const CONTACT_LOOKUP_WINDOW_LIMIT = 20;
 const CONTACT_LOOKUP_DAILY_LIMIT = 100;
 const ALLOWED_PLATFORMS = new Set(["ios", "android", "web", "desktop"]);
 type OTPPurpose = "login" | "account_deletion" | "security_change";
+export type SecurityChangeEvent = "two_factor_enabled" | "two_factor_changed" | "two_factor_disabled";
 
 export interface OTPDelivery {
   send(phone: string, code: string, purpose: OTPPurpose): Promise<void>;
+  sendSecurityAlert?(phone: string, event: SecurityChangeEvent): Promise<void>;
 }
 
 class WebhookOTPDelivery implements OTPDelivery {
@@ -39,6 +44,19 @@ class WebhookOTPDelivery implements OTPDelivery {
         "content-type": "application/json",
       },
       body: JSON.stringify({ phone, code, purpose, service: "Toj" }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) throw new Error(`SMS delivery returned HTTP ${response.status}`);
+  }
+
+  async sendSecurityAlert(phone: string, event: SecurityChangeEvent): Promise<void> {
+    const response = await fetch(this.url, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${this.bearerToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ phone, event, kind: "security_alert", service: "Toj" }),
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) throw new Error(`SMS delivery returned HTTP ${response.status}`);
@@ -374,10 +392,8 @@ async function completePhoneVerification<T>(
 }
 
 const TWO_FACTOR_MAX_ATTEMPTS = 5;
-const COMMON_PASSWORDS = new Set([
-  "12345678", "123456789", "password", "password1", "qwerty123", "letmein123",
-  "11111111", "00000000", "iloveyou", "admin123", "welcome1", "tojpassword",
-]);
+const TWO_FACTOR_ACCOUNT_WINDOW_LIMIT = 20;
+const TWO_FACTOR_NETWORK_WINDOW_LIMIT = 50;
 const RECOVERY_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 export type TwoFactorLoginResponse = {
@@ -391,7 +407,7 @@ function validateTwoFactorPassword(password: unknown): string {
   if (length < 8 || length > 128) {
     throw new AuthError("password must contain 8 to 128 characters", 400);
   }
-  if (COMMON_PASSWORDS.has(password.toLocaleLowerCase("en-US"))) {
+  if (COMMON_PASSWORDS_V1.has(password.toLocaleLowerCase("en-US"))) {
     throw new AuthError("choose a less common password", 400);
   }
   return password;
@@ -456,6 +472,9 @@ async function revokeOtherAccountDevices(sql: SQL, accountId: string, keepDevice
   if (rows.length) await sql`
     UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'security_change'
     WHERE device_id IN ${sql(rows.map((row) => String(row.id)))}`;
+  for (const row of rows) {
+    await notifySessionRevocation(sql, accountId, String(row.id), "security_change");
+  }
   return rows.map((row) => String(row.id));
 }
 
@@ -466,6 +485,7 @@ export async function completeTwoFactorLogin(
     password?: string;
     recoveryCode?: string;
     newPassword?: string;
+    networkKey?: string | null;
   },
 ): Promise<TwoFactorLoginResponse> {
   const result = await sql.begin(async (tx) => {
@@ -478,6 +498,27 @@ export async function completeTwoFactorLogin(
       return new AuthError("too many attempts; request a new SMS code", 429, undefined, "challenge_locked");
     }
     const accountId = String(challenge.account_id);
+    const networkHash = input.networkKey
+      ? hashToken(`two-factor-network|${input.networkKey}`)
+      : null;
+    if (networkHash) await tx`SELECT pg_advisory_xact_lock(${networkHash.readBigInt64BE(0)})`;
+    const accountAttempts = Number((await tx`
+      SELECT count(*) AS count FROM two_factor_attempt_budgets
+      WHERE account_id = ${accountId} AND accepted_at > now() - interval '15 minutes'`)[0].count);
+    if (accountAttempts >= TWO_FACTOR_ACCOUNT_WINDOW_LIMIT) {
+      return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
+    }
+    if (networkHash) {
+      const networkAttempts = Number((await tx`
+        SELECT count(*) AS count FROM two_factor_attempt_budgets
+        WHERE network_hash = ${networkHash} AND accepted_at > now() - interval '15 minutes'`)[0].count);
+      if (networkAttempts >= TWO_FACTOR_NETWORK_WINDOW_LIMIT) {
+        return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
+      }
+    }
+    await tx`
+      INSERT INTO two_factor_attempt_budgets (account_id, network_hash)
+      VALUES (${accountId}, ${networkHash})`;
     const factor = (await tx`
       SELECT password_hash FROM account_two_factor WHERE account_id = ${accountId} FOR UPDATE`)[0];
     if (!factor) return new AuthError("two-step verification is no longer enabled", 409, undefined, "factor_changed");
@@ -510,6 +551,9 @@ export async function completeTwoFactorLogin(
       await tx`
         UPDATE two_factor_login_challenges SET attempts = attempts + 1
         WHERE id = ${challenge.id}`;
+      if (Number(challenge.attempts) + 1 >= TWO_FACTOR_MAX_ATTEMPTS) {
+        return new AuthError("too many attempts; request a new SMS code", 429, undefined, "challenge_locked");
+      }
       return new AuthError("incorrect password or recovery code", 401, undefined, "incorrect_second_factor");
     }
     const claimed = await tx`
@@ -581,9 +625,25 @@ export async function completeSecurityStepUp(
         AND consumed_at IS NULL AND expires_at > now()
       ORDER BY created_at DESC LIMIT 1 FOR UPDATE`)[0];
     if (!challenge) return new AuthError("no active security code", 401);
+    if (Number(challenge.attempts) >= TWO_FACTOR_MAX_ATTEMPTS) {
+      return new AuthError(
+        "too many attempts; request a new security code",
+        429,
+        undefined,
+        "challenge_locked",
+      );
+    }
     const expected = codeHash(code, challenge.code_salt ? Buffer.from(challenge.code_salt) : undefined);
     if (!constantTimeEqual(Buffer.from(challenge.code_hash), expected)) {
       await tx`UPDATE otp_challenges SET attempts = attempts + 1 WHERE id = ${challenge.id}`;
+      if (Number(challenge.attempts) + 1 >= TWO_FACTOR_MAX_ATTEMPTS) {
+        return new AuthError(
+          "too many attempts; request a new security code",
+          429,
+          undefined,
+          "challenge_locked",
+        );
+      }
       return new AuthError("incorrect code", 401);
     }
     await tx`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challenge.id}`;
@@ -596,31 +656,43 @@ export async function completeSecurityStepUp(
   return result;
 }
 
-async function consumeStepUp(sql: SQL, accountId: string, tokenValue: unknown): Promise<void> {
-  if (typeof tokenValue !== "string") throw new AuthError("security verification required", 401);
-  const consumed = await sql`
-    UPDATE security_step_up_tickets SET consumed_at = now()
+async function requireStepUp(
+  sql: SQL,
+  accountId: string,
+  tokenValue: unknown,
+): Promise<{ id: string } | AuthError> {
+  if (typeof tokenValue !== "string") {
+    return new AuthError("security verification required", 401, undefined, "step_up_expired");
+  }
+  const ticket = (await sql`
+    SELECT id, attempts FROM security_step_up_tickets
     WHERE account_id = ${accountId} AND token_hash = ${hashToken(tokenValue)}
       AND consumed_at IS NULL AND expires_at > now()
-    RETURNING id`;
-  if (!consumed.length) throw new AuthError("security verification expired", 401, undefined, "step_up_expired");
+    FOR UPDATE`)[0];
+  if (!ticket) return new AuthError("security verification expired", 401, undefined, "step_up_expired");
+  if (Number(ticket.attempts) >= TWO_FACTOR_MAX_ATTEMPTS) {
+    return new AuthError("too many attempts; request a new security code", 429, undefined, "challenge_locked");
+  }
+  return { id: String(ticket.id) };
 }
 
 async function verifyCurrentFactor(
   sql: SQL,
   accountId: string,
   credential: unknown,
-): Promise<void> {
+): Promise<boolean> {
   const factor = (await sql`
     SELECT password_hash FROM account_two_factor WHERE account_id = ${accountId} FOR UPDATE`)[0];
-  if (!factor) return;
-  if (typeof credential === "string" && await Bun.password.verify(credential, String(factor.password_hash))) return;
+  if (!factor) return true;
+  if (typeof credential === "string" && await Bun.password.verify(credential, String(factor.password_hash))) {
+    return true;
+  }
   const normalized = normalizedRecoveryCode(credential);
   const recovered = normalized.length === 16 ? await sql`
     UPDATE two_factor_recovery_codes SET consumed_at = now()
     WHERE account_id = ${accountId} AND code_hash = ${recoveryCodeHash(accountId, normalized)}
       AND consumed_at IS NULL RETURNING id` : [];
-  if (!recovered.length) throw new AuthError("current password or recovery code is incorrect", 401, undefined, "incorrect_second_factor");
+  return recovered.length > 0;
 }
 
 export async function configureTwoFactor(
@@ -634,10 +706,20 @@ export async function configureTwoFactor(
   },
 ): Promise<{ enabled: true; recoveryCodes: string[]; session: AuthV2Session; revokedDeviceIds: string[] }> {
   const nextPassword = validateTwoFactorPassword(input.password);
-  const nextHash = await passwordHash(nextPassword);
-  return await sql.begin(async (tx) => {
-    await consumeStepUp(tx, input.accountId, input.stepUpToken);
-    await verifyCurrentFactor(tx, input.accountId, input.currentCredential);
+  const result = await sql.begin(async (tx) => {
+    const ticket = await requireStepUp(tx, input.accountId, input.stepUpToken);
+    if (ticket instanceof AuthError) return ticket;
+    if (!await verifyCurrentFactor(tx, input.accountId, input.currentCredential)) {
+      await tx`UPDATE security_step_up_tickets SET attempts = attempts + 1 WHERE id = ${ticket.id}`;
+      return new AuthError(
+        "current password or recovery code is incorrect",
+        401,
+        undefined,
+        "incorrect_second_factor",
+      );
+    }
+    const nextHash = await passwordHash(nextPassword);
+    await tx`UPDATE security_step_up_tickets SET consumed_at = now() WHERE id = ${ticket.id}`;
     await tx`
       INSERT INTO account_two_factor (account_id, password_hash)
       VALUES (${input.accountId}, ${nextHash})
@@ -649,15 +731,65 @@ export async function configureTwoFactor(
     });
     return { enabled: true as const, recoveryCodes, session, revokedDeviceIds };
   });
+  if (result instanceof AuthError) throw result;
+  return result;
+}
+
+export async function regenerateTwoFactorRecoveryCodes(
+  sql: SQL,
+  input: {
+    accountId: string;
+    currentDeviceId: string;
+    stepUpToken: string;
+    currentCredential: string;
+  },
+): Promise<{ enabled: true; recoveryCodes: string[]; session: AuthV2Session; revokedDeviceIds: string[] }> {
+  const result = await sql.begin(async (tx) => {
+    const ticket = await requireStepUp(tx, input.accountId, input.stepUpToken);
+    if (ticket instanceof AuthError) return ticket;
+    const factor = await tx`
+      SELECT account_id FROM account_two_factor WHERE account_id = ${input.accountId} FOR UPDATE`;
+    if (!factor.length) {
+      return new AuthError("two-step verification is not enabled", 409, undefined, "factor_changed");
+    }
+    if (!await verifyCurrentFactor(tx, input.accountId, input.currentCredential)) {
+      await tx`UPDATE security_step_up_tickets SET attempts = attempts + 1 WHERE id = ${ticket.id}`;
+      return new AuthError(
+        "current password or recovery code is incorrect",
+        401,
+        undefined,
+        "incorrect_second_factor",
+      );
+    }
+    await tx`UPDATE security_step_up_tickets SET consumed_at = now() WHERE id = ${ticket.id}`;
+    const recoveryCodes = await replaceRecoveryCodes(tx, input.accountId);
+    const revokedDeviceIds = await revokeOtherAccountDevices(tx, input.accountId, input.currentDeviceId);
+    const session = await issueV2Session(tx, {
+      accountId: input.accountId, platform: "ios", existingDeviceId: input.currentDeviceId,
+    });
+    return { enabled: true as const, recoveryCodes, session, revokedDeviceIds };
+  });
+  if (result instanceof AuthError) throw result;
+  return result;
 }
 
 export async function disableTwoFactor(
   sql: SQL,
   input: { accountId: string; currentDeviceId: string; stepUpToken: string; currentCredential: string },
 ): Promise<{ enabled: false; session: AuthV2Session; revokedDeviceIds: string[] }> {
-  return await sql.begin(async (tx) => {
-    await consumeStepUp(tx, input.accountId, input.stepUpToken);
-    await verifyCurrentFactor(tx, input.accountId, input.currentCredential);
+  const result = await sql.begin(async (tx) => {
+    const ticket = await requireStepUp(tx, input.accountId, input.stepUpToken);
+    if (ticket instanceof AuthError) return ticket;
+    if (!await verifyCurrentFactor(tx, input.accountId, input.currentCredential)) {
+      await tx`UPDATE security_step_up_tickets SET attempts = attempts + 1 WHERE id = ${ticket.id}`;
+      return new AuthError(
+        "current password or recovery code is incorrect",
+        401,
+        undefined,
+        "incorrect_second_factor",
+      );
+    }
+    await tx`UPDATE security_step_up_tickets SET consumed_at = now() WHERE id = ${ticket.id}`;
     await tx`DELETE FROM account_two_factor WHERE account_id = ${input.accountId}`;
     const revokedDeviceIds = await revokeOtherAccountDevices(tx, input.accountId, input.currentDeviceId);
     const session = await issueV2Session(tx, {
@@ -665,6 +797,60 @@ export async function disableTwoFactor(
     });
     return { enabled: false as const, session, revokedDeviceIds };
   });
+  if (result instanceof AuthError) throw result;
+  return result;
+}
+
+/** Best-effort non-secret alert. Provider failure never rolls back the committed security change. */
+export async function sendSecurityChangeAlert(
+  sql: SQL,
+  accountId: string,
+  event: SecurityChangeEvent,
+  delivery: OTPDelivery | null,
+): Promise<void> {
+  try {
+    await sql.begin(async (tx) => {
+      const state = (await tx`
+        UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
+        WHERE account_id = ${accountId}
+        RETURNING pts`)[0];
+      if (!state) return;
+      const pts = Number(state.pts);
+      await tx`
+        INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
+        VALUES (
+          ${accountId}, ${pts}, 'security.changed', ${accountId},
+          ${JSON.stringify({ event })}::jsonb
+        )`;
+      await enqueuePushDeliveries(tx, {
+        accountId,
+        pts,
+        senderAccountId: accountId,
+        forceAlert: true,
+      });
+      await notifySyncWakeups(tx, [{ accountId, pts, ptsCount: 1 }]);
+    });
+  } catch (error) {
+    console.error(new Date().toISOString(), "auth.security_alert.push_failed",
+      error instanceof Error ? error.name : "UnknownError");
+  }
+
+  if (!delivery?.sendSecurityAlert) return;
+  try {
+    const account = (await sql`
+      SELECT phone_e164_ciphertext, phone_nonce, phone_key_id
+      FROM accounts WHERE id = ${accountId}`)[0];
+    if (!account) return;
+    const phone = open({
+      ciphertext: Buffer.from(account.phone_e164_ciphertext),
+      nonce: Buffer.from(account.phone_nonce),
+      keyId: String(account.phone_key_id),
+    }, PHONE_AAD).toString("utf8");
+    await delivery.sendSecurityAlert(phone, event);
+  } catch (error) {
+    console.error(new Date().toISOString(), "auth.security_alert.sms_failed",
+      error instanceof Error ? error.name : "UnknownError");
+  }
 }
 
 /** Contact discovery: resolve a phone number to an account so the client can open a direct dialog. */
@@ -942,6 +1128,7 @@ export async function revokeDevice(
     await tx`
       UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'device_revoked'
       WHERE device_id = ${deviceId}`;
+    await notifySessionRevocation(tx, accountId, deviceId, "device_revoked");
     await options.beforeCommit?.(tx);
     return { revoked: true };
   });

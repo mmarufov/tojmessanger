@@ -9,7 +9,9 @@ import {
   startSecurityChange,
   completeSecurityStepUp,
   configureTwoFactor,
+  regenerateTwoFactorRecoveryCodes,
   disableTwoFactor,
+  sendSecurityChangeAlert,
   resolveDevice,
   lookupAccountByPhone,
   lookupAccountByUsername,
@@ -611,6 +613,7 @@ export function startCloudServer(
               password: body.password,
               recoveryCode: body.recoveryCode,
               newPassword: body.newPassword,
+              networkKey: networkKey(req, server),
             });
             if (result.recoveryCodes) metrics.recordAuthSecurity("recovery_used");
             response = json(result);
@@ -1410,6 +1413,7 @@ export function startCloudServer(
         if (url.pathname === "/v1/security/two-factor" && req.method === "PUT") {
           if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
           else {
+            const wasEnabled = (await twoFactorStatus(db, session.accountId)).enabled;
             const result = await configureTwoFactor(db, {
               accountId: session.accountId,
               currentDeviceId: session.deviceId,
@@ -1420,6 +1424,12 @@ export function startCloudServer(
             for (const deviceId of result.revokedDeviceIds) {
               disconnectDevice(sockets, session.accountId, deviceId);
             }
+            await sendSecurityChangeAlert(
+              db,
+              session.accountId,
+              wasEnabled ? "two_factor_changed" : "two_factor_enabled",
+              otpDelivery,
+            );
             metrics.recordAuthSecurity("two_factor_configured");
             response = json(result);
           }
@@ -1437,7 +1447,26 @@ export function startCloudServer(
             for (const deviceId of result.revokedDeviceIds) {
               disconnectDevice(sockets, session.accountId, deviceId);
             }
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_disabled", otpDelivery);
             metrics.recordAuthSecurity("two_factor_disabled");
+            response = json(result);
+          }
+        }
+
+        if (url.pathname === "/v1/security/two-factor/recovery-codes" && req.method === "POST") {
+          if (!twoFactorConfigured()) response = new Response("not found", { status: 404 });
+          else {
+            const result = await regenerateTwoFactorRecoveryCodes(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_changed", otpDelivery);
+            metrics.recordAuthSecurity("recovery_codes_regenerated");
             response = json(result);
           }
         }

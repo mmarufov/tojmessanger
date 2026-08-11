@@ -2815,6 +2815,7 @@ private struct TwoFactorSettingsView: View {
         case overview
         case code
         case configure
+        case regenerate
         case disable
     }
 
@@ -2851,6 +2852,8 @@ private struct TwoFactorSettingsView: View {
                     securityCodeEntry
                 case .configure:
                     passwordConfiguration
+                case .regenerate:
+                    recoveryCodeRegeneration
                 case .disable:
                     disableConfirmation
                 }
@@ -2887,6 +2890,11 @@ private struct TwoFactorSettingsView: View {
             .frame(maxWidth: .infinity)
 
             if model.twoFactorEnabled {
+                Button("Replace recovery codes") {
+                    beginStepUp(next: .regenerate)
+                }
+                .buttonStyle(.bordered)
+
                 Button("Turn off two-step verification", role: .destructive) {
                     beginStepUp(next: .disable)
                 }
@@ -2975,6 +2983,30 @@ private struct TwoFactorSettingsView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(TojTheme.danger)
+            .disabled(currentCredential.isEmpty || model.securityChangeInFlight)
+        }
+    }
+
+    private var recoveryCodeRegeneration: some View {
+        VStack(spacing: 14) {
+            Text("Enter your current password or an unused recovery code. Every old recovery code will stop working and other sessions will be signed out.")
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            SecureField("Password or recovery code", text: $currentCredential)
+                .textContentType(.password)
+                .tojSecurityField()
+            Button("Replace recovery codes") {
+                Task {
+                    if await model.regenerateTwoFactorRecoveryCodes(
+                        currentCredential: currentCredential
+                    ) {
+                        stage = .overview
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.gold)
             .disabled(currentCredential.isEmpty || model.securityChangeInFlight)
         }
     }
