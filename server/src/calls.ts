@@ -740,6 +740,23 @@ export async function createCall(sql: SQL, p: {
       return { call: snapshot(duplicate), ringTargetCount, hints: [] };
     }
 
+    // Discover the immutable direct-dialog participants without taking row locks, then enter the
+    // same account-mutation boundary used by blocking and message sends. Taking membership locks
+    // first can deadlock with a queued sender that already owns the account advisory locks.
+    const candidatePair = (await tx`
+      SELECT account_low, account_high
+      FROM direct_dialog_pairs
+      WHERE dialog_id = ${dialogId}
+        AND (${p.callerAccountId}::uuid = account_low OR ${p.callerAccountId}::uuid = account_high)`)[0];
+    if (!candidatePair) throw new CallError("eligible direct dialog required", "ineligible", 403);
+    const candidateCalleeAccountId = candidatePair.account_low === p.callerAccountId
+      ? candidatePair.account_high
+      : candidatePair.account_low;
+    const participants = [p.callerAccountId, candidateCalleeAccountId].sort();
+    await lockAccountMutations(tx, participants);
+
+    // Revalidate membership and account status while locked. Anchor the query to the discovered
+    // pair so an unexpected concurrent replacement fails closed instead of changing lock scope.
     const pair = (await tx`
       SELECT pair.account_low, pair.account_high
       FROM direct_dialog_pairs pair
@@ -750,6 +767,8 @@ export async function createCall(sql: SQL, p: {
       JOIN accounts low_account ON low_account.id = pair.account_low AND low_account.status IN ('active','limited')
       JOIN accounts high_account ON high_account.id = pair.account_high AND high_account.status IN ('active','limited')
       WHERE pair.dialog_id = ${dialogId}
+        AND pair.account_low = ${candidatePair.account_low}
+        AND pair.account_high = ${candidatePair.account_high}
         AND (${p.callerAccountId}::uuid = pair.account_low OR ${p.callerAccountId}::uuid = pair.account_high)
       FOR SHARE`)[0];
     if (!pair) throw new CallError("eligible direct dialog required", "ineligible", 403);
@@ -769,9 +788,6 @@ export async function createCall(sql: SQL, p: {
     if (selectableMediaProfiles.length === 0) {
       throw new CallError("video calls are unavailable", "video_unavailable", 409);
     }
-    const participants = [p.callerAccountId, calleeAccountId].sort();
-    await lockAccountMutations(tx, participants);
-
     const blocked = await tx`
       SELECT 1 FROM account_blocks
       WHERE (blocker_account_id = ${p.callerAccountId} AND blocked_account_id = ${calleeAccountId})
