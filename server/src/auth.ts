@@ -373,10 +373,15 @@ export async function updateProfile(
   deviceId: string,
   input: { username?: unknown; firstName?: unknown; lastName?: unknown; bio?: unknown; birthday?: unknown; colorIndex?: unknown },
 ): Promise<{ profile: ProfileDTO; pushes: ProfilePush[] }> {
-  const rawUsername = typeof input.username === "string" ? input.username.trim().toLowerCase() : "";
-  const username = rawUsername || null;
-  if (username && (!/^[a-z][a-z0-9_]{4,31}$/.test(username)
-    || new Set(["admin", "support", "settings", "login", "tojapp"]).has(username))) {
+  const hasUsername = Object.prototype.hasOwnProperty.call(input, "username");
+  if (hasUsername && input.username !== null && typeof input.username !== "string") {
+    throw new AuthError("username must be a string or null", 400);
+  }
+  const requestedUsername = hasUsername
+    ? (typeof input.username === "string" ? input.username.trim().toLowerCase() : "") || null
+    : undefined;
+  if (requestedUsername && (!/^[a-z][a-z0-9_]{4,31}$/.test(requestedUsername)
+    || new Set(["admin", "support", "settings", "login", "tojapp"]).has(requestedUsername))) {
     throw new AuthError("username must start with a letter and contain 5-32 letters, numbers, or underscores", 400);
   }
   const firstName = typeof input.firstName === "string" ? input.firstName.trim().slice(0, 48) : "";
@@ -396,6 +401,11 @@ export async function updateProfile(
       FROM accounts WHERE id = ${accountId} AND status IN ('active','limited') FOR UPDATE`)[0];
     if (!current) throw new AuthError("account unavailable", 403);
     await requireActiveDevice(tx, accountId, deviceId);
+    // Username was added after the profile endpoint shipped. Older clients omit the key, so
+    // absence must mean "preserve"; explicit null/empty string remains the clear operation.
+    const username = requestedUsername === undefined
+      ? (current.username == null ? null : String(current.username))
+      : requestedUsername;
     const currentBirthday = birthdayString(current.birthday);
     const changed = (current.username ?? null) !== username
       || current.first_name !== firstName || current.last_name !== lastName

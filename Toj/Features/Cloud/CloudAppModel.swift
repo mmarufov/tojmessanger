@@ -404,6 +404,8 @@ final class CloudAppModel {
     @ObservationIgnored private lazy var draftSyncCoordinator = DraftSyncCoordinator(api: api)
     @ObservationIgnored private lazy var dialogPreferencesCoordinator =
         DialogPreferencesCoordinator(api: api)
+    @ObservationIgnored private let productivitySyncCoordinator =
+        CloudProductivitySyncCoordinator()
     private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
@@ -417,6 +419,12 @@ final class CloudAppModel {
     private var recordingTask: Task<Void, Never>?
     private var composerMediaTask: Task<Void, Never>?
     private var profileSyncTask: Task<Void, Never>?
+    private var profileSaveTasks: [UUID: Task<Bool, Never>] = [:]
+    private var productivityTerminalAcknowledgementTask: (id: UUID, task: Task<Void, Never>)?
+    private var pendingProductivityTerminalNotice: (
+        noticeId: UUID,
+        failure: CloudProductivityTerminalError
+    )?
     private var profilePhotoMigrationTask: Task<Void, Never>?
     private var postSignInTask: Task<Void, Never>?
     private var postSyncWorkTask: Task<Void, Never>?
@@ -829,7 +837,29 @@ final class CloudAppModel {
     }
 
     func dismissOperationNotice() {
+        let terminal = pendingProductivityTerminalNotice.flatMap { pending in
+            operationNotice?.id == pending.noticeId ? pending.failure : nil
+        }
         operationNotice = nil
+        if terminal != nil { pendingProductivityTerminalNotice = nil }
+        guard let terminal, let context = currentAccountOperationContext() else { return }
+        productivityTerminalAcknowledgementTask?.task.cancel()
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.productivityTerminalAcknowledgementTask?.id == id {
+                    self.productivityTerminalAcknowledgementTask = nil
+                }
+            }
+            await self.productivitySyncCoordinator.bind(context)
+            guard self.isCurrentAccountOperation(context) else { return }
+            try? await self.productivitySyncCoordinator.acknowledgeTerminalError(terminal)
+            guard self.isCurrentAccountOperation(context) else { return }
+            let report = await self.productivitySyncCoordinator.drain(api: self.api)
+            await self.publishProductivityDrainReport(report, context: context)
+        }
+        productivityTerminalAcknowledgementTask = (id, task)
     }
 
     func resetAuthCode() {
@@ -841,10 +871,19 @@ final class CloudAppModel {
 
     func loadProfileDetails() async {
         guard let saved = storedSession else { return }
+        let generation = accountSessionGeneration
+        let expectedStore = localStore
         do {
-            profileDetails = try await tokenStore.loadProfile(accountId: saved.session.accountId)
+            let loaded = try await tokenStore.loadProfile(accountId: saved.session.accountId)
                 ?? Self.profileDetails(from: saved.displayName)
+            guard profileOperationIsCurrent(
+                saved: saved, generation: generation, store: expectedStore
+            ) else { return }
+            profileDetails = loaded
         } catch {
+            guard profileOperationIsCurrent(
+                saved: saved, generation: generation, store: expectedStore
+            ) else { return }
             profileDetails = Self.profileDetails(from: saved.displayName)
             status = "Could not load profile details"
         }
@@ -875,6 +914,30 @@ final class CloudAppModel {
 
         profileSaveInFlight = true
         defer { profileSaveInFlight = false }
+        let generation = accountSessionGeneration
+        let expectedStore = localStore
+        let operationId = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return false }
+            return await self.performProfileSave(
+                cleaned,
+                saved: saved,
+                generation: generation,
+                store: expectedStore
+            )
+        }
+        profileSaveTasks[operationId] = task
+        let result = await task.value
+        profileSaveTasks.removeValue(forKey: operationId)
+        return result
+    }
+
+    private func performProfileSave(
+        _ cleaned: StoredProfileDetails,
+        saved: StoredCloudSession,
+        generation: UInt64,
+        store expectedStore: CloudLocalStore?
+    ) async -> Bool {
         let updatedSession = StoredCloudSession(
             session: saved.session,
             phone: saved.phone,
@@ -882,13 +945,29 @@ final class CloudAppModel {
         )
 
         do {
+            guard profileOperationIsCurrent(
+                saved: saved, generation: generation, store: expectedStore
+            ),
+                  !Task.isCancelled else { return false }
             try await tokenStore.saveProfile(cleaned, accountId: saved.session.accountId)
+            guard profileOperationIsCurrent(
+                saved: saved, generation: generation, store: expectedStore
+            ),
+                  !Task.isCancelled else { return false }
             try await tokenStore.save(updatedSession)
         } catch {
-            status = "Could not save profile: \(error.localizedDescription)"
+            if profileOperationIsCurrent(
+                saved: saved, generation: generation, store: expectedStore
+            ) {
+                status = "Could not save profile: \(error.localizedDescription)"
+            }
             return false
         }
 
+        guard profileOperationIsCurrent(
+            saved: saved, generation: generation, store: expectedStore
+        ),
+              !Task.isCancelled else { return false }
         profileDetails = cleaned
         storedSession = updatedSession
         displayName = cleaned.displayName
@@ -901,9 +980,35 @@ final class CloudAppModel {
         profileSyncTask?.cancel()
         let token = saved.session.token
         profileSyncTask = Task { [weak self] in
-            await self?.uploadPendingProfile(cleaned, token: token)
+            await self?.uploadPendingProfile(
+                cleaned,
+                accountId: saved.session.accountId,
+                deviceId: saved.session.deviceId,
+                token: token,
+                generation: generation,
+                store: expectedStore
+            )
         }
         return true
+    }
+
+    private func profileOperationIsCurrent(
+        saved: StoredCloudSession,
+        generation: UInt64,
+        store expectedStore: CloudLocalStore?
+    ) -> Bool {
+        let storeMatches = switch (expectedStore, localStore) {
+        case (nil, nil): true
+        case let (expected?, current?): expected === current
+        default: false
+        }
+        return !sessionTeardownActive
+            && !isSessionTeardownInProgress
+            && accountSessionGeneration == generation
+            && storedSession?.session.accountId == saved.session.accountId
+            && storedSession?.session.deviceId == saved.session.deviceId
+            && storedSession?.session.token == saved.session.token
+            && storeMatches
     }
 
     private func reconcileProfileWithServer() {
@@ -913,40 +1018,96 @@ final class CloudAppModel {
         #endif
         profileSyncTask?.cancel()
         let local = profileDetails
+        let generation = accountSessionGeneration
+        let expectedStore = localStore
         profileSyncTask = Task { [weak self] in
             guard let self else { return }
             if local.needsServerSync {
-                await self.uploadPendingProfile(local, token: saved.session.token)
+                await self.uploadPendingProfile(
+                    local,
+                    accountId: saved.session.accountId,
+                    deviceId: saved.session.deviceId,
+                    token: saved.session.token,
+                    generation: generation,
+                    store: expectedStore
+                )
                 return
             }
             do {
                 let profile = try await self.api.getProfile(token: saved.session.token)
                 guard !Task.isCancelled else { return }
-                await self.acceptCanonicalProfile(profile, token: saved.session.token)
+                await self.acceptCanonicalProfile(
+                    profile,
+                    accountId: saved.session.accountId,
+                    deviceId: saved.session.deviceId,
+                    token: saved.session.token,
+                    generation: generation,
+                    store: expectedStore
+                )
             } catch {
                 // Keep the encrypted local snapshot. Reconciliation runs again on the next launch.
             }
         }
     }
 
-    private func uploadPendingProfile(_ local: StoredProfileDetails, token: String) async {
+    private func uploadPendingProfile(
+        _ local: StoredProfileDetails,
+        accountId: String,
+        deviceId: String,
+        token: String,
+        generation: UInt64,
+        store expectedStore: CloudLocalStore?
+    ) async {
         do {
             let profile = try await api.updateProfile(local, token: token)
-            guard !Task.isCancelled else { return }
-            await acceptCanonicalProfile(profile, token: token)
-            status = "Profile updated everywhere"
+            guard !Task.isCancelled,
+                  accountSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.deviceId == deviceId,
+                  storedSession?.session.token == token,
+                  Self.store(expectedStore, matches: localStore) else { return }
+            await acceptCanonicalProfile(
+                profile,
+                accountId: accountId,
+                deviceId: deviceId,
+                token: token,
+                generation: generation,
+                store: expectedStore
+            )
+            if accountSessionGeneration == generation,
+               storedSession?.session.accountId == accountId,
+               storedSession?.session.deviceId == deviceId,
+               storedSession?.session.token == token,
+               Self.store(expectedStore, matches: localStore) {
+                status = "Profile updated everywhere"
+            }
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  accountSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.deviceId == deviceId,
+                  storedSession?.session.token == token,
+                  Self.store(expectedStore, matches: localStore) else { return }
             status = "Profile saved offline — will sync when reconnected"
         }
     }
 
-    private func acceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
+    private func acceptCanonicalProfile(
+        _ profile: CloudProfile,
+        accountId: String,
+        deviceId: String,
+        token: String,
+        generation: UInt64,
+        store expectedStore: CloudLocalStore?
+    ) async {
         guard !sessionTeardownActive,
               let saved = storedSession,
-              saved.session.token == token
+              saved.session.accountId == accountId,
+              saved.session.deviceId == deviceId,
+              saved.session.token == token,
+              accountSessionGeneration == generation,
+              Self.store(expectedStore, matches: localStore)
         else { return }
-        let generation = savedMessagesSessionGeneration
         let details = Self.profileDetails(from: profile, pendingSync: false)
         let updatedSession = StoredCloudSession(
             session: saved.session,
@@ -956,18 +1117,37 @@ final class CloudAppModel {
         do {
             try await tokenStore.saveProfile(details, accountId: saved.session.accountId)
         } catch {
-            status = "Profile updated, but local storage could not be refreshed"
+            if accountSessionGeneration == generation,
+               storedSession?.session.accountId == accountId,
+               storedSession?.session.deviceId == deviceId,
+               storedSession?.session.token == token,
+               Self.store(expectedStore, matches: localStore) {
+                status = "Profile updated, but local storage could not be refreshed"
+            }
             return
         }
         guard !sessionTeardownActive,
-              savedMessagesSessionGeneration == generation,
+              accountSessionGeneration == generation,
               storedSession?.session.accountId == saved.session.accountId,
+              storedSession?.session.deviceId == deviceId,
               storedSession?.session.token == token,
+              Self.store(expectedStore, matches: localStore),
               !Task.isCancelled
         else { return }
         profileDetails = details
         storedSession = updatedSession
         displayName = details.displayName
+    }
+
+    private static func store(
+        _ expected: CloudLocalStore?,
+        matches current: CloudLocalStore?
+    ) -> Bool {
+        switch (expected, current) {
+        case (nil, nil): true
+        case let (expected?, current?): expected === current
+        default: false
+        }
     }
 
     func signOut() async {
@@ -1169,7 +1349,12 @@ final class CloudAppModel {
         let transferTasks = Array(mediaTransferTasks.values)
         let pendingDraftPersistenceTasks = Array(draftPersistenceTasks.values)
         let preferenceTasks = Array(preferenceMutationTasks.values)
+        let pendingProfileSaveTasks = Array(profileSaveTasks.values)
+        profileSaveTasks.removeAll()
         let pendingRetryTask = retryTask
+        let terminalAcknowledgementTask = productivityTerminalAcknowledgementTask?.task
+        productivityTerminalAcknowledgementTask = nil
+        pendingProductivityTerminalNotice = nil
         // Fence find-in-chat publication immediately, then join its detached FTS child with the
         // rest of the SQLCipher readers before the replica is cleared or destroyed.
         inChatSearchGeneration &+= 1
@@ -1187,11 +1372,14 @@ final class CloudAppModel {
             timelineObservationTask, draftObservationTask,
             viewportPersistenceTask, mediaDownloadTask,
             readReceiptRetryTask, replicaIntegrityTask, pendingInChatSearchTask,
+            terminalAcknowledgementTask,
         ].compactMap { $0 }
         backgroundTasks.forEach { $0.cancel() }
         transferTasks.forEach { $0.cancel() }
         preferenceTasks.forEach { $0.cancel() }
+        pendingProfileSaveTasks.forEach { $0.cancel() }
         await dialogPreferencesCoordinator.cancelAndWait()
+        await productivitySyncCoordinator.cancelAndWait()
         voiceRecorder.cancel()
         await hintSocket?.stop()
         hintSocket = nil
@@ -1206,6 +1394,7 @@ final class CloudAppModel {
         for task in backgroundTasks { await task.value }
         for task in transferTasks { await task.value }
         for task in preferenceTasks { await task.value }
+        for task in pendingProfileSaveTasks { _ = await task.value }
         // Draft mutations are intentionally not cancelled: every captured composer generation
         // reaches SQLCipher before logout destroys the account replica.
         for task in pendingDraftPersistenceTasks { await task.value }
@@ -1353,6 +1542,7 @@ final class CloudAppModel {
         profileSaveInFlight = false
         composerMode = .text
         operationNotice = nil
+        pendingProductivityTerminalNotice = nil
         #if DEBUG
         demoLinesByDialog = [:]
         #endif
@@ -3246,7 +3436,7 @@ final class CloudAppModel {
                 await scheduleStagedDraft(deliverAt: deliverAfter, silent: silent)
                 return
             }
-            await sendStagedDraft()
+            await sendStagedDraft(silent: silent)
             return
         }
         // A reply target can be saved before the user types, but it is not itself a message.
@@ -3290,47 +3480,64 @@ final class CloudAppModel {
         )
     }
 
+    private func currentAccountOperationContext() -> AccountOperationContext? {
+        guard !sessionTeardownActive,
+              !isSessionTeardownInProgress,
+              let session = storedSession?.session,
+              let localStore else { return nil }
+        return AccountOperationContext(
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            token: session.token,
+            generation: accountSessionGeneration,
+            store: localStore
+        )
+    }
+
+    private func isCurrentAccountOperation(_ context: AccountOperationContext) -> Bool {
+        guard !sessionTeardownActive,
+              !isSessionTeardownInProgress,
+              accountSessionGeneration == context.generation,
+              let session = storedSession?.session,
+              let localStore else { return false }
+        return session.accountId == context.accountId
+            && session.deviceId == context.deviceId
+            && session.token == context.token
+            && localStore === context.store
+    }
+
     func refreshCloudProductivity() async {
-        guard let session = storedSession?.session, let localStore else { return }
-        let generation = accountSessionGeneration
-        if let cachedFolders = try? await localStore.chatFolderSnapshot(accountId: session.accountId) {
+        guard let context = currentAccountOperationContext() else { return }
+        await productivitySyncCoordinator.bind(context)
+        if let cachedFolders = try? await context.store.effectiveChatFolderSnapshot(
+            accountId: context.accountId
+        ), isCurrentAccountOperation(context) {
             chatFolders = cachedFolders.folders.sorted { $0.position < $1.position }
             chatFolderCollectionRevision = cachedFolders.collectionRevision
         }
-        if let cachedSchedules = try? await localStore.scheduledDeliveries(accountId: session.accountId) {
+        if let cachedSchedules = try? await context.store.scheduledDeliveries(
+            accountId: context.accountId
+        ), isCurrentAccountOperation(context) {
             scheduledDeliveries = cachedSchedules.sorted { $0.deliverAt < $1.deliverAt }
         }
         if capabilities.contains(.chatFolders),
-           let snapshot = try? await api.chatFolders(token: session.token),
-           generation == accountSessionGeneration,
-           session.accountId == storedSession?.session.accountId {
-            try? await localStore.saveChatFolderSnapshot(snapshot, accountId: session.accountId)
+           let snapshot = try? await productivitySyncCoordinator.refreshFolders(api: api),
+           isCurrentAccountOperation(context) {
             chatFolders = snapshot.folders.sorted { $0.position < $1.position }
             chatFolderCollectionRevision = snapshot.collectionRevision
         }
         if capabilities.contains(.scheduledDelivery) {
-            var remote: [CloudScheduledDelivery] = []
-            var cursor: String?
-            var loadedAllPages = true
-            repeat {
-                guard let page = try? await api.scheduledDeliveries(
-                    cursor: cursor, token: session.token
-                ) else {
-                    loadedAllPages = false
-                    break
-                }
-                remote.append(contentsOf: page.deliveries)
-                cursor = page.nextCursor
-            } while cursor != nil && remote.count <= 100
-            if loadedAllPages,
-               generation == accountSessionGeneration,
-               session.accountId == storedSession?.session.accountId {
-                try? await localStore.replaceScheduledDeliveries(remote, accountId: session.accountId)
-                let merged = (try? await localStore.scheduledDeliveries(accountId: session.accountId))
-                    ?? remote
+            _ = try? await productivitySyncCoordinator.refreshScheduledDeliveries(api: api)
+            if isCurrentAccountOperation(context),
+               let merged = try? await context.store.scheduledDeliveries(
+                accountId: context.accountId
+               ), isCurrentAccountOperation(context) {
                 scheduledDeliveries = merged.sorted { $0.deliverAt < $1.deliverAt }
             }
         }
+        guard isCurrentAccountOperation(context) else { return }
+        let report = await productivitySyncCoordinator.drain(api: api)
+        await publishProductivityDrainReport(report, context: context)
     }
 
     func dialog(_ dialog: Dialog, isIncludedIn folder: CloudChatFolder) -> Bool {
@@ -3359,28 +3566,45 @@ final class CloudAppModel {
         excludeArchived: Bool = true,
         rules: [CloudChatFolderRule] = []
     ) async throws {
-        guard let session = storedSession?.session, capabilities.contains(.chatFolders) else {
+        guard let context = currentAccountOperationContext(), capabilities.contains(.chatFolders) else {
             throw CloudAPIError(status: 404, message: "Chat folders are unavailable", retryAfter: nil)
         }
-        let result = try await api.createChatFolder(
-            CloudFolderMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                folderId: UUID().uuidString.lowercased(),
-                title: title,
-                icon: icon,
-                includeDirect: includeDirect,
-                includeGroups: includeGroups,
-                includeSaved: includeSaved,
-                excludeRead: excludeRead,
-                excludeMuted: excludeMuted,
-                excludeArchived: excludeArchived,
-                rules: rules
-            ),
-            token: session.token
+        let now = ISO8601DateFormatter().string(from: Date())
+        let folder = CloudChatFolder(
+            folderId: UUID().uuidString.lowercased(),
+            title: title,
+            icon: Self.semanticFolderIcon(icon),
+            position: chatFolders.count,
+            includeDirect: includeDirect,
+            includeGroups: includeGroups,
+            includeSaved: includeSaved,
+            excludeRead: excludeRead,
+            excludeMuted: excludeMuted,
+            excludeArchived: excludeArchived,
+            revision: 0,
+            rules: rules,
+            createdAt: now,
+            updatedAt: now
         )
-        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
+        let result: CloudChatFolderSnapshot
+        do {
+            result = try await productivitySyncCoordinator.stageChatFolderMutation(
+                CloudFolderMutationIntent(
+                    operation: .create,
+                    folderId: folder.folderId,
+                    folder: folder,
+                    beforeFolderId: nil,
+                    afterFolderId: nil
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
         chatFolders = result.folders.sorted { $0.position < $1.position }
         chatFolderCollectionRevision = result.collectionRevision
+        status = "Folder saved locally"
+        scheduleOutboxRetry()
     }
 
     func updateChatFolder(
@@ -3395,42 +3619,65 @@ final class CloudAppModel {
         excludeArchived: Bool,
         rules: [CloudChatFolderRule]
     ) async throws {
-        guard let session = storedSession?.session else { return }
-        let result = try await api.updateChatFolder(
-            id: folder.folderId,
-            request: CloudFolderMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                title: title,
-                icon: icon,
-                includeDirect: includeDirect,
-                includeGroups: includeGroups,
-                includeSaved: includeSaved,
-                excludeRead: excludeRead,
-                excludeMuted: excludeMuted,
-                excludeArchived: excludeArchived,
-                rules: rules,
-                expectedRevision: chatFolderCollectionRevision
-            ),
-            token: session.token
+        guard let context = currentAccountOperationContext() else { return }
+        let desired = CloudChatFolder(
+            folderId: folder.folderId,
+            title: title,
+            icon: Self.semanticFolderIcon(icon),
+            position: folder.position,
+            includeDirect: includeDirect,
+            includeGroups: includeGroups,
+            includeSaved: includeSaved,
+            excludeRead: excludeRead,
+            excludeMuted: excludeMuted,
+            excludeArchived: excludeArchived,
+            revision: folder.revision,
+            rules: rules,
+            createdAt: folder.createdAt,
+            updatedAt: ISO8601DateFormatter().string(from: Date())
         )
-        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
+        let result: CloudChatFolderSnapshot
+        do {
+            result = try await productivitySyncCoordinator.stageChatFolderMutation(
+                CloudFolderMutationIntent(
+                    operation: .update,
+                    folderId: folder.folderId,
+                    folder: desired,
+                    beforeFolderId: nil,
+                    afterFolderId: nil
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
         chatFolders = result.folders.sorted { $0.position < $1.position }
         chatFolderCollectionRevision = result.collectionRevision
+        status = "Folder saved locally"
+        scheduleOutboxRetry()
     }
 
     func deleteChatFolder(_ folder: CloudChatFolder) async throws {
-        guard let session = storedSession?.session else { return }
-        let result = try await api.deleteChatFolder(
-            id: folder.folderId,
-            request: CloudFolderMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                expectedRevision: chatFolderCollectionRevision
-            ),
-            token: session.token
-        )
-        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        guard let context = currentAccountOperationContext() else { return }
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
+        let result: CloudChatFolderSnapshot
+        do {
+            result = try await productivitySyncCoordinator.stageChatFolderMutation(
+                CloudFolderMutationIntent(
+                    operation: .delete,
+                    folderId: folder.folderId,
+                    folder: nil,
+                    beforeFolderId: nil,
+                    afterFolderId: nil
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
         chatFolders = result.folders.sorted { $0.position < $1.position }
         chatFolderCollectionRevision = result.collectionRevision
+        status = "Folder removed locally"
+        scheduleOutboxRetry()
     }
 
     func moveChatFolder(
@@ -3438,64 +3685,101 @@ final class CloudAppModel {
         before: CloudChatFolder? = nil,
         after: CloudChatFolder? = nil
     ) async throws {
-        guard let session = storedSession?.session else { return }
-        let result = try await api.moveChatFolder(
-            id: folder.folderId,
-            request: CloudFolderMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                expectedRevision: chatFolderCollectionRevision,
-                beforeFolderId: before?.folderId,
-                afterFolderId: after?.folderId
-            ),
-            token: session.token
-        )
-        try await localStore?.saveChatFolderSnapshot(result, accountId: session.accountId)
+        guard let context = currentAccountOperationContext() else { return }
+        var desiredOrder = chatFolders.map(\.folderId)
+        desiredOrder.removeAll { $0 == folder.folderId }
+        if let before,
+           let index = desiredOrder.firstIndex(of: before.folderId) {
+            desiredOrder.insert(folder.folderId, at: index)
+        } else if let after,
+                  let index = desiredOrder.firstIndex(of: after.folderId) {
+            desiredOrder.insert(folder.folderId, at: index + 1)
+        }
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
+        let result: CloudChatFolderSnapshot
+        do {
+            result = try await productivitySyncCoordinator.stageChatFolderMutation(
+                CloudFolderMutationIntent(
+                    operation: .move,
+                    folderId: folder.folderId,
+                    folder: nil,
+                    beforeFolderId: before?.folderId,
+                    afterFolderId: after?.folderId,
+                    desiredOrder: desiredOrder
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
         chatFolders = result.folders.sorted { $0.position < $1.position }
         chatFolderCollectionRevision = result.collectionRevision
+        status = "Folder order saved locally"
+        scheduleOutboxRetry()
     }
 
     func cancelScheduledDelivery(_ delivery: CloudScheduledDelivery) async throws {
-        guard let session = storedSession?.session else { return }
+        guard let context = currentAccountOperationContext() else { return }
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
         if delivery.revision == 0 {
-            try await localStore?.discardPendingScheduledCreate(
-                scheduleId: delivery.scheduleId,
-                accountId: session.accountId
-            )
-            scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
-            return
+            let effective: [CloudScheduledDelivery]?
+            do {
+                effective = try await productivitySyncCoordinator
+                    .discardUnattemptedScheduledCreate(scheduleId: delivery.scheduleId)
+            } catch CloudProductivityRefreshError.sessionChanged { return }
+            if let effective {
+                guard isCurrentAccountOperation(context) else { return }
+                scheduledDeliveries = effective.sorted { $0.deliverAt < $1.deliverAt }
+                return
+            }
         }
-        let response = try await api.cancelScheduledDelivery(
-            id: delivery.scheduleId,
-            request: CloudScheduledMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                expectedRevision: delivery.revision
-            ),
-            token: session.token
-        )
-        try await localStore?.upsertScheduledDelivery(response.scheduledDelivery, accountId: session.accountId)
-        scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
-        scheduledDeliveries.append(response.scheduledDelivery)
-        scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+        let merged: [CloudScheduledDelivery]
+        do {
+            merged = try await productivitySyncCoordinator.stageScheduledDeliveryMutation(
+                CloudScheduledMutationIntent(
+                    operation: .cancel,
+                    scheduleId: delivery.scheduleId,
+                    deliverAt: nil
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
+        scheduledDeliveries = merged.sorted { $0.deliverAt < $1.deliverAt }
+        status = "Cancellation saved locally — it may still send until confirmed"
+        scheduleOutboxRetry()
     }
 
     func rescheduleDelivery(_ delivery: CloudScheduledDelivery, to date: Date) async throws {
-        guard let session = storedSession?.session else { return }
-        let response = try await api.updateScheduledDelivery(
-            id: delivery.scheduleId,
-            request: CloudScheduledMutationRequest(
-                clientMutationId: UUID().uuidString.lowercased(),
-                expectedRevision: delivery.revision,
-                deliverAt: ISO8601DateFormatter().string(from: date)
-            ),
-            token: session.token
-        )
-        try await localStore?.upsertScheduledDelivery(response.scheduledDelivery, accountId: session.accountId)
-        scheduledDeliveries.removeAll { $0.scheduleId == delivery.scheduleId }
-        scheduledDeliveries.append(response.scheduledDelivery)
-        scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
+        guard let context = currentAccountOperationContext() else { return }
+        await productivitySyncCoordinator.bind(context)
+        guard isCurrentAccountOperation(context) else { return }
+        let merged: [CloudScheduledDelivery]
+        do {
+            merged = try await productivitySyncCoordinator.stageScheduledDeliveryMutation(
+                CloudScheduledMutationIntent(
+                    operation: .reschedule,
+                    scheduleId: delivery.scheduleId,
+                    deliverAt: ISO8601DateFormatter().string(from: date)
+                )
+            )
+        } catch CloudProductivityRefreshError.sessionChanged { return }
+        guard isCurrentAccountOperation(context) else { return }
+        scheduledDeliveries = merged.sorted { $0.deliverAt < $1.deliverAt }
+        status = "New delivery time saved locally"
+        scheduleOutboxRetry()
     }
 
-    private func sendStagedDraft() async {
+    private static func semanticFolderIcon(_ icon: String) -> String {
+        switch icon {
+        case "person.2": "personal"
+        case "message.badge": "unread"
+        case "briefcase": "work"
+        case "star": "favorite"
+        default: icon
+        }
+    }
+
+    private func sendStagedDraft(silent: Bool) async {
         guard
             let dialogId = activeDialogId,
             let accountId = storedSession?.session.accountId,
@@ -3539,7 +3823,8 @@ final class CloudAppModel {
                 let transfer = try await localStore.consumeDraftAsSingleMedia(
                     accountId: accountId,
                     dialogId: dialogId,
-                    operationId: draft.operationId
+                    operationId: draft.operationId,
+                    silent: silent
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -3549,7 +3834,8 @@ final class CloudAppModel {
                 let group = try await localStore.consumeDraftAsMediaGroup(
                     accountId: accountId,
                     dialogId: dialogId,
-                    operationId: draft.operationId
+                    operationId: draft.operationId,
+                    silent: silent
                 )
                 await loadLocalLines(dialogId: dialogId)
                 await refreshDialogs()
@@ -3578,13 +3864,15 @@ final class CloudAppModel {
             return
         }
         guard let dialogId = activeDialogId,
-              let session = storedSession?.session,
-              let localStore else { return }
+              let context = currentAccountOperationContext() else { return }
+        let localStore = context.store
         await draftPersistenceTasks[dialogId]?.value
+        guard isCurrentAccountOperation(context), activeDialogId == dialogId else { return }
         guard let stored = try? await localStore.loadDraft(
-            accountId: session.accountId,
+            accountId: context.accountId,
             dialogId: dialogId
-        ), stored.state == "active", !stored.attachments.isEmpty else { return }
+        ), isCurrentAccountOperation(context), activeDialogId == dialogId,
+           stored.state == "active", !stored.attachments.isEmpty else { return }
         let attachments = stored.attachments.sorted { $0.position < $1.position }
         guard attachments.allSatisfy({
             $0.state == "ready" && $0.mediaId != nil && $0.media != nil
@@ -3627,11 +3915,13 @@ final class CloudAppModel {
             items: items
         )
         do {
-            let local = try await localStore.stageScheduledCreate(
+            await productivitySyncCoordinator.bind(context)
+            guard isCurrentAccountOperation(context) else { return }
+            let local = try await productivitySyncCoordinator.stageScheduledCreate(
                 request,
-                accountId: session.accountId,
                 draftOperationId: stored.operationId
             )
+            guard isCurrentAccountOperation(context), activeDialogId == dialogId else { return }
             suppressDraftPersistence = true
             draft = ""
             suppressDraftPersistence = false
@@ -3640,9 +3930,9 @@ final class CloudAppModel {
             scheduledDeliveries.append(local)
             scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
             status = String(localized: "Waiting for connection — not scheduled yet")
-            await retryPendingScheduledCreates(token: session.token, localStore: localStore)
             scheduleOutboxRetry()
         } catch {
+            guard isCurrentAccountOperation(context) else { return }
             presentNotice("Attachments were not scheduled", message: error.localizedDescription)
         }
     }
@@ -4304,6 +4594,7 @@ final class CloudAppModel {
         deliverAfter: Date? = nil
     ) async {
         guard let token = storedSession?.session.token, let dialogId = activeDialogId else { return }
+        let accountOperationContext = currentAccountOperationContext()
         openingTimelineAnchor = .bottom
         timelineTopVisibleMsgId = nil
         timelineIsAtBottom = true
@@ -4314,6 +4605,10 @@ final class CloudAppModel {
             ? attemptedDraft?.operationId
             : nil
         if let deliverAfter, deliverAfter > Date() {
+            guard let context = accountOperationContext,
+                  context.token == token,
+                  isCurrentAccountOperation(context),
+                  activeDialogId == dialogId else { return }
             guard capabilities.contains(.scheduledDelivery) else {
                 suppressDraftPersistence = true
                 draft = text
@@ -4322,13 +4617,6 @@ final class CloudAppModel {
                     "Scheduled sending is unavailable",
                     message: "Your message was restored to the composer and was not queued locally."
                 )
-                return
-            }
-            guard let localStore, let accountId = storedSession?.session.accountId else {
-                suppressDraftPersistence = true
-                draft = text
-                suppressDraftPersistence = false
-                presentNotice("Message was not scheduled", message: "Encrypted local storage is unavailable.")
                 return
             }
             let request = CloudScheduledCreateRequest(
@@ -4351,18 +4639,20 @@ final class CloudAppModel {
                 )]
             )
             do {
-                let local = try await localStore.stageScheduledCreate(
+                await productivitySyncCoordinator.bind(context)
+                guard isCurrentAccountOperation(context), activeDialogId == dialogId else { return }
+                let local = try await productivitySyncCoordinator.stageScheduledCreate(
                     request,
-                    accountId: accountId,
                     draftOperationId: attemptedDraft?.operationId
                 )
+                guard isCurrentAccountOperation(context), activeDialogId == dialogId else { return }
                 scheduledDeliveries.removeAll { $0.scheduleId == local.scheduleId }
                 scheduledDeliveries.append(local)
                 scheduledDeliveries.sort { $0.deliverAt < $1.deliverAt }
                 status = String(localized: "Waiting for connection — not scheduled yet")
-                await retryPendingScheduledCreates(token: token, localStore: localStore)
                 scheduleOutboxRetry()
             } catch {
+                guard isCurrentAccountOperation(context), activeDialogId == dialogId else { return }
                 suppressDraftPersistence = true
                 draft = text
                 suppressDraftPersistence = false
@@ -5354,7 +5644,15 @@ final class CloudAppModel {
     }
 
     func testAcceptCanonicalProfile(_ profile: CloudProfile, token: String) async {
-        await acceptCanonicalProfile(profile, token: token)
+        guard let session = storedSession?.session else { return }
+        await acceptCanonicalProfile(
+            profile,
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            token: token,
+            generation: accountSessionGeneration,
+            store: localStore
+        )
     }
 
     func testHandleRevokedSessionHint(deviceId: String? = nil) async {
@@ -6159,6 +6457,12 @@ final class CloudAppModel {
     }
 
     private func presentNotice(_ title: String, message: String, opensSettings: Bool = false) {
+        if let pending = pendingProductivityTerminalNotice,
+           operationNotice?.id == pending.noticeId {
+            // A higher-priority notice may replace this alert, but the journal error stays
+            // unacknowledged and will be offered again by the next productivity drain.
+            pendingProductivityTerminalNotice = nil
+        }
         operationNotice = Notice(title: title, message: message, opensSettings: opensSettings)
     }
 
@@ -6664,8 +6968,8 @@ final class CloudAppModel {
                 )
             }
             let updateTypes = Set((difference.updates ?? []).map(\.type))
-            if updateTypes.contains("chat_folders.updated"),
-               let snapshot = try await localStore.chatFolderSnapshot(accountId: accountId) {
+            if updateTypes.contains("chat_folders.updated") {
+                let snapshot = try await localStore.effectiveChatFolderSnapshot(accountId: accountId)
                 chatFolders = snapshot.folders.sorted { $0.position < $1.position }
                 chatFolderCollectionRevision = snapshot.collectionRevision
             }
@@ -6692,11 +6996,18 @@ final class CloudAppModel {
                 }
             }
             if !profileDetails.needsServerSync,
-               let token = storedSession?.session.token,
+               let session = storedSession?.session,
                let ownProfile = (difference.updates ?? []).reversed().compactMap({ update in
                    Self.cloudProfile(from: update, ownAccountId: accountId)
                }).first {
-                await acceptCanonicalProfile(ownProfile, token: token)
+                await acceptCanonicalProfile(
+                    ownProfile,
+                    accountId: accountId,
+                    deviceId: session.deviceId,
+                    token: session.token,
+                    generation: accountSessionGeneration,
+                    store: localStore
+                )
             }
             await enqueueArrivalMediaDownloads((difference.updates ?? []).compactMap { update -> CloudMessage? in
                 guard update.type == "message.new" || update.type == "message.edited" else { return nil }
@@ -7378,15 +7689,26 @@ final class CloudAppModel {
 
     private func retryPendingOutbox() async {
         guard !retryInFlight else { return }
-        guard let token = storedSession?.session.token, let localStore else { return }
+        guard let context = currentAccountOperationContext() else { return }
+        let token = context.token
+        let localStore = context.store
 
         retryInFlight = true
         outboxDrainHalted = false
         defer { retryInFlight = false }
 
         do {
-            await retryPendingScheduledCreates(token: token, localStore: localStore)
-            guard !outboxDrainHalted else { return }
+            await productivitySyncCoordinator.bind(context)
+            let preCreateReport = await productivitySyncCoordinator.drain(api: api)
+            await publishProductivityDrainReport(preCreateReport, context: context)
+            guard isCurrentAccountOperation(context) else { return }
+            await retryPendingScheduledCreates(context: context)
+            guard !outboxDrainHalted, isCurrentAccountOperation(context) else { return }
+            // A successful replay can turn an uncertain local create into a canonical schedule.
+            // Drain again so its queued cancellation wins immediately in the same retry pass.
+            let postCreateReport = await productivitySyncCoordinator.drain(api: api)
+            await publishProductivityDrainReport(postCreateReport, context: context)
+            guard isCurrentAccountOperation(context) else { return }
             await retryPendingGroupCreations(token: token, localStore: localStore)
             guard !outboxDrainHalted else { return }
             await retryPendingGroupMutations()
@@ -7454,36 +7776,84 @@ final class CloudAppModel {
         await retryPendingMediaGroups()
     }
 
+    private func publishProductivityDrainReport(
+        _ report: CloudProductivityDrainReport,
+        context: AccountOperationContext
+    ) async {
+        guard isCurrentAccountOperation(context) else { return }
+        if report.foldersChanged,
+           let snapshot = try? await context.store.effectiveChatFolderSnapshot(
+            accountId: context.accountId
+           ), isCurrentAccountOperation(context) {
+            chatFolders = snapshot.folders.sorted { $0.position < $1.position }
+            chatFolderCollectionRevision = snapshot.collectionRevision
+        }
+        if report.schedulesChanged,
+           let deliveries = try? await context.store.scheduledDeliveries(
+            accountId: context.accountId
+           ), isCurrentAccountOperation(context) {
+            scheduledDeliveries = deliveries.sorted { $0.deliverAt < $1.deliverAt }
+        }
+        if pendingProductivityTerminalNotice == nil,
+           let failure = report.terminalErrors.first,
+           isCurrentAccountOperation(context) {
+            let notice = Notice(
+                title: "A saved change could not be synced",
+                message: failure.message
+            )
+            pendingProductivityTerminalNotice = (notice.id, failure)
+            operationNotice = notice
+        } else if pendingProductivityTerminalNotice == nil,
+                  operationNotice == nil,
+                  let message = report.errors.first,
+                  isCurrentAccountOperation(context) {
+            presentNotice("A saved change could not be synced", message: message)
+        }
+    }
+
     private func retryPendingScheduledCreates(
-        token: String,
-        localStore: CloudLocalStore
+        context: AccountOperationContext
     ) async {
         guard capabilities.contains(.scheduledDelivery),
-              let accountId = storedSession?.session.accountId else { return }
-        let generation = accountSessionGeneration
+              isCurrentAccountOperation(context) else { return }
+        let accountId = context.accountId
+        let token = context.token
+        let localStore = context.store
         let pending: [PendingScheduledCreate]
         do {
             pending = try await localStore.pendingScheduledCreatesReady(accountId: accountId)
+            guard isCurrentAccountOperation(context) else { return }
         } catch {
+            guard isCurrentAccountOperation(context) else { return }
             status = "Scheduled messages paused: \(error.localizedDescription)"
             return
         }
         for item in pending {
             guard !Task.isCancelled,
-                  generation == accountSessionGeneration,
-                  storedSession?.session.accountId == accountId,
-                  storedSession?.session.token == token else { return }
+                  isCurrentAccountOperation(context) else { return }
+            let wasPreviouslyAttempted = item.attemptedAt != nil
             do {
-                let response = try await api.createScheduledDelivery(item.request, token: token)
-                guard generation == accountSessionGeneration,
-                      storedSession?.session.accountId == accountId else { return }
+                // Persist this before the HTTP commit point. A later local cancel may discard only
+                // creates that are known never to have reached the network.
+                try await localStore.markScheduledCreateAttempted(
+                    scheduleId: item.request.scheduleId,
+                    accountId: accountId
+                )
+                guard isCurrentAccountOperation(context) else { return }
+                let response = try await api.createScheduledDelivery(
+                    persistedBody: item.requestData,
+                    token: token
+                )
+                guard isCurrentAccountOperation(context) else { return }
                 try await localStore.acknowledgeScheduledCreate(response, accountId: accountId)
+                guard isCurrentAccountOperation(context) else { return }
                 await clearDraftAfterScheduledAcknowledgement(
                     dialogId: item.request.dialogId,
                     operationId: item.draftOperationId,
                     accountId: accountId,
                     localStore: localStore
                 )
+                guard isCurrentAccountOperation(context) else { return }
                 scheduledDeliveries.removeAll {
                     $0.scheduleId == response.scheduledDelivery.scheduleId
                 }
@@ -7493,6 +7863,7 @@ final class CloudAppModel {
             } catch is CancellationError {
                 return
             } catch {
+                guard isCurrentAccountOperation(context) else { return }
                 let disposition = cloudOperationFailureDisposition(
                     error,
                     serverAdvertisesFeature: capabilities.contains(.scheduledDelivery)
@@ -7507,6 +7878,7 @@ final class CloudAppModel {
                         after: delay,
                         error: error.localizedDescription
                     )
+                    guard isCurrentAccountOperation(context) else { return }
                     status = String(localized: "Waiting for connection — not scheduled yet")
                     publishTransportFailure(error)
                 case .authenticationRequired:
@@ -7517,18 +7889,49 @@ final class CloudAppModel {
                         after: 30,
                         error: "Sign in required"
                     )
-                case .unsupportedServer, .permanent:
+                    guard isCurrentAccountOperation(context) else { return }
+                case .unsupportedServer:
+                    // A mixed-version node or disabled route cannot prove that an earlier attempt
+                    // did not commit. Keep replaying the original bytes so cancellation can resolve
+                    // the accepted schedule instead of orphaning it.
+                    outboxDrainHalted = true
                     try? await localStore.deferScheduledCreate(
                         scheduleId: item.request.scheduleId,
                         accountId: accountId,
-                        after: 0,
-                        error: error.localizedDescription,
-                        terminal: true
+                        after: 300,
+                        error: error.localizedDescription
                     )
-                    presentNotice(
-                        "Message was not scheduled",
-                        message: "The saved draft was kept. \(error.localizedDescription)"
-                    )
+                    guard isCurrentAccountOperation(context) else { return }
+                    status = String(localized: "Scheduled-message sync is waiting for server support")
+                case .permanent:
+                    if cloudScheduledCreateCanTerminalizePermanentFailure(
+                        wasPreviouslyAttempted: wasPreviouslyAttempted
+                    ) {
+                        try? await localStore.deferScheduledCreate(
+                            scheduleId: item.request.scheduleId,
+                            accountId: accountId,
+                            after: 0,
+                            error: error.localizedDescription,
+                            terminal: true
+                        )
+                        guard isCurrentAccountOperation(context) else { return }
+                        presentNotice(
+                            "Message was not scheduled",
+                            message: "The saved draft was kept. \(error.localizedDescription)"
+                        )
+                    } else {
+                        outboxDrainHalted = true
+                        try? await localStore.deferScheduledCreate(
+                            scheduleId: item.request.scheduleId,
+                            accountId: accountId,
+                            after: 300,
+                            error: error.localizedDescription
+                        )
+                        guard isCurrentAccountOperation(context) else { return }
+                        status = String(
+                            localized: "Scheduled-message sync is waiting for server reconciliation"
+                        )
+                    }
                 }
                 if outboxDrainHalted { return }
             }
@@ -7838,6 +8241,7 @@ final class CloudAppModel {
                 draftConsumeOperationId: capabilities.contains(.cloudDrafts)
                     ? group.draftConsumeOperationId
                     : nil,
+                silent: group.payload.silent,
                 token: token
             )
             try await localStore.completeMediaGroupSend(
@@ -8139,6 +8543,7 @@ final class CloudAppModel {
                 draftConsumeOperationId: capabilities.contains(.cloudDrafts)
                     ? ready.draftOperationId
                     : nil,
+                silent: ready.silent,
                 token: token
             )
             try Task.checkCancellation()
@@ -8416,12 +8821,30 @@ final class CloudAppModel {
         let mutationDelay = try? await localStore.nextMessageMutationDelay()
         let groupMutationDelay = try? await localStore.nextPendingGroupMutationDelay()
         let scheduledCreateDelay: TimeInterval?
+        let productivityDelay: TimeInterval?
         if let accountId = storedSession?.session.accountId {
-            scheduledCreateDelay = try? await localStore.nextScheduledCreateRetryDelay(
+            if capabilities.contains(.scheduledDelivery) {
+                let storedDelay = try? await localStore.nextScheduledCreateRetryDelay(
+                    accountId: accountId
+                )
+                scheduledCreateDelay = cloudScheduledCreateRetryDelay(
+                    storedDelay,
+                    serverAdvertisesFeature: true
+                )
+            } else {
+                // Dormant durable creates are reactivated by the next capability refresh. They must
+                // not schedule a zero-delay outbox loop while the route is intentionally absent.
+                scheduledCreateDelay = cloudScheduledCreateRetryDelay(
+                    nil,
+                    serverAdvertisesFeature: false
+                )
+            }
+            productivityDelay = try? await localStore.nextProductivityMutationRetryDelay(
                 accountId: accountId
             )
         } else {
             scheduledCreateDelay = nil
+            productivityDelay = nil
         }
         var preferenceDelay: TimeInterval?
         if capabilities.contains(.chatOrganization),
@@ -8440,7 +8863,8 @@ final class CloudAppModel {
         }
         return [
             groupDelay, groupMutationDelay, preferenceDelay,
-            scheduledCreateDelay, textDelay, mediaDelay, mediaGroupDelay, mutationDelay,
+            scheduledCreateDelay, productivityDelay,
+            textDelay, mediaDelay, mediaGroupDelay, mutationDelay,
         ].compactMap { $0 }.min()
     }
 

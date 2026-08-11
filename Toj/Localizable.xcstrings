@@ -3054,7 +3054,7 @@
         }
       }
     },
-    "That file is larger than 25 MB" : {
+    "That file is larger than 100 MB" : {
 
     },
     "That file name is not supported" : {
@@ -3200,7 +3200,7 @@
         }
       }
     },
-    "This file is empty or larger than 25 MB" : {
+    "This file is empty or larger than 100 MB" : {
 
     },
     "This removes the message for everyone in this conversation." : {

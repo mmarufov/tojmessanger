@@ -231,6 +231,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
     let chatFolders: CloudChatFolderSnapshot?
     let scheduledDelivery: CloudScheduledDelivery?
     let scheduledDeliveryId: String?
+    let collectionRevision: Int64?
 
     init(
         pts: Int64,
@@ -262,7 +263,8 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         changedFields: [String]? = nil,
         chatFolders: CloudChatFolderSnapshot? = nil,
         scheduledDelivery: CloudScheduledDelivery? = nil,
-        scheduledDeliveryId: String? = nil
+        scheduledDeliveryId: String? = nil,
+        collectionRevision: Int64? = nil
     ) {
         self.pts = pts
         self.ptsCount = ptsCount
@@ -294,6 +296,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         self.chatFolders = chatFolders
         self.scheduledDelivery = scheduledDelivery
         self.scheduledDeliveryId = scheduledDeliveryId
+        self.collectionRevision = collectionRevision
     }
 
     enum CodingKeys: String, CodingKey {
@@ -327,6 +330,7 @@ nonisolated struct CloudUpdate: Codable, Sendable {
         case chatFolders = "chat_folders"
         case scheduledDelivery = "scheduled_delivery"
         case scheduledDeliveryId = "scheduled_delivery_id"
+        case collectionRevision = "collection_revision"
     }
 }
 
@@ -455,13 +459,33 @@ nonisolated struct CloudGroupLeaveResponse: Codable, Sendable {
     let closed: Bool
 }
 
-private struct ProfileUpdateRequest: Codable, Sendable {
+private struct ProfileUpdateRequest: Encodable, Sendable {
     let username: String?
     let firstName: String
     let lastName: String
     let bio: String
     let birthday: String?
     let colorIndex: Int
+
+    enum CodingKeys: String, CodingKey {
+        case username, firstName, lastName, bio, birthday, colorIndex
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        // This client edits the complete profile. Encode an explicit null for a cleared handle;
+        // omission is reserved for legacy clients and means "preserve" on the server.
+        if let username {
+            try container.encode(username, forKey: .username)
+        } else {
+            try container.encodeNil(forKey: .username)
+        }
+        try container.encode(firstName, forKey: .firstName)
+        try container.encode(lastName, forKey: .lastName)
+        try container.encode(bio, forKey: .bio)
+        try container.encodeIfPresent(birthday, forKey: .birthday)
+        try container.encode(colorIndex, forKey: .colorIndex)
+    }
 }
 
 nonisolated struct DirectDialogResponse: Codable, Sendable {
@@ -822,8 +846,43 @@ nonisolated func cloudOperationFailureDisposition(
     _ error: Error,
     serverAdvertisesFeature: Bool
 ) -> CloudFailureDisposition {
-    _ = serverAdvertisesFeature
+    if error is DecodingError {
+        // The server may have committed before returning a response this client cannot decode.
+        // Durable operations must replay the same idempotency key instead of declaring failure.
+        return .transient(retryAfter: nil)
+    }
+    if let apiError = error as? CloudAPIError {
+        if apiError.status == -1 {
+            return .transient(retryAfter: nil)
+        }
+        if apiError.status == 404, apiError.code == nil {
+            // A code-less 404 is route/version skew, not an authoritative object result. This is
+            // true even just after capability discovery because a request can hit a different node.
+            return .unsupportedServer
+        }
+        if !serverAdvertisesFeature,
+           apiError.status == 404,
+           apiError.code == "capability_unavailable" {
+            return .unsupportedServer
+        }
+    }
     return cloudFailureDisposition(error)
+}
+
+nonisolated func cloudScheduledCreateRetryDelay(
+    _ storedDelay: TimeInterval?,
+    serverAdvertisesFeature: Bool
+) -> TimeInterval? {
+    serverAdvertisesFeature ? storedDelay : nil
+}
+
+nonisolated func cloudScheduledCreateCanTerminalizePermanentFailure(
+    wasPreviouslyAttempted: Bool
+) -> Bool {
+    // Once any earlier attempt may have committed, a later 4xx cannot prove that no schedule
+    // exists on another version-skewed node. Keep replaying the original idempotent bytes until
+    // the server returns the authoritative create receipt, after which cancellation can proceed.
+    !wasPreviouslyAttempted
 }
 
 struct CloudAPI: Sendable {
@@ -1094,34 +1153,40 @@ struct CloudAPI: Sendable {
     }
 
     func createChatFolder(
-        _ request: CloudFolderMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudChatFolderSnapshot {
-        try await post("v1/chat-folders", body: request, token: token)
+        try await persistedJSON("v1/chat-folders", method: "POST", body: persistedBody, token: token)
     }
 
     func updateChatFolder(
         id: String,
-        request: CloudFolderMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudChatFolderSnapshot {
-        try await patch("v1/chat-folders/\(id)", body: request, token: token)
+        try await persistedJSON(
+            "v1/chat-folders/\(id)", method: "PATCH", body: persistedBody, token: token
+        )
     }
 
     func moveChatFolder(
         id: String,
-        request: CloudFolderMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudChatFolderSnapshot {
-        try await post("v1/chat-folders/\(id)/move", body: request, token: token)
+        try await persistedJSON(
+            "v1/chat-folders/\(id)/move", method: "POST", body: persistedBody, token: token
+        )
     }
 
     func deleteChatFolder(
         id: String,
-        request: CloudFolderMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudChatFolderSnapshot {
-        try await delete("v1/chat-folders/\(id)", body: request, token: token)
+        try await persistedJSON(
+            "v1/chat-folders/\(id)", method: "DELETE", body: persistedBody, token: token
+        )
     }
 
     func scheduledDeliveries(
@@ -1132,30 +1197,37 @@ struct CloudAPI: Sendable {
         var query: [URLQueryItem] = []
         if let dialogId { query.append(URLQueryItem(name: "dialogId", value: dialogId)) }
         if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
+        query.append(URLQueryItem(name: "limit", value: "100"))
         return try await get("v1/scheduled-messages", queryItems: query, token: token)
     }
 
     func createScheduledDelivery(
-        _ request: CloudScheduledCreateRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudScheduledMutationResponse {
-        try await post("v1/scheduled-messages", body: request, token: token)
+        try await persistedJSON(
+            "v1/scheduled-messages", method: "POST", body: persistedBody, token: token
+        )
     }
 
     func updateScheduledDelivery(
         id: String,
-        request: CloudScheduledMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudScheduledMutationResponse {
-        try await patch("v1/scheduled-messages/\(id)", body: request, token: token)
+        try await persistedJSON(
+            "v1/scheduled-messages/\(id)", method: "PATCH", body: persistedBody, token: token
+        )
     }
 
     func cancelScheduledDelivery(
         id: String,
-        request: CloudScheduledMutationRequest,
+        persistedBody: Data,
         token: String
     ) async throws -> CloudScheduledMutationResponse {
-        try await delete("v1/scheduled-messages/\(id)", body: request, token: token)
+        try await persistedJSON(
+            "v1/scheduled-messages/\(id)", method: "DELETE", body: persistedBody, token: token
+        )
     }
 
     func getDifference(
@@ -1236,6 +1308,7 @@ struct CloudAPI: Sendable {
         replyToMsgId: Int64? = nil,
         mentions: [CloudMention] = [],
         draftConsumeOperationId: String? = nil,
+        silent: Bool = false,
         token: String
     ) async throws -> SendMessageResponse {
         try await post(
@@ -1245,7 +1318,7 @@ struct CloudAPI: Sendable {
                 body: body, replyToMsgId: replyToMsgId, mediaId: mediaId,
                 forwardedFrom: nil, mentions: mentions,
                 draftConsumeOperationId: draftConsumeOperationId,
-                silent: false,
+                silent: silent,
                 linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: body)
             ),
             token: token
@@ -1310,6 +1383,7 @@ struct CloudAPI: Sendable {
         replyToMsgId: Int64?,
         mentions: [CloudMention],
         draftConsumeOperationId: String?,
+        silent: Bool = false,
         token: String
     ) async throws -> MediaGroupSendResponse {
         try await post(
@@ -1322,6 +1396,7 @@ struct CloudAPI: Sendable {
                 replyToMsgId: replyToMsgId,
                 mentions: mentions,
                 draftConsumeOperationId: draftConsumeOperationId,
+                silent: silent,
                 linkPreviewCandidate: CloudLinkPreviewCandidate.first(in: caption)
             ),
             token: token
@@ -1764,6 +1839,24 @@ struct CloudAPI: Sendable {
         return try await run(request)
     }
 
+    /// Sends the exact journaled bytes. Re-encoding a decoded request is not equivalent here:
+    /// JSON key order can change across processes, while server idempotency fingerprints bind to
+    /// the original parsed request shape.
+    private func persistedJSON<Response: Decodable>(
+        _ path: String,
+        method: String,
+        body: Data,
+        token: String
+    ) async throws -> Response {
+        precondition(["POST", "PATCH", "DELETE"].contains(method))
+        var request = URLRequest(url: config.httpURL(path: path))
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return try await run(request)
+    }
+
     private func post<Body: Encodable, Response: Decodable>(
         _ path: String,
         body: Body,
@@ -1994,6 +2087,7 @@ private struct MediaGroupSendRequest: Encodable {
     let replyToMsgId: Int64?
     let mentions: [CloudMention]
     let draftConsumeOperationId: String?
+    let silent: Bool
     let linkPreviewCandidate: CloudLinkPreviewCandidate?
 
     enum CodingKeys: String, CodingKey {
@@ -2003,6 +2097,7 @@ private struct MediaGroupSendRequest: Encodable {
         case replyToMsgId = "reply_to_msg_id"
         case mentions
         case draftConsumeOperationId = "draft_consume_operation_id"
+        case silent
         case linkPreviewCandidate = "link_preview_candidate"
     }
 }

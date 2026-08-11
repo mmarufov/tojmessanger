@@ -29,4 +29,24 @@ nonisolated enum LocalFirstMetrics {
         let milliseconds = max(0, Date().timeIntervalSince(start) * 1_000)
         logger.debug("\(name, privacy: .public): \(milliseconds, privacy: .public) ms")
     }
+
+    static func productivityRefreshIncomplete(_ reason: String) {
+        logger.error("Productivity refresh incomplete: \(reason, privacy: .public)")
+    }
+
+    static func productivityRevisionRestart(_ attempt: Int) {
+        logger.notice("Productivity collection revision changed; restart \(attempt, privacy: .public)")
+    }
+
+    static func productivityRevisionRejected() {
+        logger.notice("Rejected stale productivity collection snapshot")
+    }
+
+    static func productivityStaleSessionResultDiscarded() {
+        logger.notice("Discarded productivity result from a stale account session")
+    }
+
+    static func productivityPendingQueueAge(_ seconds: TimeInterval) {
+        logger.debug("Oldest productivity mutation age: \(max(0, seconds), privacy: .public) seconds")
+    }
 }

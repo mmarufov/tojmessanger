@@ -17,6 +17,7 @@ import {
   mediaGroupReceiptKey,
 } from "./locks";
 import { cancelMediaUpload, downloadMediaChunk } from "./media";
+import { registerPushToken } from "./push";
 import {
   ALLOWED_MUTATION_INGRESS_PER_MINUTE,
   CLEANUP_BATCH_SIZE,
@@ -418,6 +419,109 @@ describe("cloud drafts and media groups", () => {
     expect(await db`
       SELECT type FROM account_events
       WHERE account_id = ${bob.accountId} AND type = 'draft.updated'`).toHaveLength(0);
+  });
+
+  test("silent media groups stay silent and cannot collide with alerting idempotency", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerPushToken(db, bob.deviceId, "44".repeat(32), "sandbox");
+    const mediaIds = [await readyMedia(alice.accountId), await readyMedia(alice.accountId)];
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientGroupId: crypto.randomUUID(),
+      items: mediaIds.map((media_id) => ({ media_id })),
+      body: "quiet album",
+      silent: true,
+    };
+    const sent = await sendMediaGroup(db, request);
+    const bobPts = sent.pushes
+      .filter((push) => push.accountId === bob.accountId)
+      .map((push) => push.pts);
+    const deliveries = await db`
+      SELECT alert FROM push_deliveries
+      WHERE account_id = ${bob.accountId}
+        AND pts = ANY(${db.array(bobPts, "int8")}::bigint[])
+      ORDER BY pts`;
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries.every((row: any) => row.alert === false)).toBe(true);
+    expect((await sendMediaGroup(db, request)).duplicate).toBe(true);
+    await expect(sendMediaGroup(db, { ...request, silent: false }))
+      .rejects.toMatchObject({ status: 409, code: "media_group_idempotency_conflict" });
+  });
+
+  test("silent single-media sends stay silent and retain distinct idempotency", async () => {
+    const { alice, bob, dialogId } = await pair();
+    await registerPushToken(db, bob.deviceId, "45".repeat(32), "sandbox");
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      kind: "photo",
+      mediaId: await readyMedia(alice.accountId),
+      body: "quiet photo",
+      silent: true,
+    };
+    const sent = await sendMessage(db, request);
+    const bobPts = sent.pushes.find((push) => push.accountId === bob.accountId)?.pts;
+    expect(bobPts).toBeNumber();
+    expect((await db`
+      SELECT alert FROM push_deliveries
+      WHERE account_id = ${bob.accountId} AND pts = ${bobPts!}`)[0].alert).toBe(false);
+    expect((await sendMessage(db, request)).duplicate).toBe(true);
+    await expect(sendMessage(db, { ...request, silent: false }))
+      .rejects.toMatchObject({ status: 409, code: "send_idempotency_conflict" });
+
+    const historical = {
+      ...request,
+      clientMsgId: crypto.randomUUID(),
+      mediaId: await readyMedia(alice.accountId),
+      silent: false,
+    };
+    const historicalSend = await sendMessage(db, historical);
+    await db`
+      UPDATE send_requests SET fingerprint = NULL
+      WHERE sender_account_id = ${alice.accountId}
+        AND client_msg_id = ${historical.clientMsgId}`;
+    await db`
+      UPDATE messages SET send_fingerprint = NULL
+      WHERE dialog_id = ${dialogId} AND msg_id = ${historicalSend.msgId}`;
+    expect((await sendMessage(db, historical)).duplicate).toBe(true);
+    await expect(sendMessage(db, { ...historical, silent: true }))
+      .rejects.toMatchObject({ status: 409, code: "send_idempotency_conflict" });
+  });
+
+  test("single-message retries normalize link-preview aliases and object key order", async () => {
+    const { alice, dialogId } = await pair();
+    const url = "https://example.com";
+    const body = `visit ${url}`;
+    const request = {
+      senderAccountId: alice.accountId,
+      senderDeviceId: alice.deviceId,
+      dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body,
+      linkPreviewsEnabled: true,
+      linkPreviewCandidate: {
+        url,
+        utf16_offset: 6,
+        utf16_length: url.length,
+        disabled: false,
+      },
+    };
+    const sent = await sendMessage(db, request);
+    const duplicate = await sendMessage(db, {
+      ...request,
+      linkPreviewCandidate: {
+        disabled: false,
+        utf16Length: url.length,
+        url,
+        utf16Offset: 6,
+      },
+    });
+    expect(duplicate.duplicate).toBe(true);
+    expect(duplicate.msgId).toBe(sent.msgId);
   });
 
   test("one invalid group item rolls back before consuming ids or the draft", async () => {

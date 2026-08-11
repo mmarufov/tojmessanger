@@ -165,6 +165,7 @@ import {
 import {
   ScheduledDeliveryError,
   cancelScheduledDelivery,
+  completedScheduledMutationExists,
   createScheduledDelivery,
   getScheduledDelivery,
   listScheduledDeliveries,
@@ -374,6 +375,26 @@ export function startCloudServer(
 ) {
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const metrics = new OperationalMetrics();
+  const requireScheduledWorkerOrReplay = async (
+    accountId: string,
+    body: any,
+    operation: "create" | "update" | "reschedule",
+    workerHealthy: boolean,
+  ) => {
+    if (workerHealthy) return;
+    const acceptedReplay = typeof body.clientMutationId === "string"
+      && await completedScheduledMutationExists(
+        db, accountId, body.clientMutationId, operation,
+      );
+    if (acceptedReplay) return;
+    metrics.recordScheduledWorkerUnavailable();
+    throw new ScheduledDeliveryError(
+      "scheduled delivery worker is unavailable",
+      "scheduled_worker_unavailable",
+      503,
+      15,
+    );
+  };
   const callsAvailable = voiceCallsConfigured(pushSender !== null);
   const videoAvailable = videoCallsConfigured(callsAvailable);
   const groupsAvailable = process.env.TOJ_GROUPS_V1_ENABLED === "1";
@@ -482,8 +503,7 @@ export function startCloudServer(
             && chatFoldersEnabledForAccount(capabilitySession!.accountId);
           const scheduledDelivery = Boolean(capabilitySession)
             && productivitySchema.ready
-            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId)
-            && await workerHeartbeatFresh(db, "scheduled_delivery");
+            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId);
           const linkPreviews = Boolean(capabilitySession)
             && productivitySchema.ready
             && linkPreviewsEnabledForAccount(capabilitySession!.accountId)
@@ -606,7 +626,8 @@ export function startCloudServer(
           const chatFoldersAvailable = productivitySchema.ready
             && chatFoldersEnabledForAccount(session.accountId);
           const scheduledDeliveryAvailable = productivitySchema.ready
-            && scheduledDeliveryEnabledForAccount(session.accountId)
+            && scheduledDeliveryEnabledForAccount(session.accountId);
+          const scheduledDeliveryWorkerHealthy = scheduledDeliveryAvailable
             && await workerHeartbeatFresh(db, "scheduled_delivery");
           const linkPreviewsAvailable = productivitySchema.ready
             && linkPreviewsEnabledForAccount(session.accountId)
@@ -763,6 +784,9 @@ export function startCloudServer(
           }));
         }
         if (url.pathname === "/v1/scheduled-messages" && req.method === "POST" && scheduledDeliveryAvailable) {
+          await requireScheduledWorkerOrReplay(
+            session.accountId, body, "create", scheduledDeliveryWorkerHealthy,
+          );
           const result = await createScheduledDelivery(db, {
             accountId: session.accountId, deviceId: session.deviceId, body,
           });
@@ -773,22 +797,32 @@ export function startCloudServer(
           response = result ? json({ scheduledDelivery: result }) : new Response("not found", { status: 404 });
         }
         if (scheduleMatch && req.method === "PATCH" && scheduledDeliveryAvailable) {
+          await requireScheduledWorkerOrReplay(
+            session.accountId, body, "update", scheduledDeliveryWorkerHealthy,
+          );
           response = json(await updateScheduledDelivery(db, {
             accountId: session.accountId, deviceId: session.deviceId,
             deliveryId: scheduleMatch[1], body,
           }));
         }
         if (scheduleRescheduleMatch && req.method === "POST" && scheduledDeliveryAvailable) {
+          await requireScheduledWorkerOrReplay(
+            session.accountId, body, "reschedule", scheduledDeliveryWorkerHealthy,
+          );
           response = json(await updateScheduledDelivery(db, {
             accountId: session.accountId, deviceId: session.deviceId,
             deliveryId: scheduleRescheduleMatch[1], body, operation: "reschedule",
           }));
         }
         if (scheduleMatch && req.method === "DELETE" && scheduledDeliveryAvailable) {
-          response = json(await cancelScheduledDelivery(db, {
+          const result = await cancelScheduledDelivery(db, {
             accountId: session.accountId, deviceId: session.deviceId,
             deliveryId: scheduleMatch[1], body,
-          }));
+          });
+          if (!scheduledDeliveryWorkerHealthy) {
+            metrics.recordScheduledCancellationDuringOutage();
+          }
+          response = json(result);
         }
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
@@ -1500,6 +1534,7 @@ export function startCloudServer(
             draftConsumeOperationId:
               body.draft_consume_operation_id ?? body.draftConsumeOperationId,
             allowDraftConsumption: draftMedia.cloudDrafts,
+            silent: body.silent === true,
             linkPreviewCandidate: body.linkPreviewCandidate ?? body.link_preview_candidate,
             linkPreviewsEnabled: linkPreviewsAvailable,
           });

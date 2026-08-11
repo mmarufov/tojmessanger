@@ -33,6 +33,7 @@ const REQUIRED_INDEXES = [
   "chat_folder_rules_dialog_idx",
   "scheduled_deliveries_due_idx",
   "scheduled_deliveries_account_idx",
+  "scheduled_deliveries_account_delivery_idx",
   "scheduled_delivery_items_media_idx",
   "worker_heartbeats_kind_idx",
   "link_preview_cache_ready_idx",

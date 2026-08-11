@@ -4,6 +4,13 @@ BEGIN;
 SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '30s';
 
+ALTER TABLE messages
+  VALIDATE CONSTRAINT messages_send_fingerprint_size_check;
+ALTER TABLE send_requests
+  VALIDATE CONSTRAINT send_requests_fingerprint_size_check;
+ALTER TABLE scheduled_delivery_mutation_requests
+  VALIDATE CONSTRAINT scheduled_delivery_request_fingerprint_size_check;
+
 DO $$
 BEGIN
   IF EXISTS (

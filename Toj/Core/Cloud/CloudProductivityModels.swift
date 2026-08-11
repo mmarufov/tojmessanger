@@ -57,6 +57,18 @@ nonisolated struct CloudChatFolder: Codable, Identifiable, Equatable, Sendable {
     let rules: [CloudChatFolderRule]
     let createdAt: String
     let updatedAt: String
+
+    var systemImageName: String {
+        switch icon {
+        case "personal": "person.2"
+        case "unread": "message.badge"
+        case "work": "briefcase"
+        case "favorite": "star"
+        case "groups", "family": "person.3"
+        case "muted": "bell.slash"
+        default: "folder"
+        }
+    }
 }
 
 nonisolated struct CloudChatFolderSnapshot: Codable, Equatable, Sendable {
@@ -131,13 +143,16 @@ nonisolated struct PendingScheduledCreate: Identifiable, Sendable {
     var id: String { request.scheduleId }
     let accountId: String
     let request: CloudScheduledCreateRequest
+    /// Exact UTF-8 body persisted before the first HTTP attempt.
+    let requestData: Data
     let draftOperationId: String?
     let retryCount: Int
     let nextRetryAt: String?
     let lastError: String?
+    let attemptedAt: String?
 }
 
-nonisolated struct CloudScheduledMutationRequest: Encodable, Sendable {
+nonisolated struct CloudScheduledMutationRequest: Codable, Sendable {
     let clientMutationId: String
     let expectedRevision: Int64
     var deliverAt: String? = nil
@@ -146,7 +161,7 @@ nonisolated struct CloudScheduledMutationRequest: Encodable, Sendable {
     var items: [CloudScheduledItem]? = nil
 }
 
-nonisolated struct CloudFolderMutationRequest: Encodable, Sendable {
+nonisolated struct CloudFolderMutationRequest: Codable, Sendable {
     let clientMutationId: String
     var folderId: String? = nil
     var title: String? = nil
@@ -161,4 +176,99 @@ nonisolated struct CloudFolderMutationRequest: Encodable, Sendable {
     var expectedRevision: Int64? = nil
     var beforeFolderId: String? = nil
     var afterFolderId: String? = nil
+}
+
+nonisolated enum CloudFolderMutationOperation: String, Codable, Sendable {
+    case create
+    case update
+    case delete
+    case move
+}
+
+nonisolated struct CloudFolderMutationIntent: Codable, Equatable, Sendable {
+    let operation: CloudFolderMutationOperation
+    let folderId: String
+    let folder: CloudChatFolder?
+    let beforeFolderId: String?
+    let afterFolderId: String?
+    var desiredOrder: [String]? = nil
+}
+
+nonisolated struct PendingChatFolderMutation: Identifiable, Sendable {
+    var id: String { localOperationId }
+    let localOperationId: String
+    let accountId: String
+    let intent: CloudFolderMutationIntent
+    let clientMutationId: String?
+    let request: CloudFolderMutationRequest?
+    let requestData: Data?
+    let retryCount: Int
+    let attemptedAt: String?
+    let lastError: String?
+    let terminal: Bool
+    let localOrder: Int64
+}
+
+nonisolated enum CloudScheduledMutationOperation: String, Codable, Sendable {
+    case cancel
+    case reschedule
+}
+
+nonisolated struct CloudScheduledMutationIntent: Codable, Equatable, Sendable {
+    let operation: CloudScheduledMutationOperation
+    let scheduleId: String
+    let deliverAt: String?
+}
+
+nonisolated struct PendingScheduledDeliveryMutation: Identifiable, Sendable {
+    var id: String { localOperationId }
+    let localOperationId: String
+    let accountId: String
+    let intent: CloudScheduledMutationIntent
+    let clientMutationId: String?
+    let request: CloudScheduledMutationRequest?
+    let requestData: Data?
+    let retryCount: Int
+    let attemptedAt: String?
+    let lastError: String?
+    let terminal: Bool
+    let localOrder: Int64
+}
+
+nonisolated enum CloudProductivityTerminalErrorSource: String, Sendable {
+    case chatFolder
+    case scheduledCreate
+    case scheduledMutation
+}
+
+/// A durable failure remains queryable until the user dismisses its notice. This closes the
+/// process-death gap between marking a journal row terminal and publishing the error in the UI.
+nonisolated struct CloudProductivityTerminalError: Identifiable, Equatable, Sendable {
+    let source: CloudProductivityTerminalErrorSource
+    let localOperationId: String
+    let message: String
+
+    var id: String { "\(source.rawValue):\(localOperationId)" }
+}
+
+extension CloudScheduledDelivery {
+    nonisolated func applyingPendingMutation(_ intent: CloudScheduledMutationIntent) -> Self {
+        Self(
+            scheduleId: scheduleId,
+            dialogId: dialogId,
+            deliverAt: intent.deliverAt ?? deliverAt,
+            state: intent.operation == .cancel ? "cancel_pending" : "reschedule_pending",
+            silent: silent,
+            reminder: reminder,
+            revision: revision,
+            attempts: attempts,
+            lastErrorCode: lastErrorCode,
+            deliveredFirstMsgId: deliveredFirstMsgId,
+            deliveredLastMsgId: deliveredLastMsgId,
+            items: items,
+            createdAt: createdAt,
+            updatedAt: ISO8601DateFormatter().string(from: Date()),
+            completedAt: completedAt
+        )
+    }
 }

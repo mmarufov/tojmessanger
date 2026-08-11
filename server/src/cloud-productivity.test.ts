@@ -7,6 +7,7 @@ import {
   updateChatFolder,
 } from "./chat-folders";
 import { makeSql } from "./db";
+import { startCloudServer } from "./cloud";
 import { isPublicAddress, validatePublicURL } from "./safe-http-client";
 import { parseLinkPreviewMetadata } from "./link-previews";
 import {
@@ -15,6 +16,7 @@ import {
   drainScheduledDeliveries,
   failScheduledDeliveriesForRevokedDialogInTransaction,
   listScheduledDeliveries,
+  updateScheduledDelivery,
 } from "./scheduled-deliveries";
 import { editMessage, getDifference, getOrCreateDirectDialog, sendMessage } from "./sync";
 
@@ -155,6 +157,173 @@ describe("cloud productivity features", () => {
     expect(await drainScheduledDeliveries(db)).toBe(0);
     expect(Number((await db`
       SELECT count(*) AS count FROM messages WHERE dialog_id = ${dialogId}`)[0].count)).toBe(0);
+  });
+
+  test("stale worker health keeps scheduled reads, sync, and cancellation available", async () => {
+    const previousEnabled = process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED;
+    const previousRollout = process.env.TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT;
+    const previousMetricsToken = process.env.TOJ_METRICS_TOKEN;
+    process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED = "1";
+    process.env.TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT = "100";
+    process.env.TOJ_METRICS_TOKEN = "scheduled-outage-test";
+    const { alice, dialogId } = await directPair();
+    const scheduleId = crypto.randomUUID();
+    const createRequest = {
+      scheduleId,
+      clientMutationId: crypto.randomUUID(),
+      dialogId,
+      deliverAt: new Date(Date.now() + 61_000).toISOString(),
+      items: [{ clientMsgId: crypto.randomUUID(), kind: "text", body: "manageable" }],
+    };
+    const created = await createScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      body: createRequest,
+    });
+    await db`
+      UPDATE scheduled_delivery_mutation_requests SET request_fingerprint = NULL
+      WHERE account_id = ${alice.accountId}
+        AND client_mutation_id = ${createRequest.clientMutationId}`;
+    expect((await createScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      body: createRequest,
+    })).duplicate).toBe(true);
+    const rescheduleRequest = {
+      clientMutationId: crypto.randomUUID(),
+      expectedRevision: created.scheduledDelivery.revision,
+      deliverAt: new Date(Date.now() + 121_000).toISOString(),
+    };
+    const rescheduled = await updateScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      deliveryId: scheduleId,
+      operation: "reschedule",
+      body: rescheduleRequest,
+    });
+    const updateRequest = {
+      clientMutationId: crypto.randomUUID(),
+      expectedRevision: rescheduled.scheduledDelivery.revision,
+      silent: true,
+    };
+    const updated = await updateScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      deliveryId: scheduleId,
+      body: updateRequest,
+    });
+    await db`DELETE FROM worker_heartbeats WHERE worker_kind = 'scheduled_delivery'`;
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const base = `http://127.0.0.1:${server.port}`;
+    const headers = {
+      authorization: `Bearer ${alice.token}`,
+      "content-type": "application/json",
+    };
+    try {
+      const capabilities = await (await fetch(`${base}/v1/capabilities`, { headers })).json() as {
+        capabilities: string[];
+      };
+      expect(capabilities.capabilities).toContain("scheduled_delivery_v1");
+
+      const listed = await fetch(`${base}/v1/scheduled-messages?limit=100`, { headers });
+      expect(listed.status).toBe(200);
+      expect((await listed.json() as any).deliveries[0].id).toBe(scheduleId);
+
+      const detail = await fetch(`${base}/v1/scheduled-messages/${scheduleId}`, { headers });
+      expect(detail.status).toBe(200);
+      expect((await detail.json() as any).scheduledDelivery.revision)
+        .toBe(updated.scheduledDelivery.revision);
+
+      const recoveredCreate = await fetch(`${base}/v1/scheduled-messages`, {
+        method: "POST", headers, body: JSON.stringify(createRequest),
+      });
+      expect(recoveredCreate.status).toBe(200);
+      expect((await recoveredCreate.json() as any).duplicate).toBe(true);
+
+      const recoveredReschedule = await fetch(
+        `${base}/v1/scheduled-messages/${scheduleId}/reschedule`,
+        { method: "POST", headers, body: JSON.stringify(rescheduleRequest) },
+      );
+      expect(recoveredReschedule.status).toBe(200);
+      expect((await recoveredReschedule.json() as any).duplicate).toBe(true);
+      const changedReschedule = await fetch(
+        `${base}/v1/scheduled-messages/${scheduleId}/reschedule`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            ...rescheduleRequest,
+            deliverAt: new Date(Date.now() + 181_000).toISOString(),
+          }),
+        },
+      );
+      expect(changedReschedule.status).toBe(409);
+      expect((await changedReschedule.json() as any).code).toBe("idempotency_conflict");
+
+      const recoveredUpdate = await fetch(`${base}/v1/scheduled-messages/${scheduleId}`, {
+        method: "PATCH", headers, body: JSON.stringify(updateRequest),
+      });
+      expect(recoveredUpdate.status).toBe(200);
+      expect((await recoveredUpdate.json() as any).duplicate).toBe(true);
+      const changedUpdate = await fetch(`${base}/v1/scheduled-messages/${scheduleId}`, {
+        method: "PATCH", headers, body: JSON.stringify({ ...updateRequest, silent: false }),
+      });
+      expect(changedUpdate.status).toBe(409);
+      expect((await changedUpdate.json() as any).code).toBe("idempotency_conflict");
+
+      const createResponse = await fetch(`${base}/v1/scheduled-messages`, {
+        method: "POST", headers, body: "{}",
+      });
+      expect(createResponse.status).toBe(503);
+      expect(createResponse.headers.get("retry-after")).toBe("15");
+      expect((await createResponse.json() as any).code).toBe("scheduled_worker_unavailable");
+
+      const rescheduleResponse = await fetch(
+        `${base}/v1/scheduled-messages/${scheduleId}/reschedule`,
+        { method: "POST", headers, body: "{}" },
+      );
+      expect(rescheduleResponse.status).toBe(503);
+      expect((await rescheduleResponse.json() as any).code).toBe("scheduled_worker_unavailable");
+
+      const difference = await fetch(`${base}/v1/sync/difference`, {
+        method: "POST", headers, body: JSON.stringify({ sincePts: 0 }),
+      });
+      expect(difference.status).toBe(200);
+      const updates = (await difference.json() as any).updates as any[];
+      expect(updates.some((update) => update.type === "scheduled.created")).toBe(true);
+      expect(updates.some((update) => update.type === "capability.skipped")).toBe(false);
+
+      const canceled = await fetch(`${base}/v1/scheduled-messages/${scheduleId}`, {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({
+          clientMutationId: crypto.randomUUID(),
+          expectedRevision: updated.scheduledDelivery.revision,
+        }),
+      });
+      expect(canceled.status).toBe(200);
+      expect((await canceled.json() as any).scheduledDelivery.state).toBe("canceled");
+
+      const metricText = await (await fetch(`${base}/metrics`, {
+        headers: { authorization: "Bearer scheduled-outage-test" },
+      })).text();
+      expect(metricText).toContain("toj_scheduled_worker_unavailable_total 2");
+      expect(metricText)
+        .toContain("toj_scheduled_cancellations_during_worker_outage_total 1");
+
+      process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED = "0";
+      const disabled = await fetch(`${base}/v1/scheduled-messages?limit=100`, { headers });
+      expect(disabled.status).toBe(404);
+      process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED = "1";
+    } finally {
+      server.stop(true);
+      if (previousEnabled == null) delete process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED;
+      else process.env.TOJ_SCHEDULED_DELIVERY_V1_ENABLED = previousEnabled;
+      if (previousRollout == null) delete process.env.TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT;
+      else process.env.TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT = previousRollout;
+      if (previousMetricsToken == null) delete process.env.TOJ_METRICS_TOKEN;
+      else process.env.TOJ_METRICS_TOKEN = previousMetricsToken;
+    }
   });
 
   test("dialog revocation immediately fails schedules and erases encrypted payloads", async () => {

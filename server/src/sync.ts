@@ -26,7 +26,12 @@ import {
   notifySyncWakeups,
   type SyncPush,
 } from "./sync-wakeup";
-import { enqueueLinkPreview, loadLinkPreviews, type LinkPreviewDTO } from "./link-previews";
+import {
+  enqueueLinkPreview,
+  loadLinkPreviews,
+  normalizeLinkPreviewCandidate,
+  type LinkPreviewDTO,
+} from "./link-previews";
 import { getChatFolders } from "./chat-folders";
 import { getScheduledDelivery } from "./scheduled-deliveries";
 
@@ -382,14 +387,52 @@ export async function sendMessage(sql: SQL, p: {
     let mediaId: string | null = p.mediaId ?? null;
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     let mentions = normalizeMentions(p.mentions, body);
+    const linkPreviewCandidate = normalizeLinkPreviewCandidate(p.linkPreviewCandidate, body);
+    const sendFingerprint = requestFingerprintHMAC("message-send", JSON.stringify({
+      dialog_id: String(p.dialogId).toLowerCase(),
+      kind: p.kind ?? "text",
+      body: p.body ?? null,
+      reply_to_msg_id: replyToMsgId,
+      media_id: p.mediaId ?? null,
+      forwarded_from: p.forwardedFrom == null ? null : {
+        dialog_id: String(p.forwardedFrom.dialogId).toLowerCase(),
+        msg_id: Number(p.forwardedFrom.msgId),
+      },
+      mentions: mentions.map((mention) => ({
+        account_id: mention.accountId,
+        offset: mention.offset,
+        length: mention.length,
+      })),
+      draft_consume_operation_id: draftConsumeOperationId,
+      link_preview_candidate: linkPreviewCandidate,
+      scheduled_delivery_id: p.scheduledDeliveryId ?? null,
+      ...(p.silent === true ? { silent: true } : {}),
+    }));
+    const requireMatchingSendFingerprint = (stored: unknown) => {
+      if (stored == null) {
+        // Historical receipts/messages predate fingerprints. Preserve their ordinary audible
+        // replay behavior, but never let a new silent request alias an old alerting send.
+        if (p.silent !== true) return;
+      } else {
+        const existing = Buffer.from(stored as Uint8Array);
+        if (existing.length === sendFingerprint.length
+          && timingSafeEqual(existing, sendFingerprint)) return;
+      }
+      throw new SyncError(
+        "client message id already used with different input",
+        409,
+        "send_idempotency_conflict",
+      );
+    };
     const recoverCanonical = async (): Promise<SendResult | null> => {
       const canonical = (await tx`
-        SELECT dialog_id, msg_id
+        SELECT dialog_id, msg_id, send_fingerprint
         FROM messages
         WHERE sender_account_id = ${p.senderAccountId}
           AND client_msg_id = ${p.clientMsgId}
         FOR SHARE`)[0];
       if (!canonical) return null;
+      requireMatchingSendFingerprint(canonical.send_fingerprint);
       const dialogId = String(canonical.dialog_id);
       const msgId = n(canonical.msg_id);
       const event = (await tx`
@@ -432,17 +475,18 @@ export async function sendMessage(sql: SQL, p: {
     // 1) idempotency gate — before any counter is touched
     const claim = await tx`
       INSERT INTO send_requests (
-        sender_account_id, client_msg_id, dialog_id, status, draft_consume_operation_id
+        sender_account_id, client_msg_id, dialog_id, status, draft_consume_operation_id,
+        fingerprint
       )
       VALUES (
         ${p.senderAccountId}, ${p.clientMsgId}, ${p.dialogId}, 'pending',
-        ${draftConsumeOperationId}
+        ${draftConsumeOperationId}, ${sendFingerprint}
       )
       ON CONFLICT (sender_account_id, client_msg_id) DO NOTHING RETURNING status`;
     if (claim.length === 0) {
       const row = (await tx`
         SELECT status, dialog_id, msg_id, sender_pts, draft_consume_operation_id,
-               cleared_draft_revision
+               cleared_draft_revision, fingerprint
         FROM send_requests
         WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}
         FOR UPDATE`)[0];
@@ -453,6 +497,7 @@ export async function sendMessage(sql: SQL, p: {
           "send_idempotency_conflict",
         );
       }
+      requireMatchingSendFingerprint(row.fingerprint);
       if (row.status !== "completed") {
         const recovered = await recoverCanonical();
         if (recovered) return recovered;
@@ -585,11 +630,11 @@ export async function sendMessage(sql: SQL, p: {
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
                             forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-                            is_forwarded, media_id)
+                            is_forwarded, media_id, send_fingerprint)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
-              ${p.forwardedFrom != null}, ${mediaId})
+              ${p.forwardedFrom != null}, ${mediaId}, ${sendFingerprint})
       RETURNING server_ts`;
     if (mentions.length) {
       await tx`
@@ -716,6 +761,7 @@ function mediaGroupFingerprint(input: {
   mentions: MessageMention[];
   draftConsumeOperationId: string | null;
   items: NormalizedGroupItem[];
+  silent: boolean;
 }): Buffer {
   return requestFingerprintHMAC("media-group-send", JSON.stringify({
     dialog_id: input.dialogId,
@@ -731,6 +777,9 @@ function mediaGroupFingerprint(input: {
       media_id: item.mediaId,
       client_msg_id: item.clientMsgId,
     })),
+    // Preserve the historical fingerprint for ordinary sends while ensuring a silent retry can
+    // never collide with an alerting send that reused the same client group id.
+    ...(input.silent ? { silent: true } : {}),
   }));
 }
 
@@ -782,6 +831,7 @@ export async function sendMediaGroup(sql: SQL, p: {
     mentions,
     draftConsumeOperationId,
     items,
+    silent: p.silent === true,
   });
 
   return await sql.begin(async (tx) => {
@@ -808,6 +858,24 @@ export async function sendMediaGroup(sql: SQL, p: {
       SELECT 1 FROM media_group_send_requests
       WHERE sender_account_id = ${p.senderAccountId}
         AND client_group_id = ${clientGroupId}`)[0] != null;
+    const tombstone = requestStillPresent ? null : (await tx`
+      SELECT dialog_id, payload_fingerprint
+      FROM media_group_send_tombstones
+      WHERE sender_account_id = ${p.senderAccountId}
+        AND client_group_id = ${clientGroupId}
+      FOR SHARE`)[0];
+    if (tombstone) {
+      const existingFingerprint = buf(tombstone.payload_fingerprint);
+      if (tombstone.dialog_id !== dialogId
+        || existingFingerprint.length !== fingerprint.length
+        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        throw new SyncError(
+          "client group id already used with different media",
+          409,
+          "media_group_idempotency_conflict",
+        );
+      }
+    }
     const durableGroup = requestStillPresent ? [] : await tx`
       SELECT dialog_id, msg_id, client_msg_id, media_id, media_group_index, media_group_count,
              draft_consume_operation_id, draft_cleared_revision
@@ -882,23 +950,7 @@ export async function sendMediaGroup(sql: SQL, p: {
         pushes: [],
       };
     }
-    const tombstone = requestStillPresent ? null : (await tx`
-      SELECT dialog_id, payload_fingerprint
-      FROM media_group_send_tombstones
-      WHERE sender_account_id = ${p.senderAccountId}
-        AND client_group_id = ${clientGroupId}
-      FOR SHARE`)[0];
     if (tombstone) {
-      const existingFingerprint = buf(tombstone.payload_fingerprint);
-      if (tombstone.dialog_id !== dialogId
-        || existingFingerprint.length !== fingerprint.length
-        || !timingSafeEqual(existingFingerprint, fingerprint)) {
-        throw new SyncError(
-          "client group id already used with different media",
-          409,
-          "media_group_idempotency_conflict",
-        );
-      }
       throw new SyncError(
         "media group result is no longer available",
         409,

@@ -2632,6 +2632,66 @@ describe("M3 cloud sync", () => {
       .rejects.toMatchObject({ status: 401 });
   });
 
+  test("legacy profile updates preserve omitted usernames while explicit clears remain supported", async () => {
+    const owner = await makeAccount(testPhone(149), "Legacy Owner");
+    const base = {
+      firstName: "Legacy", lastName: "Owner", bio: "", birthday: null, colorIndex: 2,
+    };
+    await updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      username: "legacy_owner",
+    });
+
+    const beforeOmitted = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${owner.accountId}`)[0].pts);
+    const omitted = await updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      firstName: "Updated",
+    });
+    expect(omitted.profile.username).toBe("legacy_owner");
+    expect((await getProfile(db, owner.accountId)).username).toBe("legacy_owner");
+    const omittedDifference = await getDifference(db, owner.accountId, beforeOmitted);
+    expect(omittedDifference.kind).toBe("difference");
+    if (omittedDifference.kind === "difference") {
+      expect(omittedDifference.updates).toContainEqual(expect.objectContaining({
+        type: "profile.updated",
+        subject_account_id: owner.accountId,
+        username: "legacy_owner",
+      }));
+    }
+
+    await expect(updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      username: 42,
+    })).rejects.toMatchObject({ status: 400 });
+
+    const beforeClear = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${owner.accountId}`)[0].pts);
+    const cleared = await updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      username: null,
+    });
+    expect(cleared.profile.username).toBeNull();
+    const clearedDifference = await getDifference(db, owner.accountId, beforeClear);
+    expect(clearedDifference.kind).toBe("difference");
+    if (clearedDifference.kind === "difference") {
+      expect(clearedDifference.updates).toContainEqual(expect.objectContaining({
+        type: "profile.updated",
+        subject_account_id: owner.accountId,
+        username: null,
+      }));
+    }
+
+    await updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      username: "legacy_owner",
+    });
+    expect((await updateProfile(db, owner.accountId, owner.deviceId, {
+      ...base,
+      username: "",
+    })).profile.username).toBeNull();
+  });
+
   test("usernames are normalized, unique under concurrency, and invalid lookups are non-oracular", async () => {
     const first = await makeAccount(testPhone(147), "First");
     const second = await makeAccount(testPhone(148), "Second");

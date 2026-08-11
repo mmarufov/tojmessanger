@@ -139,6 +139,34 @@ nonisolated struct PendingMediaGroupPayload: Codable, Equatable, Sendable {
     let caption: String
     let replyToMsgId: Int64?
     let mentions: [CloudMention]
+    let silent: Bool
+
+    init(
+        items: [PendingMediaGroupItem],
+        caption: String,
+        replyToMsgId: Int64?,
+        mentions: [CloudMention],
+        silent: Bool = false
+    ) {
+        self.items = items
+        self.caption = caption
+        self.replyToMsgId = replyToMsgId
+        self.mentions = mentions
+        self.silent = silent
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case items, caption, replyToMsgId, mentions, silent
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        items = try container.decode([PendingMediaGroupItem].self, forKey: .items)
+        caption = try container.decode(String.self, forKey: .caption)
+        replyToMsgId = try container.decodeIfPresent(Int64.self, forKey: .replyToMsgId)
+        mentions = try container.decodeIfPresent([CloudMention].self, forKey: .mentions) ?? []
+        silent = try container.decodeIfPresent(Bool.self, forKey: .silent) ?? false
+    }
 }
 
 nonisolated struct PendingMediaGroupCleanup: Identifiable, Equatable, Sendable {
@@ -268,6 +296,7 @@ nonisolated struct MediaTransferRecord: Identifiable, Equatable, Sendable {
     var purpose: String = "message"
     var draftOperationId: String? = nil
     var mentions: [CloudMention] = []
+    var silent: Bool = false
     let kind: String
     let contentType: String
     let fileName: String?
@@ -773,7 +802,10 @@ actor CloudLocalStore {
             try db.execute(sql: "DELETE FROM replica_state WHERE account_id = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM cloud_chat_folder_state WHERE account_id = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM cloud_scheduled_deliveries WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM cloud_scheduled_delivery_state WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM pending_chat_folder_mutations WHERE account_id = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM pending_scheduled_delivery_creates WHERE account_id = ?", arguments: [accountId])
+            try db.execute(sql: "DELETE FROM pending_scheduled_delivery_mutations WHERE account_id = ?", arguments: [accountId])
             try deleteReplicaData(db, includeMediaTransfers: true)
         }
     }
@@ -2029,7 +2061,8 @@ actor CloudLocalStore {
     func consumeDraftAsSingleMedia(
         accountId: String,
         dialogId: String,
-        operationId: String
+        operationId: String,
+        silent: Bool = false
     ) throws -> MediaTransferRecord {
         try dbQueue.write { db in
             guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId),
@@ -2054,6 +2087,7 @@ actor CloudLocalStore {
                   caption = ?,
                   reply_to_msg_id = ?,
                   mentions_json = ?,
+                  silent = ?,
                   purpose = 'message',
                   draft_operation_id = ?,
                   state = 'ready_to_send',
@@ -2063,7 +2097,7 @@ actor CloudLocalStore {
                 WHERE transfer_id = ? AND media_id IS NOT NULL
                 """,
                 arguments: [
-                    clientMsgId, draft.text, draft.replyToMsgId, mentionsJSON,
+                    clientMsgId, draft.text, draft.replyToMsgId, mentionsJSON, silent,
                     operationId, transferId,
                 ]
             )
@@ -2110,7 +2144,8 @@ actor CloudLocalStore {
     func consumeDraftAsMediaGroup(
         accountId: String,
         dialogId: String,
-        operationId: String
+        operationId: String,
+        silent: Bool = false
     ) throws -> PendingMediaGroupSend {
         try dbQueue.write { db in
             guard let draft = try Self.fetchDraft(db, accountId: accountId, dialogId: dialogId),
@@ -2136,7 +2171,8 @@ actor CloudLocalStore {
                 items: items,
                 caption: draft.text,
                 replyToMsgId: draft.replyToMsgId,
-                mentions: draft.mentions
+                mentions: draft.mentions,
+                silent: silent
             )
             let encoder = JSONEncoder()
             let payloadJSON = String(data: try encoder.encode(payload), encoding: .utf8) ?? "{}"
@@ -2159,6 +2195,7 @@ actor CloudLocalStore {
                       client_msg_id = ?,
                       caption = ?,
                       reply_to_msg_id = ?,
+                      silent = ?,
                       purpose = 'group_send',
                       draft_operation_id = ?,
                       state = 'ready_to_send',
@@ -2169,7 +2206,7 @@ actor CloudLocalStore {
                     """,
                     arguments: [
                         item.clientMsgId, index == 0 ? draft.text : "",
-                        index == 0 ? draft.replyToMsgId : nil, operationId,
+                        index == 0 ? draft.replyToMsgId : nil, silent, operationId,
                         item.transferId, item.mediaId,
                     ]
                 )
@@ -4744,6 +4781,15 @@ actor CloudLocalStore {
                         )
                     case "chat_folders.updated":
                         guard let snapshot = update.chatFolders else { continue }
+                        if let clientMutationId = update.clientMutationId {
+                            try db.execute(
+                                sql: """
+                                DELETE FROM pending_chat_folder_mutations
+                                WHERE account_id = ? AND client_mutation_id = ?
+                                """,
+                                arguments: [accountId, clientMutationId]
+                            )
+                        }
                         let snapshotJSON = String(
                             data: try JSONEncoder().encode(snapshot), encoding: .utf8
                         )!
@@ -4773,6 +4819,41 @@ actor CloudLocalStore {
                             sql: "DELETE FROM pending_scheduled_delivery_creates WHERE schedule_id = ? AND account_id = ?",
                             arguments: [delivery.scheduleId, accountId]
                         )
+                        if let clientMutationId = update.clientMutationId {
+                            let matchesLocalCancellation = try Bool.fetchOne(
+                                db,
+                                sql: """
+                                SELECT EXISTS(
+                                  SELECT 1 FROM pending_scheduled_delivery_mutations
+                                  WHERE account_id = ? AND client_mutation_id = ?
+                                    AND operation = 'cancel'
+                                )
+                                """,
+                                arguments: [accountId, clientMutationId]
+                            ) ?? false
+                            let acknowledgesLocalCancellation = update.type == "scheduled.canceled"
+                                && matchesLocalCancellation
+                            if acknowledgesLocalCancellation {
+                                // Cancellation wins over every earlier uncertain reschedule for the
+                                // same message, including when the HTTP acknowledgement was lost and
+                                // this sync event is the first authoritative response we observe.
+                                try db.execute(
+                                    sql: """
+                                    DELETE FROM pending_scheduled_delivery_mutations
+                                    WHERE account_id = ? AND schedule_id = ?
+                                    """,
+                                    arguments: [accountId, delivery.scheduleId]
+                                )
+                            } else {
+                                try db.execute(
+                                    sql: """
+                                    DELETE FROM pending_scheduled_delivery_mutations
+                                    WHERE account_id = ? AND client_mutation_id = ?
+                                    """,
+                                    arguments: [accountId, clientMutationId]
+                                )
+                            }
+                        }
                         let payload = String(
                             data: try JSONEncoder().encode(delivery), encoding: .utf8
                         )!
@@ -4795,6 +4876,21 @@ actor CloudLocalStore {
                                 delivery.deliverAt, delivery.revision, payload, delivery.updatedAt
                             ]
                         )
+                        if let collectionRevision = update.collectionRevision {
+                            try db.execute(
+                                sql: """
+                                INSERT INTO cloud_scheduled_delivery_state(
+                                  account_id, collection_revision, updated_at
+                                ) VALUES (?, ?, datetime('now'))
+                                ON CONFLICT(account_id) DO UPDATE SET
+                                  collection_revision = MAX(
+                                    collection_revision, excluded.collection_revision
+                                  ),
+                                  updated_at = excluded.updated_at
+                                """,
+                                arguments: [accountId, collectionRevision]
+                            )
+                        }
                     case "draft.updated":
                         guard let draft = update.draft else { continue }
                         let pending = try String.fetchOne(
@@ -5674,8 +5770,17 @@ actor CloudLocalStore {
                 WHERE terminal = 0 AND acknowledged_pts IS NULL
                 """
             ) ?? 0
+            let pendingProductivity = try Int.fetchOne(
+                db,
+                sql: """
+                SELECT
+                  (SELECT COUNT(*) FROM pending_chat_folder_mutations WHERE terminal = 0)
+                  + (SELECT COUNT(*) FROM pending_scheduled_delivery_creates WHERE terminal = 0)
+                  + (SELECT COUNT(*) FROM pending_scheduled_delivery_mutations WHERE terminal = 0)
+                """
+            ) ?? 0
             return pendingText + pendingMutations + pendingMedia + pendingGroups
-                + pendingDrafts + pendingDialogPreferences
+                + pendingDrafts + pendingDialogPreferences + pendingProductivity
         }
     }
 
@@ -7085,6 +7190,88 @@ actor CloudLocalStore {
             );
             CREATE INDEX pending_scheduled_delivery_creates_ready_idx
               ON pending_scheduled_delivery_creates(account_id, terminal, next_retry_at, created_at);
+            """)
+        }
+
+        migrator.registerMigration("v14-cloud-productivity-durable-mutations") { db in
+            let transferColumns = try db.columns(in: "media_transfers").map(\.name)
+            if !transferColumns.contains("silent") {
+                try db.execute(
+                    sql: "ALTER TABLE media_transfers ADD COLUMN silent INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+            let createColumns = try db.columns(in: "pending_scheduled_delivery_creates").map(\.name)
+            if !createColumns.contains("attempted_at") {
+                try db.execute(
+                    sql: "ALTER TABLE pending_scheduled_delivery_creates ADD COLUMN attempted_at TEXT"
+                )
+            }
+            if !createColumns.contains("error_acknowledged") {
+                try db.execute(
+                    sql: "ALTER TABLE pending_scheduled_delivery_creates ADD COLUMN error_acknowledged INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+            // v13 queued a create immediately after staging it, but had no durable commit-point
+            // marker. Treat every surviving v13 row as possibly attempted so an upgrade can never
+            // delete a server-accepted schedule as a local-only draft.
+            try db.execute(
+                sql: """
+                UPDATE pending_scheduled_delivery_creates
+                SET attempted_at = COALESCE(attempted_at, created_at)
+                """
+            )
+            try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS cloud_scheduled_delivery_state (
+              account_id TEXT PRIMARY KEY,
+              collection_revision INTEGER NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS pending_chat_folder_mutations (
+              local_operation_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              folder_id TEXT NOT NULL,
+              operation TEXT NOT NULL CHECK (operation IN ('create','update','delete','move')),
+              intent_json TEXT NOT NULL,
+              client_mutation_id TEXT,
+              request_json TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              attempted_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              error_acknowledged INTEGER NOT NULL DEFAULT 0,
+              local_order INTEGER NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_chat_folder_mutations_ready_idx
+              ON pending_chat_folder_mutations(
+                account_id, terminal, next_retry_at, local_order
+              );
+            CREATE TABLE IF NOT EXISTS pending_scheduled_delivery_mutations (
+              local_operation_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              schedule_id TEXT NOT NULL,
+              operation TEXT NOT NULL CHECK (operation IN ('cancel','reschedule')),
+              intent_json TEXT NOT NULL,
+              client_mutation_id TEXT,
+              request_json TEXT,
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_retry_at TEXT,
+              attempted_at TEXT,
+              last_error TEXT,
+              terminal INTEGER NOT NULL DEFAULT 0,
+              error_acknowledged INTEGER NOT NULL DEFAULT 0,
+              local_order INTEGER NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pending_scheduled_delivery_mutations_ready_idx
+              ON pending_scheduled_delivery_mutations(
+                account_id, terminal, operation, next_retry_at, local_order
+              );
+            CREATE INDEX IF NOT EXISTS pending_scheduled_delivery_mutations_head_idx
+              ON pending_scheduled_delivery_mutations(
+                account_id, schedule_id, terminal, operation, local_order, next_retry_at
+              );
             """)
         }
 
@@ -9890,6 +10077,7 @@ actor CloudLocalStore {
             mentions: (row["mentions_json"] as String?)
                 .flatMap { $0.data(using: .utf8) }
                 .flatMap { try? JSONDecoder().decode([CloudMention].self, from: $0) } ?? [],
+            silent: (row["silent"] as Int? ?? 0) != 0,
             kind: row["kind"],
             contentType: row["content_type"], fileName: row["file_name"],
             byteSize: row["byte_size"], sha256: row["sha256"], durationMs: row["duration_ms"],
