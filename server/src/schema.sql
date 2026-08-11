@@ -181,12 +181,37 @@ CREATE TABLE IF NOT EXISTS session_rotation_receipts (
   response_ciphertext BYTEA NOT NULL,
   response_nonce BYTEA NOT NULL,
   response_key_id TEXT NOT NULL,
+  response_generation BIGINT NOT NULL
+    CONSTRAINT session_rotation_receipts_generation_check CHECK (response_generation > 0),
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (session_id, rotation_id)
 );
+ALTER TABLE session_rotation_receipts
+  ADD COLUMN IF NOT EXISTS response_generation BIGINT;
+-- Rotation receipts live for only five minutes. Receipts written by the pre-generation binary
+-- cannot safely be replayed after a newer refresh, so discard them instead of guessing a value.
+DELETE FROM session_rotation_receipts WHERE response_generation IS NULL;
+ALTER TABLE session_rotation_receipts
+  ALTER COLUMN response_generation SET NOT NULL;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'session_rotation_receipts'::regclass
+      AND conname = 'session_rotation_receipts_generation_check'
+  ) THEN
+    ALTER TABLE session_rotation_receipts
+      ADD CONSTRAINT session_rotation_receipts_generation_check
+      CHECK (response_generation > 0) NOT VALID;
+  END IF;
+END $$;
+ALTER TABLE session_rotation_receipts
+  VALIDATE CONSTRAINT session_rotation_receipts_generation_check;
 CREATE INDEX IF NOT EXISTS session_rotation_receipts_expiry_idx
   ON session_rotation_receipts(expires_at);
+INSERT INTO schema_migrations(name) VALUES ('session-rotation-generation-v1')
+ON CONFLICT (name) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS account_two_factor (
   account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -523,10 +548,13 @@ CREATE TABLE IF NOT EXISTS account_events (
   account_id        UUID   NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
-                       ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-                        'dialog.created','member.added','member.removed','member.role_changed','member.left',
-                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated',
-                        'security.changed')),
+                       ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+                        'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+                        'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+                        'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+                        'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+                        'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+                        'poll.updated','sticker_preferences.updated')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -538,30 +566,39 @@ DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v2')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v2') THEN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v2 CHECK (type IN
-      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-       'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
   END IF;
 END $$;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v3')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v3') THEN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v3 CHECK (type IN
-      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-       'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
   END IF;
 END $$;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v4')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v4') THEN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v4 CHECK (type IN
-      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-       'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-       'dialog.preferences_updated','profile.updated','draft.updated','security.changed')) NOT VALID;
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
   END IF;
 END $$;
 

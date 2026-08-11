@@ -38,6 +38,18 @@ actor TokenStore {
         try clearData(account: pendingRefreshRotationAccount)
     }
 
+    /// Permanently removes every item owned by this account-scoped service. This is deliberately
+    /// broader than `clear()`, which preserves crash markers used by the legacy singleton flow.
+    func clearAllStoredData() throws {
+        let status = SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ] as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainError(status: status)
+        }
+    }
+
     /// Removes a stale refresh result without risking a newer account/session written meanwhile.
     func clearSession(ifTokenMatches token: String) throws {
         guard let current = try load(), current.session.token == token else { return }

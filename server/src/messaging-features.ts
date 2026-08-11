@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { requireActiveDevice } from "./auth";
-import { requestFingerprintHMAC } from "./crypto";
+import { bodyAAD, requestFingerprintHMAC, seal } from "./crypto";
 import {
   DialogAccessError,
   lockDialogForMutation,
@@ -69,6 +69,42 @@ export function messagingFeatureFlagsFromEnvironment(): MessagingFeatureFlags {
     giphy: enabled("TOJ_GIPHY_ENABLED") && giphyApproved && validGiphyClientKey() != null,
     multiAccountPush: enabled("TOJ_MULTI_ACCOUNT_PUSH_ENABLED"),
     support: enabled("TOJ_SUPPORT_ENABLED"),
+  };
+}
+
+function accountInFeatureRollout(prefix: string, accountId: string): boolean {
+  const allowlist = new Set(
+    String(process.env[`${prefix}_ALLOWLIST`] ?? "")
+      .split(",")
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (allowlist.has(accountId.toLowerCase())) return true;
+  const rawPercent = Number(process.env[`${prefix}_ROLLOUT_PERCENT`] ?? 0);
+  const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, rawPercent)) : 0;
+  if (percent <= 0) return false;
+  if (percent >= 100) return true;
+  const digest = createHash("sha256").update(`${prefix}|${accountId}`).digest();
+  return digest.readUInt32BE(0) % 10_000 < Math.floor(percent * 100);
+}
+
+/** Creation and mutation admission is dark unless both the switch and account rollout gate pass. */
+export function messagingFeatureFlagsForAccount(accountId: string): MessagingFeatureFlags {
+  const configured = messagingFeatureFlagsFromEnvironment();
+  return {
+    pinnedMessages: configured.pinnedMessages
+      && accountInFeatureRollout("TOJ_PINNED_MESSAGES", accountId),
+    autoDeleteCreation: configured.autoDeleteCreation
+      && accountInFeatureRollout("TOJ_AUTO_DELETE", accountId),
+    polls: configured.polls && accountInFeatureRollout("TOJ_POLLS", accountId),
+    stickerPacks: configured.stickerPacks
+      && accountInFeatureRollout("TOJ_STICKER_PACKS", accountId),
+    giphy: configured.giphy && accountInFeatureRollout("TOJ_GIPHY", accountId),
+    multiAccountPush: configured.multiAccountPush
+      && accountInFeatureRollout("TOJ_MULTI_ACCOUNT_PUSH", accountId),
+    // FAQ and the validated support address are useful before authentication and contain no
+    // account data, so support remains a global switch rather than a per-account bucket.
+    support: configured.support,
   };
 }
 
@@ -198,6 +234,58 @@ function requireSharedMutationPermission(access: DialogAccess): void {
   }
 }
 
+async function insertFeatureServiceMessage(
+  sql: SQL,
+  actorAccountId: string,
+  dialogId: string,
+  serviceType: "message.pinned" | "message.unpinned" | "dialog.auto_delete_changed" | "poll.closed",
+  serviceData: Record<string, unknown>,
+): Promise<number> {
+  const dialog = (await sql`
+    UPDATE dialogs SET last_msg_id = last_msg_id + 1, updated_at = now()
+    WHERE id = ${dialogId} RETURNING last_msg_id`)[0];
+  const msgId = Number(dialog.last_msg_id);
+  const clientMsgId = crypto.randomUUID();
+  const sealed = seal("", bodyAAD(dialogId, msgId, actorAccountId));
+  await sql`
+    INSERT INTO messages (
+      dialog_id, msg_id, sender_account_id, client_msg_id, kind,
+      body_key_id, body_nonce, body_ciphertext, service_type, service_data
+    ) VALUES (
+      ${dialogId}, ${msgId}, ${actorAccountId}, ${clientMsgId}, 'service',
+      ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${serviceType},
+      ${JSON.stringify(serviceData)}::jsonb
+    )`;
+  return msgId;
+}
+
+async function appendFeatureServiceEvent(
+  sql: SQL,
+  input: {
+    actorAccountId: string;
+    actorDeviceId: string;
+    dialogId: string;
+    serviceType: "message.pinned" | "message.unpinned" | "dialog.auto_delete_changed" | "poll.closed";
+    serviceData: Record<string, unknown>;
+  },
+): Promise<FanoutPush[]> {
+  const msgId = await insertFeatureServiceMessage(
+    sql,
+    input.actorAccountId,
+    input.dialogId,
+    input.serviceType,
+    input.serviceData,
+  );
+  return await fanoutDialogEvent(sql, {
+    dialogId: input.dialogId,
+    type: "message.new",
+    msgId,
+    actorAccountId: input.actorAccountId,
+    sourceDeviceId: input.actorDeviceId,
+    alertRecipients: false,
+  });
+}
+
 export async function listPinnedMessages(
   sql: SQL,
   accountId: string,
@@ -313,7 +401,15 @@ export async function mutatePinnedMessage(
       SELECT count(*) AS count,
              (array_agg(msg_id ORDER BY created_at DESC, msg_id DESC))[1] AS latest_msg_id
       FROM message_pins WHERE dialog_id = ${input.dialogId}`)[0];
-    const pushes = changed ? await fanoutDialogEvent(tx, {
+    const servicePushes = changed && input.notifyMembers === true
+      ? await appendFeatureServiceEvent(tx, {
+      actorAccountId: input.actorAccountId,
+      actorDeviceId: input.actorDeviceId,
+      dialogId: input.dialogId,
+      serviceType: input.pinned ? "message.pinned" : "message.unpinned",
+      serviceData: { target_msg_id: msgId },
+    }) : [];
+    const pushes = changed ? [...servicePushes, ...await fanoutDialogEvent(tx, {
       dialogId: input.dialogId,
       type: "pin.updated",
       msgId,
@@ -321,7 +417,7 @@ export async function mutatePinnedMessage(
       sourceDeviceId: input.actorDeviceId,
       alertRecipients: input.notifyMembers === true,
       data: { pinned: input.pinned, notify_members: input.notifyMembers === true },
-    }) : [];
+    })] : [];
     const response = {
       pinned: input.pinned,
       pin_count: Number(summary.count),
@@ -355,14 +451,21 @@ export async function setDialogAutoDelete(
       RETURNING revision`)[0];
     const revision = row ? Number(row.revision) : Number((await tx`
       SELECT revision FROM dialogs WHERE id = ${input.dialogId}`)[0].revision);
-    const pushes = row ? await fanoutDialogEvent(tx, {
+    const servicePushes = row ? await appendFeatureServiceEvent(tx, {
+      actorAccountId: input.actorAccountId,
+      actorDeviceId: input.actorDeviceId,
+      dialogId: input.dialogId,
+      serviceType: "dialog.auto_delete_changed",
+      serviceData: { auto_delete_seconds: seconds },
+    }) : [];
+    const pushes = row ? [...servicePushes, ...await fanoutDialogEvent(tx, {
       dialogId: input.dialogId,
       type: "dialog.auto_delete_updated",
       actorAccountId: input.actorAccountId,
       sourceDeviceId: input.actorDeviceId,
       alertRecipients: false,
       data: { auto_delete_seconds: seconds, revision },
-    }) : [];
+    })] : [];
     const response = { auto_delete_seconds: seconds, revision };
     await completeMutation(tx, input, response);
     await notifySyncWakeups(tx, pushes);
@@ -493,7 +596,14 @@ export async function closePoll(
     if (changed) await tx`
       UPDATE message_polls SET closed_at = now(), closed_by_account_id = ${input.actorAccountId}
       WHERE dialog_id = ${input.dialogId} AND msg_id = ${msgId}`;
-    const pushes = changed ? await fanoutDialogEvent(tx, {
+    const servicePushes = changed ? await appendFeatureServiceEvent(tx, {
+      actorAccountId: input.actorAccountId,
+      actorDeviceId: input.actorDeviceId,
+      dialogId: input.dialogId,
+      serviceType: "poll.closed",
+      serviceData: { poll_msg_id: msgId },
+    }) : [];
+    const pushes = changed ? [...servicePushes, ...await fanoutDialogEvent(tx, {
       dialogId: input.dialogId,
       type: "poll.updated",
       msgId,
@@ -501,7 +611,7 @@ export async function closePoll(
       sourceDeviceId: input.actorDeviceId,
       alertRecipients: false,
       data: { closed: true },
-    }) : [];
+    })] : [];
     const pollDTO = await loadPollDTO(tx, input.dialogId, msgId, input.actorAccountId);
     if (!pollDTO) throw new MessagingFeatureError("poll is unavailable", 409, "poll_unavailable");
     const response = { poll: pollDTO };
@@ -601,7 +711,16 @@ async function appendPrivatePreferenceEvent(
     SELECT ${accountId}, ${pts}, id, false FROM devices
     WHERE account_id = ${accountId} AND platform = 'ios' AND revoked_at IS NULL
       AND id <> ${actorDeviceId}
-      AND push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL
+      AND (
+        (push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          JOIN push_installations installation USING (installation_id)
+          WHERE binding.device_id = devices.id AND binding.account_id = devices.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+      )
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
   return [{ accountId, pts, ptsCount: 1 }];
 }
@@ -746,8 +865,8 @@ export async function cleanupMessagingFeatureReceipts(sql: SQL, batchSize = 1_00
   const rows = await sql`
     WITH doomed AS (
       SELECT actor_account_id, operation_id FROM messaging_feature_mutations
-      WHERE completed_at < now() - interval '30 days'
-      ORDER BY completed_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+      WHERE completed_at IS NULL AND created_at < now() - interval '24 hours'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
     )
     DELETE FROM messaging_feature_mutations mutation USING doomed
     WHERE mutation.actor_account_id = doomed.actor_account_id

@@ -30,3 +30,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS push_account_bindings_account_active_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS messaging_feature_mutations_cleanup_idx
   ON messaging_feature_mutations(created_at)
   WHERE completed_at IS NOT NULL;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS messaging_feature_mutations_pending_cleanup_idx
+  ON messaging_feature_mutations(created_at)
+  WHERE completed_at IS NULL;
+
+INSERT INTO schema_migrations(name) VALUES ('messaging-parity-indexes-v1')
+ON CONFLICT (name) DO NOTHING;

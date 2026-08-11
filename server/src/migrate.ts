@@ -59,6 +59,18 @@ const cloudProductivityContract = new URL(
   "./schema-cloud-productivity-contract.sql",
   import.meta.url,
 ).pathname;
+const messagingParityExpand = new URL(
+  "./schema-messaging-parity-expand.sql",
+  import.meta.url,
+).pathname;
+const messagingParityConcurrent = new URL(
+  "./schema-messaging-parity-concurrent.sql",
+  import.meta.url,
+).pathname;
+const messagingParityContract = new URL(
+  "./schema-messaging-parity-contract.sql",
+  import.meta.url,
+).pathname;
 const callMediaBackfillBatchSize = 1_000;
 const preferenceBackfillBatchSize = Math.max(
   1,
@@ -442,6 +454,32 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
   $$;
 `}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${cloudProductivityContract}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messagingParityExpand}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messagingParityConcurrent}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
+  SET lock_timeout = '2s';
+  SET statement_timeout = '30min';
+  ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_auto_delete_seconds_check;
+  ALTER TABLE push_account_bindings
+    VALIDATE CONSTRAINT push_account_bindings_enabled_check;
+  DO $$
+  BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'messages'::regclass
+      AND conname = 'messages_kind_check_v3' AND NOT convalidated) THEN
+      ALTER TABLE messages VALIDATE CONSTRAINT messages_kind_check_v3;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'messages'::regclass
+      AND conname = 'messages_service_type_check_v3' AND NOT convalidated) THEN
+      ALTER TABLE messages VALIDATE CONSTRAINT messages_service_type_check_v3;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'account_events'::regclass
+      AND conname = 'account_events_type_check_v7' AND NOT convalidated) THEN
+      ALTER TABLE account_events VALIDATE CONSTRAINT account_events_type_check_v7;
+    END IF;
+  END;
+  $$;
+`}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -f ${messagingParityContract}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${accountPrivateCleanupExpand}`.quiet();
 let accountPrivateCleanupReconciliations = 0;
 const cleanupMigrationSql = makeSql(url);
@@ -530,11 +568,45 @@ try {
             WHERE budget.account_id = account.id
           )
           OR EXISTS (
+            SELECT 1 FROM public.account_two_factor AS factor
+            WHERE factor.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.device_sessions AS session
+            JOIN public.devices AS device ON device.id = session.device_id
+            WHERE device.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.messaging_feature_mutations AS mutation
+            WHERE mutation.actor_account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.poll_votes AS vote
+            WHERE vote.voter_account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.account_sticker_packs AS preference
+            WHERE preference.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.account_sticker_favorites AS preference
+            WHERE preference.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.account_sticker_recents AS preference
+            WHERE preference.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.push_account_bindings AS binding
+            WHERE binding.account_id = account.id
+          )
+          OR EXISTS (
             SELECT 1 FROM public.account_events AS event
             WHERE event.account_id = account.id
               AND event.type IN (
                 'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
-                'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+                'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed',
+                'security.changed', 'sticker_preferences.updated'
               )
           )
           OR EXISTS (

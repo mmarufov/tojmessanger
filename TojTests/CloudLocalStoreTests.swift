@@ -4823,6 +4823,178 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertNil(clearedRepresentation)
     }
 
+    func testAccountCatalogEnforcesIsolationLimitGenerationAndDurableRemovalFence() async throws {
+        let service = "com.toj.account-catalog.tests.\(UUID().uuidString)"
+        let catalog = AccountCatalog(service: service)
+        let deployment = try XCTUnwrap(
+            URL(string: "https://Cloud.Example.test/cloud/?ignored=true#fragment")
+        )
+        let accountIds = (0..<4).map { _ in UUID().uuidString.lowercased() }
+        let sessions = accountIds.enumerated().map { index, accountId in
+            storedSession(accountId: accountId, deviceId: UUID().uuidString.lowercased(), suffix: index)
+        }
+
+        for session in sessions.prefix(3) {
+            _ = try await catalog.add(session, deployment: deployment)
+        }
+        var snapshot = try await catalog.snapshot()
+        XCTAssertEqual(snapshot.accounts.map(\.accountId), Array(accountIds.prefix(3)))
+        XCTAssertEqual(snapshot.activeAccountId, accountIds[2])
+        XCTAssertEqual(Set(snapshot.accounts.map(\.deployment)), ["https://cloud.example.test/cloud"])
+        let firstInstallationId = try await catalog.installationId()
+        let secondInstallationId = try await catalog.installationId()
+        XCTAssertEqual(firstInstallationId, secondInstallationId)
+
+        do {
+            _ = try await catalog.add(sessions[3], deployment: deployment)
+            XCTFail("A fourth account must be rejected")
+        } catch let error as AccountCatalogError {
+            XCTAssertEqual(error, .accountLimitReached)
+        }
+        do {
+            _ = try await catalog.add(sessions[0], deployment: deployment)
+            XCTFail("A redundant login must not replace the existing device session")
+        } catch let error as AccountCatalogError {
+            XCTAssertEqual(
+                error,
+                .duplicateAccount(existingDeviceId: sessions[0].session.deviceId)
+            )
+        }
+
+        let activated = try await catalog.activate(accountId: accountIds[0])
+        XCTAssertEqual(activated.generation, 2)
+        snapshot = try await catalog.snapshot()
+        XCTAssertEqual(
+            snapshot.accounts.first(where: { $0.accountId == accountIds[2] })?.generation,
+            2,
+            "Switching must fence callbacks from the old foreground account"
+        )
+        do {
+            _ = try await catalog.replaceSession(
+                accountId: accountIds[0],
+                expectedGeneration: 1,
+                with: sessions[0]
+            )
+            XCTFail("A stale refresh callback must not replace current credentials")
+        } catch let error as AccountCatalogError {
+            XCTAssertEqual(error, .staleGeneration)
+        }
+
+        snapshot = try await catalog.beginRemoval(accountId: accountIds[0])
+        XCTAssertFalse(snapshot.accounts.contains(where: { $0.accountId == accountIds[0] }))
+        XCTAssertEqual(snapshot.pendingRemovalAccountIds, [accountIds[0]])
+        let relaunched = AccountCatalog(service: service)
+        let relaunchedSnapshot = try await relaunched.snapshot()
+        XCTAssertEqual(relaunchedSnapshot.pendingRemovalAccountIds, [accountIds[0]])
+        snapshot = try await relaunched.finishRemoval(accountId: accountIds[0])
+        XCTAssertTrue(snapshot.pendingRemovalAccountIds.isEmpty)
+        for accountId in accountIds[1...2] {
+            _ = try await relaunched.remove(accountId: accountId)
+        }
+    }
+
+    func testRemovingForegroundAccountFencesCallbacksBeforeReplacementOwnsForeground() async throws {
+        let service = "com.toj.account-removal.tests.\(UUID().uuidString)"
+        let catalog = AccountCatalog(service: service)
+        let deployment = try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+        let firstId = UUID().uuidString.lowercased()
+        let secondId = UUID().uuidString.lowercased()
+        _ = try await catalog.add(
+            storedSession(
+                accountId: firstId,
+                deviceId: UUID().uuidString.lowercased(),
+                suffix: 31
+            ),
+            deployment: deployment
+        )
+        _ = try await catalog.add(
+            storedSession(
+                accountId: secondId,
+                deviceId: UUID().uuidString.lowercased(),
+                suffix: 32
+            ),
+            deployment: deployment
+        )
+
+        let registry = MessagingAccountRuntimeRegistry(
+            catalog: catalog,
+            config: CloudConfig(baseURL: deployment)
+        )
+        _ = try await registry.restore()
+        let removedCandidate = await registry.runtime(accountId: secondId)
+        let replacementCandidate = await registry.runtime(accountId: firstId)
+        let removedRuntime = try XCTUnwrap(removedCandidate)
+        let replacementRuntime = try XCTUnwrap(replacementCandidate)
+        let removedFence = await removedRuntime.callbackFence
+        let removedOwnedForegroundBeforeRemoval = await removedRuntime.isForegroundOwner
+        let replacementOwnedForegroundBeforeRemoval = await replacementRuntime.isForegroundOwner
+        XCTAssertTrue(removedOwnedForegroundBeforeRemoval)
+        XCTAssertFalse(replacementOwnedForegroundBeforeRemoval)
+
+        let snapshot = try await registry.removeAccount(accountId: secondId)
+
+        XCTAssertEqual(snapshot.activeAccountId, firstId)
+        XCTAssertFalse(snapshot.accounts.contains(where: { $0.accountId == secondId }))
+        XCTAssertTrue(snapshot.pendingRemovalAccountIds.isEmpty)
+        let removedOwnedForegroundAfterRemoval = await removedRuntime.isForegroundOwner
+        let removedAcceptedStaleCallback = await removedRuntime.acceptsCallback(fence: removedFence)
+        let replacementOwnedForegroundAfterRemoval = await replacementRuntime.isForegroundOwner
+        XCTAssertFalse(removedOwnedForegroundAfterRemoval)
+        XCTAssertFalse(removedAcceptedStaleCallback)
+        XCTAssertTrue(replacementOwnedForegroundAfterRemoval)
+
+        _ = try await registry.removeAccount(accountId: firstId)
+    }
+
+    func testAccountScopedPathsKeysAndRuntimeCallbacksCannotCrossAccounts() async throws {
+        let firstId = UUID().uuidString.lowercased()
+        let secondId = UUID().uuidString.lowercased()
+        let firstPaths = try AccountStoragePaths.resolve(accountId: firstId)
+        let secondPaths = try AccountStoragePaths.resolve(accountId: secondId)
+        XCTAssertNotEqual(firstPaths.root, secondPaths.root)
+        XCTAssertTrue(firstPaths.database.path.contains("/Accounts/\(firstId)/"))
+        XCTAssertTrue(secondPaths.media.path.contains("/Accounts/\(secondId)/"))
+        XCTAssertThrowsError(try AccountStoragePaths.resolve(accountId: "../shared"))
+
+        let firstKeyStore = try LocalDatabaseKeyStore.accountScoped(accountId: firstId)
+        let secondKeyStore = try LocalDatabaseKeyStore.accountScoped(accountId: secondId)
+        let firstKey = try firstKeyStore.loadOrCreateKey()
+        let secondKey = try secondKeyStore.loadOrCreateKey()
+        XCTAssertEqual(firstKey.count, 32)
+        XCTAssertEqual(secondKey.count, 32)
+        XCTAssertNotEqual(firstKey, secondKey)
+
+        let deployment = try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+        let account = CatalogAccount(
+            accountId: firstId,
+            deployment: AccountCatalog.normalizedDeployment(deployment),
+            storedSession: storedSession(
+                accountId: firstId,
+                deviceId: UUID().uuidString.lowercased(),
+                suffix: 1
+            ),
+            state: .authenticated,
+            generation: 1,
+            addedAt: Date(),
+            lastActivatedAt: Date()
+        )
+        let runtime = try MessagingAccountRuntime(
+            account: account,
+            config: CloudConfig(baseURL: deployment)
+        )
+        try await runtime.start(with: account)
+        let firstFence = await runtime.claimForeground()
+        let acceptedBeforeRelease = await runtime.acceptsCallback(fence: firstFence)
+        XCTAssertTrue(acceptedBeforeRelease)
+        await runtime.releaseForeground()
+        let acceptedAfterRelease = await runtime.acceptsCallback(fence: firstFence)
+        XCTAssertFalse(acceptedAfterRelease)
+        try await runtime.shutDownForRemoval()
+
+        try? AccountLocalStoreFactory.destroy(accountId: firstId)
+        try? AccountLocalStoreFactory.destroy(accountId: secondId)
+    }
+
     private func makeStore() throws -> CloudLocalStore {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -4834,6 +5006,22 @@ final class CloudLocalStoreTests: XCTestCase {
         return try CloudLocalStore(
             path: directory.appending(path: "cloud.sqlite").path,
             key: Data("test-passphrase".utf8)
+        )
+    }
+
+    private func storedSession(accountId: String, deviceId: String, suffix: Int) -> StoredCloudSession {
+        StoredCloudSession(
+            session: CloudSession(
+                accountId: accountId,
+                deviceId: deviceId,
+                token: "access-\(suffix)",
+                refreshToken: "refresh-\(suffix)",
+                accessTokenExpiresAt: "2099-01-01T00:15:00.000Z",
+                sessionExpiresAt: "2099-06-01T00:00:00.000Z",
+                tokenVersion: 2
+            ),
+            phone: "+16505550\(String(format: "%03d", suffix))",
+            displayName: "Account \(suffix)"
         )
     }
 }

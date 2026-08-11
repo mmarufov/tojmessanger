@@ -53,6 +53,8 @@ export async function expireAcceptedMessages(
       await tx`DELETE FROM message_mentions WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`;
       await tx`DELETE FROM message_polls WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`;
       await tx`DELETE FROM message_external_content WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM link_preview_waiters WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_link_previews WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`;
       await tx`
         UPDATE messages
         SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
@@ -67,6 +69,12 @@ export async function expireAcceptedMessages(
           WHERE media.id = ${message.media_id}
             AND NOT EXISTS (SELECT 1 FROM messages other WHERE other.media_id = media.id)
             AND NOT EXISTS (SELECT 1 FROM dialogs other WHERE other.photo_media_id = media.id)
+            AND NOT EXISTS (
+              SELECT 1
+              FROM scheduled_delivery_items item
+              JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
+              WHERE item.media_id = media.id AND delivery.state IN ('scheduled','processing')
+            )
             AND NOT EXISTS (
               SELECT 1
               FROM draft_attachments attachment

@@ -9,6 +9,10 @@ import {
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
 import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
+import { expireAcceptedMessages, expiredMessageBacklog } from "./message-expiry";
+import { cleanupMessagingFeatureReceipts } from "./messaging-features";
+import { messagingFeatureSchemaState } from "./messaging-feature-readiness";
+import { cloudProductivitySchemaState } from "./cloud-productivity-readiness";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -44,6 +48,21 @@ export function safeRoute(pathname: string): string {
   if (/^\/v1\/link-previews\/assets\/[0-9a-f-]+$/i.test(pathname)) {
     return "/v1/link-previews/assets/:id";
   }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/pins\/\d+$/i.test(pathname)) {
+    return "/v1/dialogs/:id/pins/:msg";
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/pins$/i.test(pathname)) return "/v1/dialogs/:id/pins";
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/auto-delete$/i.test(pathname)) {
+    return "/v1/dialogs/:id/auto-delete";
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/polls\/\d+\/(vote|close)$/i.test(pathname)) {
+    return pathname.endsWith("/vote")
+      ? "/v1/dialogs/:id/polls/:msg/vote"
+      : "/v1/dialogs/:id/polls/:msg/close";
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/polls\/\d+\/voters$/i.test(pathname)) {
+    return "/v1/dialogs/:id/polls/:msg/voters";
+  }
   if (/^\/v1\/calls\/[0-9a-f-]+\/(accept|reveal|confirm|decline|cancel|end|events|ice-config|telemetry)$/i.test(pathname)) {
     return pathname.replace(/[0-9a-f-]{36}/i, ":id");
   }
@@ -72,6 +91,7 @@ export function safeRoute(pathname: string): string {
     "/v1/auth/two-factor/check", "/v1/session/refresh", "/v1/session/upgrade",
     "/v1/security/two-factor", "/v1/security/step-up/start", "/v1/security/step-up/check",
     "/v1/devices", "/v1/devices/push", "/v1/devices/voip-push",
+    "/v1/devices/push-v2", "/v1/devices/voip-push-v2",
     "/v1/devices/group-call-capabilities", "/v1/session", "/v1/account/deletion/start",
     "/v1/account", "/v1/sync/state",
     "/v1/sync/difference", "/v1/bootstrap/start", "/v1/bootstrap/dialogs",
@@ -80,6 +100,7 @@ export function safeRoute(pathname: string): string {
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
     "/v1/group-calls", "/v1/group-calls/active",
     "/v1/chat-folders", "/v1/scheduled-messages",
+    "/v1/stickers", "/v1/stickers/preferences", "/v1/giphy/config",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -339,6 +360,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
+  const messagingFeatures = await messagingFeatureSchemaState(sql, { bypassCache: true });
+  const cloudProductivity = await cloudProductivitySchemaState(sql, { bypassCache: true });
   const authSecurityRow = (await sql`
     SELECT
       to_regclass('public.device_sessions') IS NOT NULL
@@ -352,6 +375,16 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
         AND to_regclass('public.security_step_up_tickets') IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'session_rotation_receipts'
+            AND column_name = 'response_generation' AND data_type = 'bigint'
+            AND is_nullable = 'NO'
+        )
+        AND EXISTS (
+          SELECT 1 FROM schema_migrations
+          WHERE name = 'session-rotation-generation-v1'
+        )
+        AND EXISTS (
+          SELECT 1 FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'devices' AND column_name = 'auth_scheme'
         ) AS ready`)[0];
   const authSecurityReady = Boolean(authSecurityRow?.ready);
@@ -362,7 +395,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // PushKit, membership, and account-deletion paths even while admission is dark. Schema is an
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
-      && groupCallSchema.ready && authSecurityReady
+      && groupCallSchema.ready && authSecurityReady && messagingFeatures.ready
+      && cloudProductivity.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -378,6 +412,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
     authSecuritySchema: authSecurityReady ? "ready" : "incomplete",
+    messagingFeatures,
+    cloudProductivity,
     groupCalls: {
       requested: groupCallsRequested,
       infrastructure: groupCallInfrastructure ? "ready" : "disabled_or_incomplete",
@@ -388,6 +424,8 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
 }
 
 export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZE) {
+  const expiredMessages = await expireAcceptedMessages(sql, batchSize);
+  const messagingFeatureReceipts = await cleanupMessagingFeatureReceipts(sql, batchSize);
   const callData = await cleanupCallData(sql, batchSize);
   const otp = await sql`
     WITH doomed AS (
@@ -497,7 +535,10 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       SELECT mo.id FROM media_objects mo
       WHERE mo.status = 'ready'
         AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
-        AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+        AND NOT EXISTS (
+          SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible'
+            AND (m.expires_at IS NULL OR m.expires_at > now())
+        )
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_delivery_items item
@@ -524,7 +565,10 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE mo.id IN (SELECT id FROM doomed)
       AND mo.status = 'ready'
       AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
-      AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
+      AND NOT EXISTS (
+        SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible'
+          AND (m.expires_at IS NULL OR m.expires_at > now())
+      )
       AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
       AND NOT EXISTS (
         SELECT 1 FROM scheduled_delivery_items item
@@ -862,6 +906,9 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
   });
   return {
     otp: otp.length,
+    expiredMessages: expiredMessages.expired,
+    expiredMessageMedia: expiredMessages.mediaRemoved,
+    messagingFeatureReceipts,
     accessTokens: accessTokens.length,
     rotationReceipts: rotationReceipts.length,
     authChallenges: authChallenges.length,
@@ -896,7 +943,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
 }
 
 function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): number {
-  return value.otp + value.accessTokens + value.rotationReceipts + value.authChallenges
+  return value.otp + value.expiredMessages + value.messagingFeatureReceipts
+    + value.accessTokens + value.rotationReceipts + value.authChallenges
     + value.stepUpTickets + value.twoFactorBudgets
     + value.snapshots + value.pushDeliveries + value.contactLookups
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
@@ -967,8 +1015,9 @@ export function startMaintenanceWorker(
              WHERE created_at < now() - interval '24 hours')
           + (SELECT count(*) FROM media_group_send_requests
              WHERE created_at < now() - interval '24 hours') AS count`;
+      const expiredMessages = await expiredMessageBacklog(sql);
       const deletedCount = drained.rows;
-      const backlog = Number(backlogRows[0]?.count ?? 0);
+      const backlog = Number(backlogRows[0]?.count ?? 0) + expiredMessages;
       metrics?.recordCleanup(deletedCount, backlog);
       if (drained.rows > 0) {
         console.log(JSON.stringify({

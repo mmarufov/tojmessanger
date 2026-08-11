@@ -149,6 +149,46 @@ export async function insertPollContent(
     )`;
 }
 
+export async function copyStructuredMessageContent(
+  sql: SQL,
+  source: MessageKey,
+  destination: MessageKey,
+  kind: string,
+): Promise<void> {
+  if (kind === "poll") {
+    const row = (await sql`
+      SELECT * FROM message_polls
+      WHERE dialog_id = ${source.dialogId} AND msg_id = ${source.msgId}`)[0];
+    if (!row) throw new MessagingContentError("forward source poll is unavailable", 409);
+    const payload = decodePollPayload(row);
+    const sealed = seal(JSON.stringify(payload), pollAAD(destination.dialogId, destination.msgId));
+    await sql`
+      INSERT INTO message_polls (
+        dialog_id, msg_id, payload_key_id, payload_nonce, payload_ciphertext,
+        option_count, multiple_choice, anonymous, quiz
+      ) VALUES (
+        ${destination.dialogId}, ${destination.msgId}, ${sealed.keyId}, ${sealed.nonce},
+        ${sealed.ciphertext}, ${row.option_count}, ${row.multiple_choice},
+        ${row.anonymous}, ${row.quiz}
+      )`;
+    return;
+  }
+  if (kind === "sticker" || kind === "external_media") {
+    const copied = await sql`
+      INSERT INTO message_external_content (
+        dialog_id, msg_id, provider, provider_item_id, pack_id, rendition
+      )
+      SELECT ${destination.dialogId}, ${destination.msgId}, provider, provider_item_id,
+             pack_id, rendition
+      FROM message_external_content
+      WHERE dialog_id = ${source.dialogId} AND msg_id = ${source.msgId}
+      RETURNING msg_id`;
+    if (!copied.length) {
+      throw new MessagingContentError("forward source content is unavailable", 409);
+    }
+  }
+}
+
 function decodePollPayload(row: any): {
   question: string;
   options: string[];
@@ -168,36 +208,74 @@ export async function loadPollDTO(
   msgId: number,
   viewerAccountId: string,
 ): Promise<PollDTO | null> {
-  const row = (await sql`
-    SELECT poll.*, vote.option_indices AS my_option_indices
-    FROM message_polls poll
+  return (await loadPollDTOs(sql, [{ dialogId, msgId }], viewerAccountId))
+    .get(key(dialogId, msgId)) ?? null;
+}
+
+export async function loadPollDTOs(
+  sql: SQL,
+  inputKeys: MessageKey[],
+  viewerAccountId: string,
+): Promise<Map<string, PollDTO>> {
+  const result = new Map<string, PollDTO>();
+  if (!inputKeys.length) return result;
+  const rows = await sql`
+    WITH wanted AS (
+      SELECT * FROM unnest(
+        ${sql.array(inputKeys.map((item) => item.dialogId), "uuid")}::uuid[],
+        ${sql.array(inputKeys.map((item) => item.msgId), "int8")}::bigint[]
+      ) AS wanted(dialog_id, msg_id)
+    ), option_counts AS (
+      SELECT vote.dialog_id, vote.msg_id, expanded.option_index,
+             count(*)::int AS votes
+      FROM wanted
+      JOIN poll_votes vote
+        ON vote.dialog_id = wanted.dialog_id AND vote.msg_id = wanted.msg_id
+      CROSS JOIN LATERAL unnest(vote.option_indices) AS expanded(option_index)
+      GROUP BY vote.dialog_id, vote.msg_id, expanded.option_index
+    ), summaries AS (
+      SELECT vote.dialog_id, vote.msg_id, count(*)::int AS total_voters
+      FROM wanted
+      JOIN poll_votes vote
+        ON vote.dialog_id = wanted.dialog_id AND vote.msg_id = wanted.msg_id
+      GROUP BY vote.dialog_id, vote.msg_id
+    )
+    SELECT poll.*, own.option_indices AS my_option_indices,
+           COALESCE(summary.total_voters, 0) AS total_voters,
+           COALESCE((
+             SELECT jsonb_object_agg(option_index::text, votes)
+             FROM option_counts stats
+             WHERE stats.dialog_id = poll.dialog_id AND stats.msg_id = poll.msg_id
+           ), '{}'::jsonb) AS option_counts
+    FROM wanted
+    JOIN message_polls poll
+      ON poll.dialog_id = wanted.dialog_id AND poll.msg_id = wanted.msg_id
     JOIN messages message
-      ON message.dialog_id = poll.dialog_id AND message.msg_id = poll.msg_id
-    LEFT JOIN poll_votes vote
-      ON vote.dialog_id = poll.dialog_id AND vote.msg_id = poll.msg_id
-     AND vote.voter_account_id = ${viewerAccountId}
-    WHERE poll.dialog_id = ${dialogId} AND poll.msg_id = ${msgId}
-      AND message.state = 'visible'
-      AND (message.expires_at IS NULL OR message.expires_at > now())`)[0];
-  if (!row) return null;
+      ON message.dialog_id = wanted.dialog_id AND message.msg_id = wanted.msg_id
+    LEFT JOIN poll_votes own
+      ON own.dialog_id = poll.dialog_id AND own.msg_id = poll.msg_id
+     AND own.voter_account_id = ${viewerAccountId}
+    LEFT JOIN summaries summary
+      ON summary.dialog_id = poll.dialog_id AND summary.msg_id = poll.msg_id
+    WHERE message.state = 'visible'
+      AND (message.expires_at IS NULL OR message.expires_at > now())`;
+  for (const row of rows) {
+    result.set(key(String(row.dialog_id), Number(row.msg_id)), pollDTOFromRow(row));
+  }
+  return result;
+}
+
+/** Pure row projection shared by the standalone poll loader and the sync metadata batch. */
+export function pollDTOFromRow(row: any): PollDTO {
   const payload = decodePollPayload(row);
   const myOptions = (row.my_option_indices ?? []).map(Number);
   const revealResults = row.closed_at != null || myOptions.length > 0;
-  let counts: number[] = [];
-  let totalVoters = 0;
-  if (revealResults) {
-    const countRows = await sql`
-      SELECT option_index, count(*) AS votes
-      FROM poll_votes, unnest(option_indices) AS option_index
-      WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}
-      GROUP BY option_index`;
-    counts = Array.from({ length: Number(row.option_count) }, () => 0);
-    for (const countRow of countRows) counts[Number(countRow.option_index)] = Number(countRow.votes);
-    totalVoters = Number((await sql`
-      SELECT count(*) AS count FROM poll_votes
-      WHERE dialog_id = ${dialogId} AND msg_id = ${msgId}`)[0].count);
-  }
-  const revealQuizAnswer = Boolean(row.quiz) && (row.closed_at != null || myOptions.length > 0);
+  const rawCounts = typeof row.option_counts === "string"
+    ? JSON.parse(row.option_counts) : row.option_counts ?? {};
+  const counts = Array.from({ length: Number(row.option_count) }, (_, index) =>
+    Number(rawCounts[String(index)] ?? 0)
+  );
+  const revealQuizAnswer = Boolean(row.quiz) && revealResults;
   return {
     question: payload.question,
     options: payload.options.map((text, index) => ({
@@ -209,26 +287,13 @@ export async function loadPollDTO(
     anonymous: Boolean(row.anonymous),
     quiz: Boolean(row.quiz),
     closed: row.closed_at != null,
-    ...(revealResults ? { total_voters: totalVoters } : {}),
+    ...(revealResults ? { total_voters: Number(row.total_voters) } : {}),
     my_option_indices: myOptions,
     ...(revealQuizAnswer && payload.correctOptionIndex != null
       ? { correct_option_index: payload.correctOptionIndex }
       : {}),
     ...(revealQuizAnswer && payload.explanation ? { explanation: payload.explanation } : {}),
   };
-}
-
-export async function loadPollDTOs(
-  sql: SQL,
-  inputKeys: MessageKey[],
-  viewerAccountId: string,
-): Promise<Map<string, PollDTO>> {
-  const result = new Map<string, PollDTO>();
-  await Promise.all(inputKeys.map(async ({ dialogId, msgId }) => {
-    const poll = await loadPollDTO(sql, dialogId, msgId, viewerAccountId);
-    if (poll) result.set(key(dialogId, msgId), poll);
-  }));
-  return result;
 }
 
 export function normalizeGiphyReference(input: unknown): {
@@ -324,6 +389,28 @@ function stickerDTOFromRow(row: any): StickerDTO {
   };
 }
 
+/** Pure row projection shared by the standalone content loader and the sync metadata batch. */
+export function externalContentDTOFromRow(row: any): {
+  sticker: StickerDTO | null;
+  externalMedia: ExternalMediaDTO | null;
+} {
+  const rendition = typeof row.rendition === "string" ? JSON.parse(row.rendition) : row.rendition;
+  if (row.provider === "giphy") {
+    return {
+      sticker: null,
+      externalMedia: {
+        provider: "giphy",
+        provider_id: String(row.provider_item_id),
+        rendition: rendition ?? {},
+      },
+    };
+  }
+  return {
+    sticker: stickerDTOFromRow({ ...row, rendition }),
+    externalMedia: null,
+  };
+}
+
 export async function loadExternalContentDTOs(
   sql: SQL,
   inputKeys: MessageKey[],
@@ -352,16 +439,9 @@ export async function loadExternalContentDTOs(
     LEFT JOIN sticker_packs pack ON pack.id = content.pack_id`;
   for (const row of rows) {
     const messageKey = key(String(row.dialog_id), Number(row.msg_id));
-    const rendition = typeof row.rendition === "string" ? JSON.parse(row.rendition) : row.rendition;
-    if (row.provider === "giphy") {
-      externalMedia.set(messageKey, {
-        provider: "giphy",
-        provider_id: String(row.provider_item_id),
-        rendition: rendition ?? {},
-      });
-    } else {
-      stickers.set(messageKey, stickerDTOFromRow({ ...row, rendition }));
-    }
+    const projected = externalContentDTOFromRow(row);
+    if (projected.externalMedia) externalMedia.set(messageKey, projected.externalMedia);
+    if (projected.sticker) stickers.set(messageKey, projected.sticker);
   }
   return { stickers, externalMedia };
 }

@@ -13,6 +13,13 @@ import { fanoutDialogEvent } from "./fanout";
 import { fetchPublicResource, SafeHTTPError, validatePublicURL } from "./safe-http-client";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { touchWorkerHeartbeat } from "./cloud-productivity-readiness";
+import {
+  adjustProductivityActiveJobs,
+  linkPreviewWorkerConcurrency,
+  productivityWorkerLeaseSeconds,
+  recordProductivityLeaseRenewalFailure,
+  recordResolvedPreviewWaiters,
+} from "./productivity-runtime";
 
 const MAX_HTML_BYTES = 1 * 1_024 * 1_024;
 const MAX_IMAGE_BYTES = 5 * 1_024 * 1_024;
@@ -297,12 +304,13 @@ export function parseLinkPreviewMetadata(
   };
 }
 
-async function fetchImage(url: string | null): Promise<Buffer | null> {
+async function fetchImage(url: string | null, signal?: AbortSignal): Promise<Buffer | null> {
   if (!url) return null;
   try {
     const response = await fetchPublicResource(url, {
       maxBytes: MAX_IMAGE_BYTES,
       accept: "image/jpeg,image/png,image/webp,image/avif",
+      signal,
     });
     if (response.status < 200 || response.status >= 300) return null;
     const type = String(response.headers["content-type"] ?? "").split(";", 1)[0].trim();
@@ -327,7 +335,11 @@ async function fetchImage(url: string | null): Promise<Buffer | null> {
   }
 }
 
-async function claimPreviewJobs(sql: SQL, limit: number): Promise<ClaimedPreview[]> {
+async function claimPreviewJobs(
+  sql: SQL,
+  limit: number,
+  leaseSeconds: number,
+): Promise<ClaimedPreview[]> {
   return await sql.begin(async (tx) => {
     const rows = await tx`
       WITH candidates AS (
@@ -344,7 +356,8 @@ async function claimPreviewJobs(sql: SQL, limit: number): Promise<ClaimedPreview
       )
       UPDATE link_preview_cache_entries entry SET
         state = 'fetching', attempts = entry.attempts + 1, claimed_at = now(),
-        lease_expires_at = now() + interval '30 seconds', lease_token = gen_random_uuid(),
+        lease_expires_at = now() + (${leaseSeconds}::text || ' seconds')::interval,
+        lease_token = gen_random_uuid(),
         updated_at = now()
       FROM candidates
       WHERE entry.url_lookup_hmac = candidates.url_lookup_hmac
@@ -354,6 +367,25 @@ async function claimPreviewJobs(sql: SQL, limit: number): Promise<ClaimedPreview
       leaseToken: String(row.lease_token),
     }));
   });
+}
+
+async function renewPreviewLease(
+  sql: SQL,
+  claim: ClaimedPreview,
+  leaseSeconds: number,
+): Promise<boolean> {
+  try {
+    const rows = await sql`
+      UPDATE link_preview_cache_entries
+      SET lease_expires_at = now() + (${leaseSeconds}::text || ' seconds')::interval,
+          updated_at = now()
+      WHERE url_lookup_hmac = ${claim.lookup}
+        AND state = 'fetching' AND lease_token = ${claim.leaseToken}
+      RETURNING url_lookup_hmac`;
+    return rows.length === 1;
+  } catch {
+    return false;
+  }
 }
 
 async function publishPreview(
@@ -366,6 +398,28 @@ async function publishPreview(
     image: Buffer | null;
   },
 ): Promise<void> {
+  const snapshotId = crypto.randomUUID();
+  const sealedURL = seal(
+    JSON.stringify({ originalURL: result.originalURL, finalURL: result.finalURL }),
+    linkPreviewURLAAD("snapshot", snapshotId),
+  );
+  const sealedMetadata = seal(
+    JSON.stringify(result.metadata),
+    linkPreviewMetadataAAD(snapshotId),
+  );
+  const preparedAsset = result.image ? await (async () => {
+    const id = crypto.randomUUID();
+    const sealed = seal(result.image!, linkPreviewAssetAAD(id));
+    const imageInfo = await sharp(result.image!).metadata();
+    return {
+      id,
+      sealed,
+      byteSize: result.image!.length,
+      width: imageInfo.width ?? 1,
+      height: imageInfo.height ?? 1,
+      digest: linkPreviewAssetDigestHMAC(result.image!),
+    };
+  })() : null;
   await sql.begin(async (tx) => {
     const cache = (await tx`
       SELECT 1 FROM link_preview_cache_entries
@@ -373,29 +427,17 @@ async function publishPreview(
         AND state = 'fetching' AND lease_token = ${claim.leaseToken}
       FOR UPDATE`)[0];
     if (!cache) return;
-    let assetId: string | null = null;
-    if (result.image) {
-      assetId = crypto.randomUUID();
-      const sealed = seal(result.image, linkPreviewAssetAAD(assetId));
-      const imageInfo = await sharp(result.image).metadata();
+    const assetId = preparedAsset?.id ?? null;
+    if (preparedAsset) {
       await tx`
         INSERT INTO link_preview_assets(
           id, key_id, nonce, ciphertext, content_type, byte_size, width, height, digest_hmac
         ) VALUES (
-          ${assetId}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, 'image/jpeg',
-          ${result.image.length}, ${imageInfo.width ?? 1}, ${imageInfo.height ?? 1},
-          ${linkPreviewAssetDigestHMAC(result.image)}
+          ${assetId}, ${preparedAsset.sealed.keyId}, ${preparedAsset.sealed.nonce},
+          ${preparedAsset.sealed.ciphertext}, 'image/jpeg', ${preparedAsset.byteSize},
+          ${preparedAsset.width}, ${preparedAsset.height}, ${preparedAsset.digest}
         )`;
     }
-    const snapshotId = crypto.randomUUID();
-    const sealedURL = seal(
-      JSON.stringify({ originalURL: result.originalURL, finalURL: result.finalURL }),
-      linkPreviewURLAAD("snapshot", snapshotId),
-    );
-    const sealedMetadata = seal(
-      JSON.stringify(result.metadata),
-      linkPreviewMetadataAAD(snapshotId),
-    );
     await tx`
       INSERT INTO link_preview_snapshots(
         id, url_key_id, url_nonce, url_ciphertext,
@@ -410,42 +452,14 @@ async function publishPreview(
       UPDATE link_preview_cache_entries SET
         state = 'ready', current_snapshot_id = ${snapshotId}, fetched_at = now(),
         expires_at = now() + interval '24 hours', claimed_at = NULL,
-        lease_expires_at = NULL, lease_token = NULL, last_error_code = NULL, updated_at = now()
-      WHERE url_lookup_hmac = ${claim.lookup}`;
-
-    const waiters = await tx`
-      SELECT waiter.dialog_id, waiter.msg_id, waiter.expected_edit_version, waiter.generation,
-             message.sender_account_id
-      FROM link_preview_waiters waiter
-      JOIN messages message
-        ON message.dialog_id = waiter.dialog_id AND message.msg_id = waiter.msg_id
-      JOIN message_link_previews relation
-        ON relation.dialog_id = waiter.dialog_id AND relation.msg_id = waiter.msg_id
-      WHERE waiter.url_lookup_hmac = ${claim.lookup}
-        AND message.state = 'visible'
-        AND message.edit_version = waiter.expected_edit_version
-        AND relation.expected_edit_version = waiter.expected_edit_version
-        AND relation.generation = waiter.generation
-        AND relation.url_lookup_hmac = waiter.url_lookup_hmac
-      ORDER BY waiter.dialog_id, waiter.msg_id`;
-    const pushes = [];
-    for (const waiter of waiters) {
-      await tx`
-        UPDATE message_link_previews SET
-          state = 'ready', snapshot_id = ${snapshotId}, updated_at = now()
-        WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
-          AND generation = ${waiter.generation}
-          AND expected_edit_version = ${waiter.expected_edit_version}`;
-      pushes.push(...await fanoutDialogEvent(tx, {
-        dialogId: String(waiter.dialog_id),
-        type: "message.preview_updated",
-        msgId: n(waiter.msg_id),
-        actorAccountId: String(waiter.sender_account_id),
-        alertRecipients: false,
-      }));
-    }
-    await tx`DELETE FROM link_preview_waiters WHERE url_lookup_hmac = ${claim.lookup}`;
-    await notifySyncWakeups(tx, pushes);
+        lease_expires_at = NULL, lease_token = NULL, last_error_code = NULL,
+        fanout_pending = EXISTS (
+          SELECT 1 FROM link_preview_waiters waiter
+          WHERE waiter.url_lookup_hmac = ${claim.lookup}
+        ),
+        updated_at = now()
+      WHERE url_lookup_hmac = ${claim.lookup}
+        AND state = 'fetching' AND lease_token = ${claim.leaseToken}`;
   });
 }
 
@@ -465,39 +479,128 @@ async function publishUnavailable(
       UPDATE link_preview_cache_entries SET
         state = 'negative', expires_at = now() + interval '1 hour', fetched_at = now(),
         claimed_at = NULL, lease_expires_at = NULL, lease_token = NULL,
-        last_error_code = ${code}, updated_at = now()
-      WHERE url_lookup_hmac = ${claim.lookup}`;
+        last_error_code = ${code},
+        fanout_pending = EXISTS (
+          SELECT 1 FROM link_preview_waiters waiter
+          WHERE waiter.url_lookup_hmac = ${claim.lookup}
+        ),
+        updated_at = now()
+      WHERE url_lookup_hmac = ${claim.lookup}
+        AND state = 'fetching' AND lease_token = ${claim.leaseToken}`;
+  });
+}
+
+async function drainOnePreviewFanoutTransaction(
+  sql: SQL,
+  batchSize: number,
+): Promise<{ processed: number; found: boolean }> {
+  return await sql.begin(async (tx) => {
+    const cache = (await tx`
+      SELECT url_lookup_hmac, state, current_snapshot_id
+      FROM link_preview_cache_entries
+      WHERE fanout_pending AND state IN ('ready','negative')
+      ORDER BY updated_at, url_lookup_hmac
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED`)[0];
+    if (!cache) return { processed: 0, found: false };
+    const lookup = Buffer.from(cache.url_lookup_hmac);
     const waiters = await tx`
       SELECT waiter.dialog_id, waiter.msg_id, waiter.expected_edit_version, waiter.generation,
-             message.sender_account_id
+             message.sender_account_id,
+             (
+               message.state = 'visible'
+               AND (message.expires_at IS NULL OR message.expires_at > now())
+               AND message.edit_version = waiter.expected_edit_version
+               AND relation.state = 'pending'
+               AND relation.expected_edit_version = waiter.expected_edit_version
+               AND relation.generation = waiter.generation
+               AND relation.url_lookup_hmac = waiter.url_lookup_hmac
+             ) AS valid
       FROM link_preview_waiters waiter
       JOIN messages message
         ON message.dialog_id = waiter.dialog_id AND message.msg_id = waiter.msg_id
       JOIN message_link_previews relation
         ON relation.dialog_id = waiter.dialog_id AND relation.msg_id = waiter.msg_id
-      WHERE waiter.url_lookup_hmac = ${claim.lookup}
-        AND message.state = 'visible'
-        AND message.edit_version = waiter.expected_edit_version
-        AND relation.generation = waiter.generation
-      ORDER BY waiter.dialog_id, waiter.msg_id`;
+      WHERE waiter.url_lookup_hmac = ${lookup}
+      ORDER BY waiter.dialog_id, waiter.msg_id
+      LIMIT ${batchSize}
+      FOR UPDATE OF waiter SKIP LOCKED`;
     const pushes = [];
     for (const waiter of waiters) {
+      if (waiter.valid) {
+        const updated = cache.state === "ready"
+          ? await tx`
+              UPDATE message_link_previews SET
+                state = 'ready', snapshot_id = ${cache.current_snapshot_id}, updated_at = now()
+              WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
+                AND state = 'pending'
+                AND generation = ${waiter.generation}
+                AND expected_edit_version = ${waiter.expected_edit_version}
+                AND url_lookup_hmac = ${lookup}
+              RETURNING msg_id`
+          : await tx`
+              UPDATE message_link_previews SET
+                state = 'unavailable', snapshot_id = NULL, updated_at = now()
+              WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
+                AND state = 'pending'
+                AND generation = ${waiter.generation}
+                AND expected_edit_version = ${waiter.expected_edit_version}
+                AND url_lookup_hmac = ${lookup}
+              RETURNING msg_id`;
+        if (updated.length) {
+          pushes.push(...await fanoutDialogEvent(tx, {
+            dialogId: String(waiter.dialog_id),
+            type: "message.preview_updated",
+            msgId: n(waiter.msg_id),
+            actorAccountId: String(waiter.sender_account_id),
+            alertRecipients: false,
+          }));
+        }
+      } else {
+        // A message edit/delete/expiry may win after the waiter is selected. Remove only the
+        // exact stale generation; a newer relation installed by a concurrent edit must survive.
+        await tx`
+          DELETE FROM message_link_previews
+          WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
+            AND state = 'pending'
+            AND generation = ${waiter.generation}
+            AND expected_edit_version = ${waiter.expected_edit_version}
+            AND url_lookup_hmac = ${lookup}`;
+      }
       await tx`
-        UPDATE message_link_previews SET state = 'unavailable', snapshot_id = NULL, updated_at = now()
-        WHERE dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}
-          AND generation = ${waiter.generation}
-          AND expected_edit_version = ${waiter.expected_edit_version}`;
-      pushes.push(...await fanoutDialogEvent(tx, {
-        dialogId: String(waiter.dialog_id),
-        type: "message.preview_updated",
-        msgId: n(waiter.msg_id),
-        actorAccountId: String(waiter.sender_account_id),
-        alertRecipients: false,
-      }));
+        DELETE FROM link_preview_waiters
+        WHERE url_lookup_hmac = ${lookup}
+          AND dialog_id = ${waiter.dialog_id} AND msg_id = ${waiter.msg_id}`;
     }
-    await tx`DELETE FROM link_preview_waiters WHERE url_lookup_hmac = ${claim.lookup}`;
+    const remaining = Boolean((await tx`
+      SELECT EXISTS (
+        SELECT 1 FROM link_preview_waiters WHERE url_lookup_hmac = ${lookup}
+      ) AS present`)[0]?.present);
+    await tx`
+      UPDATE link_preview_cache_entries
+      SET fanout_pending = ${remaining}, updated_at = now()
+      WHERE url_lookup_hmac = ${lookup}`;
     await notifySyncWakeups(tx, pushes);
+    return { processed: waiters.length, found: true };
   });
+}
+
+/** Processes no more than 25 waiter rows per transaction and 100 rows per worker tick. */
+export async function drainLinkPreviewFanout(sql: SQL, maxRows = 100): Promise<number> {
+  const boundedMax = Math.max(1, Math.min(100, Number(maxRows)));
+  let processed = 0;
+  let transactions = 0;
+  while (processed < boundedMax && transactions < 100) {
+    const result = await drainOnePreviewFanoutTransaction(
+      sql,
+      Math.min(25, boundedMax - processed),
+    );
+    transactions += 1;
+    if (!result.found) break;
+    processed += result.processed;
+  }
+  recordResolvedPreviewWaiters(processed);
+  return processed;
 }
 
 async function returnPreviewForRetry(
@@ -516,7 +619,11 @@ async function returnPreviewForRetry(
       AND state = 'fetching' AND lease_token = ${claim.leaseToken}`;
 }
 
-async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
+async function processPreview(
+  sql: SQL,
+  claim: ClaimedPreview,
+  signal?: AbortSignal,
+): Promise<void> {
   const row = (await sql`
     SELECT url_key_id, url_nonce, url_ciphertext, attempts
     FROM link_preview_cache_entries
@@ -535,6 +642,7 @@ async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
     const response = await fetchPublicResource(originalURL, {
       maxBytes: MAX_HTML_BYTES,
       accept: "text/html,application/xhtml+xml",
+      signal,
     });
     if (response.status < 200 || response.status >= 300) {
       throw new SafeHTTPError("origin status is unavailable", "origin_status", response.status >= 500);
@@ -545,7 +653,11 @@ async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
     }
     const html = response.body.toString("utf8");
     const { metadata, imageURL } = parseMetadata(html, response.url);
-    const image = await fetchImage(imageURL);
+    const image = await fetchImage(imageURL, signal);
+    if (signal?.aborted) {
+      await returnPreviewForRetry(sql, claim, n(row.attempts), "worker_stopped");
+      return;
+    }
     await publishPreview(sql, claim, {
       originalURL,
       finalURL: response.url.toString(),
@@ -554,7 +666,9 @@ async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
     });
   } catch (error) {
     const attempts = n(row.attempts);
-    if (error instanceof SafeHTTPError && error.transient && attempts < MAX_FETCH_ATTEMPTS) {
+    if (signal?.aborted) {
+      await returnPreviewForRetry(sql, claim, attempts, "worker_stopped");
+    } else if (error instanceof SafeHTTPError && error.transient && attempts < MAX_FETCH_ATTEMPTS) {
       await returnPreviewForRetry(sql, claim, attempts, error.code);
     } else {
       await publishUnavailable(
@@ -568,37 +682,119 @@ async function processPreview(sql: SQL, claim: ClaimedPreview): Promise<void> {
   }
 }
 
-export async function drainLinkPreviews(sql: SQL, limit = 20): Promise<number> {
-  const claims = await claimPreviewJobs(sql, Math.max(1, Math.min(20, limit)));
-  for (const claim of claims) await processPreview(sql, claim);
+export async function drainLinkPreviews(
+  sql: SQL,
+  limit = linkPreviewWorkerConcurrency(),
+  options: {
+    concurrency?: number;
+    leaseSeconds?: number;
+    renewEveryMilliseconds?: number;
+    controllers?: Set<AbortController>;
+  } = {},
+): Promise<number> {
+  const concurrency = Math.max(1, Math.min(16, options.concurrency ?? linkPreviewWorkerConcurrency()));
+  const leaseSeconds = Math.max(30, Math.min(600, options.leaseSeconds ?? productivityWorkerLeaseSeconds()));
+  const renewEveryMilliseconds = Math.max(1_000, Math.min(
+    30_000,
+    Math.floor(leaseSeconds * 1_000 / 3),
+    options.renewEveryMilliseconds ?? 30_000,
+  ));
+  const claims = await claimPreviewJobs(sql, Math.max(1, Math.min(concurrency, limit)), leaseSeconds);
+  await Promise.all(claims.map(async (claim) => {
+    const controller = new AbortController();
+    options.controllers?.add(controller);
+    let finished = false;
+    let renewalRunning = false;
+    const renew = async () => {
+      if (finished || renewalRunning) return;
+      renewalRunning = true;
+      const owned = await renewPreviewLease(sql, claim, leaseSeconds);
+      renewalRunning = false;
+      if (!owned && !finished) recordProductivityLeaseRenewalFailure("link_preview");
+    };
+    const renewalTimer = setInterval(() => void renew(), renewEveryMilliseconds);
+    renewalTimer.unref?.();
+    adjustProductivityActiveJobs("link_preview", 1);
+    try {
+      await processPreview(sql, claim, controller.signal);
+    } finally {
+      finished = true;
+      clearInterval(renewalTimer);
+      options.controllers?.delete(controller);
+      adjustProductivityActiveJobs("link_preview", -1);
+    }
+  }));
   return claims.length;
 }
 
 export function startLinkPreviewWorker(
   sql: SQL,
-  options: { pollMilliseconds?: number; workerId?: string } = {},
-): () => void {
+  options: {
+    pollMilliseconds?: number;
+    workerId?: string;
+    concurrency?: number;
+    leaseSeconds?: number;
+    renewEveryMilliseconds?: number;
+    heartbeatMilliseconds?: number;
+    shutdownDrainMilliseconds?: number;
+  } = {},
+): () => Promise<void> {
   const workerId = options.workerId ?? crypto.randomUUID();
   const pollMilliseconds = Math.max(500, options.pollMilliseconds ?? 2_000);
-  let running = false;
+  const concurrency = Math.max(1, Math.min(16, options.concurrency ?? linkPreviewWorkerConcurrency()));
+  const leaseSeconds = Math.max(30, Math.min(600, options.leaseSeconds ?? productivityWorkerLeaseSeconds()));
+  const heartbeatMilliseconds = Math.max(1_000, options.heartbeatMilliseconds ?? 10_000);
+  const shutdownDrainMilliseconds = Math.max(1_000, options.shutdownDrainMilliseconds ?? 15_000);
+  let running: Promise<void> | null = null;
   let stopped = false;
+  const controllers = new Set<AbortController>();
   const tick = async () => {
     if (running || stopped) return;
-    running = true;
+    const work = (async () => {
+      try {
+        await drainLinkPreviewFanout(sql, 100);
+        if (!stopped) await drainLinkPreviews(sql, concurrency, {
+          concurrency,
+          leaseSeconds,
+          renewEveryMilliseconds: options.renewEveryMilliseconds,
+          controllers,
+        });
+      } catch {
+        // Queue depth and heartbeat age carry operational state without logging URLs or hostnames.
+      }
+    })();
+    running = work;
+    await work.finally(() => {
+      if (running === work) running = null;
+    });
+  };
+  const heartbeat = async () => {
     try {
       await touchWorkerHeartbeat(sql, "link_preview", workerId);
-      await drainLinkPreviews(sql);
     } catch {
-      // Queue depth and heartbeat age carry operational state without logging URLs or hostnames.
-    } finally {
-      running = false;
+      // The cached heartbeat snapshot fails closed; this timer keeps retrying independently.
     }
   };
+  void heartbeat();
   void tick();
   const timer = setInterval(() => void tick(), pollMilliseconds);
-  return () => {
+  const heartbeatTimer = setInterval(() => void heartbeat(), heartbeatMilliseconds);
+  timer.unref?.();
+  heartbeatTimer.unref?.();
+  return async () => {
     stopped = true;
     clearInterval(timer);
+    clearInterval(heartbeatTimer);
+    for (const controller of controllers) controller.abort();
+    const active = running;
+    if (!active) return;
+    await Promise.race([
+      active,
+      new Promise<void>((resolve) => {
+        const drainTimer = setTimeout(resolve, shutdownDrainMilliseconds);
+        drainTimer.unref?.();
+      }),
+    ]);
   };
 }
 
@@ -693,10 +889,14 @@ export async function downloadLinkPreviewAsset(
         SELECT 1
         FROM link_preview_snapshots snapshot
         JOIN message_link_previews relation ON relation.snapshot_id = snapshot.id
+        JOIN messages message
+          ON message.dialog_id = relation.dialog_id AND message.msg_id = relation.msg_id
         JOIN dialog_members member ON member.dialog_id = relation.dialog_id
         JOIN dialogs dialog ON dialog.id = relation.dialog_id
         WHERE snapshot.asset_id = asset.id
           AND member.account_id = ${accountId}
+          AND message.state = 'visible'
+          AND (message.expires_at IS NULL OR message.expires_at > now())
           AND member.left_at IS NULL
           AND dialog.closed_at IS NULL
           AND (

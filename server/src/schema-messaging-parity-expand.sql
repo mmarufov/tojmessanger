@@ -41,16 +41,18 @@ END $$;
 
 DO $$ BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v5'
+    SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v7'
   ) AND NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v5'
+    SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v7'
   ) THEN
-    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v5 CHECK (type IN (
-      'message.new','message.edited','message.deleted','message.expired','reaction.updated','read.updated',
+    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v7 CHECK (type IN (
+      'message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+      'reaction.updated','read.updated',
       'dialog.created','member.added','member.removed','member.role_changed','member.left',
       'dialog.profile_updated','dialog.closed','dialog.access_revoked','dialog.preferences_updated',
-      'profile.updated','draft.updated','security.changed','pin.updated',
-      'dialog.auto_delete_updated','poll.updated','sticker_preferences.updated'
+      'profile.updated','draft.updated','security.changed','chat_folders.updated',
+      'scheduled.created','scheduled.updated','scheduled.canceled','scheduled.failed',
+      'pin.updated','dialog.auto_delete_updated','poll.updated','sticker_preferences.updated'
     )) NOT VALID;
   END IF;
 END $$;
@@ -227,18 +229,63 @@ CREATE TABLE IF NOT EXISTS push_account_bindings (
   device_id        UUID NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
   routing_handle   UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
   active           BOOLEAN NOT NULL DEFAULT TRUE,
+  normal_enabled   BOOLEAN NOT NULL DEFAULT FALSE,
+  voip_enabled     BOOLEAN NOT NULL DEFAULT FALSE,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (installation_id, account_id)
 );
 
-CREATE OR REPLACE FUNCTION enforce_push_installation_account_limit()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
+ALTER TABLE push_account_bindings
+  ADD COLUMN IF NOT EXISTS normal_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE push_account_bindings
+  ADD COLUMN IF NOT EXISTS voip_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Upgrade the first internal schema draft without repeatedly re-enabling a kind that a newer
+-- client intentionally disabled.
+DO $$
 BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM schema_migrations WHERE name = 'push-binding-kind-flags-v1'
+  ) THEN
+    UPDATE push_account_bindings binding
+    SET normal_enabled = installation.normal_token_ciphertext IS NOT NULL,
+        voip_enabled = installation.voip_token_ciphertext IS NOT NULL
+    FROM push_installations installation
+    WHERE installation.installation_id = binding.installation_id;
+    INSERT INTO schema_migrations(name) VALUES ('push-binding-kind-flags-v1');
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'push_account_bindings'::regclass
+      AND conname = 'push_account_bindings_enabled_check'
+  ) THEN
+    ALTER TABLE push_account_bindings
+      ADD CONSTRAINT push_account_bindings_enabled_check
+      CHECK (NOT active OR normal_enabled OR voip_enabled) NOT VALID;
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION enforce_push_installation_account_limit()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  -- Lock the parent so concurrent raw SQL writers cannot both observe fewer than three bindings.
+  PERFORM 1 FROM push_installations
+  WHERE installation_id = NEW.installation_id
+  FOR UPDATE;
   IF NEW.active AND (
     SELECT count(*) FROM push_account_bindings
     WHERE installation_id = NEW.installation_id AND active
-      AND (TG_OP = 'INSERT' OR account_id <> OLD.account_id)
+      -- ON CONFLICT runs BEFORE INSERT triggers before it resolves the existing row. Excluding
+      -- the incoming account makes same-account token rotation idempotent while a fourth distinct
+      -- account still observes all three existing bindings and is rejected.
+      AND account_id <> NEW.account_id
   ) >= 3 THEN
     RAISE EXCEPTION 'installation may bind at most three active accounts'
       USING ERRCODE = 'check_violation';

@@ -23,8 +23,41 @@ nonisolated struct AccountCatalogSnapshot: Codable, Equatable, Sendable {
     var activeAccountId: String?
     var revision: UInt64 = 0
     var accounts: [CatalogAccount] = []
+    /// A catalog tombstone is persisted before account-owned credentials and files are erased.
+    /// This makes interrupted sign-out non-resurrecting; the registry retries cleanup on launch.
+    var pendingRemovalAccountIds: [String] = []
 
     static let empty = AccountCatalogSnapshot()
+
+    private enum CodingKeys: String, CodingKey {
+        case version, activeAccountId, revision, accounts, pendingRemovalAccountIds
+    }
+
+    init(
+        version: Int = 1,
+        activeAccountId: String? = nil,
+        revision: UInt64 = 0,
+        accounts: [CatalogAccount] = [],
+        pendingRemovalAccountIds: [String] = []
+    ) {
+        self.version = version
+        self.activeAccountId = activeAccountId
+        self.revision = revision
+        self.accounts = accounts
+        self.pendingRemovalAccountIds = pendingRemovalAccountIds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        activeAccountId = try container.decodeIfPresent(String.self, forKey: .activeAccountId)
+        revision = try container.decodeIfPresent(UInt64.self, forKey: .revision) ?? 0
+        accounts = try container.decodeIfPresent([CatalogAccount].self, forKey: .accounts) ?? []
+        pendingRemovalAccountIds = try container.decodeIfPresent(
+            [String].self,
+            forKey: .pendingRemovalAccountIds
+        ) ?? []
+    }
 }
 
 nonisolated enum AccountCatalogError: LocalizedError, Equatable, Sendable {
@@ -173,8 +206,9 @@ actor AccountCatalog {
         return value.accounts[index]
     }
 
+    /// Atomically makes an account unreachable before any fallible filesystem or Keychain work.
     @discardableResult
-    func remove(accountId: String) throws -> AccountCatalogSnapshot {
+    func beginRemoval(accountId: String) throws -> AccountCatalogSnapshot {
         var value = try snapshot()
         guard let removedIndex = value.accounts.firstIndex(where: { $0.accountId == accountId }) else {
             throw AccountCatalogError.accountNotFound
@@ -185,9 +219,29 @@ actor AccountCatalog {
                 .max(by: { $0.lastActivatedAt < $1.lastActivatedAt })?
                 .accountId
         }
+        if !value.pendingRemovalAccountIds.contains(accountId) {
+            value.pendingRemovalAccountIds.append(accountId)
+        }
         value.revision &+= 1
         try persist(value)
         return value
+    }
+
+    @discardableResult
+    func finishRemoval(accountId: String) throws -> AccountCatalogSnapshot {
+        var value = try snapshot()
+        value.pendingRemovalAccountIds.removeAll(where: { $0 == accountId })
+        value.revision &+= 1
+        try persist(value)
+        return value
+    }
+
+    /// Convenience for callers with no account-owned resources. Runtime removal uses the durable
+    /// begin/finish pair so a crash cannot restore credentials from an old catalog entry.
+    @discardableResult
+    func remove(accountId: String) throws -> AccountCatalogSnapshot {
+        _ = try beginRemoval(accountId: accountId)
+        return try finishRemoval(accountId: accountId)
     }
 
     /// Used only after the account-scoped database/media copy has opened and passed integrity.
@@ -214,6 +268,10 @@ actor AccountCatalog {
         guard Set(value.accounts.map(\.accountId)).count == value.accounts.count,
               value.accounts.allSatisfy({ isValidAccountId($0.accountId) })
         else { throw AccountCatalogError.invalidAccountIdentifier }
+        guard Set(value.pendingRemovalAccountIds).count == value.pendingRemovalAccountIds.count,
+              value.pendingRemovalAccountIds.allSatisfy(isValidAccountId),
+              Set(value.pendingRemovalAccountIds).isDisjoint(with: value.accounts.map(\.accountId))
+        else { throw AccountCatalogError.invalidAccountIdentifier }
         if let active = value.activeAccountId,
            !value.accounts.contains(where: { $0.accountId == active }) {
             throw AccountCatalogError.accountNotFound
@@ -224,7 +282,7 @@ actor AccountCatalog {
         }
     }
 
-    nonisolated private static func normalizedDeployment(_ url: URL) -> String {
+    nonisolated static func normalizedDeployment(_ url: URL) -> String {
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         components?.query = nil
         components?.fragment = nil
@@ -238,7 +296,7 @@ actor AccountCatalog {
     }
 }
 
-private struct AccountCatalogKeychain: Sendable {
+private nonisolated struct AccountCatalogKeychain: Sendable {
     private let service: String
     private let catalogAccount = "catalog-v1"
     private let installationAccount = "installation-id-v1"

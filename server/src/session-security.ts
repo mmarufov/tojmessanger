@@ -63,6 +63,24 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
       WHERE id = ${deviceId} AND account_id = ${registration.accountId} AND revoked_at IS NULL
       RETURNING id`;
     if (!updated.length) throw new AuthError("device is no longer active", 401, undefined, "device_revoked");
+
+    // A security change reissues the current device in place. Fence every credential and crash
+    // receipt from the previous generation before installing the replacement refresh token. If an
+    // old refresh token appears later, retaining its digest in history turns it into an explicit
+    // replay instead of an ambiguous "invalid token" response.
+    const prior = (await sql`
+      SELECT id, refresh_token_hash
+      FROM device_sessions
+      WHERE device_id = ${deviceId}
+      FOR UPDATE`)[0];
+    if (prior) {
+      await sql`
+        INSERT INTO session_refresh_token_history (token_digest, session_id)
+        VALUES (${prior.refresh_token_hash}, ${prior.id})
+        ON CONFLICT (token_digest) DO NOTHING`;
+      await sql`DELETE FROM session_access_tokens WHERE session_id = ${prior.id}`;
+      await sql`DELETE FROM session_rotation_receipts WHERE session_id = ${prior.id}`;
+    }
   } else {
     const inserted = await sql`
       INSERT INTO devices (account_id, platform, device_name, auth_token_hash, auth_scheme, last_seen_at)
@@ -161,7 +179,7 @@ export async function refreshV2Session(
   rotationId: string,
   now = new Date(),
 ): Promise<AuthV2Session> {
-  if (!/^[0-9a-f-]{36}$/i.test(rotationId)) {
+  if (!UUID_PATTERN.test(rotationId)) {
     throw new AuthError("valid rotationId required", 400, undefined, "invalid_rotation_id");
   }
   const requestDigest = hashToken(refreshToken);
@@ -179,11 +197,21 @@ export async function refreshV2Session(
         WHERE history.token_digest = ${requestDigest}`)[0];
       if (!used) return new AuthError("invalid refresh token", 401, undefined, "device_revoked");
       const receipt = (await tx`
-        SELECT response_ciphertext, response_nonce, response_key_id
-        FROM session_rotation_receipts
-        WHERE session_id = ${used.session_id} AND rotation_id = ${rotationId}
-          AND request_token_digest = ${requestDigest} AND expires_at > ${now}`)[0];
+        SELECT receipt.response_ciphertext, receipt.response_nonce, receipt.response_key_id,
+               receipt.response_generation, session.rotation_generation AS current_generation
+        FROM session_rotation_receipts receipt
+        JOIN device_sessions session ON session.id = receipt.session_id
+        WHERE receipt.session_id = ${used.session_id} AND receipt.rotation_id = ${rotationId}
+          AND receipt.request_token_digest = ${requestDigest} AND receipt.expires_at > ${now}`)[0];
       if (receipt) {
+        if (Number(receipt.response_generation) !== Number(receipt.current_generation)) {
+          return new AuthError(
+            "refresh response was superseded by a newer rotation",
+            409,
+            undefined,
+            "rotation_superseded",
+          );
+        }
         const plaintext = open({
           ciphertext: Buffer.from(receipt.response_ciphertext),
           nonce: Buffer.from(receipt.response_nonce),
@@ -211,6 +239,18 @@ export async function refreshV2Session(
       return new AuthError("session expired", 401, undefined, "session_expired");
     }
 
+    const reusedRotation = (await tx`
+      SELECT 1 FROM session_rotation_receipts
+      WHERE session_id = ${current.id} AND rotation_id = ${rotationId}`)[0];
+    if (reusedRotation) {
+      return new AuthError(
+        "rotation id was already used",
+        409,
+        undefined,
+        "rotation_id_reused",
+      );
+    }
+
     const nextAccess = token();
     const nextRefresh = token();
     const accessExpiresAt = new Date(now.getTime() + ACCESS_TOKEN_TTL_MS);
@@ -236,10 +276,11 @@ export async function refreshV2Session(
     await tx`
       INSERT INTO session_rotation_receipts
         (session_id, rotation_id, request_token_digest, response_ciphertext,
-         response_nonce, response_key_id, expires_at)
+         response_nonce, response_key_id, response_generation, expires_at)
       VALUES (
         ${current.id}, ${rotationId}, ${requestDigest}, ${sealed.ciphertext},
-        ${sealed.nonce}, ${sealed.keyId}, ${new Date(now.getTime() + ROTATION_RECEIPT_TTL_MS)}
+        ${sealed.nonce}, ${sealed.keyId}, ${Number(current.rotation_generation) + 1},
+        ${new Date(now.getTime() + ROTATION_RECEIPT_TTL_MS)}
       )`;
     return response;
   });

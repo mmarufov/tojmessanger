@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 
 nonisolated enum AccountSwitchBlocker: Equatable, Sendable {
     case activeCall
@@ -133,13 +134,27 @@ actor MessagingAccountRuntime {
         await credentialCoordinator.clear()
     }
 
-    /// Stops this account permanently. Ordinary account switching does not call this method.
-    func shutDown() async {
+    /// Irreversibly fences this runtime before foreground ownership can move to another account.
+    /// This phase cannot fail; durable credential/file cleanup may be retried from the catalog
+    /// tombstone if the later cleanup phase is interrupted.
+    func fenceForRemoval() async {
         callbackFence &+= 1
         isForegroundOwner = false
         credentialTask?.cancel()
         credentialTask = nil
         await credentialCoordinator.clear()
+    }
+
+    /// Finishes fallible account-owned cleanup after the runtime has been fenced.
+    func finishRemovalCleanup() async throws {
+        try localStore.dbQueue.close()
+        try await tokenStore.clearAllStoredData()
+    }
+
+    /// Stops this account permanently. Ordinary account switching does not call this method.
+    func shutDownForRemoval() async throws {
+        await fenceForRemoval()
+        try await finishRemovalCleanup()
     }
 }
 
@@ -161,7 +176,19 @@ actor MessagingAccountRuntimeRegistry {
     }
 
     func restore() async throws -> AccountCatalogSnapshot {
-        let snapshot = try await catalog.snapshot()
+        var snapshot = try await catalog.snapshot()
+        for accountId in snapshot.pendingRemovalAccountIds {
+            do {
+                try await TokenStore(service: "com.toj.cloud.account.\(accountId)")
+                    .clearAllStoredData()
+                try AccountLocalStoreFactory.destroy(accountId: accountId)
+                snapshot = try await catalog.finishRemoval(accountId: accountId)
+            } catch {
+                // Keep the durable tombstone and retry next launch. The removed credentials are
+                // not reachable from the account list even when filesystem cleanup is delayed.
+                continue
+            }
+        }
         for account in snapshot.accounts {
             let runtime = try runtime(for: account)
             try await runtime.start(with: account)
@@ -240,18 +267,36 @@ actor MessagingAccountRuntimeRegistry {
     }
 
     func removeAccount(accountId: String) async throws -> AccountCatalogSnapshot {
-        if let runtime = runtimes.removeValue(forKey: accountId) {
-            await runtime.shutDown()
+        let removedForegroundAccount = activeAccountId == accountId
+        var snapshot = try await catalog.beginRemoval(accountId: accountId)
+        activeAccountId = snapshot.activeAccountId
+
+        // Revoke the old runtime's callback/foreground ownership before handing ownership to its
+        // replacement. Cleanup after this point is restart-safe through the durable tombstone.
+        let removedRuntime = runtimes.removeValue(forKey: accountId)
+        if let removedRuntime {
+            await removedRuntime.fenceForRemoval()
+        }
+        if removedForegroundAccount,
+           let activeAccountId,
+           let activeRuntime = runtimes[activeAccountId] {
+            _ = await activeRuntime.claimForeground()
+        }
+        if let removedRuntime {
+            try await removedRuntime.finishRemovalCleanup()
+        } else {
+            try await TokenStore(service: "com.toj.cloud.account.\(accountId)")
+                .clearAllStoredData()
         }
         try AccountLocalStoreFactory.destroy(accountId: accountId)
-        let snapshot = try await catalog.remove(accountId: accountId)
+        snapshot = try await catalog.finishRemoval(accountId: accountId)
         activeAccountId = snapshot.activeAccountId
         return snapshot
     }
 
     private func runtime(for account: CatalogAccount) throws -> MessagingAccountRuntime {
         if let existing = runtimes[account.accountId] { return existing }
-        guard account.deployment == normalizedDeployment(config.baseURL) else {
+        guard account.deployment == AccountCatalog.normalizedDeployment(config.baseURL) else {
             throw AccountCatalogError.deploymentMismatch
         }
         let created = try MessagingAccountRuntime(account: account, config: config)
@@ -259,9 +304,4 @@ actor MessagingAccountRuntimeRegistry {
         return created
     }
 
-    private nonisolated func normalizedDeployment(_ url: URL) -> String {
-        var value = url.absoluteString.lowercased()
-        while value.last == "/" { value.removeLast() }
-        return value
-    }
 }

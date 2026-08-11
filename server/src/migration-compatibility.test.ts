@@ -21,6 +21,8 @@ describe("forward migration and previous-release startup compatibility", () => {
     const bob = await makeAccount("+16505557902", "Bob");
     const dialog = await getOrCreateDirectDialog(db, alice.accountId, bob.accountId);
     const appendedTypes = [
+      "message.expired",
+      "message.preview_updated",
       "member.role_changed",
       "member.left",
       "dialog.profile_updated",
@@ -28,6 +30,16 @@ describe("forward migration and previous-release startup compatibility", () => {
       "dialog.access_revoked",
       "dialog.preferences_updated",
       "draft.updated",
+      "security.changed",
+      "chat_folders.updated",
+      "scheduled.created",
+      "scheduled.updated",
+      "scheduled.canceled",
+      "scheduled.failed",
+      "pin.updated",
+      "dialog.auto_delete_updated",
+      "poll.updated",
+      "sticker_preferences.updated",
     ];
     const startingPts = Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${alice.accountId}`)[0].pts);
@@ -64,8 +76,13 @@ describe("forward migration and previous-release startup compatibility", () => {
         AND conname = 'account_events_type_check'`)[0];
     expect(String(constraint.definition)).toContain("draft.updated");
     expect(String(constraint.definition)).toContain("dialog.preferences_updated");
+    expect(String(constraint.definition)).toContain("security.changed");
+    expect(String(constraint.definition)).toContain("chat_folders.updated");
+    expect(String(constraint.definition)).toContain("scheduled.created");
+    expect(String(constraint.definition)).toContain("pin.updated");
+    expect(String(constraint.definition)).toContain("sticker_preferences.updated");
     expect(await db`
       SELECT name FROM schema_migrations
-      WHERE name = 'account-events-type-v3'`).toHaveLength(1);
+      WHERE name = 'account-events-type-v7'`).toHaveLength(1);
   });
 });

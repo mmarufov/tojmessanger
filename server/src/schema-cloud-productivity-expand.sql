@@ -216,9 +216,12 @@ CREATE TABLE IF NOT EXISTS link_preview_cache_entries (
   fetched_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ,
   last_error_code TEXT,
+  fanout_pending BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE link_preview_cache_entries
+  ADD COLUMN IF NOT EXISTS fanout_pending BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS message_link_previews (
   dialog_id UUID NOT NULL,
@@ -278,12 +281,13 @@ BEGIN
   END IF;
   ALTER TABLE account_events
     ADD CONSTRAINT account_events_type_check_v6 CHECK (type IN (
-      'message.new','message.edited','message.deleted','message.preview_updated',
+      'message.new','message.edited','message.deleted','message.expired','message.preview_updated',
       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
-      'chat_folders.updated','scheduled.created','scheduled.updated',
-      'scheduled.canceled','scheduled.failed'
+      'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+      'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+      'poll.updated','sticker_preferences.updated'
     )) NOT VALID;
 END;
 $$;
