@@ -18,6 +18,7 @@ import {
 import { bodyAAD, hashToken, mediaFileNameAAD, open, pushTokenAAD } from "./crypto";
 import { CLOUD_CAPABILITIES, startCloudServer } from "./cloud";
 import { updateDialogPreferences } from "./dialog-preferences";
+import { profilePhotosSchemaReadiness, updateProfilePhoto } from "./profile-photos";
 import {
   cleanupExpiredData,
   drainExpiredData,
@@ -2706,6 +2707,155 @@ describe("M3 cloud sync", () => {
     expect(await lookupAccountByUsername(db, first.accountId, "not_valid!")).toBeNull();
     await expect(updateProfile(db, first.accountId, first.deviceId, { ...profile, username: "admin" }))
       .rejects.toMatchObject({ status: 400 });
+  });
+
+  test("profile photos sync idempotently to devices and chat partners without contact discovery leakage", async () => {
+    const { alice, bob } = await makePair();
+    const outsider = await makeAccount(testPhone(147), "Outsider");
+    expect(await profilePhotosSchemaReadiness(db)).toEqual({ ready: true });
+    const bobPtsBeforePhoto = Number((await db`
+      SELECT pts FROM account_sync_states WHERE account_id = ${bob.accountId}`)[0].pts);
+    const bytes = tinyJpeg(96, 96);
+    const upload = await createMediaUpload(db, alice.accountId, alice.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "avatar.jpg",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      width: 96, height: 96, purpose: "profile_photo",
+    });
+    await uploadMediaChunk(db, alice.accountId, alice.deviceId, upload.mediaId, 0, bytes);
+    await uploadMediaThumbnail(
+      db, alice.accountId, alice.deviceId, upload.mediaId, "image/jpeg", bytes,
+    );
+    await completeMediaUpload(db, alice.accountId, alice.deviceId, upload.mediaId);
+
+    const mutationId = crypto.randomUUID();
+    const committed = await updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: upload.mediaId,
+      clientMutationId: mutationId,
+      basePhotoRevision: 0,
+    });
+    expect(committed).toMatchObject({
+      duplicate: false,
+      committedPhotoRevision: 1,
+      profile: { accountId: alice.accountId, photoRevision: 1, photo: { id: upload.mediaId } },
+    });
+    expect(committed.pushes.map((push) => push.accountId).sort())
+      .toEqual([alice.accountId, bob.accountId].sort());
+    expect((await lookupAccountByPhone(db, outsider.accountId, "+16505550100"))?.photo).toBeNull();
+    expect((await downloadMediaChunk(db, bob.accountId, upload.mediaId, 0)).bytes).toEqual(bytes);
+    await expect(downloadMediaChunk(db, outsider.accountId, upload.mediaId, 0))
+      .rejects.toMatchObject({ status: 404 });
+
+    const photoDifference = await getDifference(db, bob.accountId, bobPtsBeforePhoto);
+    expect(photoDifference.kind).toBe("difference");
+    if (photoDifference.kind === "difference") {
+      expect(photoDifference.updates).toContainEqual(expect.objectContaining({
+        type: "profile.updated",
+        subject_account_id: alice.accountId,
+        photo_revision: 1,
+        photo: expect.objectContaining({ id: upload.mediaId }),
+      }));
+    }
+    const photoSnapshot = await startBootstrap(db, bob.accountId);
+    const photoPage = await getBootstrapDialogsPage(db, bob.accountId, photoSnapshot.token);
+    expect(photoPage.dialogs.flatMap((dialog) => dialog.profiles)).toContainEqual(
+      expect.objectContaining({
+        accountId: alice.accountId,
+        photoRevision: 1,
+        photo: expect.objectContaining({ id: upload.mediaId }),
+      }),
+    );
+
+    const retry = await updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: upload.mediaId,
+      clientMutationId: mutationId,
+      basePhotoRevision: 0,
+    });
+    expect(retry).toMatchObject({ duplicate: true, committedPhotoRevision: 1 });
+    await expect(updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: null,
+      clientMutationId: mutationId,
+      basePhotoRevision: 0,
+    })).rejects.toMatchObject({ status: 409, code: "idempotency_conflict" });
+    await expect(updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: upload.mediaId,
+      clientMutationId: crypto.randomUUID(),
+      basePhotoRevision: 0,
+    })).rejects.toMatchObject({ status: 409, code: "stale_profile_photo" });
+
+    const removed = await updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: null,
+      clientMutationId: crypto.randomUUID(),
+      basePhotoRevision: 1,
+    });
+    expect(removed).toMatchObject({
+      committedPhotoRevision: 2,
+      profile: { photo: null, photoRevision: 2 },
+    });
+    await expect(downloadMediaChunk(db, bob.accountId, upload.mediaId, 0))
+      .rejects.toMatchObject({ status: 404 });
+  });
+
+  test("profile photo uploads enforce their narrow image contract", async () => {
+    const owner = await makeAccount(testPhone(148), "Owner");
+    const bytes = tinyPng(32, 32);
+    await expect(createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/png", fileName: "avatar.png",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      width: 32, height: 32, purpose: "profile_photo",
+    })).rejects.toMatchObject({ status: 415, code: "invalid_profile_photo_type" });
+    await expect(createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "avatar.jpg",
+      byteSize: 3 * 1024 * 1024 + 1, sha256: "11".repeat(32),
+      width: 1, height: 1, purpose: "profile_photo",
+    })).rejects.toMatchObject({ status: 413, code: "profile_photo_too_large" });
+    await expect(createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "avatar.jpg",
+      byteSize: 64, sha256: "11".repeat(32),
+      width: 1_025, height: 1, purpose: "profile_photo",
+    })).rejects.toMatchObject({ status: 413, code: "profile_photo_dimensions_too_large" });
+
+    const wrongPurposeBytes = tinyJpeg(16, 16);
+    const wrongPurpose = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "message.jpg",
+      byteSize: wrongPurposeBytes.length,
+      sha256: createHash("sha256").update(wrongPurposeBytes).digest("hex"),
+      width: 16, height: 16, purpose: "message",
+    });
+    await uploadMediaChunk(
+      db, owner.accountId, owner.deviceId, wrongPurpose.mediaId, 0, wrongPurposeBytes,
+    );
+    await completeMediaUpload(db, owner.accountId, owner.deviceId, wrongPurpose.mediaId);
+    await expect(updateProfilePhoto(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      mediaId: wrongPurpose.mediaId,
+      clientMutationId: crypto.randomUUID(),
+      basePhotoRevision: 0,
+    })).rejects.toMatchObject({ status: 404, code: "profile_photo_unavailable" });
+
+    const actualDimensions = tinyJpeg(16, 16);
+    const declaredDimensions = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "avatar.jpg",
+      byteSize: actualDimensions.length,
+      sha256: createHash("sha256").update(actualDimensions).digest("hex"),
+      width: 32, height: 32, purpose: "profile_photo",
+    });
+    await uploadMediaChunk(
+      db, owner.accountId, owner.deviceId, declaredDimensions.mediaId, 0, actualDimensions,
+    );
+    await expect(completeMediaUpload(
+      db, owner.accountId, owner.deviceId, declaredDimensions.mediaId,
+    )).rejects.toMatchObject({ status: 415, code: "photo_dimensions_mismatch" });
   });
 
   test("contact discovery is persistently bounded per authenticated account", async () => {

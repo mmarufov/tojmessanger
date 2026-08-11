@@ -59,6 +59,7 @@ const cloudProductivityContract = new URL(
   "./schema-cloud-productivity-contract.sql",
   import.meta.url,
 ).pathname;
+const presenceExpandSchema = new URL("./schema-presence-expand.sql", import.meta.url).pathname;
 const callMediaBackfillBatchSize = 1_000;
 const preferenceBackfillBatchSize = Math.max(
   1,
@@ -68,6 +69,7 @@ const migrationStartedAt = performance.now();
 
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${groupCallsExpandSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -c "SET LOCAL lock_timeout = '5s'" -f ${schema}`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 --single-transaction -c "SET LOCAL lock_timeout = '5s'" -f ${presenceExpandSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -f ${dialogExpandSchema}`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_type_check_saved_expand"`.quiet();
 await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_saved_owner_check"`.quiet();
@@ -191,6 +193,12 @@ await completeNamedConstraintMigration(
   "account_events",
   "account_events_type_check",
   "account_events_type_check_v3",
+);
+await completeNamedConstraintMigration(
+  "media-purpose-profile-photo-v1",
+  "media_objects",
+  "media_objects_purpose_check",
+  "media_objects_purpose_check_profile_photo",
 );
 await completeConstraintMigration(
   "message-mutation-operation-v2",

@@ -9,6 +9,7 @@ import {
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
 import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
+import { presenceSchemaReadiness } from "./presence";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -77,7 +78,7 @@ export function safeRoute(pathname: string): string {
     "/v1/messages/edit", "/v1/messages/delete", "/v1/history", "/v1/read",
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
     "/v1/group-calls", "/v1/group-calls/active",
-    "/v1/chat-folders", "/v1/scheduled-messages",
+    "/v1/chat-folders", "/v1/scheduled-messages", "/v1/presence/query",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -313,6 +314,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const preferences = await dialogPreferenceSchemaState(sql, { bypassCache: true });
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
+  const presence = await presenceSchemaReadiness(sql);
   const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
   const groupCallInfrastructure = groupCallsConfigured();
   return {
@@ -320,7 +322,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // PushKit, membership, and account-deletion paths even while admission is dark. Schema is an
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
-      && groupCallSchema.ready
+      && groupCallSchema.ready && presence.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -335,6 +337,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // Maintenance, bootstrap, difference sync, and send paths all touch these relations whenever
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
+    presence,
     groupCalls: {
       requested: groupCallsRequested,
       infrastructure: groupCallInfrastructure ? "ready" : "disabled_or_incomplete",
@@ -410,6 +413,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
         AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
         AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+        AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.profile_photo_media_id = mo.id)
         AND NOT EXISTS (
           SELECT 1 FROM scheduled_delivery_items item
           JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id
@@ -437,6 +441,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       AND GREATEST(mo.completed_at, mo.last_accessed_at) < now() - interval '24 hours'
       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible')
       AND NOT EXISTS (SELECT 1 FROM dialogs d WHERE d.photo_media_id = mo.id)
+      AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.profile_photo_media_id = mo.id)
       AND NOT EXISTS (
         SELECT 1 FROM scheduled_delivery_items item
         JOIN scheduled_deliveries delivery ON delivery.id = item.delivery_id

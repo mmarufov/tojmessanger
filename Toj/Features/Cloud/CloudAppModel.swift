@@ -133,6 +133,7 @@ final class CloudAppModel {
     struct GroupMember: Identifiable, Equatable, Sendable {
         let accountId: String
         let displayName: String
+        var photo: CloudMedia? = nil
         let role: String
         let isActive: Bool
         var id: String { accountId }
@@ -178,7 +179,6 @@ final class CloudAppModel {
         var isMuted = false
         var isArchived = false
         var mentionCount = 0
-        var isTyping = false
         var previewKind: ChatListPreviewKind = .text
         var lastMessageMine = false
         var peerAccountId: String? = nil
@@ -323,6 +323,10 @@ final class CloudAppModel {
     private(set) var currentDraft: LocalDraft?
     private(set) var profileDetails: StoredProfileDetails = .empty
     private(set) var profileSaveInFlight = false
+    private(set) var profilePhotoSyncState: ProfilePhotoSyncState = .localOnly
+    private(set) var profilePhotoDisplayData: Data?
+    private(set) var canonicalProfilePhoto: CloudMedia?
+    private(set) var profilePhotoRevision: Int64 = 0
     #if DEBUG
     private(set) var isDemoMode = false
     #endif
@@ -406,6 +410,8 @@ final class CloudAppModel {
         DialogPreferencesCoordinator(api: api)
     @ObservationIgnored private let productivitySyncCoordinator =
         CloudProductivitySyncCoordinator()
+    @ObservationIgnored private lazy var profilePhotoSyncCoordinator =
+        ProfilePhotoSyncCoordinator(api: api, mediaEngine: mediaEngine)
     private let voiceRecorder = VoiceNoteRecorder()
     private var pts: Int64 = 0
     private var hintSocket: CloudHintSocket?
@@ -527,6 +533,7 @@ final class CloudAppModel {
     let callCoordinator: CallCoordinator
     let groupCallCoordinator: GroupCallCoordinator
     let callPreferences: CallPrivacyPreferences
+    let presenceCoordinator: PresenceCoordinator
 
     var capabilities: MessagingCapabilities {
         #if DEBUG
@@ -618,7 +625,9 @@ final class CloudAppModel {
         mediaEngine injectedMediaEngine: CloudMediaTransferEngine? = nil,
         capabilityDefaults: UserDefaults = .standard
     ) {
-        self.api = injectedAPI ?? CloudAPI(config: config)
+        let resolvedAPI = injectedAPI ?? CloudAPI(config: config)
+        self.api = resolvedAPI
+        self.presenceCoordinator = PresenceCoordinator(api: resolvedAPI)
         self.tokenStore = tokenStore
         self.pushCenter = pushCenter
         self.voipPushCenter = voipPushCenter
@@ -638,6 +647,7 @@ final class CloudAppModel {
                     .videoCalls, .savedMessages,
                     .groupCalls, .groupVideoCalls, .screenSharing,
                     .chatFolders, .scheduledDelivery, .linkPreviews,
+                    .presence, .profilePhotos,
                 ])
         } ?? [.replies]
         self.localStore = injectedLocalStore
@@ -1116,6 +1126,7 @@ final class CloudAppModel {
         )
         do {
             try await tokenStore.saveProfile(details, accountId: saved.session.accountId)
+            try await localStore?.saveProfile(profile)
         } catch {
             if accountSessionGeneration == generation,
                storedSession?.session.accountId == accountId,
@@ -1137,6 +1148,165 @@ final class CloudAppModel {
         profileDetails = details
         storedSession = updatedSession
         displayName = details.displayName
+        let replacedPhotoId = canonicalProfilePhoto?.id == profile.photo?.id
+            ? nil
+            : canonicalProfilePhoto?.id
+        canonicalProfilePhoto = profile.photo
+        profilePhotoRevision = profile.photoRevision
+        if let replacedPhotoId, let localStore {
+            MediaPresentationCache.shared.revoke(mediaIds: [replacedPhotoId])
+            await mediaEngine.clearMediaCache(mediaIds: [replacedPhotoId], localStore: localStore)
+        }
+
+        let pending = try? await localStore?.pendingProfilePhotoMutation(accountId: saved.session.accountId)
+        guard pending == nil else {
+            profilePhotoSyncState = pending?.state == "conflict" ? .conflict : .pending
+            return
+        }
+        if let photo = profile.photo {
+            if let bytes = try? await mediaEngine.thumbnail(
+                media: photo,
+                token: token,
+                localStore: localStore
+            ), savedMessagesSessionGeneration == generation,
+               storedSession?.session.token == token {
+                profilePhotoDisplayData = bytes
+                _ = await EncryptedProfilePhotoStore.persist(nil, accountId: saved.session.accountId)
+            }
+            profilePhotoSyncState = .synced
+        } else {
+            let legacy = await EncryptedProfilePhotoStore.load(accountId: saved.session.accountId)
+            profilePhotoDisplayData = legacy
+            profilePhotoSyncState = capabilities.contains(.profilePhotos) && legacy != nil ? .pending : .localOnly
+            if capabilities.contains(.profilePhotos), let legacy {
+                await seedLegacyProfilePhotoIfNeeded(legacy, accountId: saved.session.accountId)
+            }
+        }
+    }
+
+    @discardableResult
+    func saveProfilePhoto(_ data: Data?, accountId: String) async -> Bool {
+        guard let session = storedSession?.session, session.accountId == accountId else { return false }
+        if !capabilities.contains(.profilePhotos) {
+            let stored = await EncryptedProfilePhotoStore.persist(data, accountId: accountId)
+            if stored {
+                profilePhotoDisplayData = data
+                profilePhotoSyncState = .localOnly
+            }
+            return stored
+        }
+        do {
+            if let data {
+                guard let photo = SafeMediaImageDecoder.prepareProfilePhotoUpload(data) else {
+                    throw CloudAppModelError.invalidMedia
+                }
+                let prepared = try await mediaEngine.prepare(
+                    data: photo.data,
+                    kind: "photo",
+                    contentType: photo.contentType,
+                    fileName: "profile-photo.\(photo.filenameExtension)",
+                    width: photo.pixelWidth,
+                    height: photo.pixelHeight,
+                    thumbnail: photo.thumbnail
+                )
+                _ = try await profilePhotoSyncCoordinator.stageSet(
+                    prepared: prepared,
+                    baseRevision: profilePhotoRevision
+                )
+            } else {
+                _ = try await profilePhotoSyncCoordinator.stageRemoval(
+                    baseRevision: profilePhotoRevision
+                )
+            }
+            guard storedSession?.session.accountId == accountId else { throw CancellationError() }
+            guard await EncryptedProfilePhotoStore.persist(data, accountId: accountId) else {
+                await profilePhotoSyncCoordinator.discard()
+                throw CloudAppModelError.localStoreUnavailable
+            }
+            profilePhotoDisplayData = data
+            profilePhotoSyncState = .pending
+            scheduleOutboxRetry()
+            BackgroundRuntimeCoordinator.shared.scheduleProcessing()
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            profilePhotoSyncState = .failed(error.localizedDescription)
+            return false
+        }
+    }
+
+    func retryProfilePhoto() async {
+        guard let accountId = storedSession?.session.accountId else { return }
+        if case .conflict = profilePhotoSyncState {
+            do {
+                let cloud = try await profilePhotoSyncCoordinator.retryMine()
+                canonicalProfilePhoto = cloud.photo
+                profilePhotoRevision = cloud.photoRevision
+            } catch {
+                profilePhotoSyncState = .failed(error.localizedDescription)
+                return
+            }
+        } else {
+            do {
+                try await profilePhotoSyncCoordinator.retryFailed()
+            } catch {
+                profilePhotoSyncState = .failed(error.localizedDescription)
+                return
+            }
+        }
+        profilePhotoSyncState = .pending
+        scheduleOutboxRetry()
+    }
+
+    func useCloudProfilePhoto() async {
+        guard let accountId = storedSession?.session.accountId else { return }
+        do {
+            let profile = try await profilePhotoSyncCoordinator.useCloudPhoto()
+            _ = await EncryptedProfilePhotoStore.persist(nil, accountId: accountId)
+            await acceptCanonicalProfile(profile, token: storedSession?.session.token ?? "")
+        } catch {
+            profilePhotoSyncState = .failed(error.localizedDescription)
+        }
+    }
+
+    func discardPendingProfilePhoto() async {
+        guard let accountId = storedSession?.session.accountId else { return }
+        await profilePhotoSyncCoordinator.discard()
+        _ = await EncryptedProfilePhotoStore.persist(nil, accountId: accountId)
+        if let token = storedSession?.session.token,
+           let profile = try? await api.getProfile(token: token) {
+            await acceptCanonicalProfile(profile, token: token)
+        } else {
+            profilePhotoDisplayData = nil
+            profilePhotoSyncState = .localOnly
+        }
+    }
+
+    private func seedLegacyProfilePhotoIfNeeded(_ data: Data, accountId: String) async {
+        guard (try? await localStore?.pendingProfilePhotoMutation(accountId: accountId)) == nil,
+              let photo = SafeMediaImageDecoder.prepareProfilePhotoUpload(data),
+              let prepared = try? await mediaEngine.prepare(
+                data: photo.data,
+                kind: "photo",
+                contentType: photo.contentType,
+                fileName: "profile-photo.\(photo.filenameExtension)",
+                width: photo.pixelWidth,
+                height: photo.pixelHeight,
+                thumbnail: photo.thumbnail
+              )
+        else { return }
+        do {
+            _ = try await profilePhotoSyncCoordinator.stageSet(
+                prepared: prepared,
+                baseRevision: profilePhotoRevision,
+                source: "legacy"
+            )
+            profilePhotoSyncState = .pending
+            scheduleOutboxRetry()
+        } catch {
+            await mediaEngine.discardPrepared(prepared)
+        }
     }
 
     private static func store(
@@ -1335,9 +1505,11 @@ final class CloudAppModel {
         // network task that ignores parent cancellation could keep teardown waiting forever.
         await savedMessagesService.reset()
         await accessPurgeCoordinator.reset()
+        await presenceCoordinator.reset(clearCacheValues: true)
         for operation in savedOperations { await operation.wait() }
         let accountId = storedSession?.session.accountId
         await draftSyncCoordinator.suspendRetries()
+        await profilePhotoSyncCoordinator.configure(store: nil, session: nil, enabled: false)
         var cleanupFailures: [String] = []
         do {
             try await tokenStore.savePendingLocalErasure(accountId: accountId)
@@ -2091,6 +2263,7 @@ final class CloudAppModel {
                 GroupMember(
                     accountId: member.accountId,
                     displayName: profiles[member.accountId]?.displayName ?? shortDialogId(member.accountId),
+                    photo: profiles[member.accountId]?.photo,
                     role: member.role,
                     isActive: member.isActive
                 )
@@ -2108,6 +2281,10 @@ final class CloudAppModel {
         return groupMembersByDialog[dialogId]?
             .first(where: { $0.accountId == accountId })?
             .displayName ?? shortDialogId(accountId)
+    }
+
+    func groupMemberPhoto(accountId: String, dialogId: String) -> CloudMedia? {
+        groupMembersByDialog[dialogId]?.first(where: { $0.accountId == accountId })?.photo
     }
 
     func updateGroupTitle(dialogId: String, title: String) async -> Bool {
@@ -2415,6 +2592,7 @@ final class CloudAppModel {
 
     private func beginConversationSelection(_ dialogId: String) {
         if let previousDialogId = activeDialogId, previousDialogId != dialogId {
+            presenceCoordinator.dialogDidChange(from: previousDialogId)
             conversationOpenStartedAt.removeValue(forKey: previousDialogId)
             finishConversationOpenWaiters(dialogId: previousDialogId)
             let pendingPersistence = draftPersistenceTasks[previousDialogId]
@@ -2742,6 +2920,7 @@ final class CloudAppModel {
     /// conversation. Unlike the regular viewport updates, this final write is not debounced.
     func flushAndDeselectDialog(_ dialogId: String) async {
         guard activeDialogId == dialogId else { return }
+        await presenceCoordinator.stopLocalTyping(dialogId: dialogId)
         viewportPersistenceTask?.cancel()
         viewportPersistenceTask = nil
         let accountId = storedSession?.session.accountId
@@ -3123,6 +3302,51 @@ final class CloudAppModel {
         dialogs.first(where: { $0.id == dialogId })?.title ?? shortDialogId(dialogId)
     }
 
+    func typingSummary(dialogId: String) -> String? {
+        guard let dialog = dialogs.first(where: { $0.id == dialogId }), dialog.type != "saved" else {
+            return nil
+        }
+        let accountIds = presenceCoordinator.typingAccountIds(dialogId: dialogId)
+        guard !accountIds.isEmpty else { return nil }
+        if dialog.type == "direct" { return String(localized: "typing…") }
+        let names = accountIds.map { accountId in
+            groupMembersByDialog[dialogId]?
+                .first(where: { $0.accountId == accountId })?.displayName
+                ?? String(localized: "Someone")
+        }
+        if names.count == 1 {
+            return String(format: String(localized: "%@ is typing…"), names[0])
+        }
+        if names.count == 2 {
+            return String(format: String(localized: "%@ and %@ are typing…"), names[0], names[1])
+        }
+        return String(format: String(localized: "%lld people are typing…"), Int64(names.count))
+    }
+
+    func directPresenceSubtitle(dialogId: String) -> String {
+        guard capabilities.contains(.presence),
+              let peer = dialogs.first(where: { $0.id == dialogId })?.peerAccountId else {
+            return String(localized: "status unavailable")
+        }
+        guard let presence = presenceCoordinator.presence(accountId: peer) else {
+            return String(localized: "status unavailable")
+        }
+        if presence.online { return String(localized: "online") }
+        return TojPresenceFormatting.lastSeen(presence.lastSeenAt)
+    }
+
+    func userEditedComposer(dialogId: String, text: String, focused: Bool) {
+        presenceCoordinator.userEditedDraft(dialogId: dialogId, text: text, focused: focused)
+    }
+
+    func composerFocusChanged(dialogId: String, focused: Bool) {
+        presenceCoordinator.composerFocusChanged(dialogId: dialogId, focused: focused, text: draft)
+    }
+
+    func stopTyping(dialogId: String) async {
+        await presenceCoordinator.stopLocalTyping(dialogId: dialogId)
+    }
+
     @discardableResult
     func ensureSavedMessages(presentsFailure: Bool = true) async -> String? {
         guard !sessionTeardownActive else { return nil }
@@ -3413,6 +3637,9 @@ final class CloudAppModel {
     }
 
     func sendDraft(silent: Bool = false, deliverAfter: Date? = nil) async {
+        if let activeDialogId {
+            await presenceCoordinator.stopLocalTyping(dialogId: activeDialogId)
+        }
         let rawText = draft
         let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         if case let .editing(messageId, _) = composerMode {
@@ -5445,6 +5672,11 @@ final class CloudAppModel {
                 session: storedSession?.session,
                 cloudEnabled: negotiatedCapabilities.contains(.cloudDrafts)
             )
+            await profilePhotoSyncCoordinator.configure(
+                store: restoredStore,
+                session: storedSession?.session,
+                enabled: negotiatedCapabilities.contains(.profilePhotos)
+            )
 
             // Publish the complete cached launch state in one main-actor turn.
             pts = launchSnapshot.pts
@@ -5752,6 +5984,7 @@ final class CloudAppModel {
     }
 
     func setForegroundActive(_ isActive: Bool) async {
+        await presenceCoordinator.setForegroundActive(isActive)
         mediaSchedulerForegrounded = isActive
         await mediaPrefetchScheduler.update(
             networkClass: ReplicaNetworkMonitor.shared.snapshot().networkClass,
@@ -5799,8 +6032,10 @@ final class CloudAppModel {
         guard launchPhase == .localReady, storedSession != nil else { return }
         #if DEBUG
         if TelegramFastUITestFixture.enabled {
-            setReplicaSyncState(.offline)
-            status = "Offline fixture — showing saved chats"
+            if TelegramFastUITestFixture.presenceScenario == nil {
+                setReplicaSyncState(.offline)
+                status = "Offline fixture — showing saved chats"
+            }
             return
         }
         #endif
@@ -5817,7 +6052,9 @@ final class CloudAppModel {
             try TelegramFastUITestFixture.reset()
         }
         let fixtureSession = TelegramFastUITestFixture.session
-        try await tokenStore.save(fixtureSession)
+        // The deterministic fixture is reinstalled on every UI-test process launch. Avoid a
+        // Keychain dependency so unsigned simulator verification can exercise the encrypted
+        // replica and presentation without failing on errSecMissingEntitlement.
         isSessionTeardownInProgress = false
         installAuthenticatedSession(fixtureSession)
         phone = fixtureSession.phone
@@ -5835,8 +6072,46 @@ final class CloudAppModel {
         }
         try await TelegramFastUITestFixture.install(into: store)
         await afterSignIn()
-        setReplicaSyncState(.offline)
-        status = "Offline fixture — showing saved chats"
+        if let scenario = TelegramFastUITestFixture.presenceScenario {
+            if scenario == "unsupported" {
+                negotiatedCapabilities.remove(.presence)
+                await presenceCoordinator.configure(
+                    store: store, session: fixtureSession.session, enabled: false
+                )
+            } else {
+                await presenceCoordinator.configure(
+                    store: store, session: fixtureSession.session, enabled: true
+                )
+                presenceCoordinator.enableFixturesForTesting()
+                await presenceCoordinator.handle(PresenceUpdateHint(
+                    type: "presence_update",
+                    accountId: TelegramFastUITestFixture.peerAccountId,
+                    online: true,
+                    lastSeenAt: nil,
+                    revision: 1
+                ))
+                if scenario == "typing" {
+                    presenceCoordinator.handle(TypingUpdateHint(
+                        type: "typing_update",
+                        dialogId: TelegramFastUITestFixture.primaryDialogId,
+                        actorAccountId: TelegramFastUITestFixture.peerAccountId,
+                        typingSessionId: "00000000-0000-4000-8000-000000000701",
+                        active: true,
+                        expiresInMs: 7_000
+                    ))
+                }
+            }
+            if scenario == "offline_override" {
+                setReplicaSyncState(.offline)
+                status = "Offline fixture — showing saved chats"
+            } else {
+                setReplicaSyncState(.ready)
+                status = "Ready"
+            }
+        } else {
+            setReplicaSyncState(.offline)
+            status = "Offline fixture — showing saved chats"
+        }
     }
     #endif
 
@@ -5975,12 +6250,15 @@ final class CloudAppModel {
             } else if local.hasDraftReply {
                 resolved.draftPreview = String(localized: "Reply draft")
             }
-            if let existing = previous[resolved.id] {
-                resolved.isTyping = existing.isTyping
-            }
             return resolved
         }
         savedMessagesDialogId = localDialogs.first(where: { $0.type == "saved" })?.dialogId
+        let directPeers = dialogs.compactMap { dialog in
+            dialog.type == "direct" ? dialog.peerAccountId : nil
+        }
+        Task { [weak self] in
+            await self?.presenceCoordinator.updateDirectPeers(directPeers)
+        }
         sortDialogsForPresentation()
         if let activeDialogId,
            let removedType = previous[activeDialogId]?.type,
@@ -6216,7 +6494,21 @@ final class CloudAppModel {
                GroupCallEngineFactory.supportsScreenShare {
                 resolved.insert(.screenSharing)
             }
+            if advertised.contains("presence_v1") { resolved.insert(.presence) }
+            if advertised.contains("profile_photos_v1"), resolved.contains(.media) {
+                resolved.insert(.profilePhotos)
+            }
             negotiatedCapabilities = resolved
+            await profilePhotoSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                enabled: resolved.contains(.profilePhotos)
+            )
+            await presenceCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                enabled: resolved.contains(.presence)
+            )
             await draftSyncCoordinator.configure(
                 store: localStore,
                 session: storedSession?.session,
@@ -6238,6 +6530,7 @@ final class CloudAppModel {
             capabilityDefaults.set(
                 Int(resolved.subtracting([
                     .videoCalls, .savedMessages, .chatFolders, .scheduledDelivery, .linkPreviews,
+                    .presence, .profilePhotos,
                 ]).rawValue),
                 forKey: capabilityCacheKey
             )
@@ -6287,6 +6580,11 @@ final class CloudAppModel {
                 store: localStore,
                 session: storedSession?.session,
                 cloudEnabled: false
+            )
+            await presenceCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                enabled: false
             )
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
@@ -6602,6 +6900,7 @@ final class CloudAppModel {
         let socket = CloudHintSocket(url: api.config.wsURL(), token: token)
         hintSocket = socket
         hintSocketToken = token
+        await presenceCoordinator.attach(socket: socket)
         hintTask = Task { [weak self, socket] in
             await socket.start()
             await withTaskGroup(of: Void.self) { group in
@@ -6626,6 +6925,12 @@ final class CloudAppModel {
                             // Teardown runs outside this exact hintTask so it can cancel and await
                             // both socket loops without ever awaiting itself.
                             return
+                        case .presence(let hint):
+                            await self.presenceCoordinator.handle(hint)
+                        case .presenceVisibility(let hint):
+                            await self.presenceCoordinator.handle(hint)
+                        case .typing(let hint):
+                            await self.presenceCoordinator.handle(hint)
                         }
                     }
                 }
@@ -6633,6 +6938,7 @@ final class CloudAppModel {
                     var hasConnected = false
                     for await state in socket.states {
                         guard let self, !Task.isCancelled else { return }
+                        await self.presenceCoordinator.transportChanged(state)
                         guard state == .connected else { continue }
                         if hasConnected {
                             await self.replicaSyncCoordinator.trigger(.socketReconnect)
@@ -6782,6 +7088,7 @@ final class CloudAppModel {
         await hintSocket?.stop()
         hintSocket = nil
         hintSocketToken = nil
+        await presenceCoordinator.attach(socket: nil)
     }
 
     private func schedulePostSyncWork(token: String) {
@@ -7528,7 +7835,8 @@ final class CloudAppModel {
         return CloudProfile(
             accountId: accountId, username: contact.username, firstName: firstName, lastName: lastName,
             displayName: displayName, bio: bio, birthday: contact.birthday,
-            colorIndex: colorIndex, updatedAt: updatedAt
+            colorIndex: colorIndex, photo: contact.photo,
+            photoRevision: contact.photoRevision ?? 0, updatedAt: updatedAt
         )
     }
 
@@ -7546,7 +7854,8 @@ final class CloudAppModel {
         return CloudProfile(
             accountId: ownAccountId, username: update.username, firstName: firstName, lastName: lastName,
             displayName: displayName, bio: bio, birthday: update.birthday,
-            colorIndex: colorIndex, updatedAt: updatedAt
+            colorIndex: colorIndex, photo: update.photo,
+            photoRevision: update.photoRevision ?? 0, updatedAt: updatedAt
         )
     }
 
@@ -7687,6 +7996,34 @@ final class CloudAppModel {
         }
     }
 
+    private func retryPendingProfilePhotoCommit() async {
+        guard capabilities.contains(.profilePhotos) else { return }
+        await handleProfilePhotoCommitResult(await profilePhotoSyncCoordinator.commitReady())
+    }
+
+    private func handleProfilePhotoCommitResult(_ result: ProfilePhotoCommitResult) async {
+        switch result {
+        case .idle, .cancelled:
+            return
+        case let .committed(profile):
+            guard let token = storedSession?.session.token else { return }
+            await acceptCanonicalProfile(profile, token: token)
+            profilePhotoSyncState = .synced
+            status = "Profile photo updated everywhere"
+            scheduleSync()
+        case let .retrying(message, delay):
+            profilePhotoSyncState = .failed(message)
+            scheduleOutboxRetry(after: delay)
+            BackgroundRuntimeCoordinator.shared.scheduleAppRefresh(
+                earliestBeginDate: Date(timeIntervalSinceNow: delay)
+            )
+        case let .failed(message):
+            profilePhotoSyncState = .failed(message)
+        case .conflict:
+            profilePhotoSyncState = .conflict
+        }
+    }
+
     private func retryPendingOutbox() async {
         guard !retryInFlight else { return }
         guard let context = currentAccountOperationContext() else { return }
@@ -7709,6 +8046,8 @@ final class CloudAppModel {
             let postCreateReport = await productivitySyncCoordinator.drain(api: api)
             await publishProductivityDrainReport(postCreateReport, context: context)
             guard isCurrentAccountOperation(context) else { return }
+            await retryPendingProfilePhotoCommit()
+            guard !outboxDrainHalted, isCurrentAccountOperation(context) else { return }
             await retryPendingGroupCreations(token: token, localStore: localStore)
             guard !outboxDrainHalted else { return }
             await retryPendingGroupMutations()
@@ -8454,6 +8793,16 @@ final class CloudAppModel {
             guard let ready = try await localStore.mediaTransfer(id: initial.transferId) else {
                 throw CloudAppModelError.localStoreUnavailable
             }
+            if ready.purpose == "profile_photo" {
+                try await profilePhotoSyncCoordinator.markUploaded(
+                    transferId: ready.transferId,
+                    mediaId: mediaId
+                )
+                await handleProfilePhotoCommitResult(
+                    await profilePhotoSyncCoordinator.commitReady()
+                )
+                return
+            }
             if ready.purpose == "draft" {
                 if !draftReadyCommitted {
                     // Repairs a row persisted by an older build at the former two-transaction
@@ -8581,6 +8930,49 @@ final class CloudAppModel {
             else { return }
             let current = try? await localStore.mediaTransfer(id: initial.transferId)
             if activeDialogId == initial.dialogId, case .uploading = composerMode { composerMode = .text }
+            if initial.purpose == "profile_photo" {
+                let disposition = cloudOperationFailureDisposition(
+                    error,
+                    serverAdvertisesFeature: capabilities.contains(.profilePhotos)
+                )
+                switch disposition {
+                case let .transient(retryAfter):
+                    let delay = retryAfter ?? retryDelay(forRetryCount: initial.retryCount + 1)
+                    try? await localStore.updateMediaTransfer(
+                        transferId: initial.transferId,
+                        mediaId: current?.mediaId,
+                        uploadOffset: current?.uploadOffset ?? initial.uploadOffset,
+                        state: current?.mediaId == nil ? "pending" : "uploading",
+                        error: error.localizedDescription,
+                        retryAfter: delay
+                    )
+                    try? await localStore.failProfilePhotoUpload(
+                        accountId: accountId,
+                        error: error.localizedDescription,
+                        retryAfter: delay
+                    )
+                    profilePhotoSyncState = .failed(error.localizedDescription)
+                    scheduleOutboxRetry(after: delay)
+                case .authenticationRequired:
+                    return
+                case .unsupportedServer:
+                    await refreshServerCapabilities()
+                    profilePhotoSyncState = .localOnly
+                case .permanent:
+                    try? await localStore.markMediaTerminal(
+                        clientMsgId: initial.clientMsgId,
+                        error: error.localizedDescription
+                    )
+                    try? await localStore.failProfilePhotoMutation(
+                        accountId: accountId,
+                        error: error.localizedDescription,
+                        retryAfter: nil,
+                        terminal: true
+                    )
+                    profilePhotoSyncState = .failed(error.localizedDescription)
+                }
+                return
+            }
             if let apiError = error as? CloudAPIError,
                apiError.code == "invalid_reply_target",
                let current,
@@ -9332,7 +9724,7 @@ final class CloudAppModel {
             Dialog(id: "demo-mehrona", title: "Меҳрона", subtitle: "Шоми Душанбе", updatedAt: Self.demoTimestamp(minutesAgo: 2), isPending: false, unreadCount: 2, isPinned: true, mentionCount: 1, previewKind: .photo),
             Dialog(id: "demo-firooz", title: "Фирӯз", subtitle: "Документы получил, спасибо", updatedAt: Self.demoTimestamp(minutesAgo: 23), isPending: false, unreadCount: 4, isMuted: true, previewKind: .file),
             Dialog(id: "demo-madina", title: "Мадина", subtitle: "Дар роҳам", updatedAt: Self.demoTimestamp(minutesAgo: 1_480), isPending: false, unreadCount: 0, draftPreview: "Пас аз даҳ дақиқа…"),
-            Dialog(id: "demo-aziz", title: "Азиз", subtitle: "Созвонимся вечером?", updatedAt: Self.demoTimestamp(minutesAgo: 2_920), isPending: false, unreadCount: 0, isTyping: true, lastMessageMine: true),
+            Dialog(id: "demo-aziz", title: "Азиз", subtitle: "Созвонимся вечером?", updatedAt: Self.demoTimestamp(minutesAgo: 2_920), isPending: false, unreadCount: 0, lastMessageMine: true),
         ]
         demoLinesByDialog = [
             "demo-mehrona": [

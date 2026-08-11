@@ -24,11 +24,37 @@ nonisolated struct SessionRevokedHint: Codable, Equatable, Sendable {
     let reason: String?
 }
 
+nonisolated struct PresenceUpdateHint: Codable, Equatable, Sendable {
+    let type: String
+    let accountId: String
+    let online: Bool
+    let lastSeenAt: String?
+    let revision: Int64
+}
+
+nonisolated struct PresenceVisibilityHint: Codable, Equatable, Sendable {
+    let type: String
+    let accountId: String
+    let visible: Bool
+}
+
+nonisolated struct TypingUpdateHint: Codable, Equatable, Sendable {
+    let type: String
+    let dialogId: String
+    let actorAccountId: String
+    let typingSessionId: String
+    let active: Bool
+    let expiresInMs: Int
+}
+
 nonisolated enum CloudSocketEvent: Equatable, Sendable {
     case sync(SyncHint)
     case call(CallHint)
     case groupCall(GroupCallSocketHint)
     case sessionRevoked(SessionRevokedHint)
+    case presence(PresenceUpdateHint)
+    case presenceVisibility(PresenceVisibilityHint)
+    case typing(TypingUpdateHint)
 }
 
 actor CloudHintSocket {
@@ -44,6 +70,7 @@ actor CloudHintSocket {
     private var task: URLSessionWebSocketTask?
     private var runLoop: Task<Void, Never>?
     private var backoff = BackoffPolicy()
+    private var presenceActive = false
     private(set) var state: State = .disconnected
 
     private let statesContinuation: AsyncStream<State>.Continuation
@@ -71,6 +98,19 @@ actor CloudHintSocket {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         setState(.disconnected)
+    }
+
+    func setPresenceActive(_ active: Bool) async {
+        presenceActive = active
+        await sendJSON(PresenceActivityMessage(type: "presence_activity", active: active))
+    }
+
+    func sendTyping(dialogId: String, active: Bool) async {
+        await sendJSON(TypingActivityMessage(
+            type: "typing_activity",
+            dialogId: dialogId,
+            active: active
+        ))
     }
 
     private func run() async {
@@ -107,6 +147,12 @@ actor CloudHintSocket {
 
     private func receiveLoop(on task: URLSessionWebSocketTask) async throws {
         setState(.connected)
+        if presenceActive {
+            try await sendJSON(
+                PresenceActivityMessage(type: "presence_activity", active: true),
+                on: task
+            )
+        }
         while !Task.isCancelled {
             let message = try await task.receive()
             backoff.reset()
@@ -117,8 +163,11 @@ actor CloudHintSocket {
 
     private func heartbeatLoop(on task: URLSessionWebSocketTask) async throws {
         while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(25))
+            try await Task.sleep(for: .seconds(20))
             try Task.checkCancellation()
+            if presenceActive {
+                try await sendJSON(PresenceHeartbeatMessage(type: "presence_heartbeat"), on: task)
+            }
             try await Self.awaitPong(on: task)
         }
     }
@@ -147,7 +196,21 @@ actor CloudHintSocket {
         statesContinuation.yield(next)
     }
 
-    private nonisolated static func event(from message: URLSessionWebSocketTask.Message) -> CloudSocketEvent? {
+    private func sendJSON<Value: Encodable & Sendable>(_ value: Value) async {
+        guard state == .connected, let task else { return }
+        try? await sendJSON(value, on: task)
+    }
+
+    private func sendJSON<Value: Encodable & Sendable>(
+        _ value: Value,
+        on task: URLSessionWebSocketTask
+    ) async throws {
+        let data = try JSONEncoder().encode(value)
+        guard let text = String(data: data, encoding: .utf8) else { return }
+        try await task.send(.string(text))
+    }
+
+    nonisolated static func event(from message: URLSessionWebSocketTask.Message) -> CloudSocketEvent? {
         let data: Data
         switch message {
         case .string(let text): data = Data(text.utf8)
@@ -168,6 +231,13 @@ actor CloudHintSocket {
                 .map(CloudSocketEvent.groupCall)
         case "session_revoked":
             return (try? decoder.decode(SessionRevokedHint.self, from: data)).map(CloudSocketEvent.sessionRevoked)
+        case "presence_update":
+            return (try? decoder.decode(PresenceUpdateHint.self, from: data)).map(CloudSocketEvent.presence)
+        case "presence_visibility":
+            return (try? decoder.decode(PresenceVisibilityHint.self, from: data))
+                .map(CloudSocketEvent.presenceVisibility)
+        case "typing_update":
+            return (try? decoder.decode(TypingUpdateHint.self, from: data)).map(CloudSocketEvent.typing)
         default:
             return nil
         }
@@ -176,4 +246,19 @@ actor CloudHintSocket {
 
 private nonisolated struct SocketDiscriminator: Codable, Sendable {
     let type: String
+}
+
+private nonisolated struct PresenceActivityMessage: Codable, Sendable {
+    let type: String
+    let active: Bool
+}
+
+private nonisolated struct PresenceHeartbeatMessage: Codable, Sendable {
+    let type: String
+}
+
+private nonisolated struct TypingActivityMessage: Codable, Sendable {
+    let type: String
+    let dialogId: String
+    let active: Bool
 }

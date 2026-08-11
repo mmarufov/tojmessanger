@@ -47,6 +47,8 @@ BEGIN
   WHERE account_id = target_account_id;
   DELETE FROM public.dialog_preference_action_budgets
   WHERE account_id = target_account_id;
+  DELETE FROM public.profile_photo_mutations
+  WHERE account_id = target_account_id;
 
   DELETE FROM public.chat_folder_mutation_requests
   WHERE account_id = target_account_id;
@@ -93,6 +95,10 @@ BEGIN
     AND NOT EXISTS (
       SELECT 1 FROM public.dialogs AS dialog
       WHERE dialog.photo_media_id = media.id
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM public.accounts AS account
+      WHERE account.profile_photo_media_id = media.id
     )
     AND NOT EXISTS (
       SELECT 1 FROM public.draft_attachments AS attachment

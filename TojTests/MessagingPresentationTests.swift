@@ -5,6 +5,120 @@ import UniformTypeIdentifiers
 @testable import Toj
 
 final class MessagingPresentationTests: XCTestCase {
+    func testPresenceWireEventsDecodeWithoutGuessingUnknownFrames() throws {
+        let presence = try XCTUnwrap(CloudHintSocket.event(from: .string("""
+        {"type":"presence_update","accountId":"peer","online":false,
+         "lastSeenAt":"2026-08-11T09:30:00.000Z","revision":7}
+        """)))
+        XCTAssertEqual(presence, .presence(PresenceUpdateHint(
+            type: "presence_update",
+            accountId: "peer",
+            online: false,
+            lastSeenAt: "2026-08-11T09:30:00.000Z",
+            revision: 7
+        )))
+        let typing = try XCTUnwrap(CloudHintSocket.event(from: .string("""
+        {"type":"typing_update","dialogId":"dialog","actorAccountId":"peer",
+         "typingSessionId":"socket","active":true,"expiresInMs":7000}
+        """)))
+        XCTAssertEqual(typing, .typing(TypingUpdateHint(
+            type: "typing_update",
+            dialogId: "dialog",
+            actorAccountId: "peer",
+            typingSessionId: "socket",
+            active: true,
+            expiresInMs: 7_000
+        )))
+        XCTAssertNil(CloudHintSocket.event(from: .string("{\"type\":\"invented_presence\"}")))
+    }
+
+    @MainActor
+    func testPresenceCoordinatorRejectsStaleRevisionsAndClearsTransportClaims() async throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        coordinator.enableFixturesForTesting()
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: true,
+            lastSeenAt: "2026-08-11T09:30:00.000Z", revision: 8
+        ))
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: false,
+            lastSeenAt: "2026-08-11T09:00:00.000Z", revision: 7
+        ))
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.revision, 8)
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, true)
+
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "dialog", actorAccountId: "peer",
+            typingSessionId: "socket", active: true, expiresInMs: 7_000
+        ))
+        XCTAssertEqual(coordinator.typingAccountIds(dialogId: "dialog"), ["peer"])
+        await coordinator.transportChanged(.disconnected)
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, false)
+        XCTAssertTrue(coordinator.typingAccountIds(dialogId: "dialog").isEmpty)
+    }
+
+    @MainActor
+    func testTypingSessionsAggregateByActorAndExpireAfterDroppedStops() async throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        coordinator.enableFixturesForTesting()
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "group", actorAccountId: "aziz",
+            typingSessionId: "aziz-phone", active: true, expiresInMs: 80
+        ))
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "group", actorAccountId: "aziz",
+            typingSessionId: "aziz-tablet", active: true, expiresInMs: 80
+        ))
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "group", actorAccountId: "madina",
+            typingSessionId: "madina-phone", active: true, expiresInMs: 80
+        ))
+        XCTAssertEqual(coordinator.typingAccountIds(dialogId: "group"), ["aziz", "madina"])
+
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "group", actorAccountId: "aziz",
+            typingSessionId: "aziz-phone", active: false, expiresInMs: 7_000
+        ))
+        XCTAssertEqual(coordinator.typingAccountIds(dialogId: "group"), ["aziz", "madina"])
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(coordinator.typingAccountIds(dialogId: "group").isEmpty)
+    }
+
+    @MainActor
+    func testProgrammaticDraftFocusDoesNotEmitTyping() throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        coordinator.enableFixturesForTesting()
+        coordinator.composerFocusChanged(dialogId: "dialog", focused: true, text: "restored")
+        XCTAssertNil(coordinator.localTypingDialogIdForTesting)
+        coordinator.userEditedDraft(dialogId: "dialog", text: "restored!", focused: true)
+        XCTAssertEqual(coordinator.localTypingDialogIdForTesting, "dialog")
+    }
+
+    func testExactLastSeenFormattingAndUnavailableFallback() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let locale = Locale(identifier: "en_US_POSIX")
+        let now = Date(timeIntervalSince1970: 1_754_908_400) // 2025-08-11 09:00 UTC
+        XCTAssertTrue(TojPresenceFormatting.lastSeen(
+            "2025-08-11T08:30:00.000Z", now: now, calendar: calendar, locale: locale
+        ).hasPrefix("last seen today at "))
+        XCTAssertTrue(TojPresenceFormatting.lastSeen(
+            "2025-08-10T08:30:00.000Z", now: now, calendar: calendar, locale: locale
+        ).hasPrefix("last seen yesterday at "))
+        XCTAssertEqual(TojPresenceFormatting.lastSeen(
+            nil, now: now, calendar: calendar, locale: locale
+        ), "status unavailable")
+    }
+
     func testCapabilitySetsKeepProductionTruthful() {
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.replies))
         XCTAssertTrue(MessagingCapabilities.productionText.contains(.editing))
@@ -19,11 +133,14 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.demo.contains(.calls))
         XCTAssertFalse(MessagingCapabilities.demo.contains(.savedMessages))
         let dailyUseBits: [MessagingCapabilities] = [
-            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch,
+            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch, .presence,
+            .profilePhotos,
         ]
         XCTAssertEqual(Set(dailyUseBits.map(\.rawValue)).count, dailyUseBits.count)
         XCTAssertEqual(MessagingCapabilities.savedMessages.rawValue, 1 << 14)
         XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
+        XCTAssertEqual(MessagingCapabilities.presence.rawValue, 1 << 22)
+        XCTAssertEqual(MessagingCapabilities.profilePhotos.rawValue, 1 << 23)
     }
 
     func testSavedCapabilityDistinguishesOfflineUnknownSupportAndWithdrawal() {

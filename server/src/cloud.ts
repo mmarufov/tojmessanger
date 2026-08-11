@@ -111,6 +111,11 @@ import {
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
 import {
+  profilePhotosSchemaReadiness,
+  ProfilePhotoError,
+  updateProfilePhoto,
+} from "./profile-photos";
+import {
   ensureSavedMessages,
   savedMessagesConfigured,
   savedMessagesEnabledForAccount,
@@ -184,8 +189,32 @@ import {
   scheduledDeliveryEnabledForAccount,
   workerHeartbeatFresh,
 } from "./cloud-productivity-readiness";
+import {
+  heartbeatPresence,
+  PresenceError,
+  presenceEnabledForAccount,
+  presenceMetrics,
+  presenceSchemaReadiness,
+  publishPresenceVisibility,
+  publishTyping,
+  queryPresence,
+  recordPresenceRejectedFrame,
+  setPresenceActivity,
+  startPresenceCleanupWorker,
+  startPresenceNotificationListener,
+  type PresenceBroadcast,
+  validPresenceDialogId,
+} from "./presence";
 
-type SocketData = { accountId: string; deviceId: string };
+type SocketData = {
+  accountId: string;
+  deviceId: string;
+  connectionId: string;
+  presenceActive: boolean;
+  typingDialogs: Set<string>;
+  lastTypingAt: Map<string, number>;
+  activityQueue: Promise<void>;
+};
 type Db = typeof defaultSql;
 
 export type CloudServerOptions = {
@@ -225,6 +254,8 @@ function cloudCapabilities(
   chatFolders: boolean,
   scheduledDelivery: boolean,
   linkPreviews: boolean,
+  profilePhotos: boolean,
+  presence: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -239,6 +270,8 @@ function cloudCapabilities(
   if (chatFolders) capabilities.push("chat_folders_v1");
   if (scheduledDelivery) capabilities.push("scheduled_delivery_v1");
   if (linkPreviews) capabilities.push("link_previews_v1");
+  if (profilePhotos) capabilities.push("profile_photos_v1");
+  if (presence) capabilities.push("presence_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -359,6 +392,20 @@ function disconnectAccount(
   sockets.delete(accountId);
 }
 
+function pushPresenceBroadcasts(
+  sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
+  broadcasts: PresenceBroadcast[],
+) {
+  for (const broadcast of broadcasts) {
+    const payload = JSON.stringify(broadcast.event);
+    for (const accountId of broadcast.recipientAccountIds) {
+      for (const ws of sockets.get(accountId) ?? []) {
+        if (ws.readyState === 1) ws.send(payload);
+      }
+    }
+  }
+}
+
 function networkKey(req: Request, server: { requestIP(request: Request): { address: string } | null }): string | null {
   const forwarded = process.env.TOJ_TRUST_PROXY === "1"
     ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
@@ -374,6 +421,7 @@ export function startCloudServer(
   options: CloudServerOptions = {},
 ) {
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
+  const presenceSocketCleanupTasks = new Set<Promise<void>>();
   const metrics = new OperationalMetrics();
   const requireScheduledWorkerOrReplay = async (
     accountId: string,
@@ -403,6 +451,9 @@ export function startCloudServer(
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
   const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
+  const profilePhotosConfigured = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED === "1";
+  const profilePhotosAvailable = async () => profilePhotosConfigured
+    && (await profilePhotosSchemaReadiness(db)).ready;
   const draftMediaAvailability = async () => {
     const schema = await draftMediaSchemaState(db);
     return {
@@ -448,6 +499,16 @@ export function startCloudServer(
       pushGroupCallHints(sockets, hints);
     },
   ) : () => {};
+  const presenceDatabaseURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL
+    ?? process.env.DATABASE_URL ?? null;
+  const stopPresenceNotifications = backgroundWorkers ? startPresenceNotificationListener(
+    presenceDatabaseURL,
+    (broadcast) => pushPresenceBroadcasts(sockets, [broadcast]),
+  ) : () => {};
+  const stopPresenceCleanup = backgroundWorkers ? startPresenceCleanupWorker(
+    db,
+    (broadcasts) => pushPresenceBroadcasts(sockets, broadcasts),
+  ) : () => {};
 
   const server = Bun.serve<SocketData>({
     port,
@@ -479,6 +540,7 @@ export function startCloudServer(
               && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
           const groupCallSchema = await groupCallSchemaReadiness(db);
+          const presenceSchema = await presenceSchemaReadiness(db);
           const groupCallDevice = capabilitySession != null && groupCallSchema.ready
             ? (await db`
                 SELECT supports_group_screen_share
@@ -523,6 +585,10 @@ export function startCloudServer(
             chatFolders,
             scheduledDelivery,
             linkPreviews,
+            await profilePhotosAvailable(),
+            capabilitySession != null
+              && presenceSchema.ready
+              && presenceEnabledForAccount(capabilitySession.accountId),
           ));
         }
 
@@ -533,7 +599,8 @@ export function startCloudServer(
           else response = new Response(
             metrics.render()
               + await dialogPreferenceBacklogMetrics(db)
-              + await groupCallBacklogMetrics(db),
+              + await groupCallBacklogMetrics(db)
+              + await presenceMetrics(db),
             { headers: { "content-type": "text/plain; version=0.0.4" } },
           );
         }
@@ -546,7 +613,14 @@ export function startCloudServer(
           if (!token) response = new Response("token required", { status: 401 });
           else {
           const dev = await resolveDevice(db, token);
-          if (server.upgrade(req, { data: dev })) response = undefined;
+          if (server.upgrade(req, { data: {
+            ...dev,
+            connectionId: crypto.randomUUID(),
+            presenceActive: false,
+            typingDialogs: new Set<string>(),
+            lastTypingAt: new Map<string, number>(),
+            activityQueue: Promise.resolve(),
+          } })) response = undefined;
           else response = new Response("upgrade failed", { status: 400 });
           }
         }
@@ -606,6 +680,17 @@ export function startCloudServer(
         ) {
           response = json({
             error: "dialog preferences capability unavailable",
+            code: "capability_unavailable",
+          }, 404);
+        }
+
+        else if (
+          url.pathname === "/v1/profile/photo"
+          && req.method === "PUT"
+          && !await profilePhotosAvailable()
+        ) {
+          response = json({
+            error: "profile photos capability unavailable",
             code: "capability_unavailable",
           }, 404);
         }
@@ -823,6 +908,10 @@ export function startCloudServer(
             metrics.recordScheduledCancellationDuringOutage();
           }
           response = json(result);
+        }
+
+        if (url.pathname === "/v1/presence/query" && req.method === "POST") {
+          response = json(await queryPresence(db, session.accountId, body.accountIds));
         }
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
@@ -1199,11 +1288,18 @@ export function startCloudServer(
           const result = await blockAccount(db, session.accountId, blockMatch[1]);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
+          pushPresenceBroadcasts(sockets, await publishPresenceVisibility(
+            db, session.accountId, blockMatch[1], false,
+          ));
           response = json({ blocked: result.blocked });
         }
 
         if (blockMatch && req.method === "DELETE") {
-          response = json(await unblockAccount(db, session.accountId, blockMatch[1]));
+          const result = await unblockAccount(db, session.accountId, blockMatch[1]);
+          pushPresenceBroadcasts(sockets, await publishPresenceVisibility(
+            db, session.accountId, blockMatch[1], true,
+          ));
+          response = json(result);
         }
 
         if (url.pathname === "/v1/calls" && req.method === "POST") {
@@ -1428,6 +1524,26 @@ export function startCloudServer(
           response = json(result.profile);
         }
 
+        if (url.pathname === "/v1/profile/photo" && req.method === "PUT") {
+          if (!await profilePhotosAvailable()) {
+            response = new Response("not found", { status: 404 });
+          } else {
+            const result = await updateProfilePhoto(db, {
+              accountId: session.accountId,
+              deviceId: session.deviceId,
+              mediaId: body.mediaId,
+              clientMutationId: body.clientMutationId,
+              basePhotoRevision: body.basePhotoRevision,
+            });
+            pushHints(sockets, result.pushes);
+            response = json({
+              profile: result.profile,
+              committedPhotoRevision: result.committedPhotoRevision,
+              duplicate: result.duplicate,
+            });
+          }
+        }
+
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
           if (!body.peerAccountId) throw new SyncError("peerAccountId required");
           response = json(await getOrCreateDirectDialog(
@@ -1635,6 +1751,8 @@ export function startCloudServer(
           : err instanceof GroupError ? err.status
           : err instanceof SavedMessagesError ? err.status
           : err instanceof DialogPreferenceError ? err.status
+          : err instanceof ProfilePhotoError ? err.status
+          : err instanceof PresenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof DraftError ? err.status
           : err instanceof ChatFolderError ? err.status
@@ -1672,6 +1790,8 @@ export function startCloudServer(
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof SavedMessagesError ? { code: err.code } : {}),
           ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
+          ...(err instanceof ProfilePhotoError ? { code: err.code } : {}),
+          ...(err instanceof PresenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
           ...(err instanceof DraftError ? { code: err.code } : {}),
           ...(err instanceof ChatFolderError ? { code: err.code } : {}),
@@ -1709,10 +1829,119 @@ export function startCloudServer(
           set.delete(ws);
           if (set.size === 0) sockets.delete(ws.data.accountId);
         }
+        const cleanup = (async () => {
+          await ws.data.activityQueue.catch(() => {});
+          for (const dialogId of ws.data.typingDialogs) {
+            pushPresenceBroadcasts(sockets, await publishTyping(db, {
+              accountId: ws.data.accountId,
+              dialogId,
+              typingSessionId: ws.data.connectionId,
+              active: false,
+            }));
+          }
+          ws.data.typingDialogs.clear();
+          if (ws.data.presenceActive) {
+            pushPresenceBroadcasts(sockets, await setPresenceActivity(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+              active: false,
+            }));
+          }
+        })().catch(() => {});
+        presenceSocketCleanupTasks.add(cleanup);
+        void cleanup.finally(() => presenceSocketCleanupTasks.delete(cleanup));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.close" }));
       },
       message(ws, raw) {
-        if (String(raw) === "ping") ws.send("pong");
+        const text = String(raw);
+        if (text === "ping") { ws.send("pong"); return; }
+        if (Buffer.byteLength(text) > 4_096) {
+          recordPresenceRejectedFrame("oversized");
+          return;
+        }
+        const handleActivity = async () => {
+          let value: any;
+          try { value = JSON.parse(text); } catch {
+            recordPresenceRejectedFrame("malformed");
+            return;
+          }
+          if (!value || typeof value.type !== "string") {
+            recordPresenceRejectedFrame("malformed");
+            return;
+          }
+          if (!presenceEnabledForAccount(ws.data.accountId)
+            || !(await presenceSchemaReadiness(db)).ready) {
+            recordPresenceRejectedFrame("unauthorized");
+            return;
+          }
+          if (value.type === "presence_activity") {
+            if (typeof value.active !== "boolean") {
+              recordPresenceRejectedFrame("malformed");
+              return;
+            }
+            ws.data.presenceActive = value.active;
+            if (!value.active) {
+              for (const dialogId of ws.data.typingDialogs) {
+                pushPresenceBroadcasts(sockets, await publishTyping(db, {
+                  accountId: ws.data.accountId,
+                  dialogId,
+                  typingSessionId: ws.data.connectionId,
+                  active: false,
+                }));
+              }
+              ws.data.typingDialogs.clear();
+            }
+            pushPresenceBroadcasts(sockets, await setPresenceActivity(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+              active: value.active,
+            }));
+          } else if (value.type === "presence_heartbeat" && ws.data.presenceActive) {
+            pushPresenceBroadcasts(sockets, await heartbeatPresence(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+            }));
+          } else if (value.type === "typing_activity") {
+            if (!ws.data.presenceActive
+              || !validPresenceDialogId(value.dialogId)
+              || typeof value.active !== "boolean") {
+              recordPresenceRejectedFrame("malformed");
+              return;
+            }
+            const now = Date.now();
+            const previous = ws.data.lastTypingAt.get(value.dialogId) ?? 0;
+            if (value.active && now - previous < 2_000) {
+              recordPresenceRejectedFrame("rate_limited");
+              return;
+            }
+            const broadcasts = await publishTyping(db, {
+              accountId: ws.data.accountId,
+              dialogId: value.dialogId,
+              typingSessionId: ws.data.connectionId,
+              active: value.active,
+            });
+            if (value.active && broadcasts.length === 0) {
+              recordPresenceRejectedFrame("unauthorized");
+              return;
+            }
+            if (value.active) {
+              ws.data.lastTypingAt.set(value.dialogId, now);
+              ws.data.typingDialogs.add(value.dialogId);
+            } else {
+              ws.data.typingDialogs.delete(value.dialogId);
+              ws.data.lastTypingAt.delete(value.dialogId);
+            }
+            pushPresenceBroadcasts(sockets, broadcasts);
+          } else {
+            recordPresenceRejectedFrame("unsupported");
+          }
+        };
+        ws.data.activityQueue = ws.data.activityQueue
+          .then(handleActivity, handleActivity)
+          .catch(() => {});
       },
     },
   });
@@ -1729,7 +1958,13 @@ export function startCloudServer(
     stopSyncNotifications();
     stopCallNotifications();
     stopGroupCallNotifications();
-    return originalStop(closeActiveConnections);
+    stopPresenceNotifications();
+    stopPresenceCleanup();
+    const stopped = originalStop(closeActiveConnections);
+    return Promise.resolve(stopped).then(async (value) => {
+      await Promise.allSettled([...presenceSocketCleanupTasks]);
+      return value;
+    });
   }) as typeof server.stop;
 
   console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.listening", port: server.port }));
