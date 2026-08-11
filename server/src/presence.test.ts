@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { checkVerification, startVerification } from "./auth";
-import { blockAccount } from "./calls";
+import { blockAccount, revokeDeviceAndTerminateCalls } from "./calls";
 import { startCloudServer } from "./cloud";
 import { makeSql } from "./db";
 import { hashToken } from "./crypto";
@@ -8,10 +8,12 @@ import { createGroup, removeGroupMember } from "./groups";
 import {
   expirePresenceLeases,
   heartbeatPresence,
+  nextPresenceConnectionEpoch,
   presenceEnabledForAccount,
   presenceSchemaReadiness,
   publishTyping,
   queryPresence,
+  revokeAccountPresence,
   setPresenceActivity,
   startPresenceNotificationListener,
 } from "./presence";
@@ -51,6 +53,12 @@ describe.serial("presence_v1", () => {
     expect(presenceEnabledForAccount(user.accountId)).toBe(false);
     process.env.TOJ_PRESENCE_ALLOWLIST = user.accountId;
     expect(presenceEnabledForAccount(user.accountId)).toBe(true);
+  });
+
+  test("query fails closed when rollout is enabled before the presence schema", async () => {
+    const missingSchema = (async () => [{}]) as unknown as typeof db;
+    await expect(queryPresence(missingSchema, crypto.randomUUID(), []))
+      .rejects.toMatchObject({ status: 404, code: "capability_unavailable" });
   });
 
   test("capability and query endpoint are authenticated, gated, and bounded", async () => {
@@ -148,6 +156,136 @@ describe.serial("presence_v1", () => {
     }
   }, 5_000);
 
+  test("revocation on one node closes the matching socket on another node", async () => {
+    const { alice } = await directPair();
+    const previousNotificationURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL = TEST_URL;
+    const socketNode = startCloudServer(0, db, null, null, { backgroundWorkers: true });
+    const revokeNode = startCloudServer(0, db, null, null, { backgroundWorkers: true });
+    const socket = new WebSocket(`ws://127.0.0.1:${socketNode.port}/v1/ws`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    });
+    const opened = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("websocket open timed out")), 3_000);
+      socket.onopen = () => { clearTimeout(timer); resolve(); };
+      socket.onerror = () => { clearTimeout(timer); reject(new Error("websocket error")); };
+    });
+    const events: any[] = [];
+    socket.onmessage = (message) => {
+      try { events.push(JSON.parse(String(message.data))); } catch {}
+    };
+    const closed = new Promise<CloseEvent>((resolve) => {
+      socket.onclose = resolve;
+    });
+    try {
+      await opened;
+      // Let both LISTEN connections reach readiness before committing the revocation.
+      await Bun.sleep(150);
+      const response = await fetch(`http://127.0.0.1:${revokeNode.port}/v1/session`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(response.status).toBe(200);
+      await response.json();
+      const close = await Promise.race([
+        closed,
+        Bun.sleep(3_000).then(() => { throw new Error("remote revocation close timed out"); }),
+      ]);
+      expect(close.code).toBe(4001);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "session_revoked",
+        deviceId: alice.deviceId,
+        reason: "device_revoked",
+      }));
+    } finally {
+      socket.close();
+      const stopping = Promise.all([socketNode.stop(true), revokeNode.stop(true)]);
+      // Bun 1.3.11 can leave stop(true) pending after a server-initiated WebSocket close even
+      // though the close event has fired and the port has stopped accepting connections.
+      await Promise.race([stopping, Bun.sleep(1_000)]);
+      if (previousNotificationURL === undefined) delete process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+      else process.env.TOJ_CALL_NOTIFY_DATABASE_URL = previousNotificationURL;
+    }
+  }, 8_000);
+
+  test("same-node revocation sends the sticky control frame before closing", async () => {
+    const { alice } = await directPair();
+    const server = startCloudServer(0, db, null, null, { backgroundWorkers: false });
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/ws`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    });
+    const opened = new Promise<void>((resolve, reject) => {
+      socket.onopen = () => resolve();
+      socket.onerror = () => reject(new Error("websocket error"));
+    });
+    let resolveRevocation!: (value: any) => void;
+    const revocation = new Promise<any>((resolve) => { resolveRevocation = resolve; });
+    socket.onmessage = (message) => {
+      try {
+        const value = JSON.parse(String(message.data));
+        if (value.type === "session_revoked") resolveRevocation(value);
+      } catch {}
+    };
+    const closed = new Promise<CloseEvent>((resolve) => { socket.onclose = resolve; });
+    try {
+      await opened;
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/session`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${alice.token}` },
+      });
+      expect(response.status).toBe(200);
+      expect(await Promise.race([
+        revocation,
+        Bun.sleep(2_000).then(() => { throw new Error("revocation frame timed out"); }),
+      ])).toMatchObject({
+        type: "session_revoked", deviceId: alice.deviceId, reason: "device_revoked",
+      });
+      expect((await closed).code).toBe(4001);
+    } finally {
+      socket.close();
+      await Promise.race([server.stop(true), Bun.sleep(1_000)]);
+    }
+  }, 5_000);
+
+  test("credential audit closes a revoked socket after a missed notification", async () => {
+    const { alice } = await directPair();
+    const previousNotificationURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL = "postgres://127.0.0.1:1/unreachable";
+    const server = startCloudServer(0, db, null, null, {
+      backgroundWorkers: true,
+      socketAuthorizationIntervalMs: 250,
+    });
+    const socket = new WebSocket(`ws://127.0.0.1:${server.port}/v1/ws`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    });
+    const opened = new Promise<void>((resolve, reject) => {
+      socket.onopen = () => resolve();
+      socket.onerror = () => reject(new Error("websocket error"));
+    });
+    const events: any[] = [];
+    socket.onmessage = (message) => {
+      try { events.push(JSON.parse(String(message.data))); } catch {}
+    };
+    const closed = new Promise<CloseEvent>((resolve) => { socket.onclose = resolve; });
+    try {
+      await opened;
+      await revokeDeviceAndTerminateCalls(db, alice.accountId, alice.deviceId);
+      const close = await Promise.race([
+        closed,
+        Bun.sleep(3_000).then(() => { throw new Error("authorization audit timed out"); }),
+      ]);
+      expect(close.code).toBe(4001);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: "session_revoked", deviceId: alice.deviceId,
+      }));
+    } finally {
+      socket.close();
+      await Promise.race([server.stop(true), Bun.sleep(1_000)]);
+      if (previousNotificationURL === undefined) delete process.env.TOJ_CALL_NOTIFY_DATABASE_URL;
+      else process.env.TOJ_CALL_NOTIFY_DATABASE_URL = previousNotificationURL;
+    }
+  }, 6_000);
+
   test("only direct peers receive exact online and final-device last seen", async () => {
     const { alice, bob } = await directPair();
     const outsider = await account("+16505559803", "Outsider");
@@ -208,6 +346,32 @@ describe.serial("presence_v1", () => {
       .toBe(true);
   });
 
+  test("a superseded socket cannot reclaim the newer connection lease", async () => {
+    const { alice, bob } = await directPair();
+    const oldConnection = crypto.randomUUID();
+    const newConnection = crypto.randomUUID();
+    const oldEpoch = await nextPresenceConnectionEpoch(db);
+    const newEpoch = await nextPresenceConnectionEpoch(db);
+    await setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId: oldConnection, connectionEpoch: oldEpoch, active: true,
+    });
+    await setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId: newConnection, connectionEpoch: newEpoch, active: true,
+    });
+    await expect(setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId: oldConnection, connectionEpoch: oldEpoch, active: true,
+    })).rejects.toMatchObject({ code: "stale_presence_connection", status: 409 });
+    expect(await setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId: oldConnection, connectionEpoch: oldEpoch, active: false,
+    })).toEqual([]);
+    expect((await queryPresence(db, bob.accountId, [alice.accountId])).presences[0].online)
+      .toBe(true);
+  });
+
   test("expired leases publish the last confirmed heartbeat and advance revision", async () => {
     const { alice, bob } = await directPair();
     await setPresenceActivity(db, {
@@ -249,6 +413,118 @@ describe.serial("presence_v1", () => {
       .toBe(true);
   });
 
+  test("heartbeat revives an expired lease with an observable online revision", async () => {
+    const { alice, bob } = await directPair();
+    const connectionId = crypto.randomUUID();
+    const connectionEpoch = await nextPresenceConnectionEpoch(db);
+    await setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId, connectionEpoch, active: true,
+    });
+    await db`
+      UPDATE device_presence_leases
+      SET last_heartbeat_at = now() - interval '2 seconds',
+          expires_at = now() - interval '1 second'
+      WHERE device_id = ${alice.deviceId}`;
+    expect((await queryPresence(db, bob.accountId, [alice.accountId])).presences[0])
+      .toMatchObject({ online: false, revision: 1 });
+    const broadcasts = await heartbeatPresence(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId, connectionEpoch,
+    });
+    expect(broadcasts[0]?.event).toMatchObject({
+      type: "presence_update", online: true, revision: 2,
+    });
+    expect((await queryPresence(db, bob.accountId, [alice.accountId])).presences[0])
+      .toMatchObject({ online: true, revision: 2 });
+  });
+
+  test("device revocation atomically removes its lease and rejects stale activity", async () => {
+    const { alice } = await directPair();
+    const connectionId = crypto.randomUUID();
+    await setPresenceActivity(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      connectionId,
+      active: true,
+    });
+
+    const result = await revokeDeviceAndTerminateCalls(db, alice.accountId, alice.deviceId);
+    expect(result.presenceBroadcasts[0]?.event).toEqual(expect.objectContaining({
+      type: "presence_update",
+      accountId: alice.accountId,
+      online: false,
+    }));
+    const rows = await db`
+      SELECT
+        (SELECT count(*) FROM device_presence_leases
+         WHERE account_id = ${alice.accountId}) AS leases,
+        (SELECT last_seen_at IS NOT NULL FROM account_presence
+         WHERE account_id = ${alice.accountId}) AS has_last_seen`;
+    expect(Number(rows[0].leases)).toBe(0);
+    expect(rows[0].has_last_seen).toBe(true);
+    await expect(heartbeatPresence(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      connectionId,
+    })).rejects.toMatchObject({ status: 401 });
+    await expect(setPresenceActivity(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      connectionId,
+      active: true,
+    })).rejects.toMatchObject({ status: 401 });
+  });
+
+  test("account-private cleanup erases exact presence state for tombstoned accounts", async () => {
+    const { alice } = await directPair();
+    await setPresenceActivity(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      connectionId: crypto.randomUUID(),
+      active: true,
+    });
+    await db`SELECT public.toj_cleanup_account_private_state_v1(${alice.accountId})`;
+    const rows = await db`
+      SELECT
+        (SELECT count(*) FROM device_presence_leases
+         WHERE account_id = ${alice.accountId}) AS leases,
+        (SELECT count(*) FROM account_presence
+         WHERE account_id = ${alice.accountId}) AS presence`;
+    expect(Number(rows[0].leases)).toBe(0);
+    expect(Number(rows[0].presence)).toBe(0);
+  });
+
+  test("account deletion publishes terminal offline and visibility revocation before erasure", async () => {
+    const { alice, bob } = await directPair();
+    await setPresenceActivity(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      connectionId: crypto.randomUUID(),
+      active: true,
+    });
+    const broadcasts = await db.begin(async (tx) => {
+      const terminal = await revokeAccountPresence(tx, alice.accountId);
+      await tx`SELECT public.toj_cleanup_account_private_state_v1(${alice.accountId})`;
+      return terminal;
+    });
+    expect(broadcasts).toContainEqual(expect.objectContaining({
+      recipientAccountIds: [bob.accountId],
+      event: expect.objectContaining({
+        type: "presence_update", accountId: alice.accountId, online: false,
+      }),
+    }));
+    expect(broadcasts).toContainEqual(expect.objectContaining({
+      recipientAccountIds: [bob.accountId],
+      event: {
+        type: "presence_visibility", accountId: alice.accountId, visible: false,
+      },
+    }));
+    expect(await db`
+      SELECT account_id FROM account_presence WHERE account_id = ${alice.accountId}`)
+      .toHaveLength(0);
+  });
+
   test("PostgreSQL notifications deliver presence events across server processes", async () => {
     const { alice, bob } = await directPair();
     let resolveBroadcast: ((value: unknown) => void) | undefined;
@@ -278,15 +554,16 @@ describe.serial("presence_v1", () => {
 
   test("blocking hides direct presence and direct typing in both directions", async () => {
     const { alice, bob, dialogId } = await directPair();
+    const connectionId = crypto.randomUUID();
     await setPresenceActivity(db, {
       accountId: alice.accountId, deviceId: alice.deviceId,
-      connectionId: crypto.randomUUID(), active: true,
+      connectionId, active: true,
     });
     await blockAccount(db, bob.accountId, alice.accountId);
     expect(await queryPresence(db, bob.accountId, [alice.accountId])).toEqual({ presences: [] });
     expect(await publishTyping(db, {
-      accountId: alice.accountId, dialogId,
-      typingSessionId: crypto.randomUUID(), active: true,
+      accountId: alice.accountId, deviceId: alice.deviceId, dialogId,
+      typingSessionId: connectionId, active: true,
     })).toEqual([]);
   });
 
@@ -302,9 +579,14 @@ describe.serial("presence_v1", () => {
       title: "Presence",
       memberIds: [alice.accountId, bob.accountId],
     });
+    const typingSessionId = crypto.randomUUID();
+    await setPresenceActivity(db, {
+      accountId: alice.accountId, deviceId: alice.deviceId,
+      connectionId: typingSessionId, active: true,
+    });
     const event = await publishTyping(db, {
-      accountId: alice.accountId, dialogId: groupId,
-      typingSessionId: crypto.randomUUID(), active: true,
+      accountId: alice.accountId, deviceId: alice.deviceId, dialogId: groupId,
+      typingSessionId, active: true,
     });
     expect(event[0]?.recipientAccountIds.sort()).toEqual([bob.accountId, owner.accountId].sort());
     expect(event[0]?.event).toEqual(expect.objectContaining({
@@ -318,8 +600,8 @@ describe.serial("presence_v1", () => {
       clientMutationId: crypto.randomUUID(),
     });
     expect(await publishTyping(db, {
-      accountId: alice.accountId, dialogId: groupId,
-      typingSessionId: crypto.randomUUID(), active: true,
+      accountId: alice.accountId, deviceId: alice.deviceId, dialogId: groupId,
+      typingSessionId, active: true,
     })).toEqual([]);
   });
 });

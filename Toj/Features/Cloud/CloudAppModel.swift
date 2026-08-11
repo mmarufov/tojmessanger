@@ -1112,13 +1112,30 @@ final class CloudAppModel {
     ) async {
         guard !sessionTeardownActive,
               let saved = storedSession,
+              profile.accountId == accountId,
               saved.session.accountId == accountId,
               saved.session.deviceId == deviceId,
               saved.session.token == token,
               accountSessionGeneration == generation,
               Self.store(expectedStore, matches: localStore)
         else { return }
-        let details = Self.profileDetails(from: profile, pendingSync: false)
+        let canonical: CloudProfile
+        do {
+            try await expectedStore?.saveProfile(profile)
+            canonical = try await expectedStore?.profile(accountId: accountId) ?? profile
+        } catch {
+            status = "Profile updated, but local storage could not be refreshed"
+            return
+        }
+        guard !sessionTeardownActive,
+              accountSessionGeneration == generation,
+              storedSession?.session.accountId == accountId,
+              storedSession?.session.deviceId == deviceId,
+              storedSession?.session.token == token,
+              Self.store(expectedStore, matches: localStore),
+              !Task.isCancelled
+        else { return }
+        let details = Self.profileDetails(from: canonical, pendingSync: false)
         let updatedSession = StoredCloudSession(
             session: saved.session,
             phone: saved.phone,
@@ -1126,7 +1143,6 @@ final class CloudAppModel {
         )
         do {
             try await tokenStore.saveProfile(details, accountId: saved.session.accountId)
-            try await localStore?.saveProfile(profile)
         } catch {
             if accountSessionGeneration == generation,
                storedSession?.session.accountId == accountId,
@@ -1148,38 +1164,81 @@ final class CloudAppModel {
         profileDetails = details
         storedSession = updatedSession
         displayName = details.displayName
-        let replacedPhotoId = canonicalProfilePhoto?.id == profile.photo?.id
+        let photoIdentityChanged = canonicalProfilePhoto?.id != canonical.photo?.id
+        let replacedPhotoId = canonicalProfilePhoto?.id == canonical.photo?.id
             ? nil
             : canonicalProfilePhoto?.id
-        canonicalProfilePhoto = profile.photo
-        profilePhotoRevision = profile.photoRevision
-        if let replacedPhotoId, let localStore {
+        canonicalProfilePhoto = canonical.photo
+        profilePhotoRevision = canonical.photoRevision
+        if let replacedPhotoId, let expectedStore {
             MediaPresentationCache.shared.revoke(mediaIds: [replacedPhotoId])
-            await mediaEngine.clearMediaCache(mediaIds: [replacedPhotoId], localStore: localStore)
+            await mediaEngine.clearMediaCache(mediaIds: [replacedPhotoId], localStore: expectedStore)
+            guard !sessionTeardownActive,
+                  accountSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.deviceId == deviceId,
+                  storedSession?.session.token == token,
+                  Self.store(expectedStore, matches: localStore)
+            else { return }
         }
 
-        let pending = try? await localStore?.pendingProfilePhotoMutation(accountId: saved.session.accountId)
+        let pending = try? await expectedStore?.pendingProfilePhotoMutation(accountId: accountId)
+        guard !sessionTeardownActive,
+              accountSessionGeneration == generation,
+              storedSession?.session.accountId == accountId,
+              storedSession?.session.deviceId == deviceId,
+              storedSession?.session.token == token,
+              Self.store(expectedStore, matches: localStore)
+        else { return }
         guard pending == nil else {
             profilePhotoSyncState = pending?.state == "conflict" ? .conflict : .pending
             return
         }
-        if let photo = profile.photo {
+        if let photo = canonical.photo {
+            // Never present bytes for a different canonical media object if its replacement cannot
+            // be fetched yet. A pending local mutation is handled above and deliberately keeps its
+            // optimistic preview.
+            if photoIdentityChanged { profilePhotoDisplayData = nil }
             if let bytes = try? await mediaEngine.thumbnail(
                 media: photo,
                 token: token,
-                localStore: localStore
-            ), savedMessagesSessionGeneration == generation,
-               storedSession?.session.token == token {
+                localStore: expectedStore
+            ), accountSessionGeneration == generation,
+               storedSession?.session.accountId == accountId,
+               storedSession?.session.deviceId == deviceId,
+               storedSession?.session.token == token,
+               Self.store(expectedStore, matches: localStore) {
                 profilePhotoDisplayData = bytes
-                _ = await EncryptedProfilePhotoStore.persist(nil, accountId: saved.session.accountId)
+                _ = await EncryptedProfilePhotoStore.persist(nil, accountId: accountId)
+                guard !sessionTeardownActive,
+                      accountSessionGeneration == generation,
+                      storedSession?.session.accountId == accountId,
+                      storedSession?.session.deviceId == deviceId,
+                      storedSession?.session.token == token,
+                      Self.store(expectedStore, matches: localStore)
+                else { return }
             }
+            guard !sessionTeardownActive,
+                  accountSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.deviceId == deviceId,
+                  storedSession?.session.token == token,
+                  Self.store(expectedStore, matches: localStore)
+            else { return }
             profilePhotoSyncState = .synced
         } else {
-            let legacy = await EncryptedProfilePhotoStore.load(accountId: saved.session.accountId)
+            let legacy = await EncryptedProfilePhotoStore.load(accountId: accountId)
+            guard !sessionTeardownActive,
+                  accountSessionGeneration == generation,
+                  storedSession?.session.accountId == accountId,
+                  storedSession?.session.deviceId == deviceId,
+                  storedSession?.session.token == token,
+                  Self.store(expectedStore, matches: localStore)
+            else { return }
             profilePhotoDisplayData = legacy
             profilePhotoSyncState = capabilities.contains(.profilePhotos) && legacy != nil ? .pending : .localOnly
             if capabilities.contains(.profilePhotos), let legacy {
-                await seedLegacyProfilePhotoIfNeeded(legacy, accountId: saved.session.accountId)
+                await seedLegacyProfilePhotoIfNeeded(legacy, accountId: accountId)
             }
         }
     }
@@ -1187,17 +1246,25 @@ final class CloudAppModel {
     @discardableResult
     func saveProfilePhoto(_ data: Data?, accountId: String) async -> Bool {
         guard let session = storedSession?.session, session.accountId == accountId else { return false }
+        let generation = accountSessionGeneration
         if !capabilities.contains(.profilePhotos) {
             let stored = await EncryptedProfilePhotoStore.persist(data, accountId: accountId)
-            if stored {
+            let current = generation == accountSessionGeneration && storedSession?.session == session
+            if stored, current {
                 profilePhotoDisplayData = data
                 profilePhotoSyncState = .localOnly
             }
-            return stored
+            return stored && current
         }
         do {
             if let data {
-                guard let photo = SafeMediaImageDecoder.prepareProfilePhotoUpload(data) else {
+                let photo = await Task.detached(priority: .userInitiated) {
+                    SafeMediaImageDecoder.prepareProfilePhotoUpload(data)
+                }.value
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session
+                else { throw CancellationError() }
+                guard let photo else {
                     throw CloudAppModelError.invalidMedia
                 }
                 let prepared = try await mediaEngine.prepare(
@@ -1209,6 +1276,12 @@ final class CloudAppModel {
                     height: photo.pixelHeight,
                     thumbnail: photo.thumbnail
                 )
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session
+                else {
+                    await mediaEngine.discardPrepared(prepared)
+                    throw CancellationError()
+                }
                 _ = try await profilePhotoSyncCoordinator.stageSet(
                     prepared: prepared,
                     baseRevision: profilePhotoRevision
@@ -1218,11 +1291,19 @@ final class CloudAppModel {
                     baseRevision: profilePhotoRevision
                 )
             }
-            guard storedSession?.session.accountId == accountId else { throw CancellationError() }
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session
+            else { throw CancellationError() }
             guard await EncryptedProfilePhotoStore.persist(data, accountId: accountId) else {
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session
+                else { throw CancellationError() }
                 await profilePhotoSyncCoordinator.discard()
                 throw CloudAppModelError.localStoreUnavailable
             }
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session
+            else { throw CancellationError() }
             profilePhotoDisplayData = data
             profilePhotoSyncState = .pending
             scheduleOutboxRetry()
@@ -1231,26 +1312,41 @@ final class CloudAppModel {
         } catch is CancellationError {
             return false
         } catch {
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return false }
             profilePhotoSyncState = .failed(error.localizedDescription)
             return false
         }
     }
 
     func retryProfilePhoto() async {
-        guard let accountId = storedSession?.session.accountId else { return }
+        guard let session = storedSession?.session else { return }
+        let generation = accountSessionGeneration
         if case .conflict = profilePhotoSyncState {
             do {
                 let cloud = try await profilePhotoSyncCoordinator.retryMine()
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session else { return }
                 canonicalProfilePhoto = cloud.photo
                 profilePhotoRevision = cloud.photoRevision
+            } catch is CancellationError {
+                return
             } catch {
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session else { return }
                 profilePhotoSyncState = .failed(error.localizedDescription)
                 return
             }
         } else {
             do {
                 try await profilePhotoSyncCoordinator.retryFailed()
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session else { return }
+            } catch is CancellationError {
+                return
             } catch {
+                guard generation == accountSessionGeneration,
+                      storedSession?.session == session else { return }
                 profilePhotoSyncState = .failed(error.localizedDescription)
                 return
             }
@@ -1260,32 +1356,76 @@ final class CloudAppModel {
     }
 
     func useCloudProfilePhoto() async {
-        guard let accountId = storedSession?.session.accountId else { return }
+        guard let session = storedSession?.session else { return }
+        let generation = accountSessionGeneration
+        let expectedStore = localStore
         do {
             let profile = try await profilePhotoSyncCoordinator.useCloudPhoto()
-            _ = await EncryptedProfilePhotoStore.persist(nil, accountId: accountId)
-            await acceptCanonicalProfile(profile, token: storedSession?.session.token ?? "")
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return }
+            _ = await EncryptedProfilePhotoStore.persist(nil, accountId: session.accountId)
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return }
+            await acceptCanonicalProfile(
+                profile,
+                accountId: session.accountId,
+                deviceId: session.deviceId,
+                token: session.token,
+                generation: generation,
+                store: expectedStore
+            )
+        } catch is CancellationError {
+            return
         } catch {
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return }
             profilePhotoSyncState = .failed(error.localizedDescription)
         }
     }
 
     func discardPendingProfilePhoto() async {
-        guard let accountId = storedSession?.session.accountId else { return }
+        guard let session = storedSession?.session else { return }
+        let generation = accountSessionGeneration
+        let expectedStore = localStore
         await profilePhotoSyncCoordinator.discard()
-        _ = await EncryptedProfilePhotoStore.persist(nil, accountId: accountId)
-        if let token = storedSession?.session.token,
-           let profile = try? await api.getProfile(token: token) {
-            await acceptCanonicalProfile(profile, token: token)
-        } else {
+        guard generation == accountSessionGeneration,
+              storedSession?.session == session else { return }
+        _ = await EncryptedProfilePhotoStore.persist(nil, accountId: session.accountId)
+        guard generation == accountSessionGeneration,
+              storedSession?.session == session else { return }
+        do {
+            let profile = try await api.getProfile(token: session.token)
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return }
+            await acceptCanonicalProfile(
+                profile,
+                accountId: session.accountId,
+                deviceId: session.deviceId,
+                token: session.token,
+                generation: generation,
+                store: expectedStore
+            )
+        } catch {
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session else { return }
             profilePhotoDisplayData = nil
             profilePhotoSyncState = .localOnly
         }
     }
 
     private func seedLegacyProfilePhotoIfNeeded(_ data: Data, accountId: String) async {
+        guard let session = storedSession?.session, session.accountId == accountId else { return }
+        let generation = accountSessionGeneration
         guard (try? await localStore?.pendingProfilePhotoMutation(accountId: accountId)) == nil,
-              let photo = SafeMediaImageDecoder.prepareProfilePhotoUpload(data),
+              generation == accountSessionGeneration,
+              storedSession?.session == session
+        else { return }
+        let photo = await Task.detached(priority: .utility) {
+            SafeMediaImageDecoder.prepareProfilePhotoUpload(data)
+        }.value
+        guard generation == accountSessionGeneration,
+              storedSession?.session == session,
+              let photo,
               let prepared = try? await mediaEngine.prepare(
                 data: photo.data,
                 kind: "photo",
@@ -1296,12 +1436,21 @@ final class CloudAppModel {
                 thumbnail: photo.thumbnail
               )
         else { return }
+        guard generation == accountSessionGeneration,
+              storedSession?.session == session
+        else {
+            await mediaEngine.discardPrepared(prepared)
+            return
+        }
         do {
             _ = try await profilePhotoSyncCoordinator.stageSet(
                 prepared: prepared,
                 baseRevision: profilePhotoRevision,
                 source: "legacy"
             )
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session
+            else { return }
             profilePhotoSyncState = .pending
             scheduleOutboxRetry()
         } catch {
@@ -1712,6 +1861,10 @@ final class CloudAppModel {
         accountDeletionCode = ""
         profileDetails = .empty
         profileSaveInFlight = false
+        profilePhotoSyncState = .localOnly
+        profilePhotoDisplayData = nil
+        canonicalProfilePhoto = nil
+        profilePhotoRevision = 0
         composerMode = .text
         operationNotice = nil
         pendingProductivityTerminalNotice = nil
@@ -6586,6 +6739,11 @@ final class CloudAppModel {
                 session: storedSession?.session,
                 enabled: false
             )
+            await profilePhotoSyncCoordinator.configure(
+                store: localStore,
+                session: storedSession?.session,
+                enabled: false
+            )
             capabilityDefaults.set(Int(MessagingCapabilities.replies.rawValue), forKey: capabilityCacheKey)
         } catch {
             // Keep the last successfully negotiated set when the server cannot be reached.
@@ -6906,7 +7064,10 @@ final class CloudAppModel {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { [weak self, socket] in
                     for await event in socket.events {
-                        guard let self, !Task.isCancelled else { return }
+                        guard let self,
+                              !Task.isCancelled,
+                              await self.isCurrentHintSocket(socket, token: token)
+                        else { return }
                         switch event {
                         case .sync(let hint):
                             // The payload carries the account cursor; skip the probe entirely when
@@ -6918,13 +7079,9 @@ final class CloudAppModel {
                             await self.callCoordinator.handle(hint)
                         case .groupCall(let hint):
                             await self.groupCallCoordinator.handle(hint)
-                        case .sessionRevoked(let hint):
-                            guard await self.scheduleSessionClearFromRevokedHint(
-                                deviceId: hint.deviceId
-                            ) != nil else { continue }
-                            // Teardown runs outside this exact hintTask so it can cancel and await
-                            // both socket loops without ever awaiting itself.
-                            return
+                        case .sessionRevoked:
+                            // Routed through the dedicated lossless control stream below.
+                            continue
                         case .presence(let hint):
                             await self.presenceCoordinator.handle(hint)
                         case .presenceVisibility(let hint):
@@ -6935,13 +7092,31 @@ final class CloudAppModel {
                     }
                 }
                 group.addTask { [weak self, socket] in
+                    for await hint in socket.revocations {
+                        guard let self,
+                              !Task.isCancelled,
+                              await self.isCurrentHintSocket(socket, token: token)
+                        else { return }
+                        guard await self.scheduleSessionClearFromRevokedHint(
+                            deviceId: hint.deviceId
+                        ) != nil else { continue }
+                        // Teardown runs outside this exact hintTask so it can cancel and await all
+                        // socket loops without ever awaiting itself.
+                        return
+                    }
+                }
+                group.addTask { [weak self, socket] in
                     var hasConnected = false
                     for await state in socket.states {
-                        guard let self, !Task.isCancelled else { return }
+                        guard let self,
+                              !Task.isCancelled,
+                              await self.isCurrentHintSocket(socket, token: token)
+                        else { return }
                         await self.presenceCoordinator.transportChanged(state)
                         guard state == .connected else { continue }
                         if hasConnected {
                             await self.replicaSyncCoordinator.trigger(.socketReconnect)
+                            await self.callCoordinator.reconcileActiveCalls()
                             await self.groupCallCoordinator.reconcileAfterSocketReconnect()
                         }
                         hasConnected = true
@@ -6950,6 +7125,13 @@ final class CloudAppModel {
                 await group.waitForAll()
             }
         }
+    }
+
+    private func isCurrentHintSocket(_ socket: CloudHintSocket, token: String) -> Bool {
+        hintSocket === socket
+            && hintSocketToken == token
+            && storedSession?.session.token == token
+            && !sessionTeardownActive
     }
 
     @discardableResult
@@ -8006,11 +8188,46 @@ final class CloudAppModel {
         case .idle, .cancelled:
             return
         case let .committed(profile):
-            guard let token = storedSession?.session.token else { return }
-            await acceptCanonicalProfile(profile, token: token)
+            guard let session = storedSession?.session,
+                  session.accountId == profile.accountId else { return }
+            let generation = accountSessionGeneration
+            let expectedStore = localStore
+            let token = session.token
+            await acceptCanonicalProfile(
+                profile,
+                accountId: session.accountId,
+                deviceId: session.deviceId,
+                token: token,
+                generation: generation,
+                store: expectedStore
+            )
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session,
+                  Self.store(expectedStore, matches: localStore),
+                  await profilePhotoSyncCoordinator.pending() == nil
+            else { return }
             profilePhotoSyncState = .synced
             status = "Profile photo updated everywhere"
             scheduleSync()
+        case let .superseded(profile):
+            // The response is still canonical server state, but a newer local intent owns the
+            // optimistic overlay and its pending status.
+            guard let session = storedSession?.session,
+                  session.accountId == profile.accountId else { return }
+            let generation = accountSessionGeneration
+            let expectedStore = localStore
+            await acceptCanonicalProfile(
+                profile,
+                accountId: session.accountId,
+                deviceId: session.deviceId,
+                token: session.token,
+                generation: generation,
+                store: expectedStore
+            )
+            guard generation == accountSessionGeneration,
+                  storedSession?.session == session,
+                  Self.store(expectedStore, matches: localStore) else { return }
+            scheduleOutboxRetry()
         case let .retrying(message, delay):
             profilePhotoSyncState = .failed(message)
             scheduleOutboxRetry(after: delay)
@@ -8946,11 +9163,16 @@ final class CloudAppModel {
                         error: error.localizedDescription,
                         retryAfter: delay
                     )
-                    try? await localStore.failProfilePhotoUpload(
+                    guard let mutation = try? await localStore.pendingProfilePhotoMutation(
+                        accountId: accountId
+                    ), mutation.transferId == initial.transferId else { return }
+                    let failed = try? await localStore.failProfilePhotoUpload(
                         accountId: accountId,
+                        clientMutationId: mutation.clientMutationId,
                         error: error.localizedDescription,
                         retryAfter: delay
                     )
+                    guard failed == true else { return }
                     profilePhotoSyncState = .failed(error.localizedDescription)
                     scheduleOutboxRetry(after: delay)
                 case .authenticationRequired:
@@ -8963,12 +9185,17 @@ final class CloudAppModel {
                         clientMsgId: initial.clientMsgId,
                         error: error.localizedDescription
                     )
-                    try? await localStore.failProfilePhotoMutation(
+                    guard let mutation = try? await localStore.pendingProfilePhotoMutation(
+                        accountId: accountId
+                    ), mutation.transferId == initial.transferId else { return }
+                    let failed = try? await localStore.failProfilePhotoMutation(
                         accountId: accountId,
+                        clientMutationId: mutation.clientMutationId,
                         error: error.localizedDescription,
                         retryAfter: nil,
                         terminal: true
                     )
+                    guard failed == true else { return }
                     profilePhotoSyncState = .failed(error.localizedDescription)
                 }
                 return

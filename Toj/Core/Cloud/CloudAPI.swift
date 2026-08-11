@@ -395,6 +395,7 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
 
     init(
         accountId: String,
+        username: String? = nil,
         firstName: String,
         lastName: String,
         displayName: String,
@@ -406,6 +407,7 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
         updatedAt: String
     ) {
         self.accountId = accountId
+        self.username = username
         self.firstName = firstName
         self.lastName = lastName
         self.displayName = displayName
@@ -420,6 +422,7 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         accountId = try values.decode(String.self, forKey: .accountId)
+        username = try values.decodeIfPresent(String.self, forKey: .username)
         firstName = try values.decode(String.self, forKey: .firstName)
         lastName = try values.decode(String.self, forKey: .lastName)
         displayName = try values.decode(String.self, forKey: .displayName)
@@ -432,7 +435,7 @@ nonisolated struct CloudProfile: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accountId, firstName, lastName, displayName, bio, birthday, colorIndex
+        case accountId, username, firstName, lastName, displayName, bio, birthday, colorIndex
         case photo, photoRevision, updatedAt
     }
 }

@@ -2712,6 +2712,7 @@ describe("M3 cloud sync", () => {
   test("profile photos sync idempotently to devices and chat partners without contact discovery leakage", async () => {
     const { alice, bob } = await makePair();
     const outsider = await makeAccount(testPhone(147), "Outsider");
+    await db`UPDATE accounts SET username = 'alice_photo' WHERE id = ${alice.accountId}`;
     expect(await profilePhotosSchemaReadiness(db)).toEqual({ ready: true });
     const bobPtsBeforePhoto = Number((await db`
       SELECT pts FROM account_sync_states WHERE account_id = ${bob.accountId}`)[0].pts);
@@ -2738,7 +2739,12 @@ describe("M3 cloud sync", () => {
     expect(committed).toMatchObject({
       duplicate: false,
       committedPhotoRevision: 1,
-      profile: { accountId: alice.accountId, photoRevision: 1, photo: { id: upload.mediaId } },
+      profile: {
+        accountId: alice.accountId,
+        username: "alice_photo",
+        photoRevision: 1,
+        photo: { id: upload.mediaId },
+      },
     });
     expect(committed.pushes.map((push) => push.accountId).sort())
       .toEqual([alice.accountId, bob.accountId].sort());
@@ -2803,6 +2809,19 @@ describe("M3 cloud sync", () => {
     });
     await expect(downloadMediaChunk(db, bob.accountId, upload.mediaId, 0))
       .rejects.toMatchObject({ status: 404 });
+    await db`DELETE FROM media_objects WHERE id = ${upload.mediaId}`;
+    const durableRetry = await updateProfilePhoto(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      mediaId: upload.mediaId,
+      clientMutationId: mutationId,
+      basePhotoRevision: 0,
+    });
+    expect(durableRetry).toMatchObject({
+      duplicate: true,
+      committedPhotoRevision: 1,
+      profile: { username: "alice_photo", photo: null, photoRevision: 2 },
+    });
   });
 
   test("profile photo uploads enforce their narrow image contract", async () => {
@@ -2856,6 +2875,63 @@ describe("M3 cloud sync", () => {
     await expect(completeMediaUpload(
       db, owner.accountId, owner.deviceId, declaredDimensions.mediaId,
     )).rejects.toMatchObject({ status: 415, code: "photo_dimensions_mismatch" });
+  });
+
+  test("profile photo mutation receipts have a replay-safe daily action budget", async () => {
+    const owner = await makeAccount(testPhone(149), "Budgeted photos");
+    const firstMutationId = crypto.randomUUID();
+    for (let index = 0; index < 120; index += 1) {
+      const result = await updateProfilePhoto(db, {
+        accountId: owner.accountId,
+        deviceId: owner.deviceId,
+        mediaId: null,
+        clientMutationId: index === 0 ? firstMutationId : crypto.randomUUID(),
+        basePhotoRevision: 0,
+      });
+      expect(result.committedPhotoRevision).toBe(0);
+    }
+    await expect(updateProfilePhoto(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      mediaId: null,
+      clientMutationId: crypto.randomUUID(),
+      basePhotoRevision: 0,
+    })).rejects.toMatchObject({ status: 429, code: "profile_photo_rate_limited" });
+    await expect(updateProfilePhoto(db, {
+      accountId: owner.accountId,
+      deviceId: owner.deviceId,
+      mediaId: null,
+      clientMutationId: firstMutationId,
+      basePhotoRevision: 0,
+    })).resolves.toMatchObject({ duplicate: true, committedPhotoRevision: 0 });
+    expect(Number((await db`
+      SELECT mutation_count FROM profile_photo_action_budgets
+      WHERE account_id = ${owner.accountId}`)[0].mutation_count)).toBe(120);
+  }, 10_000);
+
+  test("status-only mixed-version deletion clears and erases a private profile photo", async () => {
+    const owner = await makeAccount(testPhone(150), "Legacy deletion");
+    const bytes = tinyJpeg(64, 64);
+    const upload = await createMediaUpload(db, owner.accountId, owner.deviceId, {
+      kind: "photo", contentType: "image/jpeg", fileName: "legacy.jpg",
+      byteSize: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      width: 64, height: 64, purpose: "profile_photo",
+    });
+    await uploadMediaChunk(db, owner.accountId, owner.deviceId, upload.mediaId, 0, bytes);
+    await uploadMediaThumbnail(
+      db, owner.accountId, owner.deviceId, upload.mediaId, "image/jpeg", bytes,
+    );
+    await completeMediaUpload(db, owner.accountId, owner.deviceId, upload.mediaId);
+    await db`
+      UPDATE accounts SET profile_photo_media_id = ${upload.mediaId}
+      WHERE id = ${owner.accountId}`;
+
+    // This is the only write an older binary knew how to perform.
+    await db`UPDATE accounts SET status = 'deleted' WHERE id = ${owner.accountId}`;
+    expect((await db`
+      SELECT status, profile_photo_media_id FROM accounts WHERE id = ${owner.accountId}`)[0])
+      .toMatchObject({ status: "deleted", profile_photo_media_id: null });
+    expect(await db`SELECT id FROM media_objects WHERE id = ${upload.mediaId}`).toHaveLength(0);
   });
 
   test("contact discovery is persistently bounded per authenticated account", async () => {

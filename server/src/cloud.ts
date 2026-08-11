@@ -12,6 +12,7 @@ import {
   listDevices,
   startAccountDeletion,
   privateBetaOTPConfigured,
+  requireActiveDevice,
   AuthError,
   type OTPDelivery,
 } from "./auth";
@@ -192,6 +193,7 @@ import {
 import {
   heartbeatPresence,
   PresenceError,
+  presenceConfigured,
   presenceEnabledForAccount,
   presenceMetrics,
   presenceSchemaReadiness,
@@ -199,6 +201,7 @@ import {
   publishTyping,
   queryPresence,
   recordPresenceRejectedFrame,
+  nextPresenceConnectionEpoch,
   setPresenceActivity,
   startPresenceCleanupWorker,
   startPresenceNotificationListener,
@@ -210,9 +213,11 @@ type SocketData = {
   accountId: string;
   deviceId: string;
   connectionId: string;
+  presenceEpoch: string | null;
   presenceActive: boolean;
   typingDialogs: Set<string>;
   lastTypingAt: Map<string, number>;
+  activityDepth: number;
   activityQueue: Promise<void>;
 };
 type Db = typeof defaultSql;
@@ -221,6 +226,8 @@ export type CloudServerOptions = {
   /** Deterministic integration tests can disable all polling/listener side effects. */
   backgroundWorkers?: boolean;
   groupCallSFUControl?: GroupCallSFUControl;
+  /** Test-only override for the credential reconciliation cadence. */
+  socketAuthorizationIntervalMs?: number;
 };
 
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
@@ -380,7 +387,13 @@ function disconnectDevice(
   deviceId: string,
 ) {
   for (const socket of sockets.get(accountId) ?? []) {
-    if (socket.data.deviceId === deviceId) socket.close(4001, "device revoked");
+    if (socket.data.deviceId !== deviceId) continue;
+    if (socket.readyState === 1) {
+      socket.send(JSON.stringify({
+        type: "session_revoked", deviceId, reason: "device_revoked",
+      }));
+    }
+    socket.close(4001, "device revoked");
   }
 }
 
@@ -388,7 +401,14 @@ function disconnectAccount(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
 ) {
-  for (const socket of sockets.get(accountId) ?? []) socket.close(4002, "account deleted");
+  for (const socket of sockets.get(accountId) ?? []) {
+    if (socket.readyState === 1) {
+      socket.send(JSON.stringify({
+        type: "session_revoked", deviceId: null, reason: "account_deleted",
+      }));
+    }
+    socket.close(4002, "account deleted");
+  }
   sockets.delete(accountId);
 }
 
@@ -400,7 +420,18 @@ function pushPresenceBroadcasts(
     const payload = JSON.stringify(broadcast.event);
     for (const accountId of broadcast.recipientAccountIds) {
       for (const ws of sockets.get(accountId) ?? []) {
-        if (ws.readyState === 1) ws.send(payload);
+        if (broadcast.event.type === "session_revoked") {
+          if (broadcast.event.deviceId == null
+            || ws.data.deviceId === broadcast.event.deviceId) {
+            if (ws.readyState === 1) ws.send(payload);
+            ws.close(
+              broadcast.event.deviceId == null ? 4002 : 4001,
+              broadcast.event.deviceId == null ? "account deleted" : "device revoked",
+            );
+          }
+        } else if (ws.readyState === 1) {
+          ws.send(payload);
+        }
       }
     }
   }
@@ -422,6 +453,33 @@ export function startCloudServer(
 ) {
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const presenceSocketCleanupTasks = new Set<Promise<void>>();
+  const recentPresenceDeliveries = new Map<string, number>();
+  const deliverPresenceBroadcasts = (broadcasts: PresenceBroadcast[]) => {
+    const now = Date.now();
+    const unique: PresenceBroadcast[] = [];
+    for (const broadcast of broadcasts) {
+      const recipientAccountIds = broadcast.recipientAccountIds.filter((accountId) => {
+        // Mixed-version notifications may not carry a publication ID. They have no matching local
+        // direct delivery on this new node, so pass them through without semantic coalescing.
+        if (!broadcast.deliveryId) return true;
+        const key = `${accountId}\0${broadcast.deliveryId}`;
+        const previous = recentPresenceDeliveries.get(key) ?? 0;
+        if (now - previous <= 5_000) return false;
+        // Refresh insertion order so the first entry remains the least-recently delivered key.
+        recentPresenceDeliveries.delete(key);
+        recentPresenceDeliveries.set(key, now);
+        if (recentPresenceDeliveries.size > 2_048) {
+          const oldest = recentPresenceDeliveries.keys().next().value;
+          if (oldest !== undefined) recentPresenceDeliveries.delete(oldest);
+        }
+        return true;
+      });
+      if (recipientAccountIds.length > 0) {
+        unique.push({ ...broadcast, recipientAccountIds });
+      }
+    }
+    if (unique.length > 0) pushPresenceBroadcasts(sockets, unique);
+  };
   const metrics = new OperationalMetrics();
   const requireScheduledWorkerOrReplay = async (
     accountId: string,
@@ -452,8 +510,31 @@ export function startCloudServer(
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
   const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
   const profilePhotosConfigured = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED === "1";
-  const profilePhotosAvailable = async () => profilePhotosConfigured
-    && (await profilePhotosSchemaReadiness(db)).ready;
+  let profilePhotosSchemaCache: { ready: boolean; expiresAt: number } | null = null;
+  let profilePhotosSchemaProbe: Promise<boolean> | null = null;
+  const profilePhotosAvailable = async (): Promise<boolean> => {
+    if (!profilePhotosConfigured) return false;
+    const now = Date.now();
+    if (profilePhotosSchemaCache && profilePhotosSchemaCache.expiresAt > now) {
+      return profilePhotosSchemaCache.ready;
+    }
+    if (!profilePhotosSchemaProbe) {
+      profilePhotosSchemaProbe = profilePhotosSchemaReadiness(db)
+        .then((state) => {
+          profilePhotosSchemaCache = {
+            ready: state.ready,
+            expiresAt: Date.now() + (state.ready ? 60_000 : 2_000),
+          };
+          return state.ready;
+        })
+        .catch(() => {
+          profilePhotosSchemaCache = { ready: false, expiresAt: Date.now() + 2_000 };
+          return false;
+        })
+        .finally(() => { profilePhotosSchemaProbe = null; });
+    }
+    return await profilePhotosSchemaProbe;
+  };
   const draftMediaAvailability = async () => {
     const schema = await draftMediaSchemaState(db);
     return {
@@ -462,6 +543,53 @@ export function startCloudServer(
     };
   };
   const backgroundWorkers = options.backgroundWorkers !== false;
+  let socketAuthorizationRunning = false;
+  const auditSocketAuthorizations = async () => {
+    if (socketAuthorizationRunning || sockets.size === 0) return;
+    socketAuthorizationRunning = true;
+    try {
+      const deviceIds = [...new Set(
+        [...sockets.values()].flatMap((set) => [...set].map((socket) => socket.data.deviceId)),
+      )];
+      if (deviceIds.length === 0) return;
+      const activeRows = await db`
+        SELECT device.id, device.account_id
+        FROM devices AS device
+        JOIN accounts AS account ON account.id = device.account_id
+        WHERE device.id = ANY(${db.array(deviceIds, "uuid")}::uuid[])
+          AND device.revoked_at IS NULL
+          AND account.status IN ('active','limited')`;
+      const active = new Set(activeRows.map((row) => `${row.account_id}\0${row.id}`));
+      for (const [accountId, accountSockets] of sockets) {
+        for (const socket of accountSockets) {
+          if (active.has(`${accountId}\0${socket.data.deviceId}`)) continue;
+          if (socket.readyState === 1) {
+            socket.send(JSON.stringify({
+              type: "session_revoked",
+              deviceId: socket.data.deviceId,
+              reason: "device_revoked",
+            }));
+          }
+          socket.close(4001, "device revoked");
+        }
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "cloud.ws_authorization_audit_error",
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      }));
+    } finally {
+      socketAuthorizationRunning = false;
+    }
+  };
+  const socketAuthorizationInterval = backgroundWorkers
+    ? setInterval(
+        () => { void auditSocketAuthorizations(); },
+        Math.max(250, options.socketAuthorizationIntervalMs ?? 5_000),
+      )
+    : null;
+  socketAuthorizationInterval?.unref?.();
   const stopPushWorker = backgroundWorkers ? startPushWorker(db, pushSender) : () => {};
   const stopMaintenanceWorker = backgroundWorkers
     ? startMaintenanceWorker(db, undefined, metrics) : () => {};
@@ -501,14 +629,41 @@ export function startCloudServer(
   ) : () => {};
   const presenceDatabaseURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL
     ?? process.env.DATABASE_URL ?? null;
+  // The same channel carries credential-revocation control frames, which must stay active even
+  // while the presence feature is dark or its schema has not reached this node yet.
   const stopPresenceNotifications = backgroundWorkers ? startPresenceNotificationListener(
     presenceDatabaseURL,
-    (broadcast) => pushPresenceBroadcasts(sockets, [broadcast]),
+    (broadcast) => deliverPresenceBroadcasts([broadcast]),
   ) : () => {};
-  const stopPresenceCleanup = backgroundWorkers ? startPresenceCleanupWorker(
+  const stopPresenceCleanup = backgroundWorkers && presenceConfigured() ? startPresenceCleanupWorker(
     db,
-    (broadcasts) => pushPresenceBroadcasts(sockets, broadcasts),
+    deliverPresenceBroadcasts,
   ) : () => {};
+
+  let realtimePresenceSchemaCache: { ready: boolean; expiresAt: number } | null = null;
+  let realtimePresenceSchemaProbe: Promise<boolean> | null = null;
+  const realtimePresenceSchemaReady = async (): Promise<boolean> => {
+    const now = Date.now();
+    if (realtimePresenceSchemaCache && realtimePresenceSchemaCache.expiresAt > now) {
+      return realtimePresenceSchemaCache.ready;
+    }
+    if (!realtimePresenceSchemaProbe) {
+      realtimePresenceSchemaProbe = presenceSchemaReadiness(db)
+        .then((state) => {
+          realtimePresenceSchemaCache = {
+            ready: state.ready,
+            expiresAt: Date.now() + (state.ready ? 60_000 : 2_000),
+          };
+          return state.ready;
+        })
+        .catch(() => {
+          realtimePresenceSchemaCache = { ready: false, expiresAt: Date.now() + 2_000 };
+          return false;
+        })
+        .finally(() => { realtimePresenceSchemaProbe = null; });
+    }
+    return await realtimePresenceSchemaProbe;
+  };
 
   const server = Bun.serve<SocketData>({
     port,
@@ -616,9 +771,11 @@ export function startCloudServer(
           if (server.upgrade(req, { data: {
             ...dev,
             connectionId: crypto.randomUUID(),
+            presenceEpoch: null,
             presenceActive: false,
             typingDialogs: new Set<string>(),
             lastTypingAt: new Map<string, number>(),
+            activityDepth: 0,
             activityQueue: Promise.resolve(),
           } })) response = undefined;
           else response = new Response("upgrade failed", { status: 400 });
@@ -1288,7 +1445,7 @@ export function startCloudServer(
           const result = await blockAccount(db, session.accountId, blockMatch[1]);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
-          pushPresenceBroadcasts(sockets, await publishPresenceVisibility(
+          deliverPresenceBroadcasts(await publishPresenceVisibility(
             db, session.accountId, blockMatch[1], false,
           ));
           response = json({ blocked: result.blocked });
@@ -1296,7 +1453,7 @@ export function startCloudServer(
 
         if (blockMatch && req.method === "DELETE") {
           const result = await unblockAccount(db, session.accountId, blockMatch[1]);
-          pushPresenceBroadcasts(sockets, await publishPresenceVisibility(
+          deliverPresenceBroadcasts(await publishPresenceVisibility(
             db, session.accountId, blockMatch[1], true,
           ));
           response = json(result);
@@ -1424,6 +1581,7 @@ export function startCloudServer(
             session.deviceId,
             options.groupCallSFUControl,
           );
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectDevice(sockets, session.accountId, session.deviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
@@ -1446,6 +1604,7 @@ export function startCloudServer(
           );
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectAccount(sockets, session.accountId);
           response = json({ deleted: result.deleted });
         }
@@ -1466,6 +1625,7 @@ export function startCloudServer(
             targetDeviceId,
             options.groupCallSFUControl,
           );
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectDevice(sockets, session.accountId, targetDeviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
@@ -1525,23 +1685,19 @@ export function startCloudServer(
         }
 
         if (url.pathname === "/v1/profile/photo" && req.method === "PUT") {
-          if (!await profilePhotosAvailable()) {
-            response = new Response("not found", { status: 404 });
-          } else {
-            const result = await updateProfilePhoto(db, {
-              accountId: session.accountId,
-              deviceId: session.deviceId,
-              mediaId: body.mediaId,
-              clientMutationId: body.clientMutationId,
-              basePhotoRevision: body.basePhotoRevision,
-            });
-            pushHints(sockets, result.pushes);
-            response = json({
-              profile: result.profile,
-              committedPhotoRevision: result.committedPhotoRevision,
-              duplicate: result.duplicate,
-            });
-          }
+          const result = await updateProfilePhoto(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            mediaId: body.mediaId,
+            clientMutationId: body.clientMutationId,
+            basePhotoRevision: body.basePhotoRevision,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({
+            profile: result.profile,
+            committedPhotoRevision: result.committedPhotoRevision,
+            duplicate: result.duplicate,
+          });
         }
 
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
@@ -1814,13 +1970,14 @@ export function startCloudServer(
         sockets.set(ws.data.accountId, set);
         // Late-join hint: a client reconnecting after a gap learns the current cursor right away
         // instead of waiting for the next new event to produce a push.
-        getState(db, ws.data.accountId)
+        requireActiveDevice(db, ws.data.accountId, ws.data.deviceId)
+          .then(() => getState(db, ws.data.accountId))
           .then((state) => {
             if (ws.readyState === 1) {
               ws.send(JSON.stringify({ type: "sync_hint", pts: state.pts, ptsCount: 0 }));
             }
           })
-          .catch(() => {});
+          .catch(() => ws.close(4001, "device revoked"));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
       },
       close(ws) {
@@ -1832,20 +1989,23 @@ export function startCloudServer(
         const cleanup = (async () => {
           await ws.data.activityQueue.catch(() => {});
           for (const dialogId of ws.data.typingDialogs) {
-            pushPresenceBroadcasts(sockets, await publishTyping(db, {
+            deliverPresenceBroadcasts(await publishTyping(db, {
               accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
               dialogId,
               typingSessionId: ws.data.connectionId,
               active: false,
+              allowRevokedCleanup: true,
             }));
           }
           ws.data.typingDialogs.clear();
           if (ws.data.presenceActive) {
-            pushPresenceBroadcasts(sockets, await setPresenceActivity(db, {
+            deliverPresenceBroadcasts(await setPresenceActivity(db, {
               accountId: ws.data.accountId,
               deviceId: ws.data.deviceId,
               connectionId: ws.data.connectionId,
               active: false,
+              allowRevokedCleanup: true,
             }));
           }
         })().catch(() => {});
@@ -1871,7 +2031,7 @@ export function startCloudServer(
             return;
           }
           if (!presenceEnabledForAccount(ws.data.accountId)
-            || !(await presenceSchemaReadiness(db)).ready) {
+            || !(await realtimePresenceSchemaReady())) {
             recordPresenceRejectedFrame("unauthorized");
             return;
           }
@@ -1880,11 +2040,15 @@ export function startCloudServer(
               recordPresenceRejectedFrame("malformed");
               return;
             }
+            if (value.active && ws.data.presenceEpoch == null) {
+              ws.data.presenceEpoch = await nextPresenceConnectionEpoch(db);
+            }
             ws.data.presenceActive = value.active;
             if (!value.active) {
               for (const dialogId of ws.data.typingDialogs) {
-                pushPresenceBroadcasts(sockets, await publishTyping(db, {
+                deliverPresenceBroadcasts(await publishTyping(db, {
                   accountId: ws.data.accountId,
+                  deviceId: ws.data.deviceId,
                   dialogId,
                   typingSessionId: ws.data.connectionId,
                   active: false,
@@ -1892,17 +2056,19 @@ export function startCloudServer(
               }
               ws.data.typingDialogs.clear();
             }
-            pushPresenceBroadcasts(sockets, await setPresenceActivity(db, {
+            deliverPresenceBroadcasts(await setPresenceActivity(db, {
               accountId: ws.data.accountId,
               deviceId: ws.data.deviceId,
               connectionId: ws.data.connectionId,
+              connectionEpoch: ws.data.presenceEpoch ?? undefined,
               active: value.active,
             }));
           } else if (value.type === "presence_heartbeat" && ws.data.presenceActive) {
-            pushPresenceBroadcasts(sockets, await heartbeatPresence(db, {
+            deliverPresenceBroadcasts(await heartbeatPresence(db, {
               accountId: ws.data.accountId,
               deviceId: ws.data.deviceId,
               connectionId: ws.data.connectionId,
+              connectionEpoch: ws.data.presenceEpoch ?? undefined,
             }));
           } else if (value.type === "typing_activity") {
             if (!ws.data.presenceActive
@@ -1917,8 +2083,15 @@ export function startCloudServer(
               recordPresenceRejectedFrame("rate_limited");
               return;
             }
+            if (value.active
+              && !ws.data.typingDialogs.has(value.dialogId)
+              && ws.data.typingDialogs.size >= 8) {
+              recordPresenceRejectedFrame("rate_limited");
+              return;
+            }
             const broadcasts = await publishTyping(db, {
               accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
               dialogId: value.dialogId,
               typingSessionId: ws.data.connectionId,
               active: value.active,
@@ -1934,14 +2107,32 @@ export function startCloudServer(
               ws.data.typingDialogs.delete(value.dialogId);
               ws.data.lastTypingAt.delete(value.dialogId);
             }
-            pushPresenceBroadcasts(sockets, broadcasts);
+            deliverPresenceBroadcasts(broadcasts);
           } else {
             recordPresenceRejectedFrame("unsupported");
           }
         };
+        if (ws.data.activityDepth >= 32) {
+          recordPresenceRejectedFrame("rate_limited");
+          return;
+        }
+        ws.data.activityDepth += 1;
         ws.data.activityQueue = ws.data.activityQueue
           .then(handleActivity, handleActivity)
-          .catch(() => {});
+          .catch((error) => {
+            if (error instanceof AuthError) {
+              recordPresenceRejectedFrame("unauthorized");
+              ws.close(4001, "device revoked");
+            } else if (error instanceof PresenceError
+              && error.code === "stale_presence_connection") {
+              recordPresenceRejectedFrame("unauthorized");
+              ws.data.presenceActive = false;
+              ws.close(4003, "connection superseded");
+            }
+          })
+          .finally(() => {
+            ws.data.activityDepth = Math.max(0, ws.data.activityDepth - 1);
+          });
       },
     },
   });
@@ -1960,6 +2151,7 @@ export function startCloudServer(
     stopGroupCallNotifications();
     stopPresenceNotifications();
     stopPresenceCleanup();
+    if (socketAuthorizationInterval) clearInterval(socketAuthorizationInterval);
     const stopped = originalStop(closeActiveConnections);
     return Promise.resolve(stopped).then(async (value) => {
       await Promise.allSettled([...presenceSocketCleanupTasks]);

@@ -10,6 +10,7 @@ import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
 import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
 import { presenceSchemaReadiness } from "./presence";
+import { profilePhotosSchemaReadiness } from "./profile-photos";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -315,6 +316,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
   const draftMedia = await draftMediaSchemaState(sql, { bypassCache: true });
   const groupCallSchema = await groupCallSchemaReadiness(sql, { bypassCache: true });
   const presence = await presenceSchemaReadiness(sql);
+  const profilePhotos = await profilePhotosSchemaReadiness(sql);
   const groupCallsRequested = process.env.TOJ_GROUP_CALLS_ENABLED === "1";
   const groupCallInfrastructure = groupCallsConfigured();
   return {
@@ -322,7 +324,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // PushKit, membership, and account-deletion paths even while admission is dark. Schema is an
     // unconditional binary contract; feature flags only control new starts and joins.
     status: savedMessages.ready && preferences.ready && draftMedia.ready
-      && groupCallSchema.ready && presence.ready
+      && groupCallSchema.ready && presence.ready && profilePhotos.ready
       && (!groupCallsRequested || groupCallInfrastructure)
       ? "ready"
       : "not_ready",
@@ -338,6 +340,9 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
     // the binary is live. Entry-point switches cannot make a partial schema safe.
     draftMedia,
     presence,
+    // Profile columns are read by ordinary auth and sync paths even while photo mutation entry
+    // points are dark, so this is an unconditional binary/schema admission contract.
+    profilePhotos: profilePhotos.ready ? "ready" : "incomplete",
     groupCalls: {
       requested: groupCallsRequested,
       infrastructure: groupCallInfrastructure ? "ready" : "disabled_or_incomplete",
@@ -646,6 +651,17 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE budget.account_id = doomed.account_id
       AND budget.bucket_started = doomed.bucket_started
     RETURNING budget.account_id`;
+  const profilePhotoBudgets = await sql`
+    WITH doomed AS (
+      SELECT account_id, bucket_started FROM profile_photo_action_budgets
+      WHERE updated_at < now() - interval '48 hours'
+      ORDER BY updated_at LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM profile_photo_action_budgets budget USING doomed
+    WHERE budget.account_id = doomed.account_id
+      AND budget.bucket_started = doomed.bucket_started
+    RETURNING budget.account_id`;
   const scheduledDeliveries = await sql`
     WITH doomed AS (
       SELECT id FROM scheduled_deliveries
@@ -794,6 +810,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     groupMutations: groupMutations.length,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
     dialogPreferenceBudgets: dialogPreferenceBudgets.length,
+    profilePhotoBudgets: profilePhotoBudgets.length,
     scheduledDeliveries: scheduledDeliveries.length,
     scheduledBudgets: scheduledBudgets.length,
     folderBudgets: folderBudgets.length,
@@ -812,6 +829,7 @@ function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): nu
     + value.messageMutations + value.draftMutations + value.draftBudgets
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
+    + value.profilePhotoBudgets
     + value.scheduledDeliveries + value.scheduledBudgets + value.folderBudgets
     + value.previewBudgets + value.previewCache + value.previewSnapshots + value.previewAssets
     + Object.values(value.callData).reduce((sum, count) => sum + count, 0);

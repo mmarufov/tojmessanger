@@ -1218,40 +1218,58 @@ actor CloudLocalStore {
 
     func failProfilePhotoMutation(
         accountId: String,
+        clientMutationId: String,
         error: String,
         retryAfter: TimeInterval?,
         conflict: Bool = false,
         terminal: Bool = false
-    ) throws {
+    ) throws -> Bool {
         let next = retryAfter.map { Self.sqliteTimestamp(Date().addingTimeInterval($0)) }
-        try dbQueue.write { db in
+        return try dbQueue.write { db in
             try db.execute(
                 sql: """
                 UPDATE pending_profile_photo_mutations
                 SET state = ?, retry_count = retry_count + 1, next_retry_at = ?,
                     last_error = ?, terminal = ?, updated_at = datetime('now')
-                WHERE account_id = ?
+                WHERE account_id = ? AND client_mutation_id = ?
                 """,
-                arguments: [conflict ? "conflict" : "ready_to_commit", next, error, terminal, accountId]
+                arguments: [
+                    conflict ? "conflict" : "ready_to_commit", next, error, terminal,
+                    accountId, clientMutationId,
+                ]
             )
+            return db.changesCount == 1
         }
     }
 
-    func failProfilePhotoUpload(accountId: String, error: String, retryAfter: TimeInterval) throws {
+    func failProfilePhotoUpload(
+        accountId: String,
+        clientMutationId: String,
+        error: String,
+        retryAfter: TimeInterval
+    ) throws -> Bool {
         try dbQueue.write { db in
             try db.execute(
                 sql: """
                 UPDATE pending_profile_photo_mutations
                 SET state = 'pending', retry_count = retry_count + 1, next_retry_at = ?,
                     last_error = ?, terminal = 0, updated_at = datetime('now')
-                WHERE account_id = ?
+                WHERE account_id = ? AND client_mutation_id = ?
                 """,
-                arguments: [Self.sqliteTimestamp(Date().addingTimeInterval(retryAfter)), error, accountId]
+                arguments: [
+                    Self.sqliteTimestamp(Date().addingTimeInterval(retryAfter)), error,
+                    accountId, clientMutationId,
+                ]
             )
+            return db.changesCount == 1
         }
     }
 
-    func rebaseProfilePhotoMutation(accountId: String, baseRevision: Int64) throws {
+    func rebaseProfilePhotoMutation(
+        accountId: String,
+        clientMutationId: String,
+        baseRevision: Int64
+    ) throws -> Bool {
         try dbQueue.write { db in
             try db.execute(
                 sql: """
@@ -1259,55 +1277,80 @@ actor CloudLocalStore {
                 SET client_mutation_id = ?, base_photo_revision = ?, state = 'ready_to_commit',
                     retry_count = 0, next_retry_at = NULL, last_error = NULL, terminal = 0,
                     updated_at = datetime('now')
-                WHERE account_id = ?
+                WHERE account_id = ? AND client_mutation_id = ?
                 """,
-                arguments: [UUID().uuidString.lowercased(), baseRevision, accountId]
+                arguments: [
+                    UUID().uuidString.lowercased(), baseRevision, accountId, clientMutationId,
+                ]
             )
+            return db.changesCount == 1
         }
     }
 
-    func retryProfilePhotoMutation(accountId: String) throws {
+    func retryProfilePhotoMutation(accountId: String, clientMutationId: String) throws -> Bool {
         try dbQueue.write { db in
             try db.execute(
                 sql: """
                 UPDATE pending_profile_photo_mutations
-                SET state = CASE WHEN media_id IS NULL THEN 'pending' ELSE 'ready_to_commit' END,
+                SET state = CASE
+                      WHEN operation = 'remove' THEN 'ready_to_commit'
+                      WHEN media_id IS NULL THEN 'pending'
+                      ELSE 'ready_to_commit'
+                    END,
                     retry_count = 0, next_retry_at = NULL, last_error = NULL,
                     terminal = 0, updated_at = datetime('now')
-                WHERE account_id = ? AND state <> 'conflict'
+                WHERE account_id = ? AND client_mutation_id = ? AND state <> 'conflict'
                 """,
-                arguments: [accountId]
+                arguments: [accountId, clientMutationId]
             )
+            let retried = db.changesCount == 1
+            guard retried else { return false }
             try db.execute(
                 sql: """
                 UPDATE media_transfers
                 SET terminal = 0, next_retry_at = NULL, last_error = NULL,
                     state = CASE WHEN media_id IS NULL THEN 'pending' ELSE state END
                 WHERE transfer_id IN (
-                  SELECT transfer_id FROM pending_profile_photo_mutations WHERE account_id = ?
+                  SELECT transfer_id FROM pending_profile_photo_mutations
+                  WHERE account_id = ? AND client_mutation_id = ?
                 )
                 """,
-                arguments: [accountId]
+                arguments: [accountId, clientMutationId]
             )
+            return true
         }
     }
 
-    func completeProfilePhotoMutation(accountId: String, profile: CloudProfile) throws -> String? {
+    /// Applies canonical server state while completing only the mutation that produced it.
+    /// A newer optimistic intent for the same account must survive a delayed response.
+    func completeProfilePhotoMutation(
+        accountId: String,
+        clientMutationId: String,
+        profile: CloudProfile
+    ) throws -> Bool {
         try dbQueue.write { db in
-            let transferId = try String.fetchOne(
+            let mutation = try Row.fetchOne(
                 db,
-                sql: "SELECT transfer_id FROM pending_profile_photo_mutations WHERE account_id = ?",
-                arguments: [accountId]
+                sql: """
+                SELECT transfer_id FROM pending_profile_photo_mutations
+                WHERE account_id = ? AND client_mutation_id = ?
+                """,
+                arguments: [accountId, clientMutationId]
             )
             try upsertProfile(db, profile: profile)
+            guard let mutation else { return false }
+            let transferId: String? = mutation["transfer_id"]
             if let transferId {
                 try db.execute(sql: "DELETE FROM media_transfers WHERE transfer_id = ?", arguments: [transferId])
             }
             try db.execute(
-                sql: "DELETE FROM pending_profile_photo_mutations WHERE account_id = ?",
-                arguments: [accountId]
+                sql: """
+                DELETE FROM pending_profile_photo_mutations
+                WHERE account_id = ? AND client_mutation_id = ?
+                """,
+                arguments: [accountId, clientMutationId]
             )
-            return transferId
+            return db.changesCount == 1
         }
     }
 
@@ -1326,6 +1369,56 @@ actor CloudLocalStore {
                 arguments: [accountId]
             )
             return transferId
+        }
+    }
+
+    /// Rolls back only the mutation created by a suspended coordinator operation. A newer intent
+    /// for the same account must survive even if the older task resumes after reconfiguration.
+    func discardProfilePhotoMutation(
+        accountId: String,
+        clientMutationId: String
+    ) throws -> Bool {
+        try dbQueue.write { db in
+            guard let transferId = try String.fetchOne(
+                db,
+                sql: """
+                SELECT transfer_id FROM pending_profile_photo_mutations
+                WHERE account_id = ? AND client_mutation_id = ?
+                """,
+                arguments: [accountId, clientMutationId]
+            ) else {
+                let exists = try Bool.fetchOne(
+                    db,
+                    sql: """
+                    SELECT EXISTS(
+                      SELECT 1 FROM pending_profile_photo_mutations
+                      WHERE account_id = ? AND client_mutation_id = ?
+                    )
+                    """,
+                    arguments: [accountId, clientMutationId]
+                ) ?? false
+                guard exists else { return false }
+                try db.execute(
+                    sql: """
+                    DELETE FROM pending_profile_photo_mutations
+                    WHERE account_id = ? AND client_mutation_id = ?
+                    """,
+                    arguments: [accountId, clientMutationId]
+                )
+                return db.changesCount == 1
+            }
+            try db.execute(
+                sql: "DELETE FROM media_transfers WHERE transfer_id = ?",
+                arguments: [transferId]
+            )
+            try db.execute(
+                sql: """
+                DELETE FROM pending_profile_photo_mutations
+                WHERE account_id = ? AND client_mutation_id = ?
+                """,
+                arguments: [accountId, clientMutationId]
+            )
+            return db.changesCount == 1
         }
     }
 
@@ -6312,25 +6405,34 @@ actor CloudLocalStore {
     }
 
     func savePresenceSnapshot(_ snapshot: LocalPresenceSnapshot) throws {
+        try savePresenceSnapshots([snapshot])
+    }
+
+    func savePresenceSnapshots(_ snapshots: [LocalPresenceSnapshot]) throws {
+        guard !snapshots.isEmpty else { return }
         try dbQueue.write { db in
-            try db.execute(
-                sql: """
-                INSERT INTO peer_presence_cache (
-                  observer_account_id, subject_account_id, last_seen_at, revision, updated_at
-                ) VALUES (?, ?, ?, ?, datetime('now'))
-                ON CONFLICT(observer_account_id, subject_account_id) DO UPDATE SET
-                  last_seen_at = excluded.last_seen_at,
-                  revision = excluded.revision,
-                  updated_at = excluded.updated_at
-                WHERE excluded.revision >= peer_presence_cache.revision
-                """,
-                arguments: [
-                    snapshot.observerAccountId,
-                    snapshot.subjectAccountId,
-                    snapshot.lastSeenAt,
-                    snapshot.revision,
-                ]
-            )
+            for snapshot in snapshots {
+                try db.execute(
+                    sql: """
+                    INSERT INTO peer_presence_cache (
+                      observer_account_id, subject_account_id, last_seen_at, revision, updated_at
+                    ) VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(observer_account_id, subject_account_id) DO UPDATE SET
+                      last_seen_at = excluded.last_seen_at,
+                      revision = excluded.revision,
+                      updated_at = excluded.updated_at
+                    WHERE excluded.revision > peer_presence_cache.revision
+                       OR (excluded.revision = peer_presence_cache.revision
+                           AND excluded.last_seen_at IS NOT peer_presence_cache.last_seen_at)
+                    """,
+                    arguments: [
+                        snapshot.observerAccountId,
+                        snapshot.subjectAccountId,
+                        snapshot.lastSeenAt,
+                        snapshot.revision,
+                    ]
+                )
+            }
         }
     }
 
@@ -7688,6 +7790,16 @@ actor CloudLocalStore {
             );
             CREATE INDEX IF NOT EXISTS pending_profile_photo_ready_idx
               ON pending_profile_photo_mutations(account_id, terminal, state, next_retry_at);
+            """)
+        }
+
+        migrator.registerMigration("v17-profile-photo-lookup-index") { db in
+            // Avatar authorization and revocation start from an immutable media ID. Index the
+            // JSON projection so each visible avatar does not scan the full profile cache.
+            try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS profiles_photo_media_id_idx
+              ON profiles(json_extract(photo_media_json, '$.id'))
+              WHERE photo_media_json IS NOT NULL;
             """)
         }
 
@@ -9690,17 +9802,24 @@ actor CloudLocalStore {
               photo_media_json, photo_revision, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id) DO UPDATE SET
-              first_name = excluded.first_name,
-              last_name = excluded.last_name,
-              display_name = excluded.display_name,
-              bio = excluded.bio,
-              birthday = excluded.birthday,
-              color_index = excluded.color_index,
-              photo_media_json = excluded.photo_media_json,
-              photo_revision = excluded.photo_revision,
-              updated_at = excluded.updated_at
-            WHERE excluded.updated_at >= profiles.updated_at
-               OR excluded.photo_revision >= profiles.photo_revision
+              first_name = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.first_name ELSE profiles.first_name END,
+              last_name = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.last_name ELSE profiles.last_name END,
+              display_name = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.display_name ELSE profiles.display_name END,
+              bio = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.bio ELSE profiles.bio END,
+              birthday = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.birthday ELSE profiles.birthday END,
+              color_index = CASE WHEN excluded.updated_at > profiles.updated_at
+                THEN excluded.color_index ELSE profiles.color_index END,
+              photo_media_json = CASE WHEN excluded.photo_revision > profiles.photo_revision
+                THEN excluded.photo_media_json ELSE profiles.photo_media_json END,
+              photo_revision = MAX(profiles.photo_revision, excluded.photo_revision),
+              updated_at = MAX(profiles.updated_at, excluded.updated_at)
+            WHERE excluded.updated_at > profiles.updated_at
+               OR excluded.photo_revision > profiles.photo_revision
             """,
             arguments: [
                 profile.accountId, profile.firstName, profile.lastName, profile.displayName,

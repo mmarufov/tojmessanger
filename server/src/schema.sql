@@ -281,12 +281,12 @@ EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 DO $$ BEGIN
   ALTER TABLE accounts ADD CONSTRAINT accounts_profile_photo_media_id_fkey
-    FOREIGN KEY (profile_photo_media_id) REFERENCES media_objects(id) ON DELETE SET NULL;
+    FOREIGN KEY (profile_photo_media_id) REFERENCES media_objects(id) ON DELETE SET NULL NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 DO $$ BEGIN
   ALTER TABLE accounts ADD CONSTRAINT accounts_profile_photo_revision_check
-    CHECK (profile_photo_revision >= 0);
+    CHECK (profile_photo_revision >= 0) NOT VALID;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
@@ -310,6 +310,19 @@ CREATE TABLE IF NOT EXISTS profile_photo_mutations (
 );
 CREATE INDEX IF NOT EXISTS profile_photo_mutations_account_created_idx
   ON profile_photo_mutations(account_id, created_at DESC);
+
+-- Exact replays do not consume this budget. New mutation IDs are bounded per UTC day so a
+-- compromised authenticated client cannot turn durable idempotency receipts into unbounded
+-- high-rate storage growth.
+CREATE TABLE IF NOT EXISTS profile_photo_action_budgets (
+  account_id      UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  bucket_started  TIMESTAMPTZ NOT NULL,
+  mutation_count  INT NOT NULL DEFAULT 0 CHECK (mutation_count >= 0),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, bucket_started)
+);
+CREATE INDEX IF NOT EXISTS profile_photo_action_budgets_retention_idx
+  ON profile_photo_action_budgets(bucket_started, account_id);
 
 -- Kept separately from media_objects so create/cancel loops cannot evade per-account rate limits.
 CREATE TABLE IF NOT EXISTS media_upload_attempts (

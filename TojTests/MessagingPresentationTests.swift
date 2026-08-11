@@ -32,6 +32,40 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertNil(CloudHintSocket.event(from: .string("{\"type\":\"invented_presence\"}")))
     }
 
+    func testCredentialCloseAndUpgradeFailuresBecomeStickyRevocationHints() {
+        XCTAssertEqual(
+            CloudHintSocket.revocationHint(statusCode: 401, closeCode: 0),
+            SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "unauthorized")
+        )
+        XCTAssertEqual(
+            CloudHintSocket.revocationHint(statusCode: nil, closeCode: 4001),
+            SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "device_revoked")
+        )
+        XCTAssertEqual(
+            CloudHintSocket.revocationHint(statusCode: nil, closeCode: 4002),
+            SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "account_deleted")
+        )
+        XCTAssertNil(CloudHintSocket.revocationHint(statusCode: 503, closeCode: 1006))
+    }
+
+    func testSocketEventOverflowForcesReconciliationInsteadOfSilentPresenceLoss() async throws {
+        let socket = CloudHintSocket(
+            url: try XCTUnwrap(URL(string: "wss://presence.example.test/v1/ws")),
+            token: "token"
+        )
+        for pts in 0..<512 {
+            let accepted = await socket.enqueueForTesting(.sync(SyncHint(
+                type: "sync_hint", pts: Int64(pts), ptsCount: 1
+            )))
+            XCTAssertTrue(accepted)
+        }
+        let overflowed = await socket.enqueueForTesting(.presence(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: false,
+            lastSeenAt: "2026-08-11T09:30:00.000Z", revision: 8
+        )))
+        XCTAssertFalse(overflowed)
+    }
+
     @MainActor
     func testPresenceCoordinatorRejectsStaleRevisionsAndClearsTransportClaims() async throws {
         let api = CloudAPI(config: CloudConfig(
@@ -58,6 +92,86 @@ final class MessagingPresentationTests: XCTestCase {
         await coordinator.transportChanged(.disconnected)
         XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, false)
         XCTAssertTrue(coordinator.typingAccountIds(dialogId: "dialog").isEmpty)
+    }
+
+    @MainActor
+    func testVisibilityInvalidationRejectsLatePresenceAndTypingUntilAuthoritativeRefresh() async throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        coordinator.enableFixturesForTesting()
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: true,
+            lastSeenAt: nil, revision: 3
+        ))
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "dialog", actorAccountId: "peer",
+            typingSessionId: "peer-socket", active: true, expiresInMs: 7_000
+        ))
+
+        await coordinator.handle(PresenceVisibilityHint(
+            type: "presence_visibility", accountId: "peer", visible: false
+        ))
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: true,
+            lastSeenAt: nil, revision: 4
+        ))
+        coordinator.handle(TypingUpdateHint(
+            type: "typing_update", dialogId: "dialog", actorAccountId: "peer",
+            typingSessionId: "late-peer-socket", active: true, expiresInMs: 7_000
+        ))
+
+        XCTAssertNil(coordinator.presence(accountId: "peer"))
+        XCTAssertTrue(coordinator.typingAccountIds(dialogId: "dialog").isEmpty)
+    }
+
+    @MainActor
+    func testPeriodicAuthoritativeRefreshHealsADroppedOfflineNotification() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PresenceMockURLProtocol.self]
+        let probe = PresenceQueryProbe()
+        PresenceMockURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/cloud/v1/presence/query")
+            let online = probe.nextIsOnline()
+            return (
+                try XCTUnwrap(HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["content-type": "application/json"]
+                )),
+                Data("""
+                {"presences":[{"accountId":"peer","online":\(online),
+                 "lastSeenAt":"2026-08-11T09:30:00.000Z","revision":\(online ? 1 : 2)}]}
+                """.utf8)
+            )
+        }
+        defer { PresenceMockURLProtocol.handler = nil }
+        let api = CloudAPI(
+            config: CloudConfig(
+                baseURL: try XCTUnwrap(URL(string: "https://presence.example.test/cloud"))
+            ),
+            session: URLSession(configuration: configuration)
+        )
+        let coordinator = PresenceCoordinator(
+            api: api,
+            authoritativeRefreshInterval: .milliseconds(80)
+        )
+        await coordinator.configure(
+            store: nil,
+            session: CloudSession(accountId: "observer", deviceId: "device", token: "token"),
+            enabled: true
+        )
+        await coordinator.transportChanged(.connected)
+        await coordinator.updateDirectPeers(["peer"])
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, true)
+
+        // No WebSocket offline event is delivered. The periodic authenticated snapshot must heal
+        // the stale online claim while the recipient socket remains connected.
+        try await Task.sleep(for: .milliseconds(220))
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, false)
+        XCTAssertGreaterThanOrEqual(probe.count, 2)
+        await coordinator.reset(clearCacheValues: true)
     }
 
     @MainActor
@@ -103,6 +217,64 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertEqual(coordinator.localTypingDialogIdForTesting, "dialog")
     }
 
+    @MainActor
+    func testInitialCapabilityNegotiationKeepsAnAlreadyConnectedPresenceSocket() async throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        let socket = CloudHintSocket(
+            url: try XCTUnwrap(URL(string: "wss://presence.example.test/v1/ws")),
+            token: "token-a"
+        )
+        await coordinator.attach(socket: socket)
+        await coordinator.transportChanged(.connected)
+        await coordinator.configure(
+            store: nil,
+            session: CloudSession(accountId: "account-a", deviceId: "device-a", token: "token-a"),
+            enabled: true
+        )
+
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer", online: true,
+            lastSeenAt: nil, revision: 1
+        ))
+        XCTAssertEqual(coordinator.presence(accountId: "peer")?.online, true)
+
+        await coordinator.configure(
+            store: nil,
+            session: CloudSession(accountId: "account-b", deviceId: "device-b", token: "token-b"),
+            enabled: true
+        )
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "peer-b", online: true,
+            lastSeenAt: nil, revision: 1
+        ))
+        XCTAssertEqual(
+            coordinator.presence(accountId: "peer-b")?.online,
+            false,
+            "A socket authenticated as the prior account must not survive an identity switch"
+        )
+    }
+
+    @MainActor
+    func testRemovedDirectPeerPurgesCachedPresenceImmediately() async throws {
+        let api = CloudAPI(config: CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://presence.example.test"))
+        ))
+        let coordinator = PresenceCoordinator(api: api)
+        coordinator.enableFixturesForTesting()
+        await coordinator.handle(PresenceUpdateHint(
+            type: "presence_update", accountId: "former-peer", online: false,
+            lastSeenAt: "2026-08-11T09:30:00.000Z", revision: 4
+        ))
+        await coordinator.updateDirectPeers(["former-peer"])
+        XCTAssertNotNil(coordinator.presence(accountId: "former-peer"))
+
+        await coordinator.updateDirectPeers([])
+        XCTAssertNil(coordinator.presence(accountId: "former-peer"))
+    }
+
     func testExactLastSeenFormattingAndUnavailableFallback() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
@@ -133,14 +305,17 @@ final class MessagingPresentationTests: XCTestCase {
         XCTAssertTrue(MessagingCapabilities.demo.contains(.calls))
         XCTAssertFalse(MessagingCapabilities.demo.contains(.savedMessages))
         let dailyUseBits: [MessagingCapabilities] = [
-            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch, .presence,
-            .profilePhotos,
+            .savedMessages, .cloudDrafts, .dialogPreferences, .localSearch, .chatFolders,
+            .scheduledDelivery, .linkPreviews, .presence, .profilePhotos,
         ]
         XCTAssertEqual(Set(dailyUseBits.map(\.rawValue)).count, dailyUseBits.count)
         XCTAssertEqual(MessagingCapabilities.savedMessages.rawValue, 1 << 14)
         XCTAssertEqual(MessagingCapabilities.localSearch.rawValue, 1 << 17)
-        XCTAssertEqual(MessagingCapabilities.presence.rawValue, 1 << 22)
-        XCTAssertEqual(MessagingCapabilities.profilePhotos.rawValue, 1 << 23)
+        XCTAssertEqual(MessagingCapabilities.chatFolders.rawValue, 1 << 22)
+        XCTAssertEqual(MessagingCapabilities.scheduledDelivery.rawValue, 1 << 23)
+        XCTAssertEqual(MessagingCapabilities.linkPreviews.rawValue, 1 << 24)
+        XCTAssertEqual(MessagingCapabilities.presence.rawValue, 1 << 25)
+        XCTAssertEqual(MessagingCapabilities.profilePhotos.rawValue, 1 << 26)
     }
 
     func testSavedCapabilityDistinguishesOfflineUnknownSupportAndWithdrawal() {
@@ -1091,5 +1266,44 @@ private actor ReplicaCoordinatorHolder {
     func isCurrent(_ generation: UInt64) async -> Bool {
         guard let coordinator else { return false }
         return await coordinator.isCurrent(generation)
+    }
+}
+
+private final class PresenceMockURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            let handler = try XCTUnwrap(Self.handler)
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class PresenceQueryProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var queryCount = 0
+
+    func nextIsOnline() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        queryCount += 1
+        return queryCount == 1
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return queryCount
     }
 }

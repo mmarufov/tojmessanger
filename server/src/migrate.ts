@@ -200,6 +200,8 @@ await completeNamedConstraintMigration(
   "media_objects_purpose_check",
   "media_objects_purpose_check_profile_photo",
 );
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE accounts VALIDATE CONSTRAINT accounts_profile_photo_media_id_fkey"`.quiet();
+await $`psql ${url} -v ON_ERROR_STOP=1 -c "SET lock_timeout = '5s'; ALTER TABLE accounts VALIDATE CONSTRAINT accounts_profile_photo_revision_check"`.quiet();
 await completeConstraintMigration(
   "message-mutation-operation-v2",
   "message_mutation_requests",
@@ -449,10 +451,12 @@ const cleanupMigrationSql = makeSql(url);
 try {
   while (true) {
     const staleAccounts = await cleanupMigrationSql`
-      SELECT account.id
+      SELECT account.id, account.profile_photo_media_id
       FROM public.accounts AS account
       WHERE account.status = 'deleted'
         AND (
+          account.profile_photo_media_id IS NOT NULL
+          OR
           EXISTS (
             SELECT 1 FROM public.dialogs AS dialog
             WHERE dialog.type = 'saved' AND dialog.created_by = account.id
@@ -495,6 +499,10 @@ try {
           )
           OR EXISTS (
             SELECT 1 FROM public.dialog_preference_action_budgets AS budget
+            WHERE budget.account_id = account.id
+          )
+          OR EXISTS (
+            SELECT 1 FROM public.profile_photo_action_budgets AS budget
             WHERE budget.account_id = account.id
           )
           OR EXISTS (
@@ -555,6 +563,10 @@ try {
                 WHERE dialog.photo_media_id = media.id
               )
               AND NOT EXISTS (
+                SELECT 1 FROM public.accounts AS referencing_account
+                WHERE referencing_account.profile_photo_media_id = media.id
+              )
+              AND NOT EXISTS (
                 SELECT 1 FROM public.draft_attachments AS attachment
                 WHERE attachment.media_id = media.id
               )
@@ -566,6 +578,30 @@ try {
     await cleanupMigrationSql.begin(async (tx) => {
       for (const row of staleAccounts) {
         await tx`SELECT public.toj_cleanup_account_private_state_v1(${row.id})`;
+        if (row.profile_photo_media_id) {
+          await tx`
+            UPDATE public.accounts
+            SET profile_photo_media_id = NULL
+            WHERE id = ${row.id} AND status = 'deleted'`;
+          await tx`
+            DELETE FROM public.media_objects AS media
+            WHERE media.id = ${row.profile_photo_media_id}
+              AND media.owner_account_id = ${row.id}
+              AND NOT EXISTS (
+                SELECT 1 FROM public.messages AS message WHERE message.media_id = media.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM public.dialogs AS dialog WHERE dialog.photo_media_id = media.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM public.accounts AS account
+                WHERE account.profile_photo_media_id = media.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM public.draft_attachments AS attachment
+                WHERE attachment.media_id = media.id
+              )`;
+        }
       }
     });
     accountPrivateCleanupReconciliations += staleAccounts.length;

@@ -71,24 +71,41 @@ actor CloudHintSocket {
     private var runLoop: Task<Void, Never>?
     private var backoff = BackoffPolicy()
     private var presenceActive = false
+    private var credentialRevoked = false
+    private var revocationDelivered = false
     private(set) var state: State = .disconnected
 
     private let statesContinuation: AsyncStream<State>.Continuation
     nonisolated let states: AsyncStream<State>
     private let eventsContinuation: AsyncStream<CloudSocketEvent>.Continuation
     nonisolated let events: AsyncStream<CloudSocketEvent>
+    private let revocationsContinuation: AsyncStream<SessionRevokedHint>.Continuation
+    nonisolated let revocations: AsyncStream<SessionRevokedHint>
 
     init(url: URL, token: String, session: URLSession = URLSession(configuration: .ephemeral)) {
         self.url = url
         self.token = token
         self.session = session
-        (states, statesContinuation) = AsyncStream.makeStream(of: State.self)
+        (states, statesContinuation) = AsyncStream.makeStream(
+            of: State.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
         statesContinuation.yield(.disconnected)
-        (events, eventsContinuation) = AsyncStream.makeStream(of: CloudSocketEvent.self)
+        // Sync/presence events carry monotonic revisions or expiring leases. Keeping the newest
+        // bounded window preserves recovery while preventing a stalled MainActor consumer from
+        // growing memory without limit; revocation uses the separate control stream below.
+        (events, eventsContinuation) = AsyncStream.makeStream(
+            of: CloudSocketEvent.self,
+            bufferingPolicy: .bufferingNewest(512)
+        )
+        (revocations, revocationsContinuation) = AsyncStream.makeStream(
+            of: SessionRevokedHint.self,
+            bufferingPolicy: .bufferingNewest(8)
+        )
     }
 
     func start() {
-        guard runLoop == nil else { return }
+        guard runLoop == nil, !credentialRevoked else { return }
         runLoop = Task { await run() }
     }
 
@@ -137,9 +154,19 @@ actor CloudHintSocket {
             } catch {
                 // Reconnect below.
             }
+            if let hint = Self.revocationHint(
+                statusCode: (task.response as? HTTPURLResponse)?.statusCode,
+                closeCode: task.closeCode.rawValue
+            ) {
+                credentialRevoked = true
+                if !revocationDelivered {
+                    revocationDelivered = true
+                    revocationsContinuation.yield(hint)
+                }
+            }
             task.cancel(with: .abnormalClosure, reason: nil)
             setState(.disconnected)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !credentialRevoked else { return }
             let delay = backoff.nextDelay()
             try? await Task.sleep(for: .seconds(delay))
         }
@@ -157,8 +184,39 @@ actor CloudHintSocket {
             let message = try await task.receive()
             backoff.reset()
             guard let event = Self.event(from: message) else { continue }
-            eventsContinuation.yield(event)
+            if case .sessionRevoked(let hint) = event {
+                // Credential invalidation is a sticky control signal, never part of the bounded
+                // high-rate sync/presence queue.
+                credentialRevoked = true
+                revocationDelivered = true
+                revocationsContinuation.yield(hint)
+                throw CloudHintSocketError.credentialRevoked
+            } else {
+                guard enqueue(event) else {
+                    // Presence revisions are per peer, not part of the global sync cursor. Once
+                    // any event is evicted, reconnect so the app runs both difference sync and a
+                    // full known-peer presence refresh instead of displaying stale online state.
+                    throw CloudHintSocketError.eventBufferOverflow
+                }
+            }
         }
+    }
+
+    @discardableResult
+    private func enqueue(_ event: CloudSocketEvent) -> Bool {
+        switch eventsContinuation.yield(event) {
+        case .enqueued:
+            return true
+        case .dropped(_), .terminated:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
+    @discardableResult
+    func enqueueForTesting(_ event: CloudSocketEvent) -> Bool {
+        enqueue(event)
     }
 
     private func heartbeatLoop(on task: URLSessionWebSocketTask) async throws {
@@ -242,6 +300,28 @@ actor CloudHintSocket {
             return nil
         }
     }
+
+    nonisolated static func revocationHint(
+        statusCode: Int?,
+        closeCode: Int
+    ) -> SessionRevokedHint? {
+        if statusCode == 401 {
+            return SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "unauthorized")
+        }
+        switch closeCode {
+        case 4001:
+            return SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "device_revoked")
+        case 4002:
+            return SessionRevokedHint(type: "session_revoked", deviceId: nil, reason: "account_deleted")
+        default:
+            return nil
+        }
+    }
+}
+
+private nonisolated enum CloudHintSocketError: Error {
+    case credentialRevoked
+    case eventBufferOverflow
 }
 
 private nonisolated struct SocketDiscriminator: Codable, Sendable {

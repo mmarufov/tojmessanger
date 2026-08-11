@@ -3,7 +3,6 @@ import { randomBytes, randomInt } from "node:crypto";
 import {
   seal, open, PHONE_AAD, phoneLookupHash, codeHash, hashToken, normalizePhone, constantTimeEqual,
 } from "./crypto";
-import { enqueuePushDeliveries } from "./push";
 import { loadMediaDTO, type MediaDTO } from "./media";
 
 const OTP_TTL_MS = 5 * 60_000;
@@ -379,13 +378,34 @@ export async function fanoutProfileUpdate(
   profile: ProfileDTO,
 ): Promise<ProfilePush[]> {
   const recipientRows = await tx`
-    SELECT DISTINCT peer.account_id
-    FROM dialog_members mine
-    JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id AND peer.left_at IS NULL
-    JOIN dialogs dialog ON dialog.id = mine.dialog_id AND dialog.closed_at IS NULL
-    WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
-    UNION SELECT ${accountId}::uuid AS account_id`;
-  const recipients = recipientRows.map((row) => String(row.account_id)).sort();
+    WITH recipients AS (
+      SELECT DISTINCT peer.account_id
+      FROM dialog_members mine
+      JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id AND peer.left_at IS NULL
+      JOIN dialogs dialog ON dialog.id = mine.dialog_id AND dialog.closed_at IS NULL
+      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+      UNION SELECT ${accountId}::uuid AS account_id
+    ), shared_direct_dialogs AS (
+      SELECT peer.account_id,
+             jsonb_agg(DISTINCT mine.dialog_id ORDER BY mine.dialog_id) AS dialog_ids
+      FROM dialog_members mine
+      JOIN dialog_members peer
+        ON peer.dialog_id = mine.dialog_id
+       AND peer.account_id <> ${accountId}
+       AND peer.left_at IS NULL
+      JOIN dialogs dialog
+        ON dialog.id = mine.dialog_id
+       AND dialog.type = 'direct'
+       AND dialog.closed_at IS NULL
+      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
+      GROUP BY peer.account_id
+    )
+    SELECT recipient.account_id,
+           COALESCE(shared.dialog_ids, '[]'::jsonb) AS shared_dialog_ids
+    FROM recipients recipient
+    LEFT JOIN shared_direct_dialogs shared ON shared.account_id = recipient.account_id
+    ORDER BY recipient.account_id`;
+  const recipients = recipientRows.map((row) => String(row.account_id));
   const baseData = {
     subject_account_id: profile.accountId,
     username: profile.username,
@@ -399,35 +419,54 @@ export async function fanoutProfileUpdate(
     photo_revision: profile.photoRevision,
     updated_at: profile.updatedAt,
   };
-  const pushes: ProfilePush[] = [];
-  for (const recipient of recipients) {
-    const sharedRows = recipient === accountId ? [] : await tx`
-      SELECT mine.dialog_id
-      FROM dialog_members mine
-      JOIN dialog_members peer ON peer.dialog_id = mine.dialog_id
-      JOIN dialogs dialog ON dialog.id = mine.dialog_id AND dialog.type = 'direct'
-      WHERE mine.account_id = ${accountId} AND mine.left_at IS NULL
-        AND peer.account_id = ${recipient} AND peer.left_at IS NULL
-        AND dialog.closed_at IS NULL
-      ORDER BY mine.dialog_id`;
-    const data = JSON.stringify({
-      ...baseData,
-      shared_dialog_ids: sharedRows.map((row) => String(row.dialog_id)),
-    });
-    const state = (await tx`
-      UPDATE account_sync_states SET pts = pts + 1, updated_at = now()
-      WHERE account_id = ${recipient} RETURNING pts`)[0];
-    const pts = Number(state.pts);
-    await tx`
-      INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
-      VALUES (${recipient}, ${pts}, 'profile.updated', ${accountId}, ${data}::jsonb)`;
-    await enqueuePushDeliveries(tx, {
-      accountId: recipient, pts, senderAccountId: accountId,
-      sourceDeviceId: deviceId, alertRecipients: false,
-    });
-    pushes.push({ accountId: recipient, pts, ptsCount: 1 });
+  // Keep lock acquisition deterministic while advancing every recipient in one set-based write.
+  await tx`
+    SELECT account_id FROM account_sync_states
+    WHERE account_id = ANY(${tx.array(recipients, "uuid")}::uuid[])
+    ORDER BY account_id FOR UPDATE`;
+  const stateRows = await tx`
+    UPDATE account_sync_states
+    SET pts = pts + 1, updated_at = now()
+    WHERE account_id = ANY(${tx.array(recipients, "uuid")}::uuid[])
+    RETURNING account_id, pts`;
+  if (stateRows.length !== recipients.length) {
+    throw new AuthError("profile recipient state unavailable", 503);
   }
-  return pushes;
+  const sharedByAccount = new Map(recipientRows.map((row) => [
+    String(row.account_id),
+    (row.shared_dialog_ids ?? []).map(String),
+  ]));
+  const eventRows = stateRows.map((state) => ({
+    account_id: String(state.account_id),
+    pts: Number(state.pts),
+    data: {
+      ...baseData,
+      shared_dialog_ids: sharedByAccount.get(String(state.account_id)) ?? [],
+    },
+  })).sort((left, right) => left.account_id.localeCompare(right.account_id));
+  const encodedRows = JSON.stringify(eventRows);
+  await tx`
+    INSERT INTO account_events (account_id, pts, type, actor_account_id, data)
+    SELECT event.account_id, event.pts, 'profile.updated', ${accountId}, event.data
+    FROM jsonb_to_recordset(${encodedRows}::text::jsonb)
+      AS event(account_id uuid, pts bigint, data jsonb)`;
+  await tx`
+    INSERT INTO push_deliveries (account_id, pts, device_id, alert)
+    SELECT event.account_id, event.pts, device.id, false
+    FROM jsonb_to_recordset(${encodedRows}::text::jsonb)
+      AS event(account_id uuid, pts bigint, data jsonb)
+    JOIN devices device ON device.account_id = event.account_id
+    WHERE device.platform = 'ios'
+      AND device.revoked_at IS NULL
+      AND device.push_token_hash IS NOT NULL
+      AND device.push_token_ciphertext IS NOT NULL
+      AND device.id <> ${deviceId}
+    ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
+  return eventRows.map((event) => ({
+    accountId: event.account_id,
+    pts: event.pts,
+    ptsCount: 1,
+  }));
 }
 
 /** Persist a profile and fan a silent sync event out to every device and active chat partner. */
@@ -648,7 +687,10 @@ export async function deleteAccount(
   sql: SQL,
   accountId: string,
   code: string,
-  options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
+  options: {
+    beforeCleanup?: (tx: SQL) => Promise<void>;
+    beforeCommit?: (tx: SQL) => Promise<void>;
+  } = {},
 ): Promise<{ deleted: true }> {
   if (!/^\d{6}$/.test(code)) throw new AuthError("enter the 6-digit code", 400);
   const result: { deleted: true } | AuthError = await sql.begin(async (tx) => {
@@ -681,6 +723,7 @@ export async function deleteAccount(
     if (!account || !["active", "limited"].includes(account.status)) {
       return new AuthError("account unavailable", 403);
     }
+    await options.beforeCleanup?.(tx);
     // This database-boundary function is also called by the account-status trigger used by old
     // binaries. Keeping current and mixed-node deletion on one path prevents semantic drift.
     await tx`SELECT public.toj_cleanup_account_private_state_v1(${accountId})`;
