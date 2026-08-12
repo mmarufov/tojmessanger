@@ -291,6 +291,13 @@ final class CloudAppModel {
     private(set) var requestedCode = false
     private(set) var authRequestInFlight = false
     private(set) var authVerifyInFlight = false
+    private(set) var twoFactorChallengeId: String?
+    private(set) var recoveredTwoFactorCodes: [String] = []
+    private(set) var twoFactorEnabled = false
+    private(set) var twoFactorRecoveryCodesRemaining = 0
+    private(set) var securityChangeInFlight = false
+    private(set) var securityStepUpToken: String?
+    private(set) var requiresDifferentAccountCleanupConfirmation = false
     private(set) var resendSeconds = 0
     private(set) var activeDialogId: String?
     private(set) var pendingDeepLinkDialogId: String?
@@ -330,6 +337,11 @@ final class CloudAppModel {
     var phone = "+992 "
     var displayName = ""
     var code = ""
+    var twoFactorPassword = ""
+    var twoFactorRecoveryCode = ""
+    var twoFactorReplacementPassword = ""
+    var usesTwoFactorRecovery = false
+    var securityCode = ""
     var peerPhone = ""
     var draft = "" {
         didSet {
@@ -439,6 +451,14 @@ final class CloudAppModel {
     private var readReceiptRetryTask: Task<Void, Never>?
     private var replicaIntegrityTask: Task<Void, Never>?
     private var localRestoreTask: Task<Void, Never>?
+    private var credentialUpdateTask: Task<Void, Never>?
+    private var credentialRefreshLoopTask: Task<Void, Never>?
+    private var expiredSessionAccountId: String?
+    private var pendingDifferentAccountAuthentication: (
+        session: CloudSession,
+        phone: String,
+        displayName: String
+    )?
     private var localRestoreCompleted = false
     private var backgroundMediaRuntimePrepared = false
     private var mediaSchedulerForegrounded = false
@@ -508,7 +528,7 @@ final class CloudAppModel {
     }
     private struct SessionClearBarrier {
         let id: UUID
-        var waiters: [CheckedContinuation<Void, Never>]
+        var waiters: [CheckedContinuation<Bool, Never>]
     }
     private var trackedSavedOperations: [UUID: TrackedSavedOperation] = [:]
     private var sessionClearBarrier: SessionClearBarrier?
@@ -552,6 +572,13 @@ final class CloudAppModel {
         guard sessionClearBarrier == nil else { return }
         sessionTeardownActive = false
         storedSession = session
+        Task {
+            await SessionCredentialCoordinator.shared.install(
+                session,
+                config: api.config,
+                tokenStore: tokenStore
+            )
+        }
     }
 
     var replicaSyncSnapshot: ReplicaSyncSnapshot {
@@ -602,6 +629,15 @@ final class CloudAppModel {
 
     func consumePendingDeepLink() {
         pendingDeepLinkDialogId = nil
+    }
+
+    var canVerifySecondFactor: Bool {
+        guard twoFactorChallengeId != nil, !authVerifyInFlight else { return false }
+        if usesTwoFactorRecovery {
+            return twoFactorRecoveryCode.filter { $0.isLetter || $0.isNumber }.count == 16
+                && twoFactorReplacementPassword.count >= 8
+        }
+        return !twoFactorPassword.isEmpty
     }
 
     init(
@@ -662,6 +698,27 @@ final class CloudAppModel {
         voipPushCenter.bind { [weak self] token, environment in
             await self?.uploadVoIPPushToken(token, environment: environment)
         }
+        credentialUpdateTask = Task { [weak self] in
+            for await event in SessionCredentialCoordinator.shared.updates {
+                guard let self, !Task.isCancelled else { return }
+                switch event {
+                case let .updated(updated):
+                    guard !self.sessionTeardownActive,
+                          self.storedSession?.session.accountId == updated.session.accountId,
+                          self.storedSession?.session.deviceId == updated.session.deviceId
+                    else { continue }
+                    self.storedSession = updated
+                    await self.startHints(token: updated.session.token)
+                case let .authenticationRequired(expired):
+                    await self.pauseForExpiredSession(expired)
+                case let .securityRevoked(revoked):
+                    guard self.storedSession?.session.deviceId == revoked.session.deviceId else {
+                        continue
+                    }
+                    await self.clearLocalSession(finalStatus: "Session ended for security")
+                }
+            }
+        }
     }
 
     func start() async {
@@ -713,22 +770,68 @@ final class CloudAppModel {
                 return
             }
             #endif
-            let pendingRevocation = try await tokenStore.loadPendingRevocationToken()
+            let pendingRevocations = try await tokenStore.loadPendingRevocations()
             let pendingLocalErasure = try await tokenStore.hasPendingLocalErasure()
+            let pendingReauthentication = try await tokenStore
+                .loadPendingReauthenticationAccountId()
             let savedSession = try await tokenStore.load()
-            if let pendingRevocation {
-                Task { [weak self] in await self?.revokeSignedOutToken(pendingRevocation) }
+            let launchAction = PendingRevocationLaunchPolicy.action(
+                savedSession: savedSession,
+                pendingRevocations: pendingRevocations,
+                hasPendingLocalErasure: pendingLocalErasure,
+                pendingReauthenticationAccountId: pendingReauthentication
+            )
+            if case .eraseLocalReplica = launchAction, !pendingLocalErasure {
+                // Remote revocation can clear its own marker before the longer teardown reaches
+                // disk. Persist destructive intent first so a crash in that window still erases
+                // the replica on the next launch.
+                let accountId = savedSession?.session.accountId
+                    ?? pendingRevocations.first(where: \.eraseLocalReplicaOnLaunch)?
+                        .localReplicaAccountId
+                try await tokenStore.savePendingLocalErasure(accountId: accountId)
+            } else if case let .requireAuthentication(localReplicaAccountId) = launchAction,
+                      let accountId = localReplicaAccountId ?? savedSession?.session.accountId {
+                // A revocation retry may clear its own token marker at any moment. Establish the
+                // independent local-replica fence first so successful remote cleanup cannot make a
+                // later launch forget that reauthentication is still required.
+                try await tokenStore.savePendingReauthentication(accountId: accountId)
             }
-            let revocationMatchesSession = pendingRevocation.map {
-                savedSession?.session.token == $0
-            } ?? false
-            let revocationOutlivedSession = pendingRevocation != nil && savedSession == nil
-            if pendingLocalErasure || revocationMatchesSession || revocationOutlivedSession {
+            for pendingRevocation in pendingRevocations {
+                Task { [weak self] in await self?.revokeSignedOutToken(pendingRevocation.token) }
+            }
+            switch launchAction {
+            case .eraseLocalReplica:
                 // Sign-out was interrupted. Restore only enough identity to erase its profile,
                 // then finish deleting SQLCipher, its key, media, and Keychain session data.
                 storedSession = savedSession
                 await clearLocalSession(finalStatus: "Signed out")
                 return
+            case let .requireAuthentication(localReplicaAccountId):
+                if let savedSession {
+                    // Launch has not installed credentials or started account work yet. Remove only
+                    // this stale session while retaining the independent replica-authentication
+                    // marker; a different-account credential is also queued for remote cleanup.
+                    if let localReplicaAccountId,
+                       savedSession.session.accountId != localReplicaAccountId {
+                        try await tokenStore.savePendingRevocationToken(
+                            savedSession.session.token,
+                            eraseLocalReplicaOnLaunch: false,
+                            localReplicaAccountId: localReplicaAccountId
+                        )
+                        Task { [weak self] in
+                            await self?.revokeSignedOutToken(savedSession.session.token)
+                        }
+                    }
+                    try await tokenStore.clearSession(ifTokenMatches: savedSession.session.token)
+                }
+                expiredSessionAccountId = localReplicaAccountId
+                    ?? savedSession?.session.accountId
+                launchPhase = .localReady
+                setReplicaSyncState(.sessionExpired)
+                status = "Session expired. Sign in again to resume your saved chats."
+                return
+            case .restoreSavedSession:
+                break
             }
             if let saved = savedSession {
                 isSessionTeardownInProgress = false
@@ -808,32 +911,175 @@ final class CloudAppModel {
         authVerifyInFlight = true
         defer { authVerifyInFlight = false }
         do {
-            let session = try await api.checkAuth(
-                phone: trimmedPhone,
-                code: trimmedCode,
-                displayName: name,
-                deviceName: UIDevice.current.name
+            let publicCapabilities = try await api.capabilities()
+            let supportsV2 = publicCapabilities.capabilities.contains("auth_sessions_v2")
+            if supportsV2 {
+                let response = try await api.checkAuthV2(
+                    phone: trimmedPhone,
+                    code: trimmedCode,
+                    displayName: name,
+                    deviceName: UIDevice.current.name
+                )
+                if response.state == "two_factor_required", let challengeId = response.challengeId {
+                    twoFactorChallengeId = challengeId
+                    status = "Enter your two-step verification password"
+                    return
+                }
+                guard let session = response.session else {
+                    throw CloudAPIError(
+                        status: -1,
+                        message: "Invalid authentication response",
+                        retryAfter: nil
+                    )
+                }
+                await finishAuthentication(
+                    session: session,
+                    phone: trimmedPhone,
+                    displayName: name
+                )
+            } else {
+                let session = try await api.checkAuth(
+                    phone: trimmedPhone,
+                    code: trimmedCode,
+                    displayName: name,
+                    deviceName: UIDevice.current.name
+                )
+                await finishAuthentication(
+                    session: session,
+                    phone: trimmedPhone,
+                    displayName: name
+                )
+            }
+        } catch {
+            status = "Sign in failed: \(error.localizedDescription)"
+        }
+    }
+
+    func verifySecondFactor() async {
+        guard canVerifySecondFactor, let challengeId = twoFactorChallengeId else { return }
+        authVerifyInFlight = true
+        defer { authVerifyInFlight = false }
+        do {
+            let response = try await api.completeTwoFactorLogin(
+                challengeId: challengeId,
+                password: usesTwoFactorRecovery ? nil : twoFactorPassword,
+                recoveryCode: usesTwoFactorRecovery ? twoFactorRecoveryCode : nil,
+                newPassword: usesTwoFactorRecovery ? twoFactorReplacementPassword : nil
             )
-            let stored = StoredCloudSession(session: session, phone: trimmedPhone, displayName: name)
+            recoveredTwoFactorCodes = response.recoveryCodes ?? []
+            await finishAuthentication(
+                session: response.session,
+                phone: phone.trimmingCharacters(in: .whitespacesAndNewlines),
+                displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        } catch {
+            status = "Two-step verification failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishAuthentication(
+        session: CloudSession,
+        phone: String,
+        displayName: String
+    ) async {
+        if let expiredSessionAccountId, expiredSessionAccountId != session.accountId {
+            do {
+                // The successful login already created a server device. Persist its revocation
+                // token before showing a destructive local-replica choice so cancellation, loss
+                // of network, or process death cannot strand an unreachable live session.
+                try await tokenStore.savePendingRevocationToken(
+                    session.token,
+                    eraseLocalReplicaOnLaunch: false,
+                    localReplicaAccountId: expiredSessionAccountId
+                )
+            } catch {
+                _ = try? await api.revokeSession(token: session.token)
+                status = "Sign in could not be staged safely: \(error.localizedDescription)"
+                return
+            }
+            pendingDifferentAccountAuthentication = (session, phone, displayName)
+            requiresDifferentAccountCleanupConfirmation = true
+            status = "Confirm before replacing the saved chats from another account."
+            return
+        }
+        let stored = StoredCloudSession(session: session, phone: phone, displayName: displayName)
+        do {
             try await tokenStore.save(stored)
+            do {
+                try await tokenStore.clearPendingRevocationToken(ifMatches: session.token)
+                try await tokenStore.markPendingRevocationsRemoteOnly(
+                    localReplicaAccountId: session.accountId
+                )
+                try await tokenStore.clearPendingReauthentication()
+            } catch {
+                // Leave the durable revocation marker intact and remove the newly saved session.
+                // On relaunch Toj will retry revocation instead of restoring ambiguous identity.
+                try? await tokenStore.clearSession(ifTokenMatches: session.token)
+                throw error
+            }
+            // Clear the in-memory replacement fence only after both the new credential and the
+            // removal of its durable reauthentication marker have committed successfully.
+            expiredSessionAccountId = nil
             sessionEpoch &+= 1
             sessionTearingDown = false
             isSessionTeardownInProgress = false
             accountSessionGeneration &+= 1
             installAuthenticatedSession(stored)
-            profileDetails = Self.profileDetails(from: name)
+            profileDetails = Self.profileDetails(from: displayName)
             try? await tokenStore.saveProfile(profileDetails, accountId: session.accountId)
             resendTask?.cancel()
             resendTask = nil
             resendSeconds = 0
+            twoFactorChallengeId = nil
+            twoFactorPassword = ""
+            twoFactorRecoveryCode = ""
+            twoFactorReplacementPassword = ""
+            usesTwoFactorRecovery = false
             status = "Signed in"
             setReplicaSyncState(.checking)
             await afterSignIn()
             await prepareBackgroundMediaRuntime()
             await activateForegroundServices()
         } catch {
+            // Authentication already created a server-side device. If its durable local commit
+            // fails, revoke that otherwise unreachable credential before allowing another retry.
+            _ = try? await api.revokeSession(token: session.token)
             status = "Sign in failed: \(error.localizedDescription)"
         }
+    }
+
+    func cancelDifferentAccountSignIn() async {
+        guard let pending = pendingDifferentAccountAuthentication else { return }
+        pendingDifferentAccountAuthentication = nil
+        requiresDifferentAccountCleanupConfirmation = false
+        // Cancellation resolves only this staged token's relationship to the preserved replica.
+        // Keep retrying its remote revoke without turning that cleanup into a second auth fence;
+        // the independent reauthentication marker for the original account remains authoritative.
+        try? await tokenStore.markPendingRevocationRemoteOnly(ifMatches: pending.session.token)
+        await revokeSignedOutToken(pending.session.token)
+        status = "Saved chats were kept. Sign in with the original account to resume."
+    }
+
+    func confirmDifferentAccountSignIn() async {
+        guard let pending = pendingDifferentAccountAuthentication else { return }
+        pendingDifferentAccountAuthentication = nil
+        requiresDifferentAccountCleanupConfirmation = false
+        let cleanupSucceeded = await clearLocalSession(
+            finalStatus: "Previous account removed from this device"
+        )
+        guard cleanupSucceeded else {
+            // Never install another account over a replica whose destructive cleanup was partial.
+            // The revocation marker survives a transient network failure and is retried at launch.
+            await revokeSignedOutToken(pending.session.token)
+            status = "Could not safely replace the previous account. Restart Toj to finish cleanup."
+            return
+        }
+        expiredSessionAccountId = nil
+        await finishAuthentication(
+            session: pending.session,
+            phone: pending.phone,
+            displayName: pending.displayName
+        )
     }
 
     func dismissOperationNotice() {
@@ -866,6 +1112,11 @@ final class CloudAppModel {
         guard !authRequestInFlight, !authVerifyInFlight else { return }
         requestedCode = false
         code = ""
+        twoFactorChallengeId = nil
+        twoFactorPassword = ""
+        twoFactorRecoveryCode = ""
+        twoFactorReplacementPassword = ""
+        usesTwoFactorRecovery = false
         status = "Signed out"
     }
 
@@ -1162,7 +1413,10 @@ final class CloudAppModel {
         if let sessionToken {
             // Save before clearing the active session. If the app is killed or offline, the next
             // launch still has enough information to revoke the server session.
-            try? await tokenStore.savePendingRevocationToken(sessionToken)
+            try? await tokenStore.savePendingRevocationToken(
+                sessionToken,
+                localReplicaAccountId: storedSession?.session.accountId
+            )
         }
         await clearLocalSession(finalStatus: "Signed out")
         if let sessionToken {
@@ -1177,10 +1431,10 @@ final class CloudAppModel {
     private func revokeSignedOutToken(_ token: String) async {
         do {
             _ = try await api.revokeSession(token: token)
-            try await tokenStore.clearPendingRevocationToken()
+            try await tokenStore.clearPendingRevocationToken(ifMatches: token)
         } catch {
             if revocationIsTerminal(error) {
-                try? await tokenStore.clearPendingRevocationToken()
+                try? await tokenStore.clearPendingRevocationToken(ifMatches: token)
             }
         }
     }
@@ -1226,6 +1480,228 @@ final class CloudAppModel {
         } catch {
             status = "Could not revoke device: \(error.localizedDescription)"
         }
+    }
+
+    func loadTwoFactorStatus() async {
+        guard let token = storedSession?.session.token else { return }
+        do {
+            let response = try await api.twoFactorStatus(token: token)
+            twoFactorEnabled = response.enabled
+            twoFactorRecoveryCodesRemaining = response.recoveryCodesRemaining
+        } catch let error as CloudAPIError where error.status == 404 {
+            twoFactorEnabled = false
+            twoFactorRecoveryCodesRemaining = 0
+        } catch {
+            status = "Could not load two-step verification: \(error.localizedDescription)"
+        }
+    }
+
+    func acknowledgeRecoveryCodes() {
+        recoveredTwoFactorCodes = []
+    }
+
+    func requestSecurityChangeCode() async -> Bool {
+        guard let token = storedSession?.session.token, !securityChangeInFlight else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.startSecurityStepUp(token: token)
+            securityCode = response.code ?? ""
+            status = "Security code requested"
+            return true
+        } catch {
+            status = "Could not request security code: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func verifySecurityChangeCode() async -> Bool {
+        guard let token = storedSession?.session.token,
+              securityCode.filter(\.isNumber).count == 6,
+              !securityChangeInFlight
+        else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.checkSecurityStepUp(
+                code: securityCode.filter(\.isNumber),
+                token: token
+            )
+            securityStepUpToken = response.stepUpToken
+            return true
+        } catch {
+            status = "Security verification failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func saveTwoFactor(password: String, currentCredential: String?) async -> Bool {
+        guard let saved = storedSession,
+              let stepUpToken = securityStepUpToken,
+              !securityChangeInFlight
+        else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.configureTwoFactor(
+                stepUpToken: stepUpToken,
+                password: password,
+                currentCredential: currentCredential,
+                token: saved.session.token
+            )
+            let sessionInstalled = await applySecuritySession(
+                response.session,
+                replacing: saved
+            )
+            recoveredTwoFactorCodes = response.recoveryCodes ?? []
+            twoFactorEnabled = true
+            twoFactorRecoveryCodesRemaining = recoveredTwoFactorCodes.count
+            securityStepUpToken = nil
+            securityCode = ""
+            status = sessionInstalled
+                ? "Two-step verification updated"
+                : "Two-step verification updated. Sign in again to resume your saved chats."
+            return true
+        } catch {
+            status = "Could not update two-step verification: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func disableTwoFactor(currentCredential: String) async -> Bool {
+        guard let saved = storedSession,
+              let stepUpToken = securityStepUpToken,
+              !securityChangeInFlight
+        else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.disableTwoFactor(
+                stepUpToken: stepUpToken,
+                currentCredential: currentCredential,
+                token: saved.session.token
+            )
+            let sessionInstalled = await applySecuritySession(
+                response.session,
+                replacing: saved
+            )
+            twoFactorEnabled = false
+            twoFactorRecoveryCodesRemaining = 0
+            recoveredTwoFactorCodes = []
+            securityStepUpToken = nil
+            securityCode = ""
+            status = sessionInstalled
+                ? "Two-step verification disabled"
+                : "Two-step verification disabled. Sign in again to resume your saved chats."
+            return true
+        } catch {
+            status = "Could not disable two-step verification: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func regenerateTwoFactorRecoveryCodes(currentCredential: String) async -> Bool {
+        guard let saved = storedSession,
+              let stepUpToken = securityStepUpToken,
+              !securityChangeInFlight
+        else { return false }
+        securityChangeInFlight = true
+        defer { securityChangeInFlight = false }
+        do {
+            let response = try await api.regenerateTwoFactorRecoveryCodes(
+                stepUpToken: stepUpToken,
+                currentCredential: currentCredential,
+                token: saved.session.token
+            )
+            let sessionInstalled = await applySecuritySession(
+                response.session,
+                replacing: saved
+            )
+            recoveredTwoFactorCodes = response.recoveryCodes ?? []
+            twoFactorRecoveryCodesRemaining = recoveredTwoFactorCodes.count
+            securityStepUpToken = nil
+            securityCode = ""
+            status = sessionInstalled
+                ? "Recovery codes replaced"
+                : "Recovery codes replaced. Sign in again to resume your saved chats."
+            return true
+        } catch {
+            status = "Could not replace recovery codes: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func applySecuritySession(
+        _ session: CloudSession,
+        replacing saved: StoredCloudSession
+    ) async -> Bool {
+        guard canInstallReissuedSession(replacing: saved) else {
+            await abandonReissuedSession(
+                session.token,
+                preservingLocalReplicaFor: saved.session.accountId
+            )
+            return false
+        }
+        let replacement = StoredCloudSession(
+            session: session,
+            phone: saved.phone,
+            displayName: saved.displayName
+        )
+        do {
+            try await tokenStore.save(replacement)
+        } catch {
+            // The server already committed the security change and superseded `saved`. Establish
+            // the replica-authentication fence before remote cleanup can consume its own marker.
+            try? await tokenStore.savePendingReauthentication(
+                accountId: saved.session.accountId
+            )
+            await abandonReissuedSession(
+                session.token,
+                preservingLocalReplicaFor: saved.session.accountId
+            )
+            await pauseForExpiredSession(saved)
+            return false
+        }
+        // Saving crosses an actor boundary. Logout, remote revocation, or account replacement may
+        // have won while Keychain was writing; remove only this response and never resurrect it.
+        guard canInstallReissuedSession(replacing: saved) else {
+            try? await tokenStore.clearSession(ifTokenMatches: session.token)
+            await abandonReissuedSession(
+                session.token,
+                preservingLocalReplicaFor: saved.session.accountId
+            )
+            return false
+        }
+        installAuthenticatedSession(replacement)
+        await startHints(token: session.token)
+        return true
+    }
+
+    private func canInstallReissuedSession(replacing saved: StoredCloudSession) -> Bool {
+        !sessionTeardownActive
+            && sessionClearBarrier == nil
+            && storedSession?.session.accountId == saved.session.accountId
+            && storedSession?.session.deviceId == saved.session.deviceId
+            && storedSession?.session.token == saved.session.token
+    }
+
+    private func abandonReissuedSession(
+        _ token: String,
+        preservingLocalReplicaFor accountId: String
+    ) async {
+        do {
+            try await tokenStore.savePendingRevocationToken(
+                token,
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: accountId
+            )
+        } catch {
+            // Keychain is already unavailable. A direct best-effort revoke is the only remaining
+            // safe cleanup path; the replacement is never installed in memory.
+            _ = try? await api.revokeSession(token: token)
+            return
+        }
+        await revokeSignedOutToken(token)
     }
 
     func requestAccountDeletionCode() async -> Bool {
@@ -1275,49 +1751,54 @@ final class CloudAppModel {
         defer { accountDeletionInFlight = false }
         // Persist intent before the network call. If the app is killed after the server commits,
         // launch will not restore a now-invalid session or leave the local replica visible.
-        try? await tokenStore.savePendingRevocationToken(saved.session.token)
+        try? await tokenStore.savePendingRevocationToken(
+            saved.session.token,
+            localReplicaAccountId: saved.session.accountId
+        )
         do {
             _ = try await api.deleteAccount(code: digits, token: saved.session.token)
             await clearLocalSession(finalStatus: "Account deleted")
-            try? await tokenStore.clearPendingRevocationToken()
+            try? await tokenStore.clearPendingRevocationToken(ifMatches: saved.session.token)
             return true
         } catch {
             if let apiError = error as? CloudAPIError {
                 if apiError.status == 401 || apiError.status == 403 {
                     await clearLocalSession(finalStatus: "Session ended")
-                    try? await tokenStore.clearPendingRevocationToken()
+                    try? await tokenStore.clearPendingRevocationToken(ifMatches: saved.session.token)
                     return true
                 }
                 // The server definitely rejected this request before deletion completed.
-                try? await tokenStore.clearPendingRevocationToken()
+                try? await tokenStore.clearPendingRevocationToken(ifMatches: saved.session.token)
             }
             status = "Could not confirm account deletion: \(error.localizedDescription)"
             return false
         }
     }
 
-    private func clearLocalSession(finalStatus: String) async {
+    @discardableResult
+    private func clearLocalSession(finalStatus: String) async -> Bool {
         if sessionClearBarrier != nil {
-            await withCheckedContinuation { continuation in
+            return await withCheckedContinuation { continuation in
                 sessionClearBarrier?.waiters.append(continuation)
             }
-            return
         }
         // This flag changes synchronously before the first suspension point. User actions cannot
         // enqueue new Saved/forward SQL while teardown is waiting on older work.
         sessionTeardownActive = true
         let id = UUID()
         sessionClearBarrier = SessionClearBarrier(id: id, waiters: [])
-        await performClearLocalSession(finalStatus: finalStatus)
+        let succeeded = await performClearLocalSession(finalStatus: finalStatus)
         if sessionClearBarrier?.id == id {
             let waiters = sessionClearBarrier?.waiters ?? []
             sessionClearBarrier = nil
-            waiters.forEach { $0.resume() }
+            waiters.forEach { $0.resume(returning: succeeded) }
         }
+        return succeeded
     }
 
-    private func performClearLocalSession(finalStatus: String) async {
+    private func performClearLocalSession(finalStatus: String) async -> Bool {
         beginSessionTeardown()
+        await SessionCredentialCoordinator.shared.clear()
         // Both session fences are entered before teardown's first suspension point. Draft/media
         // work validates the epoch; preference work validates the account generation.
         isSessionTeardownInProgress = true
@@ -1336,7 +1817,7 @@ final class CloudAppModel {
         await savedMessagesService.reset()
         await accessPurgeCoordinator.reset()
         for operation in savedOperations { await operation.wait() }
-        let accountId = storedSession?.session.accountId
+        let accountId = storedSession?.session.accountId ?? expiredSessionAccountId
         await draftSyncCoordinator.suspendRetries()
         var cleanupFailures: [String] = []
         do {
@@ -1372,7 +1853,7 @@ final class CloudAppModel {
             timelineObservationTask, draftObservationTask,
             viewportPersistenceTask, mediaDownloadTask,
             readReceiptRetryTask, replicaIntegrityTask, pendingInChatSearchTask,
-            terminalAcknowledgementTask,
+            terminalAcknowledgementTask, credentialRefreshLoopTask,
         ].compactMap { $0 }
         backgroundTasks.forEach { $0.cancel() }
         transferTasks.forEach { $0.cancel() }
@@ -1422,6 +1903,7 @@ final class CloudAppModel {
         mediaDownloadTask = nil
         readReceiptRetryTask = nil
         replicaIntegrityTask = nil
+        credentialRefreshLoopTask = nil
         composerMediaOperationId = nil
         composerMediaDialogId = nil
         activeComposerTransferId = nil
@@ -1481,12 +1963,20 @@ final class CloudAppModel {
         }
         if cleanupFailures.isEmpty {
             do {
+                // A queued token can outlive successful local cleanup while the device is offline.
+                // Downgrade it to remote-only before clearing the crash marker so a later login is
+                // never erased merely because that old server revocation still needs retrying.
+                try await tokenStore.markPendingRevocationLocalErasureCompleted(
+                    accountId: accountId
+                )
+                try await tokenStore.clearPendingReauthentication()
                 try await tokenStore.clearPendingLocalErasure()
             } catch {
                 cleanupFailures.append(error.localizedDescription)
             }
         }
         storedSession = nil
+        expiredSessionAccountId = nil
         activeDialogId = nil
         dialogs = []
         chatFolders = []
@@ -1552,6 +2042,7 @@ final class CloudAppModel {
         status = cleanupFailures.isEmpty
             ? finalStatus
             : "Signed out; local cleanup needs another attempt"
+        return cleanupFailures.isEmpty
     }
 
     /// Changes the session epoch synchronously, before logout's first suspension point. Every
@@ -5743,12 +6234,116 @@ final class CloudAppModel {
             foregrounded: true
         )
         guard launchPhase == .localReady, storedSession != nil else { return }
+        await prepareCurrentCredentials()
+        guard launchPhase == .localReady, storedSession != nil else { return }
+        startCredentialRefreshLoopIfNeeded()
         guard postSignInTask == nil else { return }
         postSignInTask = Task { [weak self] in
             guard let self else { return }
             await self.startOnlineServices()
             self.postSignInTask = nil
         }
+    }
+
+    private func startCredentialRefreshLoopIfNeeded() {
+        guard credentialRefreshLoopTask == nil else { return }
+        credentialRefreshLoopTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { return }
+                await self.prepareCurrentCredentials()
+            }
+        }
+    }
+
+    private func prepareCurrentCredentials() async {
+        guard let saved = storedSession, !sessionTeardownActive else { return }
+        do {
+            if saved.session.tokenVersion < 2 {
+                let capabilities = try await api.capabilities(token: saved.session.token)
+                guard capabilities.capabilities.contains("auth_sessions_v2") else { return }
+                let upgraded = try await api.upgradeSession(token: saved.session.token)
+                let installed = await applySecuritySession(upgraded, replacing: saved)
+                if !installed, storedSession == nil {
+                    status = "Session upgraded. Sign in again to resume your saved chats."
+                }
+            } else {
+                _ = try await SessionCredentialCoordinator.shared.refreshIfNeeded(
+                    matching: saved.session.token
+                )
+            }
+        } catch let error as CloudAPIError {
+            switch error.code {
+            case "session_expired":
+                await pauseForExpiredSession(saved)
+            case "device_revoked", "refresh_reuse_detected":
+                await clearLocalSession(finalStatus: "Session ended for security")
+            default:
+                publishTransportFailure(error)
+            }
+        } catch {
+            publishTransportFailure(error)
+        }
+    }
+
+    private func pauseForExpiredSession(_ saved: StoredCloudSession) async {
+        guard storedSession?.session.deviceId == saved.session.deviceId else { return }
+        expiredSessionAccountId = saved.session.accountId
+        // Save the local-replica identity before removing the expired credential. If Keychain is
+        // unavailable, retain the old session item as a conservative identity fallback on launch.
+        let reauthenticationMarkerSaved: Bool
+        do {
+            try await tokenStore.savePendingReauthentication(accountId: saved.session.accountId)
+            reauthenticationMarkerSaved = true
+        } catch {
+            reauthenticationMarkerSaved = false
+        }
+        accountSessionGeneration &+= 1
+        savedMessagesSessionGeneration &+= 1
+        let cloudTasks: [Task<Void, Never>] = [
+            postSignInTask, postSyncWorkTask, historyHydrationTask, mediaDownloadTask,
+            readReceiptRetryTask, retryTask, resendTask, profileSyncTask,
+            composerMediaTask,
+        ].compactMap { $0 }
+        let transfers = Array(mediaTransferTasks.values)
+        let preferences = Array(preferenceMutationTasks.values)
+        cloudTasks.forEach { $0.cancel() }
+        transfers.forEach { $0.cancel() }
+        preferences.forEach { $0.cancel() }
+        credentialRefreshLoopTask?.cancel()
+        credentialRefreshLoopTask = nil
+        hintTask?.cancel()
+        hintTask = nil
+        storedSession = nil
+        await draftSyncCoordinator.suspendRetries()
+        await dialogPreferencesCoordinator.cancelAndWait()
+        await hintSocket?.stop()
+        hintSocket = nil
+        await replicaSyncCoordinator.stop()
+        await mediaPrefetchScheduler.stop()
+        await BackgroundRuntimeCoordinator.shared.removeWorkHandlersAndWait()
+        for task in cloudTasks { await task.value }
+        for task in transfers { await task.value }
+        for task in preferences { await task.value }
+        postSignInTask = nil
+        postSyncWorkTask = nil
+        historyHydrationTask = nil
+        mediaDownloadTask = nil
+        readReceiptRetryTask = nil
+        retryTask = nil
+        resendTask = nil
+        profileSyncTask = nil
+        composerMediaTask = nil
+        mediaTransferTasks.removeAll()
+        mediaTransferDialogIds.removeAll()
+        preferenceMutationTasks.removeAll()
+        await SessionCredentialCoordinator.shared.clear()
+        if reauthenticationMarkerSaved {
+            try? await tokenStore.clearSession(ifTokenMatches: saved.session.token)
+        }
+        launchPhase = .localReady
+        setReplicaSyncState(.sessionExpired)
+        status = "Session expired. Sign in again to resume your saved chats."
     }
 
     func setForegroundActive(_ isActive: Bool) async {

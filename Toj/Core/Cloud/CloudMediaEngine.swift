@@ -3269,7 +3269,7 @@ enum MediaCacheError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .unsupportedSize: String(localized: "This file is empty or larger than 100 MB")
+        case .unsupportedSize: String(localized: "This file is empty or larger than 25 MB")
         case .thumbnailTooLarge: String(localized: "The media preview is too large")
         case .localQuotaExceeded: String(localized: "Toj needs more free media storage on this device")
         case .encryptionFailed: String(localized: "Could not encrypt the local media")

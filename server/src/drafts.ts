@@ -268,7 +268,8 @@ export async function loadDrafts(
     ? await sql`
         SELECT draft.*, reply.sender_account_id AS reply_sender_account_id,
                reply.state AS reply_state, reply.body_key_id AS reply_body_key_id,
-               reply.body_nonce AS reply_body_nonce, reply.body_ciphertext AS reply_body_ciphertext
+               reply.body_nonce AS reply_body_nonce, reply.body_ciphertext AS reply_body_ciphertext,
+               reply.expires_at AS reply_expires_at
         FROM account_dialog_drafts draft
         LEFT JOIN messages reply
           ON reply.dialog_id = draft.dialog_id AND reply.msg_id = draft.reply_to_msg_id
@@ -277,7 +278,8 @@ export async function loadDrafts(
     : await sql`
         SELECT draft.*, reply.sender_account_id AS reply_sender_account_id,
                reply.state AS reply_state, reply.body_key_id AS reply_body_key_id,
-               reply.body_nonce AS reply_body_nonce, reply.body_ciphertext AS reply_body_ciphertext
+               reply.body_nonce AS reply_body_nonce, reply.body_ciphertext AS reply_body_ciphertext,
+               reply.expires_at AS reply_expires_at
         FROM account_dialog_drafts draft
         LEFT JOIN messages reply
           ON reply.dialog_id = draft.dialog_id AND reply.msg_id = draft.reply_to_msg_id
@@ -324,7 +326,10 @@ export async function loadDrafts(
     const replyToMsgId = row.reply_to_msg_id == null ? null : n(row.reply_to_msg_id);
     let replyPreview: DraftReplyPreviewDTO | null = null;
     if (replyToMsgId != null) {
-      const unavailable = row.reply_state !== "visible";
+      const unavailable = row.reply_state !== "visible" || (
+        row.reply_expires_at != null
+        && new Date(row.reply_expires_at).getTime() <= Date.now()
+      );
       const replyText = unavailable || row.reply_body_ciphertext == null ? "" : open({
         keyId: row.reply_body_key_id,
         nonce: buf(row.reply_body_nonce),
@@ -469,7 +474,9 @@ export async function putDraft(sql: SQL, input: {
     if (normalized.replyToMsgId != null) {
       const reply = await tx`
         SELECT msg_id FROM messages
-        WHERE dialog_id = ${dialogId} AND msg_id = ${normalized.replyToMsgId}`;
+        WHERE dialog_id = ${dialogId} AND msg_id = ${normalized.replyToMsgId}
+          AND state = 'visible'
+          AND (expires_at IS NULL OR expires_at > now())`;
       if (!reply.length) {
         throw new DraftError("reply target not found", 409, "invalid_reply_target");
       }

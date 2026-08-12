@@ -4811,7 +4811,7 @@ nonisolated private enum PickerError: LocalizedError, Sendable {
         switch self {
         case .unreadable: String(localized: "That item could not be read")
         case .emptyFile: String(localized: "Empty files cannot be sent")
-        case .tooLarge: String(localized: "That file is larger than 100 MB")
+        case .tooLarge: String(localized: "That file is larger than 25 MB")
         case .unsupportedVideo: String(localized: "That video format could not be prepared")
         case .invalidFileName: String(localized: "That file name is not supported")
         }

@@ -87,11 +87,45 @@ BEGIN
           WHERE budget.account_id = account.id
         )
         OR EXISTS (
+          SELECT 1 FROM public.account_two_factor AS factor
+          WHERE factor.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.device_sessions AS session
+          JOIN public.devices AS device ON device.id = session.device_id
+          WHERE device.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.messaging_feature_mutations AS mutation
+          WHERE mutation.actor_account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.poll_votes AS vote
+          WHERE vote.voter_account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.account_sticker_packs AS preference
+          WHERE preference.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.account_sticker_favorites AS preference
+          WHERE preference.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.account_sticker_recents AS preference
+          WHERE preference.account_id = account.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.push_account_bindings AS binding
+          WHERE binding.account_id = account.id
+        )
+        OR EXISTS (
           SELECT 1 FROM public.account_events AS event
           WHERE event.account_id = account.id
             AND event.type IN (
               'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
-              'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+              'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed',
+              'security.changed', 'sticker_preferences.updated'
             )
         )
         OR EXISTS (

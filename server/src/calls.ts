@@ -734,6 +734,22 @@ export async function createCall(sql: SQL, p: {
       return { call: snapshot(duplicate), ringTargetCount, hints: [] };
     }
 
+    // Discover the immutable direct pair without taking row locks, then acquire the shared
+    // account-mutation boundary before locking membership rows. Blocking takes that advisory
+    // boundary first, so reversing the order here can deadlock (membership -> advisory versus
+    // advisory -> membership) when a new call races a block.
+    const candidatePair = (await tx`
+      SELECT account_low, account_high
+      FROM direct_dialog_pairs
+      WHERE dialog_id = ${dialogId}
+        AND (${p.callerAccountId}::uuid = account_low OR ${p.callerAccountId}::uuid = account_high)`)[0];
+    if (!candidatePair) throw new CallError("eligible direct dialog required", "ineligible", 403);
+    const calleeAccountId = candidatePair.account_low === p.callerAccountId
+      ? candidatePair.account_high
+      : candidatePair.account_low;
+    const participants = [p.callerAccountId, calleeAccountId].sort();
+    await lockAccountMutations(tx, participants);
+
     const pair = (await tx`
       SELECT pair.account_low, pair.account_high
       FROM direct_dialog_pairs pair
@@ -747,7 +763,6 @@ export async function createCall(sql: SQL, p: {
         AND (${p.callerAccountId}::uuid = pair.account_low OR ${p.callerAccountId}::uuid = pair.account_high)
       FOR SHARE`)[0];
     if (!pair) throw new CallError("eligible direct dialog required", "ineligible", 403);
-    const calleeAccountId = pair.account_low === p.callerAccountId ? pair.account_high : pair.account_low;
     // Both accounts must be inside an account-scoped rollout. Direct unit callers can omit
     // `videoRolloutReady` and provide an explicit videoEnabled value for deterministic fixtures.
     const recipientVideoEnabled = p.videoRolloutReady == null
@@ -763,9 +778,6 @@ export async function createCall(sql: SQL, p: {
     if (selectableMediaProfiles.length === 0) {
       throw new CallError("video calls are unavailable", "video_unavailable", 409);
     }
-    const participants = [p.callerAccountId, calleeAccountId].sort();
-    await lockAccountMutations(tx, participants);
-
     const blocked = await tx`
       SELECT 1 FROM account_blocks
       WHERE (blocker_account_id = ${p.callerAccountId} AND blocked_account_id = ${calleeAccountId})
@@ -779,12 +791,14 @@ export async function createCall(sql: SQL, p: {
           SELECT 1 FROM messages
           WHERE dialog_id = ${dialogId} AND sender_account_id = ${p.callerAccountId}
             AND state = 'visible' AND kind <> 'service'
+            AND (expires_at IS NULL OR expires_at > now())
           LIMIT 1
         ) AS caller_spoke,
         EXISTS (
           SELECT 1 FROM messages
           WHERE dialog_id = ${dialogId} AND sender_account_id = ${calleeAccountId}
             AND state = 'visible' AND kind <> 'service'
+            AND (expires_at IS NULL OR expires_at > now())
           LIMIT 1
         ) AS callee_spoke`)[0];
     if (!reciprocal?.caller_spoke || !reciprocal?.callee_spoke) {
@@ -832,11 +846,20 @@ export async function createCall(sql: SQL, p: {
         supported_call_media_profile_versions, call_view_version
       FROM devices
       WHERE account_id = ${calleeAccountId} AND platform = 'ios' AND revoked_at IS NULL
-        AND voip_push_token_hash IS NOT NULL
-        AND voip_push_token_ciphertext IS NOT NULL
-        AND voip_push_token_nonce IS NOT NULL
-        AND voip_push_token_key_id IS NOT NULL
-        AND voip_push_environment IS NOT NULL
+        AND (
+          (voip_push_token_hash IS NOT NULL
+            AND voip_push_token_ciphertext IS NOT NULL
+            AND voip_push_token_nonce IS NOT NULL
+            AND voip_push_token_key_id IS NOT NULL
+            AND voip_push_environment IS NOT NULL)
+          OR EXISTS (
+            SELECT 1 FROM push_account_bindings binding
+            JOIN push_installations installation USING (installation_id)
+            WHERE binding.device_id = devices.id AND binding.account_id = devices.account_id
+              AND binding.active AND binding.voip_enabled
+              AND installation.voip_token_ciphertext IS NOT NULL
+          )
+        )
       ORDER BY id FOR SHARE`;
     const targets = candidateTargets.flatMap((target: CallRow) => {
       const targetProtocols = numericArray(target.supported_call_protocol_versions, [1]);

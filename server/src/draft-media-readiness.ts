@@ -209,12 +209,15 @@ const LEGACY_EVENT_CONSTRAINT =
   "'draft.updated'::text])";
 const CURRENT_EVENT_CONSTRAINT =
   "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
-  "'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
+  "'message.expired'::text, 'message.preview_updated'::text, 'reaction.updated'::text, " +
+  "'read.updated'::text, 'dialog.created'::text, " +
   "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
   "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
-  "'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, " +
-  "'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])";
+  "'draft.updated'::text, 'security.changed'::text, 'chat_folders.updated'::text, " +
+  "'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, " +
+  "'scheduled.failed'::text, 'pin.updated'::text, 'dialog.auto_delete_updated'::text, " +
+  "'poll.updated'::text, 'sticker_preferences.updated'::text])";
 const LOCKED_SEARCH_PATH = "search_path=pg_catalog, public, pg_temp";
 const EXPECTED_CLEANUP_TRIGGER =
   "CREATE TRIGGER accounts_cleanup_saved_messages BEFORE UPDATE OF status ON accounts " +

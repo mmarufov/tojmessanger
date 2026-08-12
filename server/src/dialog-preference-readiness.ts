@@ -99,14 +99,26 @@ const LEGACY_EVENT_CONSTRAINT =
   "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
   "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
   "'draft.updated'::text])";
-const CURRENT_EVENT_CONSTRAINT =
+const PRODUCTIVITY_EVENT_CONSTRAINT =
   "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
-  "'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, " +
-  "'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, " +
-  "'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, " +
-  "'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, " +
-  "'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, " +
-  "'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])";
+  "'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, " +
+  "'dialog.created'::text, 'member.added'::text, 'member.removed'::text, " +
+  "'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, " +
+  "'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, " +
+  "'profile.updated'::text, 'draft.updated'::text, 'chat_folders.updated'::text, " +
+  "'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, " +
+  "'scheduled.failed'::text])";
+const MESSAGING_EVENT_CONSTRAINT =
+  "type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, " +
+  "'message.expired'::text, 'message.preview_updated'::text, 'reaction.updated'::text, " +
+  "'read.updated'::text, 'dialog.created'::text, 'member.added'::text, " +
+  "'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, " +
+  "'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, " +
+  "'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text, " +
+  "'security.changed'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, " +
+  "'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text, " +
+  "'pin.updated'::text, 'dialog.auto_delete_updated'::text, 'poll.updated'::text, " +
+  "'sticker_preferences.updated'::text])";
 const FINAL_TRIGGER_FUNCTION = "mirror_dialog_notification_mode_to_preferences_v1_final";
 const STAGING_TRIGGER_FUNCTION =
   "mirror_dialog_notification_mode_to_preferences_v1_staging";
@@ -249,8 +261,11 @@ export async function dialogPreferenceSchemaState(
                    constraint_row.conbin,
                    constraint_row.conrelid,
                    TRUE
-                 )
-                 = ANY(${sql.array([LEGACY_EVENT_CONSTRAINT, CURRENT_EVENT_CONSTRAINT], "text")}::text[])
+                 ) = ANY(${sql.array([
+                   LEGACY_EVENT_CONSTRAINT,
+                   PRODUCTIVITY_EVENT_CONSTRAINT,
+                   MESSAGING_EVENT_CONSTRAINT,
+                 ], "text")}::text[])
           FROM pg_catalog.pg_constraint constraint_row
           WHERE constraint_row.conrelid = 'public.account_events'::pg_catalog.regclass
             AND constraint_row.conname = 'account_events_type_check'

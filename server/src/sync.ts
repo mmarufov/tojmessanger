@@ -34,6 +34,21 @@ import {
 } from "./link-previews";
 import { getChatFolders } from "./chat-folders";
 import { getScheduledDelivery } from "./scheduled-deliveries";
+import {
+  copyStructuredMessageContent,
+  externalContentDTOFromRow,
+  insertGiphyContent,
+  insertPollContent,
+  insertStickerContent,
+  normalizeGiphyReference,
+  normalizePollCreation,
+  pollDTOFromRow,
+  requireStickerForSend,
+  type ExternalMediaDTO,
+  type PollDTO,
+  type StickerDTO,
+} from "./messaging-content";
+import { recordStickerRecent } from "./messaging-features";
 
 export class SyncError extends Error {
   constructor(
@@ -66,6 +81,10 @@ export type MessageDTO = {
   media_group_count: number | null;
   service_type: string | null; service_data: Record<string, unknown> | null;
   link_preview: LinkPreviewDTO | null;
+  poll?: PollDTO;
+  sticker?: StickerDTO;
+  external_media?: ExternalMediaDTO;
+  expires_at?: string;
   state: string; server_ts: string;
 };
 export type Push = SyncPush;
@@ -109,17 +128,24 @@ async function requireActiveAccount(sql: SQL, accountId: string): Promise<void> 
   if (rows.length === 0) throw new SyncError("account unavailable");
 }
 
-async function loadMessage(sql: SQL, dialogId: string, msgId: number): Promise<MessageDTO | null> {
-  return (await loadMessages(sql, [{ dialogId, msgId }])).get(`${dialogId}:${msgId}`) ?? null;
+async function loadMessage(
+  sql: SQL,
+  dialogId: string,
+  msgId: number,
+  viewerAccountId?: string,
+): Promise<MessageDTO | null> {
+  return (await loadMessages(sql, [{ dialogId, msgId }], true, viewerAccountId))
+    .get(`${dialogId}:${msgId}`) ?? null;
 }
 
 type MessageKey = { dialogId: string; msgId: number };
 
-/** Loads an arbitrary event page in two bounded queries: messages+media, then all reactions. */
+/** Loads an arbitrary event page in two bounded queries: messages+media, then all metadata. */
 async function loadMessages(
   sql: SQL,
   inputKeys: MessageKey[],
   includeLinkPreviews = true,
+  viewerAccountId?: string,
 ): Promise<Map<string, MessageDTO>> {
   const unique = new Map<string, MessageKey>();
   for (const key of inputKeys) unique.set(`${key.dialogId}:${key.msgId}`, key);
@@ -137,6 +163,7 @@ async function loadMessages(
            m.body_key_id, m.body_nonce, m.body_ciphertext, m.reply_to_msg_id,
            m.forwarded_from_account_id, m.forwarded_from_dialog_id, m.forwarded_from_msg_id,
            m.is_forwarded, m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
+           m.expires_at,
            m.media_group_id, m.media_group_index, m.media_group_count,
            media.id AS media_object_id, media.kind AS media_object_kind,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
@@ -148,12 +175,25 @@ async function loadMessages(
            media.thumbnail_ciphertext AS media_thumbnail_ciphertext
     FROM wanted key
     JOIN messages m ON m.dialog_id = key.dialog_id AND m.msg_id = key.msg_id
+      AND (m.state <> 'visible' OR m.expires_at IS NULL OR m.expires_at > now())
     LEFT JOIN media_objects media ON media.id = m.media_id AND media.status = 'ready'`;
 
   const metadataRows = await sql`
     WITH wanted AS (
       SELECT * FROM unnest(${dialogIds}::uuid[], ${messageIds}::bigint[])
         AS key(dialog_id, msg_id)
+    ), option_counts AS (
+      SELECT vote.dialog_id, vote.msg_id, expanded.option_index,
+             count(*)::int AS votes
+      FROM wanted
+      JOIN poll_votes vote USING (dialog_id, msg_id)
+      CROSS JOIN LATERAL unnest(vote.option_indices) AS expanded(option_index)
+      GROUP BY vote.dialog_id, vote.msg_id, expanded.option_index
+    ), poll_summaries AS (
+      SELECT vote.dialog_id, vote.msg_id, count(*)::int AS total_voters
+      FROM wanted
+      JOIN poll_votes vote USING (dialog_id, msg_id)
+      GROUP BY vote.dialog_id, vote.msg_id
     )
     SELECT key.dialog_id, key.msg_id,
            COALESCE((
@@ -176,10 +216,56 @@ async function loadMessages(
              FROM message_mentions mention
              WHERE mention.dialog_id = key.dialog_id AND mention.msg_id = key.msg_id
            ), '[]'::jsonb) AS mentions
-    FROM wanted key`;
+           , poll.payload_key_id AS poll_payload_key_id,
+           poll.payload_nonce AS poll_payload_nonce,
+           poll.payload_ciphertext AS poll_payload_ciphertext,
+           poll.option_count AS poll_option_count,
+           poll.multiple_choice AS poll_multiple_choice,
+           poll.anonymous AS poll_anonymous,
+           poll.quiz AS poll_quiz,
+           poll.closed_at AS poll_closed_at,
+           own_vote.option_indices AS poll_my_option_indices,
+           COALESCE(poll_summary.total_voters, 0) AS poll_total_voters,
+           COALESCE((
+             SELECT jsonb_object_agg(option_index::text, votes)
+             FROM option_counts stats
+             WHERE stats.dialog_id = key.dialog_id AND stats.msg_id = key.msg_id
+           ), '{}'::jsonb) AS poll_option_counts,
+           content.provider AS content_provider,
+           content.provider_item_id AS content_provider_item_id,
+           content.pack_id AS content_pack_id,
+           content.rendition AS content_rendition,
+           sticker.format AS sticker_format,
+           sticker.mime_type AS sticker_mime_type,
+           sticker.byte_size AS sticker_byte_size,
+           sticker.width AS sticker_width,
+           sticker.height AS sticker_height,
+           sticker.sha256 AS sticker_sha256,
+           sticker.asset_url AS sticker_asset_url,
+           sticker.status AS sticker_status,
+           pack.status AS sticker_pack_status,
+           COALESCE(
+             sticker.pack_version,
+             (content.rendition->>'pack_version')::int
+           ) AS sticker_pack_version
+    FROM wanted key
+    LEFT JOIN message_polls poll USING (dialog_id, msg_id)
+    LEFT JOIN poll_votes own_vote
+      ON own_vote.dialog_id = key.dialog_id AND own_vote.msg_id = key.msg_id
+     AND own_vote.voter_account_id = ${viewerAccountId ?? "00000000-0000-0000-0000-000000000000"}
+    LEFT JOIN poll_summaries poll_summary
+      ON poll_summary.dialog_id = key.dialog_id AND poll_summary.msg_id = key.msg_id
+    LEFT JOIN message_external_content content
+      ON content.dialog_id = key.dialog_id AND content.msg_id = key.msg_id
+    LEFT JOIN stickers sticker
+      ON content.provider = 'toj_sticker' AND sticker.id = content.provider_item_id
+    LEFT JOIN sticker_packs pack ON pack.id = content.pack_id`;
 
   const reactions = new Map<string, { account_id: string; emoji: string }[]>();
   const mentions = new Map<string, { account_id: string; offset: number; length: number }[]>();
+  const polls = new Map<string, PollDTO>();
+  const stickers = new Map<string, StickerDTO>();
+  const externalMedia = new Map<string, ExternalMediaDTO>();
   for (const metadata of metadataRows) {
     const key = `${metadata.dialog_id}:${n(metadata.msg_id)}`;
     reactions.set(key, (metadata.reactions ?? []).map((reaction: any) => ({
@@ -191,6 +277,43 @@ async function loadMessages(
       offset: n(mention.offset),
       length: n(mention.length),
     })));
+    if (metadata.poll_payload_key_id != null) {
+      polls.set(key, pollDTOFromRow({
+        dialog_id: metadata.dialog_id,
+        msg_id: metadata.msg_id,
+        payload_key_id: metadata.poll_payload_key_id,
+        payload_nonce: metadata.poll_payload_nonce,
+        payload_ciphertext: metadata.poll_payload_ciphertext,
+        option_count: metadata.poll_option_count,
+        multiple_choice: metadata.poll_multiple_choice,
+        anonymous: metadata.poll_anonymous,
+        quiz: metadata.poll_quiz,
+        closed_at: metadata.poll_closed_at,
+        my_option_indices: metadata.poll_my_option_indices,
+        total_voters: metadata.poll_total_voters,
+        option_counts: metadata.poll_option_counts,
+      }));
+    }
+    if (metadata.content_provider != null) {
+      const projected = externalContentDTOFromRow({
+        provider: metadata.content_provider,
+        provider_item_id: metadata.content_provider_item_id,
+        pack_id: metadata.content_pack_id,
+        rendition: metadata.content_rendition,
+        format: metadata.sticker_format,
+        mime_type: metadata.sticker_mime_type,
+        byte_size: metadata.sticker_byte_size,
+        width: metadata.sticker_width,
+        height: metadata.sticker_height,
+        sha256: metadata.sticker_sha256,
+        asset_url: metadata.sticker_asset_url,
+        status: metadata.sticker_status,
+        pack_status: metadata.sticker_pack_status,
+        pack_version: metadata.sticker_pack_version,
+      });
+      if (projected.sticker) stickers.set(key, projected.sticker);
+      if (projected.externalMedia) externalMedia.set(key, projected.externalMedia);
+    }
   }
   const previews = includeLinkPreviews ? await loadLinkPreviews(sql, keys) : new Map();
 
@@ -239,6 +362,16 @@ async function loadMessages(
       service_type: row.service_type ?? null,
       service_data: row.service_data == null ? null : eventData(row.service_data),
       link_preview: row.state === "deleted_for_all" ? null : previews.get(key) ?? null,
+      ...(row.state !== "deleted_for_all" && polls.has(key)
+        ? { poll: polls.get(key)! }
+        : {}),
+      ...(row.state !== "deleted_for_all" && stickers.has(key)
+        ? { sticker: stickers.get(key)! }
+        : {}),
+      ...(row.state !== "deleted_for_all" && externalMedia.has(key)
+        ? { external_media: externalMedia.get(key)! }
+        : {}),
+      ...(row.expires_at == null ? {} : { expires_at: iso(row.expires_at) }),
       state: row.state, server_ts: iso(row.server_ts),
     });
   }
@@ -367,47 +500,100 @@ export async function sendMessage(sql: SQL, p: {
   scheduledDeliveryId?: string | null;
   linkPreviewCandidate?: unknown;
   linkPreviewsEnabled?: boolean;
+  poll?: unknown;
+  pollsEnabled?: boolean;
+  stickerId?: string | null;
+  stickersEnabled?: boolean;
+  giphyReference?: unknown;
+  giphyEnabled?: boolean;
   /** Server-only escape hatch for generated lifecycle rows such as call history. */
   internalService?: boolean;
 }): Promise<SendResult> {
   if (p.draftConsumeOperationId != null && p.allowDraftConsumption === false) {
     throw new SyncError("cloud drafts are unavailable", 404, "capability_unavailable");
   }
+  const structuredInputs = [p.poll != null, p.stickerId != null, p.giphyReference != null]
+    .filter(Boolean).length;
+  if (structuredInputs > 1 || (structuredInputs > 0 && (p.mediaId != null || p.forwardedFrom))) {
+    throw new SyncError("message content types are mutually exclusive");
+  }
+  if (p.poll != null && p.pollsEnabled !== true) {
+    throw new SyncError("polls are unavailable", 404, "capability_unavailable");
+  }
+  if (p.stickerId != null && p.stickersEnabled !== true) {
+    throw new SyncError("stickers are unavailable", 404, "capability_unavailable");
+  }
+  if (p.giphyReference != null && p.giphyEnabled !== true) {
+    throw new SyncError("GIPHY is unavailable", 404, "capability_unavailable");
+  }
+  const pollContent = p.poll == null ? null : normalizePollCreation(p.poll);
+  const giphyContent = p.giphyReference == null ? null : normalizeGiphyReference(p.giphyReference);
+  if (structuredInputs > 0 && String(p.body ?? "").length > 0) {
+    throw new SyncError("structured messages do not support a text body");
+  }
+  if (structuredInputs > 0 && p.linkPreviewCandidate != null) {
+    throw new SyncError("structured messages do not support link previews");
+  }
+  const fingerprintBody = String(p.body ?? "");
+  const fingerprintMentions = normalizeMentions(p.mentions, fingerprintBody);
+  const fingerprintReplyToMsgId = optionalMessageId(p.replyToMsgId);
+  const fingerprintDraftOperationId = p.draftConsumeOperationId == null
+    ? null : String(p.draftConsumeOperationId).toLowerCase();
+  if (fingerprintDraftOperationId != null && !UUID_PATTERN.test(fingerprintDraftOperationId)) {
+    throw new SyncError("invalid draft consume operation id");
+  }
+  const fingerprintPreview = normalizeLinkPreviewCandidate(
+    p.linkPreviewCandidate,
+    fingerprintBody,
+  );
+  // Preserve the exact fingerprint emitted by the productivity baseline for ordinary sends so
+  // in-flight retries survive this deploy. New structured content uses a versioned, typed shape.
+  const sendFingerprint = structuredInputs === 0
+    ? requestFingerprintHMAC("message-send", JSON.stringify({
+        dialog_id: String(p.dialogId).toLowerCase(),
+        kind: p.kind ?? "text",
+        body: p.body ?? null,
+        reply_to_msg_id: fingerprintReplyToMsgId,
+        media_id: p.mediaId ?? null,
+        forwarded_from: p.forwardedFrom == null ? null : {
+          dialog_id: String(p.forwardedFrom.dialogId).toLowerCase(),
+          msg_id: Number(p.forwardedFrom.msgId),
+        },
+        mentions: fingerprintMentions.map((mention) => ({
+          account_id: mention.accountId,
+          offset: mention.offset,
+          length: mention.length,
+        })),
+        draft_consume_operation_id: fingerprintDraftOperationId,
+        link_preview_candidate: fingerprintPreview,
+        scheduled_delivery_id: p.scheduledDeliveryId ?? null,
+        ...(p.silent === true ? { silent: true } : {}),
+      }))
+    : requestFingerprintHMAC("message-send-v2", JSON.stringify({
+        dialogId: String(p.dialogId).toLowerCase(),
+        contentKind: pollContent ? "poll"
+          : p.stickerId != null ? "sticker"
+          : "external_media",
+        replyToMsgId: fingerprintReplyToMsgId,
+        draftConsumeOperationId: fingerprintDraftOperationId,
+        silent: p.silent === true,
+        poll: pollContent,
+        stickerId: p.stickerId == null ? null : String(p.stickerId),
+        giphy: giphyContent,
+      }));
   return await sql.begin(async (tx) => {
-    const draftConsumeOperationId = p.draftConsumeOperationId == null
-      ? null
-      : String(p.draftConsumeOperationId).toLowerCase();
-    if (draftConsumeOperationId != null && !UUID_PATTERN.test(draftConsumeOperationId)) {
-      throw new SyncError("invalid draft consume operation id");
-    }
-    let body = p.forwardedFrom || p.mediaId ? String(p.body ?? "") : requireTextBody(p.body);
+    const draftConsumeOperationId = fingerprintDraftOperationId;
+    let body = p.forwardedFrom || p.mediaId || structuredInputs > 0
+      ? String(p.body ?? "") : requireTextBody(p.body);
     if (Buffer.byteLength(body, "utf8") > MAX_TEXT_BYTES) throw new SyncError("message body too large");
     let kind = p.kind ?? "text";
     let forwardedFromAccountId: string | null = null;
+    let forwardedSource: MessageKey | null = null;
     let mediaId: string | null = p.mediaId ?? null;
-    const replyToMsgId = optionalMessageId(p.replyToMsgId);
-    let mentions = normalizeMentions(p.mentions, body);
-    const linkPreviewCandidate = normalizeLinkPreviewCandidate(p.linkPreviewCandidate, body);
-    const sendFingerprint = requestFingerprintHMAC("message-send", JSON.stringify({
-      dialog_id: String(p.dialogId).toLowerCase(),
-      kind: p.kind ?? "text",
-      body: p.body ?? null,
-      reply_to_msg_id: replyToMsgId,
-      media_id: p.mediaId ?? null,
-      forwarded_from: p.forwardedFrom == null ? null : {
-        dialog_id: String(p.forwardedFrom.dialogId).toLowerCase(),
-        msg_id: Number(p.forwardedFrom.msgId),
-      },
-      mentions: mentions.map((mention) => ({
-        account_id: mention.accountId,
-        offset: mention.offset,
-        length: mention.length,
-      })),
-      draft_consume_operation_id: draftConsumeOperationId,
-      link_preview_candidate: linkPreviewCandidate,
-      scheduled_delivery_id: p.scheduledDeliveryId ?? null,
-      ...(p.silent === true ? { silent: true } : {}),
-    }));
+    let stickerContent: StickerDTO | null = null;
+    const replyToMsgId = fingerprintReplyToMsgId;
+    let mentions = fingerprintMentions;
+    const linkPreviewCandidate = fingerprintPreview;
     const requireMatchingSendFingerprint = (stored: unknown) => {
       if (stored == null) {
         // Historical receipts/messages predate fingerprints. Preserve their ordinary audible
@@ -451,7 +637,7 @@ export async function sendMessage(sql: SQL, p: {
             sender_pts = ${senderPts}
         WHERE sender_account_id = ${p.senderAccountId}
           AND client_msg_id = ${p.clientMsgId}`;
-      const msg = await loadMessage(tx, dialogId, msgId);
+      const msg = await loadMessage(tx, dialogId, msgId, p.senderAccountId);
       if (p.internalService === true && (
         dialogId !== p.dialogId
         || msg?.sender_account_id !== p.senderAccountId
@@ -503,7 +689,7 @@ export async function sendMessage(sql: SQL, p: {
         if (recovered) return recovered;
         throw new SyncError("send already in progress");
       }
-      const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id));
+      const msg = await loadMessage(tx, row.dialog_id, n(row.msg_id), p.senderAccountId);
       if (p.internalService === true && (
         row.dialog_id !== p.dialogId
         || msg?.sender_account_id !== p.senderAccountId
@@ -547,12 +733,25 @@ export async function sendMessage(sql: SQL, p: {
     if (p.forwardedFrom) {
       if (mentions.length) throw new SyncError("forwarded messages cannot add mentions");
       const sourceMsgId = optionalMessageId(p.forwardedFrom.msgId)!;
+      forwardedSource = { dialogId: p.forwardedFrom.dialogId, msgId: sourceMsgId };
       await requireDialogReadAccess(tx, p.senderAccountId, p.forwardedFrom.dialogId);
       const source = (await tx`
-        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext, media_id
+        SELECT sender_account_id, kind, state, body_key_id, body_nonce, body_ciphertext, media_id,
+               expires_at
         FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}
         FOR SHARE`)[0];
-      if (!source || source.state !== "visible") throw new SyncError("forward source not found");
+      if (!source || source.state !== "visible" || (
+        source.expires_at != null && new Date(source.expires_at).getTime() <= Date.now()
+      )) throw new SyncError("forward source not found");
+      if (source.kind === "poll" && p.pollsEnabled !== true) {
+        throw new SyncError("polls are unavailable", 404, "capability_unavailable");
+      }
+      if (source.kind === "sticker" && p.stickersEnabled !== true) {
+        throw new SyncError("stickers are unavailable", 404, "capability_unavailable");
+      }
+      if (source.kind === "external_media" && p.giphyEnabled !== true) {
+        throw new SyncError("GIPHY is unavailable", 404, "capability_unavailable");
+      }
       body = open(
         { keyId: source.body_key_id, nonce: buf(source.body_nonce), ciphertext: buf(source.body_ciphertext) },
         bodyAAD(p.forwardedFrom.dialogId, sourceMsgId, source.sender_account_id),
@@ -571,9 +770,19 @@ export async function sendMessage(sql: SQL, p: {
       if (media.purpose !== "message") throw new SyncError("media purpose does not allow messages");
       kind = media.kind;
       await tx`UPDATE media_objects SET last_accessed_at = now() WHERE id = ${mediaId}`;
-    } else if (!mediaId && !p.forwardedFrom && kind !== "text"
+    } else if (!mediaId && !p.forwardedFrom && structuredInputs === 0 && kind !== "text"
       && !(kind === "service" && p.internalService === true)) {
       throw new SyncError("media upload required");
+    }
+
+    if (pollContent) kind = "poll";
+    if (p.stickerId != null) {
+      stickerContent = await requireStickerForSend(tx, String(p.stickerId));
+      kind = "sticker";
+    }
+    if (giphyContent) kind = "external_media";
+    if (structuredInputs > 0 && mentions.length) {
+      throw new SyncError("structured messages do not support mentions");
     }
 
     const access = await lockDialogForMutation(tx, p.senderAccountId, p.dialogId);
@@ -593,12 +802,14 @@ export async function sendMessage(sql: SQL, p: {
 
     if (replyToMsgId != null) {
       const target = await tx`
-        SELECT state FROM messages
+        SELECT state, expires_at FROM messages
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${replyToMsgId}`;
       if (target.length === 0) {
         throw new SyncError("reply target not found", 409, "invalid_reply_target");
       }
-      if (target[0].state !== "visible") {
+      if (target[0].state !== "visible" || (
+        target[0].expires_at != null && new Date(target[0].expires_at).getTime() <= Date.now()
+      )) {
         throw new SyncError(
           "original message is unavailable",
           409,
@@ -626,16 +837,34 @@ export async function sendMessage(sql: SQL, p: {
 
     // 5) encrypt + store the body once
     const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
+    const expiresAt = p.internalService === true || access.autoDeleteSeconds == null
+      ? null
+      : new Date(Date.now() + access.autoDeleteSeconds * 1_000);
     const inserted = await tx`
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
                             forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-                            is_forwarded, media_id, send_fingerprint)
+                            is_forwarded, media_id, send_fingerprint, expires_at)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
-              ${p.forwardedFrom != null}, ${mediaId}, ${sendFingerprint})
-      RETURNING server_ts`;
+              ${p.forwardedFrom != null}, ${mediaId}, ${sendFingerprint}, ${expiresAt})
+      RETURNING server_ts, expires_at`;
+    if (forwardedSource && ["poll", "sticker", "external_media"].includes(kind)) {
+      await copyStructuredMessageContent(
+        tx,
+        forwardedSource,
+        { dialogId: p.dialogId, msgId },
+        kind,
+      );
+    } else if (pollContent) {
+      await insertPollContent(tx, p.dialogId, msgId, pollContent);
+    } else if (stickerContent) {
+      await insertStickerContent(tx, p.dialogId, msgId, stickerContent);
+      await recordStickerRecent(tx, p.senderAccountId, stickerContent.id);
+    } else if (giphyContent) {
+      await insertGiphyContent(tx, p.dialogId, msgId, giphyContent);
+    }
     if (mentions.length) {
       await tx`
         INSERT INTO message_mentions (dialog_id, msg_id, account_id, entity_offset, length)
@@ -653,7 +882,7 @@ export async function sendMessage(sql: SQL, p: {
         msgId,
         editVersion: 0,
         body,
-        candidate: p.linkPreviewCandidate,
+        candidate: linkPreviewCandidate,
       });
     }
 
@@ -897,7 +1126,7 @@ export async function sendMediaGroup(sql: SQL, p: {
         dialogId: String(row.dialog_id),
         msgId: n(row.msg_id),
       }));
-      const loaded = await loadMessages(tx, keys);
+      const loaded = await loadMessages(tx, keys, true, p.senderAccountId);
       const messages = keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`))
         .filter((message): message is MessageDTO => message != null);
       const first = messages[0];
@@ -993,7 +1222,7 @@ export async function sendMediaGroup(sql: SQL, p: {
       for (let msgId = n(existing.first_msg_id); msgId <= n(existing.last_msg_id); msgId += 1) {
         keys.push({ dialogId, msgId });
       }
-      const loaded = await loadMessages(tx, keys);
+      const loaded = await loadMessages(tx, keys, true, p.senderAccountId);
       const messages = keys.map((key) => loaded.get(`${key.dialogId}:${key.msgId}`))
         .filter((message): message is MessageDTO => message != null);
       return {
@@ -1049,7 +1278,7 @@ export async function sendMediaGroup(sql: SQL, p: {
       WHERE id = ANY(${tx.array(sortedMediaIds, "uuid")}::uuid[])`;
     const mediaById = new Map(mediaRows.map((row: any) => [String(row.id), row]));
 
-    await lockDialogForMutation(tx, p.senderAccountId, dialogId);
+    const access = await lockDialogForMutation(tx, p.senderAccountId, dialogId);
     const blocked = await tx`
       SELECT 1
       FROM direct_dialog_pairs pair
@@ -1061,9 +1290,11 @@ export async function sendMediaGroup(sql: SQL, p: {
     if (blocked.length) throw new SyncError("conversation is blocked");
     if (replyToMsgId != null) {
       const target = (await tx`
-        SELECT state FROM messages
+        SELECT state, expires_at FROM messages
         WHERE dialog_id = ${dialogId} AND msg_id = ${replyToMsgId}`)[0];
-      if (!target || target.state !== "visible") {
+      if (!target || target.state !== "visible" || (
+        target.expires_at != null && new Date(target.expires_at).getTime() <= Date.now()
+      )) {
         throw new SyncError(
           "original message is unavailable",
           409,
@@ -1089,6 +1320,9 @@ export async function sendMediaGroup(sql: SQL, p: {
       RETURNING last_msg_id`)[0];
     const lastMsgId = n(allocation.last_msg_id);
     const firstMsgId = lastMsgId - items.length + 1;
+    const expiresAt = p.internalService === true || access.autoDeleteSeconds == null
+      ? null
+      : new Date(Date.now() + access.autoDeleteSeconds * 1_000);
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
       const msgId = firstMsgId + index;
@@ -1099,13 +1333,13 @@ export async function sendMediaGroup(sql: SQL, p: {
         INSERT INTO messages (
           dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
           body_key_id, body_nonce, body_ciphertext, reply_to_msg_id, media_id,
-          media_group_id, media_group_index, media_group_count
+          media_group_id, media_group_index, media_group_count, expires_at
         )
         VALUES (
           ${dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null},
           ${item.clientMsgId}, ${media.kind}, ${sealed.keyId}, ${sealed.nonce},
           ${sealed.ciphertext}, ${index === 0 ? replyToMsgId : null}, ${item.mediaId},
-          ${clientGroupId}, ${index}, ${items.length}
+          ${clientGroupId}, ${index}, ${items.length}, ${expiresAt}
         )`;
     }
     if (mentions.length) {
@@ -1172,7 +1406,7 @@ export async function sendMediaGroup(sql: SQL, p: {
         AND client_group_id = ${clientGroupId}`;
     await notifySyncWakeups(tx, pushes);
     const keys = items.map((_, index) => ({ dialogId, msgId: firstMsgId + index }));
-    const loaded = await loadMessages(tx, keys);
+    const loaded = await loadMessages(tx, keys, true, p.senderAccountId);
     return {
       dialogId,
       clientGroupId,
@@ -1278,7 +1512,7 @@ async function mutateMessage(sql: SQL, p: {
         throw new SyncError("client mutation id already used");
       }
       if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
-      const message = await loadMessage(tx, p.dialogId, msgId);
+      const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
       if (!message) throw new SyncError("message not found");
       return {
         dialogId: p.dialogId, msgId, actorPts: n(existing.actor_pts), duplicate: true,
@@ -1294,12 +1528,14 @@ async function mutateMessage(sql: SQL, p: {
       WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
       ORDER BY account_id FOR UPDATE`;
     const row = (await tx`
-      SELECT sender_account_id, kind, state, edit_version, media_id
+      SELECT sender_account_id, kind, state, edit_version, media_id, expires_at
       FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}
       FOR UPDATE`)[0];
     if (!row) throw new SyncError("message not found");
     if (row.sender_account_id !== p.actorAccountId) throw new SyncError("only the sender can change this message");
-    if (row.state !== "visible") throw new SyncError("message already deleted");
+    if (row.state !== "visible" || (
+      row.expires_at != null && new Date(row.expires_at).getTime() <= Date.now()
+    )) throw new SyncError("message is unavailable", 409, "message_expired");
     if (p.operation === "edit") {
       if (row.kind !== "text") throw new SyncError("only text messages can be edited");
       const body = requireTextBody(p.body);
@@ -1337,6 +1573,11 @@ async function mutateMessage(sql: SQL, p: {
         WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
       await tx`DELETE FROM link_preview_waiters WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
       await tx`DELETE FROM message_link_previews WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_pins WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_reactions WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_mentions WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_polls WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
+      await tx`DELETE FROM message_external_content WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId}`;
       if (row.media_id) {
         // A forwarded copy owns a live reference of its own. Delete the encrypted object only when
         // this was the final visible reference, otherwise that forwarded message must keep working.
@@ -1344,7 +1585,9 @@ async function mutateMessage(sql: SQL, p: {
           DELETE FROM media_objects mo
           WHERE mo.id = ${row.media_id}
             AND NOT EXISTS (
-              SELECT 1 FROM messages m WHERE m.media_id = mo.id AND m.state = 'visible'
+              SELECT 1 FROM messages m
+              WHERE m.media_id = mo.id AND m.state = 'visible'
+                AND (m.expires_at IS NULL OR m.expires_at > now())
             )`;
       }
     }
@@ -1363,7 +1606,7 @@ async function mutateMessage(sql: SQL, p: {
     await tx`
       UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${mutationId}`;
-    const message = await loadMessage(tx, p.dialogId, msgId);
+    const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
     if (!message) throw new SyncError("message not found after mutation");
     return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
   });
@@ -1408,7 +1651,7 @@ export async function setReaction(sql: SQL, p: {
         throw new SyncError("client mutation id already used");
       }
       if (existing.status !== "completed") throw new SyncError("message mutation already in progress");
-      const message = await loadMessage(tx, p.dialogId, msgId);
+      const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
       if (!message) throw new SyncError("message not found");
       return { dialogId: p.dialogId, msgId, actorPts: n(existing.actor_pts), duplicate: true, message, pushes: [] };
     }
@@ -1420,8 +1663,11 @@ export async function setReaction(sql: SQL, p: {
       SELECT account_id FROM dialog_members WHERE dialog_id = ${p.dialogId} AND left_at IS NULL
       ORDER BY account_id FOR UPDATE`;
     const messageRow = (await tx`
-      SELECT state FROM messages WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} FOR UPDATE`)[0];
-    if (!messageRow || messageRow.state !== "visible") throw new SyncError("message not found");
+      SELECT state, expires_at FROM messages
+      WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} FOR UPDATE`)[0];
+    if (!messageRow || messageRow.state !== "visible" || (
+      messageRow.expires_at != null && new Date(messageRow.expires_at).getTime() <= Date.now()
+    )) throw new SyncError("message not found");
     if (emoji == null) {
       await tx`DELETE FROM message_reactions WHERE dialog_id = ${p.dialogId} AND msg_id = ${msgId} AND account_id = ${p.actorAccountId}`;
     } else {
@@ -1445,7 +1691,7 @@ export async function setReaction(sql: SQL, p: {
     await tx`
       UPDATE message_mutation_requests SET status = 'completed', actor_pts = ${actorPts}
       WHERE actor_account_id = ${p.actorAccountId} AND client_mutation_id = ${p.clientMutationId}`;
-    const message = await loadMessage(tx, p.dialogId, msgId);
+    const message = await loadMessage(tx, p.dialogId, msgId, p.actorAccountId);
     if (!message) throw new SyncError("message not found");
     return { dialogId: p.dialogId, msgId, actorPts, duplicate: false, message, pushes };
   });
@@ -1660,13 +1906,18 @@ export async function getDifference(
   });
   const messageKeys: MessageKey[] = rows.flatMap((event, index) =>
     event.msg_id != null && [
-      "message.new", "message.edited", "message.deleted", "reaction.updated",
-      "message.preview_updated",
+      "message.new", "message.edited", "message.deleted", "message.expired",
+      "reaction.updated", "message.preview_updated", "poll.updated",
     ].includes(event.type) && !accessDecisions[index].replaceWithRevocation
       ? [{ dialogId: event.dialog_id, msgId: n(event.msg_id) }]
       : []
   );
-  const messages = await loadMessages(sql, messageKeys, opts.linkPreviewsEnabled === true);
+  const messages = await loadMessages(
+    sql,
+    messageKeys,
+    opts.linkPreviewsEnabled === true,
+    accountId,
+  );
   const draftDialogIds = rows
     .filter((event: any, index: number) =>
       event.type === "draft.updated" && !accessDecisions[index].replaceWithRevocation
@@ -1705,8 +1956,9 @@ export async function getDifference(
       };
     } else if (
       ev.type === "message.new" || ev.type === "message.edited"
-      || ev.type === "message.deleted" || ev.type === "reaction.updated"
-      || ev.type === "message.preview_updated"
+      || ev.type === "message.deleted" || ev.type === "message.expired"
+      || ev.type === "reaction.updated" || ev.type === "message.preview_updated"
+      || ev.type === "poll.updated"
     ) {
       if (ev.type === "message.preview_updated" && opts.linkPreviewsEnabled === false) {
         update = { pts, ptsCount: 1, type: "capability.skipped" };
@@ -2092,15 +2344,17 @@ export async function getBootstrapDialogsPage(
         AND m.msg_id <= ${n(row.ceiling_msg_id)}
         AND m.msg_id > self.last_read_msg_id
         AND m.sender_account_id <> ${accountId}
-        AND m.state = 'visible'`)[0];
+        AND m.state = 'visible'
+        AND (m.expires_at IS NULL OR m.expires_at > now())`)[0];
     const msgRows = previewMessages === 0 ? [] : await sql`
       SELECT msg_id FROM messages
       WHERE dialog_id = ${row.dialog_id} AND msg_id <= ${n(row.ceiling_msg_id)}
+        AND (state <> 'visible' OR expires_at IS NULL OR expires_at > now())
       ORDER BY msg_id DESC
       LIMIT ${previewMessages}`;
     const messages: MessageDTO[] = [];
     for (const msgRow of [...msgRows].reverse()) {
-      const msg = await loadMessage(sql, row.dialog_id, n(msgRow.msg_id));
+      const msg = await loadMessage(sql, row.dialog_id, n(msgRow.msg_id), accountId);
       if (msg) messages.push(msg);
     }
     dialogs.push({
@@ -2172,17 +2426,20 @@ export async function getHistory(
     ? await sql`
         SELECT msg_id FROM messages
         WHERE dialog_id = ${dialogId} AND msg_id > ${opts.afterMsgId}
+          AND (state <> 'visible' OR expires_at IS NULL OR expires_at > now())
         ORDER BY msg_id ASC
         LIMIT ${limit + 1}`
     : opts.beforeMsgId
     ? await sql`
         SELECT msg_id FROM messages
         WHERE dialog_id = ${dialogId} AND msg_id < ${opts.beforeMsgId}
+          AND (state <> 'visible' OR expires_at IS NULL OR expires_at > now())
         ORDER BY msg_id DESC
         LIMIT ${limit + 1}`
     : await sql`
         SELECT msg_id FROM messages
         WHERE dialog_id = ${dialogId}
+          AND (state <> 'visible' OR expires_at IS NULL OR expires_at > now())
         ORDER BY msg_id DESC
         LIMIT ${limit + 1}`;
 
@@ -2192,7 +2449,7 @@ export async function getHistory(
   const loaded = await loadMessages(sql, rows.slice(0, limit).map((row: any) => ({
     dialogId,
     msgId: n(row.msg_id),
-  })));
+  })), true, accountId);
   for (const row of rows.slice(0, limit)) {
     const msg = loaded.get(`${dialogId}:${n(row.msg_id)}`);
     if (!msg) continue;
@@ -2236,7 +2493,8 @@ export async function readHistory(sql: SQL, p: {
         WHERE dialog_id = ${p.dialogId}
           AND msg_id > ${n(current.last_read_msg_id)}
           AND sender_account_id <> ${p.accountId}
-          AND state = 'visible'`)[0];
+          AND state = 'visible'
+          AND (expires_at IS NULL OR expires_at > now())`)[0];
       return {
         dialogId: p.dialogId,
         maxReadMsgId: n(current.last_read_msg_id),
@@ -2251,7 +2509,8 @@ export async function readHistory(sql: SQL, p: {
       WHERE dialog_id = ${p.dialogId}
         AND msg_id > ${n(member.last_read_msg_id)}
         AND sender_account_id <> ${p.accountId}
-        AND state = 'visible'`)[0];
+        AND state = 'visible'
+        AND (expires_at IS NULL OR expires_at > now())`)[0];
     const unreadCount = n(unread?.count);
     const data = JSON.stringify({
       reader_account_id: p.accountId,

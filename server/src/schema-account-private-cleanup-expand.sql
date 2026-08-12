@@ -70,13 +70,52 @@ BEGIN
   DELETE FROM public.link_preview_action_budgets
   WHERE account_id = target_account_id;
 
+  -- Security credentials, replay material, and account-scoped feature preferences must not
+  -- survive anonymization. The account row is retained, so FK cascades never run here.
+  DELETE FROM public.security_step_up_tickets
+  WHERE account_id = target_account_id;
+  DELETE FROM public.two_factor_attempt_budgets
+  WHERE account_id = target_account_id;
+  DELETE FROM public.two_factor_login_challenges
+  WHERE account_id = target_account_id;
+  DELETE FROM public.two_factor_recovery_codes
+  WHERE account_id = target_account_id;
+  DELETE FROM public.account_two_factor
+  WHERE account_id = target_account_id;
+  DELETE FROM public.device_sessions AS session
+  USING public.devices AS device
+  WHERE session.device_id = device.id AND device.account_id = target_account_id;
+
+  DELETE FROM public.messaging_feature_mutations
+  WHERE actor_account_id = target_account_id;
+  DELETE FROM public.poll_votes
+  WHERE voter_account_id = target_account_id;
+  DELETE FROM public.account_sticker_favorites
+  WHERE account_id = target_account_id;
+  DELETE FROM public.account_sticker_recents
+  WHERE account_id = target_account_id;
+  DELETE FROM public.account_sticker_packs
+  WHERE account_id = target_account_id;
+  WITH removed AS (
+    DELETE FROM public.push_account_bindings
+    WHERE account_id = target_account_id
+    RETURNING installation_id
+  )
+  DELETE FROM public.push_installations AS installation
+  WHERE installation.installation_id IN (SELECT installation_id FROM removed)
+    AND NOT EXISTS (
+      SELECT 1 FROM public.push_account_bindings AS binding
+      WHERE binding.installation_id = installation.installation_id
+    );
+
   -- Push rows cascade from these private sync events. Message/group lifecycle history belonging to
   -- peers remains intact; only draft and preference presentation state is removed.
   DELETE FROM public.account_events
   WHERE account_id = target_account_id
     AND type IN (
       'draft.updated', 'dialog.preferences_updated', 'chat_folders.updated',
-      'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed'
+      'scheduled.created', 'scheduled.updated', 'scheduled.canceled', 'scheduled.failed',
+      'security.changed', 'sticker_preferences.updated'
     );
   DELETE FROM public.bootstrap_snapshots
   WHERE account_id = target_account_id;

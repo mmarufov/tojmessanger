@@ -22,6 +22,7 @@ export type DialogAccess = {
   membersCanSend: boolean;
   membersCanAddMembers: boolean;
   membersCanEditInfo: boolean;
+  autoDeleteSeconds: number | null;
 };
 
 const n = (value: unknown) => Number(value as any);
@@ -38,6 +39,7 @@ function accessFromRow(row: any): DialogAccess {
     membersCanSend: row.members_can_send ?? true,
     membersCanAddMembers: row.members_can_add_members ?? false,
     membersCanEditInfo: row.members_can_edit_info ?? false,
+    autoDeleteSeconds: row.auto_delete_seconds == null ? null : n(row.auto_delete_seconds),
   };
 }
 
@@ -60,6 +62,7 @@ export async function requireDialogReadAccess(
   const row = (await sql`
     SELECT d.id, d.type, d.created_by, d.revision, d.last_msg_id, d.closed_at,
            d.members_can_send, d.members_can_add_members, d.members_can_edit_info,
+           d.auto_delete_seconds,
            dm.role, dm.notification_mode, dm.left_at
     FROM dialogs d
     LEFT JOIN dialog_members dm
@@ -88,7 +91,8 @@ export async function lockDialogForMutation(
 ): Promise<DialogAccess> {
   const dialog = (await sql`
     SELECT id, type, created_by, revision, last_msg_id, closed_at,
-           members_can_send, members_can_add_members, members_can_edit_info
+           members_can_send, members_can_add_members, members_can_edit_info,
+           auto_delete_seconds
     FROM dialogs WHERE id = ${dialogId}
     FOR UPDATE`)[0];
   if (!dialog) throw new DialogAccessError("dialog not found", "group_not_found", 404);
