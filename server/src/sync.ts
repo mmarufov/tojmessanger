@@ -1,8 +1,9 @@
 import type { SQL } from "bun";
 import { Client } from "pg";
 import { timingSafeEqual } from "node:crypto";
-import { seal, open, bodyAAD, requestFingerprintHMAC } from "./crypto";
+import { bodyAAD, mediaGroupClientMessageIdDigest, requestFingerprintIndex } from "./crypto";
 import { loadMediaDTO, mediaDTOFromRow, type MediaDTO } from "./media";
+import { openForScope, preloadEnvelopeKeys, sealForScope } from "./envelope-crypto";
 import { requireActiveDevice } from "./auth";
 import {
   lockAccountMutations,
@@ -34,6 +35,7 @@ import {
 } from "./link-previews";
 import { getChatFolders } from "./chat-folders";
 import { getScheduledDelivery } from "./scheduled-deliveries";
+import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 
 export class SyncError extends Error {
   constructor(
@@ -139,6 +141,7 @@ async function loadMessages(
            m.is_forwarded, m.media_id, m.service_type, m.service_data, m.edit_version, m.state, m.server_ts,
            m.media_group_id, m.media_group_index, m.media_group_count,
            media.id AS media_object_id, media.kind AS media_object_kind,
+           media.owner_account_id AS media_owner_account_id,
            media.content_type AS media_content_type, media.file_name AS media_file_name,
            media.file_name_key_id AS media_file_name_key_id,
            media.file_name_nonce AS media_file_name_nonce,
@@ -195,18 +198,25 @@ async function loadMessages(
   const previews = includeLinkPreviews ? await loadLinkPreviews(sql, keys) : new Map();
 
   const result = new Map<string, MessageDTO>();
+  await preloadEnvelopeKeys(sql, rows.flatMap((row: any) => [
+    row.body_key_id,
+    row.media_file_name_key_id,
+  ]).filter(Boolean).map(String));
   for (const row of rows) {
     const dialogId = row.dialog_id;
     const msgId = n(row.msg_id);
     const key = `${dialogId}:${msgId}`;
     const text = row.state === "deleted_for_all"
       ? ""
-      : open(
+      : (await openForScope(
+          sql,
+          { kind: "account", accountId: String(row.sender_account_id) },
           { keyId: row.body_key_id, nonce: buf(row.body_nonce), ciphertext: buf(row.body_ciphertext) },
           bodyAAD(dialogId, msgId, row.sender_account_id),
-        ).toString("utf8");
-    const media = row.media_object_id == null ? null : mediaDTOFromRow({
+        )).toString("utf8");
+    const media = row.media_object_id == null ? null : await mediaDTOFromRow(sql, {
       id: row.media_object_id,
+      owner_account_id: row.media_owner_account_id,
       kind: row.media_object_kind,
       content_type: row.media_content_type,
       file_name: row.media_file_name,
@@ -388,7 +398,7 @@ export async function sendMessage(sql: SQL, p: {
     const replyToMsgId = optionalMessageId(p.replyToMsgId);
     let mentions = normalizeMentions(p.mentions, body);
     const linkPreviewCandidate = normalizeLinkPreviewCandidate(p.linkPreviewCandidate, body);
-    const sendFingerprint = requestFingerprintHMAC("message-send", JSON.stringify({
+    const sendFingerprintCanonical = JSON.stringify({
       dialog_id: String(p.dialogId).toLowerCase(),
       kind: p.kind ?? "text",
       body: p.body ?? null,
@@ -407,16 +417,27 @@ export async function sendMessage(sql: SQL, p: {
       link_preview_candidate: linkPreviewCandidate,
       scheduled_delivery_id: p.scheduledDeliveryId ?? null,
       ...(p.silent === true ? { silent: true } : {}),
-    }));
-    const requireMatchingSendFingerprint = (stored: unknown) => {
+    });
+    const sendFingerprint = requestFingerprintIndex("message-send", sendFingerprintCanonical);
+    const requireMatchingSendFingerprint = (stored: unknown, storedKeyId: unknown) => {
+      if (storedKeyId === EXPIRED_BLIND_INDEX_KEY_ID) {
+        throw new SyncError(
+          "send result is no longer available", 409, "send_result_expired",
+        );
+      }
       if (stored == null) {
         // Historical receipts/messages predate fingerprints. Preserve their ordinary audible
         // replay behavior, but never let a new silent request alias an old alerting send.
         if (p.silent !== true) return;
       } else {
         const existing = Buffer.from(stored as Uint8Array);
-        if (existing.length === sendFingerprint.length
-          && timingSafeEqual(existing, sendFingerprint)) return;
+        const expected = requestFingerprintIndex(
+          "message-send",
+          sendFingerprintCanonical,
+          storedKeyId == null ? "legacy-v1" : String(storedKeyId),
+        ).digest;
+        if (existing.length === expected.length
+          && timingSafeEqual(existing, expected)) return;
       }
       throw new SyncError(
         "client message id already used with different input",
@@ -426,13 +447,22 @@ export async function sendMessage(sql: SQL, p: {
     };
     const recoverCanonical = async (): Promise<SendResult | null> => {
       const canonical = (await tx`
-        SELECT dialog_id, msg_id, send_fingerprint
+        SELECT dialog_id, msg_id, send_fingerprint, send_fingerprint_key_id
         FROM messages
         WHERE sender_account_id = ${p.senderAccountId}
           AND client_msg_id = ${p.clientMsgId}
         FOR SHARE`)[0];
       if (!canonical) return null;
-      requireMatchingSendFingerprint(canonical.send_fingerprint);
+      requireMatchingSendFingerprint(
+        canonical.send_fingerprint,
+        canonical.send_fingerprint_key_id,
+      );
+      if (canonical.send_fingerprint != null
+        && String(canonical.send_fingerprint_key_id ?? "legacy-v1") !== sendFingerprint.keyId) {
+        await tx`UPDATE messages SET send_fingerprint = ${sendFingerprint.digest},
+          send_fingerprint_key_id = ${sendFingerprint.keyId}
+          WHERE dialog_id = ${canonical.dialog_id} AND msg_id = ${canonical.msg_id}`;
+      }
       const dialogId = String(canonical.dialog_id);
       const msgId = n(canonical.msg_id);
       const event = (await tx`
@@ -448,7 +478,8 @@ export async function sendMessage(sql: SQL, p: {
       await tx`
         UPDATE send_requests
         SET status = 'completed', dialog_id = ${dialogId}, msg_id = ${msgId},
-            sender_pts = ${senderPts}
+            sender_pts = ${senderPts}, fingerprint = ${sendFingerprint.digest},
+            fingerprint_key_id = ${sendFingerprint.keyId}
         WHERE sender_account_id = ${p.senderAccountId}
           AND client_msg_id = ${p.clientMsgId}`;
       const msg = await loadMessage(tx, dialogId, msgId);
@@ -476,17 +507,17 @@ export async function sendMessage(sql: SQL, p: {
     const claim = await tx`
       INSERT INTO send_requests (
         sender_account_id, client_msg_id, dialog_id, status, draft_consume_operation_id,
-        fingerprint
+        fingerprint, fingerprint_key_id
       )
       VALUES (
         ${p.senderAccountId}, ${p.clientMsgId}, ${p.dialogId}, 'pending',
-        ${draftConsumeOperationId}, ${sendFingerprint}
+        ${draftConsumeOperationId}, ${sendFingerprint.digest}, ${sendFingerprint.keyId}
       )
       ON CONFLICT (sender_account_id, client_msg_id) DO NOTHING RETURNING status`;
     if (claim.length === 0) {
       const row = (await tx`
         SELECT status, dialog_id, msg_id, sender_pts, draft_consume_operation_id,
-               cleared_draft_revision, fingerprint
+               cleared_draft_revision, fingerprint, fingerprint_key_id
         FROM send_requests
         WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}
         FOR UPDATE`)[0];
@@ -497,7 +528,13 @@ export async function sendMessage(sql: SQL, p: {
           "send_idempotency_conflict",
         );
       }
-      requireMatchingSendFingerprint(row.fingerprint);
+      requireMatchingSendFingerprint(row.fingerprint, row.fingerprint_key_id);
+      if (row.fingerprint != null
+        && String(row.fingerprint_key_id ?? "legacy-v1") !== sendFingerprint.keyId) {
+        await tx`UPDATE send_requests SET fingerprint = ${sendFingerprint.digest},
+          fingerprint_key_id = ${sendFingerprint.keyId}
+          WHERE sender_account_id = ${p.senderAccountId} AND client_msg_id = ${p.clientMsgId}`;
+      }
       if (row.status !== "completed") {
         const recovered = await recoverCanonical();
         if (recovered) return recovered;
@@ -553,10 +590,12 @@ export async function sendMessage(sql: SQL, p: {
         FROM messages WHERE dialog_id = ${p.forwardedFrom.dialogId} AND msg_id = ${sourceMsgId}
         FOR SHARE`)[0];
       if (!source || source.state !== "visible") throw new SyncError("forward source not found");
-      body = open(
+      body = (await openForScope(
+        tx,
+        { kind: "account", accountId: String(source.sender_account_id) },
         { keyId: source.body_key_id, nonce: buf(source.body_nonce), ciphertext: buf(source.body_ciphertext) },
         bodyAAD(p.forwardedFrom.dialogId, sourceMsgId, source.sender_account_id),
-      ).toString("utf8");
+      )).toString("utf8");
       kind = source.kind;
       mediaId = source.media_id;
       forwardedFromAccountId = source.sender_account_id;
@@ -625,16 +664,22 @@ export async function sendMessage(sql: SQL, p: {
     const msgId = n(dlg[0].last_msg_id);
 
     // 5) encrypt + store the body once
-    const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.senderAccountId));
+    const sealed = await sealForScope(
+      tx,
+      { kind: "account", accountId: p.senderAccountId },
+      body,
+      bodyAAD(p.dialogId, msgId, p.senderAccountId),
+    );
     const inserted = await tx`
       INSERT INTO messages (dialog_id, msg_id, sender_account_id, sender_device_id, client_msg_id, kind,
                             body_key_id, body_nonce, body_ciphertext, reply_to_msg_id,
                             forwarded_from_account_id, forwarded_from_dialog_id, forwarded_from_msg_id,
-                            is_forwarded, media_id, send_fingerprint)
+                            is_forwarded, media_id, send_fingerprint, send_fingerprint_key_id)
       VALUES (${p.dialogId}, ${msgId}, ${p.senderAccountId}, ${p.senderDeviceId ?? null}, ${p.clientMsgId},
               ${kind}, ${sealed.keyId}, ${sealed.nonce}, ${sealed.ciphertext}, ${replyToMsgId},
               ${forwardedFromAccountId}, ${p.forwardedFrom?.dialogId ?? null}, ${p.forwardedFrom?.msgId ?? null},
-              ${p.forwardedFrom != null}, ${mediaId}, ${sendFingerprint})
+              ${p.forwardedFrom != null}, ${mediaId},
+              ${sendFingerprint.digest}, ${sendFingerprint.keyId})
       RETURNING server_ts`;
     if (mentions.length) {
       await tx`
@@ -719,10 +764,8 @@ type NormalizedGroupItem = {
 };
 
 function deterministicGroupClientMessageId(clientGroupId: string, index: number): string {
-  const bytes = Buffer.from(requestFingerprintHMAC(
-    "media-group-client-message-id",
-    `${clientGroupId}:${index}`,
-  ).subarray(0, 16));
+  // This identifier is persisted protocol state and must not change when blind-index keys rotate.
+  const bytes = Buffer.from(mediaGroupClientMessageIdDigest(clientGroupId, index).subarray(0, 16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = bytes.toString("hex");
@@ -762,8 +805,8 @@ function mediaGroupFingerprint(input: {
   draftConsumeOperationId: string | null;
   items: NormalizedGroupItem[];
   silent: boolean;
-}): Buffer {
-  return requestFingerprintHMAC("media-group-send", JSON.stringify({
+}): { canonical: string; digest: Buffer; keyId: string } {
+  const canonical = JSON.stringify({
     dialog_id: input.dialogId,
     body: input.body,
     reply_to_msg_id: input.replyToMsgId,
@@ -780,7 +823,22 @@ function mediaGroupFingerprint(input: {
     // Preserve the historical fingerprint for ordinary sends while ensuring a silent retry can
     // never collide with an alerting send that reused the same client group id.
     ...(input.silent ? { silent: true } : {}),
-  }));
+  });
+  const index = requestFingerprintIndex("media-group-send", canonical);
+  return { canonical, digest: index.digest, keyId: index.keyId };
+}
+
+function mediaGroupFingerprintMatches(
+  row: any,
+  fingerprint: { canonical: string; digest: Buffer; keyId: string },
+): boolean {
+  const existing = buf(row.payload_fingerprint);
+  const expected = requestFingerprintIndex(
+    "media-group-send",
+    fingerprint.canonical,
+    row.fingerprint_key_id ?? "legacy-v1",
+  ).digest;
+  return existing.length === expected.length && timingSafeEqual(existing, expected);
 }
 
 /**
@@ -859,21 +917,29 @@ export async function sendMediaGroup(sql: SQL, p: {
       WHERE sender_account_id = ${p.senderAccountId}
         AND client_group_id = ${clientGroupId}`)[0] != null;
     const tombstone = requestStillPresent ? null : (await tx`
-      SELECT dialog_id, payload_fingerprint
+      SELECT dialog_id, payload_fingerprint, fingerprint_key_id
       FROM media_group_send_tombstones
       WHERE sender_account_id = ${p.senderAccountId}
         AND client_group_id = ${clientGroupId}
       FOR SHARE`)[0];
     if (tombstone) {
-      const existingFingerprint = buf(tombstone.payload_fingerprint);
+      if (tombstone.fingerprint_key_id === EXPIRED_BLIND_INDEX_KEY_ID) {
+        throw new SyncError(
+          "media group result is no longer available", 409, "media_group_result_expired",
+        );
+      }
       if (tombstone.dialog_id !== dialogId
-        || existingFingerprint.length !== fingerprint.length
-        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        || !mediaGroupFingerprintMatches(tombstone, fingerprint)) {
         throw new SyncError(
           "client group id already used with different media",
           409,
           "media_group_idempotency_conflict",
         );
+      }
+      if (String(tombstone.fingerprint_key_id ?? "legacy-v1") !== fingerprint.keyId) {
+        await tx`UPDATE media_group_send_tombstones
+          SET payload_fingerprint = ${fingerprint.digest}, fingerprint_key_id = ${fingerprint.keyId}
+          WHERE sender_account_id = ${p.senderAccountId} AND client_group_id = ${clientGroupId}`;
       }
     }
     const durableGroup = requestStillPresent ? [] : await tx`
@@ -931,11 +997,13 @@ export async function sendMediaGroup(sql: SQL, p: {
       const senderPts = Math.max(n(messagePts.pts), clearedRevision ?? 0);
       await tx`
         INSERT INTO media_group_send_requests (
-          sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+          sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+          fingerprint_key_id, status,
           first_msg_id, last_msg_id, sender_pts, draft_consume_operation_id,
           cleared_draft_revision
         ) VALUES (
-          ${p.senderAccountId}, ${clientGroupId}, ${dialogId}, ${fingerprint}, 'completed',
+          ${p.senderAccountId}, ${clientGroupId}, ${dialogId},
+          ${fingerprint.digest}, ${fingerprint.keyId}, 'completed',
           ${firstMsgId}, ${lastMsgId}, ${senderPts}, ${draftConsumeOperationId},
           ${clearedRevision}
         )
@@ -959,32 +1027,38 @@ export async function sendMediaGroup(sql: SQL, p: {
     }
     const claim = await tx`
       INSERT INTO media_group_send_requests (
-        sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+        sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+        fingerprint_key_id, status,
         draft_consume_operation_id
       )
       VALUES (
-        ${p.senderAccountId}, ${clientGroupId}, ${dialogId}, ${fingerprint}, 'pending',
+        ${p.senderAccountId}, ${clientGroupId}, ${dialogId},
+        ${fingerprint.digest}, ${fingerprint.keyId}, 'pending',
         ${draftConsumeOperationId}
       )
       ON CONFLICT (sender_account_id, client_group_id) DO NOTHING
       RETURNING client_group_id`;
     if (claim.length === 0) {
       const existing = (await tx`
-        SELECT dialog_id, payload_fingerprint, status, first_msg_id, last_msg_id,
+        SELECT dialog_id, payload_fingerprint, fingerprint_key_id,
+               status, first_msg_id, last_msg_id,
                sender_pts, cleared_draft_revision
         FROM media_group_send_requests
         WHERE sender_account_id = ${p.senderAccountId}
           AND client_group_id = ${clientGroupId}
         FOR UPDATE`)[0];
-      const existingFingerprint = buf(existing.payload_fingerprint);
       if (existing.dialog_id !== dialogId
-        || existingFingerprint.length !== fingerprint.length
-        || !timingSafeEqual(existingFingerprint, fingerprint)) {
+        || !mediaGroupFingerprintMatches(existing, fingerprint)) {
         throw new SyncError(
           "client group id already used with different media",
           409,
           "media_group_idempotency_conflict",
         );
+      }
+      if (String(existing.fingerprint_key_id ?? "legacy-v1") !== fingerprint.keyId) {
+        await tx`UPDATE media_group_send_requests
+          SET payload_fingerprint = ${fingerprint.digest}, fingerprint_key_id = ${fingerprint.keyId}
+          WHERE sender_account_id = ${p.senderAccountId} AND client_group_id = ${clientGroupId}`;
       }
       if (existing.status !== "completed") {
         throw new SyncError("media group send already in progress", 409);
@@ -1093,7 +1167,12 @@ export async function sendMediaGroup(sql: SQL, p: {
       const item = items[index];
       const msgId = firstMsgId + index;
       const caption = index === 0 ? body : "";
-      const sealed = seal(caption, bodyAAD(dialogId, msgId, p.senderAccountId));
+      const sealed = await sealForScope(
+        tx,
+        { kind: "account", accountId: p.senderAccountId },
+        caption,
+        bodyAAD(dialogId, msgId, p.senderAccountId),
+      );
       const media = mediaById.get(item.mediaId)!;
       await tx`
         INSERT INTO messages (
@@ -1306,7 +1385,12 @@ async function mutateMessage(sql: SQL, p: {
       const expected = Number(p.expectedEditVersion);
       if (!Number.isSafeInteger(expected) || expected < 0) throw new SyncError("expected edit version required");
       if (n(row.edit_version) !== expected) throw new SyncError("message was edited on another device");
-      const sealed = seal(body, bodyAAD(p.dialogId, msgId, p.actorAccountId));
+      const sealed = await sealForScope(
+        tx,
+        { kind: "account", accountId: p.actorAccountId },
+        body,
+        bodyAAD(p.dialogId, msgId, p.actorAccountId),
+      );
       await tx`
         UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
           body_ciphertext = ${sealed.ciphertext}, edit_version = edit_version + 1,
@@ -1329,7 +1413,12 @@ async function mutateMessage(sql: SQL, p: {
     } else {
       // Replace the live ciphertext as well as returning a tombstone. This prevents deleted text
       // from remaining decryptable in the primary database (backups retain their normal lifecycle).
-      const sealed = seal("", bodyAAD(p.dialogId, msgId, p.actorAccountId));
+      const sealed = await sealForScope(
+        tx,
+        { kind: "account", accountId: p.actorAccountId },
+        "",
+        bodyAAD(p.dialogId, msgId, p.actorAccountId),
+      );
       await tx`
         UPDATE messages SET body_key_id = ${sealed.keyId}, body_nonce = ${sealed.nonce},
           body_ciphertext = ${sealed.ciphertext}, media_id = NULL,

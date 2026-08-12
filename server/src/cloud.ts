@@ -184,6 +184,25 @@ import {
   scheduledDeliveryEnabledForAccount,
   workerHeartbeatFresh,
 } from "./cloud-productivity-readiness";
+import {
+  abuseReportMetrics,
+  abuseReportSchemaReadiness,
+  abuseReportsConfigured,
+  ReportError,
+  submitAbuseReport,
+} from "./reports";
+import {
+  assertCryptoConfiguration,
+  CryptoUnavailableError,
+  envelopeMetrics,
+  envelopeReadiness,
+} from "./envelope-crypto";
+import {
+  assertBlindIndexConfiguration,
+  blindIndexDatabaseReadiness,
+  blindIndexMetrics,
+} from "./blind-index";
+import { startAccountSecurityEventListener } from "./account-security-events";
 
 type SocketData = { accountId: string; deviceId: string };
 type Db = typeof defaultSql;
@@ -192,6 +211,8 @@ export type CloudServerOptions = {
   /** Deterministic integration tests can disable all polling/listener side effects. */
   backgroundWorkers?: boolean;
   groupCallSFUControl?: GroupCallSFUControl;
+  /** Defaults to five seconds; tests may shorten the fail-closed session reconciliation pass. */
+  accountSecurityRecheckMs?: number;
 };
 
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
@@ -225,6 +246,7 @@ function cloudCapabilities(
   chatFolders: boolean,
   scheduledDelivery: boolean,
   linkPreviews: boolean,
+  abuseReports: boolean,
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
   if (voiceCalls) capabilities.push("voice_calls_v1");
@@ -239,6 +261,7 @@ function cloudCapabilities(
   if (chatFolders) capabilities.push("chat_folders_v1");
   if (scheduledDelivery) capabilities.push("scheduled_delivery_v1");
   if (linkPreviews) capabilities.push("link_previews_v1");
+  if (abuseReports) capabilities.push("abuse_reports_v1");
   return { ...CLOUD_CAPABILITIES, capabilities };
 }
 
@@ -354,9 +377,40 @@ function disconnectDevice(
 function disconnectAccount(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
+  reason = "account disabled",
 ) {
-  for (const socket of sockets.get(accountId) ?? []) socket.close(4002, "account deleted");
+  for (const socket of sockets.get(accountId) ?? []) socket.close(4002, reason);
   sockets.delete(accountId);
+}
+
+function disconnectAllAccounts(
+  sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
+  reason: string,
+) {
+  for (const accountId of [...sockets.keys()]) disconnectAccount(sockets, accountId, reason);
+}
+
+export async function revalidateSocketSessions(
+  db: Db,
+  sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
+): Promise<void> {
+  const entries = [...sockets.entries()].flatMap(([accountId, set]) =>
+    [...set].map((socket) => ({ accountId, deviceId: socket.data.deviceId, socket }))
+  );
+  if (!entries.length) return;
+  const deviceIds = [...new Set(entries.map((entry) => entry.deviceId))];
+  const active = await db`
+    SELECT device.id, device.account_id
+    FROM devices device
+    JOIN accounts account ON account.id = device.account_id
+    WHERE device.id = ANY(${db.array(deviceIds, "uuid")}::uuid[])
+      AND device.revoked_at IS NULL AND account.status IN ('active','limited')`;
+  const allowed = new Set(active.map((row: any) => `${row.account_id}:${row.id}`));
+  for (const entry of entries) {
+    if (!allowed.has(`${entry.accountId}:${entry.deviceId}`)) {
+      entry.socket.close(4002, "account or device disabled");
+    }
+  }
 }
 
 function networkKey(req: Request, server: { requestIP(request: Request): { address: string } | null }): string | null {
@@ -373,8 +427,41 @@ export function startCloudServer(
   otpDelivery: OTPDelivery | null = otpDeliveryFromEnvironment(),
   options: CloudServerOptions = {},
 ) {
+  assertCryptoConfiguration();
+  assertBlindIndexConfiguration();
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const metrics = new OperationalMetrics();
+  // Exact key-reference audits touch every encrypted/blind-index domain. Share a short-lived,
+  // single-flight snapshot between readiness probes and metrics scrapes; operator commands remain
+  // uncached for cutover and retirement decisions.
+  let cryptoReadinessSnapshot: {
+    expiresAt: number;
+    value: Promise<{
+      encryption: Awaited<ReturnType<typeof envelopeReadiness>>;
+      blindIndexes: Awaited<ReturnType<typeof blindIndexDatabaseReadiness>>;
+    }>;
+  } | null = null;
+  const cryptoReadiness = async () => {
+    const now = Date.now();
+    if (cryptoReadinessSnapshot && cryptoReadinessSnapshot.expiresAt > now) {
+      return await cryptoReadinessSnapshot.value;
+    }
+    const configuredTTL = Number(process.env.TOJ_CRYPTO_READINESS_CACHE_TTL_MS ?? 30_000);
+    const ttl = Number.isFinite(configuredTTL)
+      ? Math.max(1_000, Math.min(5 * 60_000, configuredTTL))
+      : 30_000;
+    const value = Promise.all([
+      envelopeReadiness(db),
+      blindIndexDatabaseReadiness(db),
+    ]).then(([encryption, blindIndexes]) => ({ encryption, blindIndexes }));
+    cryptoReadinessSnapshot = { expiresAt: now + ttl, value };
+    try {
+      return await value;
+    } catch (error) {
+      if (cryptoReadinessSnapshot?.value === value) cryptoReadinessSnapshot = null;
+      throw error;
+    }
+  };
   const requireScheduledWorkerOrReplay = async (
     accountId: string,
     body: any,
@@ -403,6 +490,9 @@ export function startCloudServer(
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
   const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
+  const abuseReportAvailability = async () => (
+    abuseReportsConfigured() && (await abuseReportSchemaReadiness(db)).ready
+  );
   const draftMediaAvailability = async () => {
     const schema = await draftMediaSchemaState(db);
     return {
@@ -411,6 +501,8 @@ export function startCloudServer(
     };
   };
   const backgroundWorkers = options.backgroundWorkers !== false;
+  const accountSecurityDatabaseUrl = process.env.TOJ_CALL_NOTIFY_DATABASE_URL
+    ?? process.env.DATABASE_URL ?? null;
   const stopPushWorker = backgroundWorkers ? startPushWorker(db, pushSender) : () => {};
   const stopMaintenanceWorker = backgroundWorkers
     ? startMaintenanceWorker(db, undefined, metrics) : () => {};
@@ -430,6 +522,28 @@ export function startCloudServer(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
     (wakeup) => pushHints(sockets, [wakeup]),
   ) : () => {};
+  const stopAccountSecurityNotifications = backgroundWorkers
+    ? startAccountSecurityEventListener(
+        accountSecurityDatabaseUrl,
+        (event) => disconnectAccount(sockets, event.accountId, `account ${event.reason}`),
+        {
+          // Losing the revocation channel fails closed: existing sessions are disconnected and
+          // the periodic database pass independently catches any event missed by NOTIFY.
+          onUnavailable: () => disconnectAllAccounts(sockets, "session validation unavailable"),
+          onReady: () => revalidateSocketSessions(db, sockets),
+        },
+      )
+    : () => {};
+  const accountSecurityRecheckMs = Math.max(
+    25,
+    Math.min(300_000, options.accountSecurityRecheckMs ?? 5_000),
+  );
+  const accountSecurityRecheck = backgroundWorkers ? setInterval(() => {
+    void revalidateSocketSessions(db, sockets).catch(() => {
+      disconnectAllAccounts(sockets, "session validation unavailable");
+    });
+  }, accountSecurityRecheckMs) : null;
+  accountSecurityRecheck?.unref?.();
   const stopCallNotifications = backgroundWorkers ? startCallNotificationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
     async (wakeup) => {
@@ -461,10 +575,29 @@ export function startCloudServer(
         if (url.pathname === "/health") response = new Response("ok");
 
         else if (url.pathname === "/ready") {
-          const state = await readiness(db, {
+          const baseState = await readiness(db, {
             sms: otpDelivery ? "configured" : privateBetaOTPConfigured() ? "development" : "disabled",
             push: pushSender ? "configured" : "disabled",
           });
+          const reportSchema = await abuseReportSchemaReadiness(db);
+          const reportsRequested = process.env.TOJ_ABUSE_REPORTS_ENABLED === "1";
+          const reportsOperational = abuseReportsConfigured();
+          const reportsReady = !reportsRequested || (reportsOperational && reportSchema.ready);
+          const { encryption, blindIndexes } = await cryptoReadiness();
+          const state = {
+            ...baseState,
+            status: baseState.status === "ready" && reportsReady
+              && encryption.ready && blindIndexes.ready
+              && !encryption.launchBlocking && !blindIndexes.launchBlocking
+              ? "ready" : "not_ready",
+            abuseReports: {
+              requested: reportsRequested,
+              operationalGate: reportsOperational ? "ready" : "disabled_or_incomplete",
+              schema: reportSchema,
+            },
+            encryption,
+            blindIndexes,
+          };
           response = json(state, state.status === "ready" ? 200 : 503);
         }
 
@@ -523,6 +656,7 @@ export function startCloudServer(
             chatFolders,
             scheduledDelivery,
             linkPreviews,
+            await abuseReportAvailability(),
           ));
         }
 
@@ -530,12 +664,18 @@ export function startCloudServer(
           const metricsToken = process.env.TOJ_METRICS_TOKEN;
           if (!metricsToken) response = new Response("not found", { status: 404 });
           else if (bearer(req) !== metricsToken) response = new Response("unauthorized", { status: 401 });
-          else response = new Response(
-            metrics.render()
-              + await dialogPreferenceBacklogMetrics(db)
-              + await groupCallBacklogMetrics(db),
-            { headers: { "content-type": "text/plain; version=0.0.4" } },
-          );
+          else {
+            const cryptoState = await cryptoReadiness();
+            response = new Response(
+              metrics.render()
+                + await dialogPreferenceBacklogMetrics(db)
+                + await groupCallBacklogMetrics(db)
+                + await abuseReportMetrics(db)
+                + await envelopeMetrics(db, cryptoState.encryption)
+                + blindIndexMetrics(cryptoState.blindIndexes),
+              { headers: { "content-type": "text/plain; version=0.0.4" } },
+            );
+          }
         }
 
         else if (url.pathname === "/v1/ws") {
@@ -594,6 +734,10 @@ export function startCloudServer(
             || !(await savedMessagesSchemaReadiness(db)).ready
           )
         ) {
+          response = new Response("not found", { status: 404 });
+        }
+
+        else if (url.pathname === "/v1/reports" && !(await abuseReportAvailability())) {
           response = new Response("not found", { status: 404 });
         }
 
@@ -823,6 +967,12 @@ export function startCloudServer(
             metrics.recordScheduledCancellationDuringOutage();
           }
           response = json(result);
+        }
+
+        if (url.pathname === "/v1/reports" && req.method === "POST") {
+          const result = await submitAbuseReport(db, session.accountId, session.deviceId, body);
+          metrics.recordAbuseReport(result.duplicate ? "duplicate" : "submitted");
+          response = json(result, result.duplicate ? 200 : 201);
         }
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
@@ -1640,6 +1790,8 @@ export function startCloudServer(
           : err instanceof ChatFolderError ? err.status
           : err instanceof ScheduledDeliveryError ? err.status
           : err instanceof LinkPreviewError ? err.status
+          : err instanceof ReportError ? err.status
+          : err instanceof CryptoUnavailableError ? err.status
           : err instanceof SyncError ? err.status
           : err instanceof PushError ? 400 : 500;
         if (status === 500) {
@@ -1663,6 +1815,11 @@ export function startCloudServer(
         }
         if (err instanceof ChatFolderError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
         if (err instanceof ScheduledDeliveryError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof ReportError && err.retryAfter) headers["retry-after"] = String(err.retryAfter);
+        if (err instanceof CryptoUnavailableError) headers["retry-after"] = "5";
+        if (err instanceof ReportError && err.code === "report_rate_limited") {
+          metrics.recordAbuseReport("rate_limited");
+        }
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
@@ -1677,6 +1834,8 @@ export function startCloudServer(
           ...(err instanceof ChatFolderError ? { code: err.code } : {}),
           ...(err instanceof ScheduledDeliveryError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof LinkPreviewError ? { code: err.code } : {}),
+          ...(err instanceof ReportError ? { code: err.code } : {}),
+          ...(err instanceof CryptoUnavailableError ? { code: err.code } : {}),
           ...(err instanceof SyncError ? { code: err.code, ...err.details } : {}),
         }, status, headers);
       }
@@ -1727,6 +1886,8 @@ export function startCloudServer(
     stopScheduledDeliveryWorker();
     stopLinkPreviewWorker();
     stopSyncNotifications();
+    stopAccountSecurityNotifications();
+    if (accountSecurityRecheck) clearInterval(accountSecurityRecheck);
     stopCallNotifications();
     stopGroupCallNotifications();
     return originalStop(closeActiveConnections);

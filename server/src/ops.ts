@@ -9,6 +9,8 @@ import {
 import { dialogPreferenceSchemaState } from "./dialog-preference-readiness";
 import { draftMediaSchemaState } from "./draft-media-readiness";
 import { groupCallSchemaReadiness, groupCallsConfigured } from "./group-calls";
+import { cleanupAbuseReports } from "./reports";
+import { EXPIRED_BLIND_INDEX_KEY_ID } from "./blind-index";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const CLEANUP_BATCH_SIZE = 1_000;
@@ -78,6 +80,7 @@ export function safeRoute(pathname: string): string {
     "/v1/media/uploads", "/v1/calls", "/v1/calls/active",
     "/v1/group-calls", "/v1/group-calls/active",
     "/v1/chat-folders", "/v1/scheduled-messages",
+    "/v1/reports",
   ]);
   return known.has(pathname) ? pathname : "unmatched";
 }
@@ -102,6 +105,7 @@ export class OperationalMetrics {
   private scheduledCancellationsDuringOutage = 0;
   private cleanupDeleted = 0;
   private cleanupBacklog = 0;
+  private readonly abuseReports = new Map<string, number>();
 
   recordCleanup(deleted: number, backlog: number): void {
     this.cleanupDeleted += deleted;
@@ -118,14 +122,8 @@ export class OperationalMetrics {
     this.durations.set(durationKey, duration);
   }
 
-  recordSavedMessagesEnsure(
-    result: "created" | "existing" | "repaired" | "error",
-    durationMs: number,
-  ): void {
-    this.savedMessageEnsures.set(result, (this.savedMessageEnsures.get(result) ?? 0) + 1);
-    this.savedMessageEnsureCount += 1;
-    this.savedMessageEnsureSumSeconds += durationMs / 1_000;
-    if (result === "repaired") this.savedMessageInvariantViolations += 1;
+  recordAbuseReport(result: "submitted" | "duplicate" | "rate_limited"): void {
+    this.abuseReports.set(result, (this.abuseReports.get(result) ?? 0) + 1);
   }
 
   recordScheduledWorkerUnavailable(): void {
@@ -134,6 +132,16 @@ export class OperationalMetrics {
 
   recordScheduledCancellationDuringOutage(): void {
     this.scheduledCancellationsDuringOutage += 1;
+  }
+
+  recordSavedMessagesEnsure(
+    result: "created" | "existing" | "repaired" | "error",
+    durationMs: number,
+  ): void {
+    this.savedMessageEnsures.set(result, (this.savedMessageEnsures.get(result) ?? 0) + 1);
+    this.savedMessageEnsureCount += 1;
+    this.savedMessageEnsureSumSeconds += durationMs / 1_000;
+    if (result === "repaired") this.savedMessageInvariantViolations += 1;
   }
 
   render(): string {
@@ -147,6 +155,13 @@ export class OperationalMetrics {
     for (const [key, count] of [...this.requests].sort()) {
       const [method, route, status] = key.split("\u0000");
       lines.push(`toj_http_requests_total{method="${metricLabel(method)}",route="${metricLabel(route)}",status="${status}"} ${count}`);
+    }
+    lines.push(
+      "# HELP toj_abuse_report_requests_total Report submissions by safe outcome.",
+      "# TYPE toj_abuse_report_requests_total counter",
+    );
+    for (const result of ["submitted", "duplicate", "rate_limited"] as const) {
+      lines.push(`toj_abuse_report_requests_total{result="${result}"} ${this.abuseReports.get(result) ?? 0}`);
     }
     lines.push(
       "# HELP toj_http_request_duration_seconds_sum Cumulative HTTP request duration.",
@@ -346,6 +361,7 @@ export async function readiness(sql: SQL, providers: { sms: ProviderState; push:
 
 export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZE) {
   const callData = await cleanupCallData(sql, batchSize);
+  const abuseReportData = await cleanupAbuseReports(sql, batchSize);
   const otp = await sql`
     WITH doomed AS (
       SELECT id FROM otp_challenges
@@ -491,7 +507,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       ),
     );
     const doomed = candidates.length ? await tx`
-      SELECT account_id, operation_id, dialog_id, payload_fingerprint,
+      SELECT account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
              status, resulting_revision
       FROM draft_mutation_requests
       WHERE created_at < now() - interval '24 hours'
@@ -507,10 +523,12 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     if (completed.length) {
       await tx`
         INSERT INTO draft_mutation_tombstones (
-          account_id, operation_id, dialog_id, payload_fingerprint, resulting_revision
+          account_id, operation_id, dialog_id, payload_fingerprint, fingerprint_key_id,
+          resulting_revision
         )
         SELECT request.account_id, request.operation_id, request.dialog_id,
-               request.payload_fingerprint, request.resulting_revision
+               request.payload_fingerprint, request.fingerprint_key_id,
+               request.resulting_revision
         FROM draft_mutation_requests request
         WHERE (request.account_id, request.operation_id) IN (
           SELECT * FROM unnest(
@@ -552,7 +570,8 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       ),
     );
     const doomed = candidates.length ? await tx`
-      SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint, status,
+      SELECT sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+             fingerprint_key_id, status,
              first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
       FROM media_group_send_requests
       WHERE created_at < now() - interval '24 hours'
@@ -569,10 +588,12 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
       await tx`
         INSERT INTO media_group_send_tombstones (
           sender_account_id, client_group_id, dialog_id, payload_fingerprint,
+          fingerprint_key_id,
           first_msg_id, last_msg_id, sender_pts, cleared_draft_revision
         )
         SELECT request.sender_account_id, request.client_group_id, request.dialog_id,
-               request.payload_fingerprint, request.first_msg_id, request.last_msg_id,
+               request.payload_fingerprint, request.fingerprint_key_id,
+               request.first_msg_id, request.last_msg_id,
                request.sender_pts, request.cleared_draft_revision
         FROM media_group_send_requests request
         WHERE (request.sender_account_id, request.client_group_id) IN (
@@ -626,6 +647,89 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     WHERE request.actor_account_id = doomed.actor_account_id
       AND request.client_mutation_id = doomed.client_mutation_id
     RETURNING request.client_mutation_id`;
+  // Idempotency identifiers remain permanently consumed, but their keyed canonical digest is
+  // only needed during the documented retry horizon. Replacing it after 90 days lets operators
+  // retire historical blind-index keys without permitting the operation ID to execute again.
+  const expiredSendFingerprints = await sql`
+    WITH doomed AS (
+      SELECT sender_account_id, client_msg_id FROM send_requests
+      WHERE status = 'completed' AND fingerprint IS NOT NULL
+        AND created_at < now() - interval '90 days'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE send_requests request SET fingerprint = NULL,
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE request.sender_account_id = doomed.sender_account_id
+      AND request.client_msg_id = doomed.client_msg_id
+    RETURNING request.client_msg_id`;
+  const expiredMessageFingerprints = await sql`
+    WITH doomed AS (
+      SELECT dialog_id, msg_id FROM messages
+      WHERE send_fingerprint IS NOT NULL AND server_ts < now() - interval '90 days'
+      ORDER BY server_ts, dialog_id, msg_id LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE messages message SET send_fingerprint = NULL,
+      send_fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE message.dialog_id = doomed.dialog_id AND message.msg_id = doomed.msg_id
+    RETURNING message.msg_id`;
+  const expiredDraftFingerprints = await sql`
+    WITH doomed AS (
+      SELECT account_id, operation_id FROM draft_mutation_tombstones
+      WHERE fingerprint_key_id <> ${EXPIRED_BLIND_INDEX_KEY_ID}
+        AND created_at < now() - interval '90 days'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE draft_mutation_tombstones tombstone
+    SET payload_fingerprint = gen_random_bytes(32),
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE tombstone.account_id = doomed.account_id
+      AND tombstone.operation_id = doomed.operation_id
+    RETURNING tombstone.operation_id`;
+  const expiredMediaGroupFingerprints = await sql`
+    WITH doomed AS (
+      SELECT sender_account_id, client_group_id FROM media_group_send_tombstones
+      WHERE fingerprint_key_id <> ${EXPIRED_BLIND_INDEX_KEY_ID}
+        AND created_at < now() - interval '90 days'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE media_group_send_tombstones tombstone
+    SET payload_fingerprint = gen_random_bytes(32),
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE tombstone.sender_account_id = doomed.sender_account_id
+      AND tombstone.client_group_id = doomed.client_group_id
+    RETURNING tombstone.client_group_id`;
+  const expiredFolderFingerprints = await sql`
+    WITH doomed AS (
+      SELECT account_id, client_mutation_id FROM chat_folder_mutation_requests
+      WHERE status = 'completed' AND fingerprint_key_id <> ${EXPIRED_BLIND_INDEX_KEY_ID}
+        AND created_at < now() - interval '90 days'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE chat_folder_mutation_requests request
+    SET fingerprint = gen_random_bytes(32), request_fingerprint = NULL,
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE request.account_id = doomed.account_id
+      AND request.client_mutation_id = doomed.client_mutation_id
+    RETURNING request.client_mutation_id`;
+  const expiredScheduledFingerprints = await sql`
+    WITH doomed AS (
+      SELECT account_id, client_mutation_id FROM scheduled_delivery_mutation_requests
+      WHERE status = 'completed' AND fingerprint_key_id <> ${EXPIRED_BLIND_INDEX_KEY_ID}
+        AND created_at < now() - interval '90 days'
+      ORDER BY created_at LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+    )
+    UPDATE scheduled_delivery_mutation_requests request
+    SET fingerprint = gen_random_bytes(32), request_fingerprint = NULL,
+      fingerprint_key_id = ${EXPIRED_BLIND_INDEX_KEY_ID}
+    FROM doomed WHERE request.account_id = doomed.account_id
+      AND request.client_mutation_id = doomed.client_mutation_id
+    RETURNING request.client_mutation_id`;
+  const blindIndexReceiptsExpired = expiredSendFingerprints.length
+    + expiredMessageFingerprints.length
+    + expiredDraftFingerprints.length
+    + expiredMediaGroupFingerprints.length
+    + expiredFolderFingerprints.length
+    + expiredScheduledFingerprints.length;
   // Preference mutation IDs are client-generated and can be retried after an arbitrarily long
   // offline period or lost response. Keep completed dedupe state until account deletion so a
   // committed patch can never be interpreted as a new mutation.
@@ -787,6 +891,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     mediaGroupBudgets: mediaGroupBudgets.length,
     groupCreates: groupCreates.length,
     groupMutations: groupMutations.length,
+    blindIndexReceiptsExpired,
     dialogPreferenceRequests: dialogPreferenceRequests.length,
     dialogPreferenceBudgets: dialogPreferenceBudgets.length,
     scheduledDeliveries: scheduledDeliveries.length,
@@ -798,6 +903,7 @@ export async function cleanupExpiredData(sql: SQL, batchSize = CLEANUP_BATCH_SIZ
     previewAssets: previewAssets.length,
     accountEvents: events.length,
     callData,
+    abuseReportData,
   };
 }
 
@@ -806,10 +912,12 @@ function cleanupCount(value: Awaited<ReturnType<typeof cleanupExpiredData>>): nu
     + value.mediaUploads + value.mediaAttempts + value.mediaOrphans + value.sendRequests
     + value.messageMutations + value.draftMutations + value.draftBudgets
     + value.mediaGroupSends + value.mediaGroupBudgets + value.groupCreates + value.groupMutations
+    + value.blindIndexReceiptsExpired
     + value.dialogPreferenceRequests + value.dialogPreferenceBudgets + value.accountEvents
     + value.scheduledDeliveries + value.scheduledBudgets + value.folderBudgets
     + value.previewBudgets + value.previewCache + value.previewSnapshots + value.previewAssets
-    + Object.values(value.callData).reduce((sum, count) => sum + count, 0);
+    + Object.values(value.callData).reduce((sum, count) => sum + count, 0)
+    + Object.values(value.abuseReportData).reduce((sum, count) => sum + count, 0);
 }
 
 export async function drainExpiredData(
