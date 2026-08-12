@@ -13,6 +13,7 @@ struct CloudRootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var model = CloudAppModel.shared
     @State private var appLock = AppLockController.shared
+    @State private var pendingLockedDeepLink: URL?
 
     var body: some View {
         Group {
@@ -114,7 +115,20 @@ struct CloudRootView: View {
         )) {
             TojGroupCallScreen(coordinator: model.groupCallCoordinator)
         }
-        .onOpenURL { model.handleDeepLink($0) }
+        .onOpenURL { url in
+            // Do not let an external navigation mutate or reveal account state behind the lock.
+            // Keep only the newest user intent and deliver it after device-owner authentication.
+            if appLock.presentsGate {
+                pendingLockedDeepLink = url
+            } else {
+                model.handleDeepLink(url)
+            }
+        }
+        .onChange(of: appLock.presentsGate) { _, presentsGate in
+            guard !presentsGate, let url = pendingLockedDeepLink else { return }
+            pendingLockedDeepLink = nil
+            model.handleDeepLink(url)
+        }
         .fullScreenCover(isPresented: Binding(
             get: { appLock.presentsGate },
             set: { _ in }

@@ -250,7 +250,7 @@ actor AccountCatalog {
         deployment: URL,
         now: Date = Date()
     ) throws -> CatalogAccount {
-        var value = try snapshot()
+        let value = try snapshot()
         if let existing = value.accounts.first(where: {
             $0.accountId == storedSession.session.accountId.lowercased()
         }) { return existing }
@@ -283,12 +283,22 @@ actor AccountCatalog {
     }
 
     nonisolated static func normalizedDeployment(_ url: URL) -> String {
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        components?.query = nil
-        components?.fragment = nil
-        var value = components?.url?.absoluteString ?? url.absoluteString
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            var value = url.absoluteString
+            while value.last == "/" { value.removeLast() }
+            return value
+        }
+        components.query = nil
+        components.fragment = nil
+        // URL schemes and hosts are case-insensitive; paths are not. Lowercasing the entire URL
+        // can silently redirect an account to a different deployment endpoint.
+        let normalizedScheme = components.scheme?.lowercased()
+        let normalizedHost = components.host?.lowercased()
+        components.scheme = normalizedScheme
+        components.host = normalizedHost
+        var value = components.url?.absoluteString ?? url.absoluteString
         while value.last == "/" { value.removeLast() }
-        return value.lowercased()
+        return value
     }
 
     nonisolated static func isValidAccountId(_ value: String) -> Bool {

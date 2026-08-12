@@ -37,6 +37,67 @@ final class CloudLocalStoreTests: XCTestCase {
         XCTAssertNil(encoded["token"])
     }
 
+    func testCredentialInstallDoesNotRebindTokensAcrossAccountsOrDevices() async throws {
+        let coordinator = SessionCredentialCoordinator()
+        let config = CloudConfig(
+            baseURL: try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+        )
+        let store = TokenStore(service: "com.toj.credential-account-fence.\(UUID().uuidString)")
+
+        let firstAccount = storedSession(accountId: "account-a", deviceId: "device-a", suffix: 1)
+        await coordinator.install(firstAccount, config: config, tokenStore: store)
+        let firstAuthorization = await coordinator.authorizationToken(
+            matching: firstAccount.session.token
+        )
+        XCTAssertEqual(firstAuthorization, firstAccount.session.token)
+
+        let secondAccount = storedSession(accountId: "account-b", deviceId: "device-b", suffix: 2)
+        await coordinator.install(secondAccount, config: config, tokenStore: store)
+        let reboundAcrossAccounts = await coordinator.authorizationToken(
+            matching: firstAccount.session.token
+        )
+        XCTAssertNil(reboundAcrossAccounts)
+        let secondAuthorization = await coordinator.authorizationToken(
+            matching: secondAccount.session.token
+        )
+        XCTAssertEqual(secondAuthorization, secondAccount.session.token)
+
+        let rotatedSecondAccount = StoredCloudSession(
+            session: CloudSession(
+                accountId: secondAccount.session.accountId,
+                deviceId: secondAccount.session.deviceId,
+                token: "access-rotated",
+                refreshToken: "refresh-rotated",
+                accessTokenExpiresAt: "2099-01-01T00:15:00.000Z",
+                sessionExpiresAt: "2099-06-01T00:00:00.000Z",
+                tokenVersion: 2
+            ),
+            phone: secondAccount.phone,
+            displayName: secondAccount.displayName
+        )
+        await coordinator.install(rotatedSecondAccount, config: config, tokenStore: store)
+        let reboundWithinDevice = await coordinator.authorizationToken(
+            matching: secondAccount.session.token
+        )
+        XCTAssertNil(reboundWithinDevice)
+        await coordinator.handleAuthenticationFailure(
+            code: "device_revoked",
+            matching: secondAccount.session.token
+        )
+        let replacementSurvivedLateFailure = await coordinator.authorizationToken(
+            matching: rotatedSecondAccount.session.token
+        )
+        XCTAssertEqual(replacementSurvivedLateFailure, rotatedSecondAccount.session.token)
+
+        let replacementDevice = storedSession(accountId: "account-b", deviceId: "device-c", suffix: 3)
+        await coordinator.install(replacementDevice, config: config, tokenStore: store)
+        let reboundAcrossDevices = await coordinator.authorizationToken(
+            matching: rotatedSecondAccount.session.token
+        )
+        XCTAssertNil(reboundAcrossDevices)
+        try await store.clear()
+    }
+
     func testCredentialRefreshIsSingleFlightAndPersistsTheRotatedSession() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudAPIMockURLProtocol.self]
@@ -1768,12 +1829,328 @@ final class CloudLocalStoreTests: XCTestCase {
     func testPendingSessionRevocationTokenPersistsSeparately() async throws {
         let store = TokenStore(service: "com.toj.tests.\(UUID().uuidString)")
         try? await store.clearPendingRevocationToken()
-        try await store.savePendingRevocationToken("test-revocation-token")
+        try await store.savePendingRevocationToken(
+            "test-revocation-token",
+            localReplicaAccountId: "account-a"
+        )
+        try await store.savePendingRevocationToken(
+            "second-revocation-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account-b"
+        )
         let loaded = try await store.loadPendingRevocationToken()
         XCTAssertEqual(loaded, "test-revocation-token")
-        try await store.clearPendingRevocationToken()
+        let intents = try await store.loadPendingRevocations()
+        XCTAssertEqual(intents, [
+            PendingSessionRevocation(
+                token: "test-revocation-token",
+                eraseLocalReplicaOnLaunch: true,
+                localReplicaAccountId: "account-a"
+            ),
+            PendingSessionRevocation(
+                token: "second-revocation-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "account-b"
+            ),
+        ])
+        try await store.clearPendingRevocationToken(ifMatches: "different-token")
+        var preserved = try await store.loadPendingRevocationTokens()
+        XCTAssertEqual(preserved, ["test-revocation-token", "second-revocation-token"])
+        try await store.clearPendingRevocationToken(ifMatches: "test-revocation-token")
+        preserved = try await store.loadPendingRevocationTokens()
+        XCTAssertEqual(preserved, ["second-revocation-token"])
+        try await store.clearPendingRevocationToken(ifMatches: "second-revocation-token")
         let cleared = try await store.loadPendingRevocationToken()
         XCTAssertNil(cleared)
+    }
+
+    func testPendingRevocationQueueMigratesTheLegacySingleTokenFormat() async throws {
+        let service = "com.toj.pending-revocation-migration.\(UUID().uuidString)"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "pending-session-revocation",
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: Data("legacy-revocation-token".utf8),
+        ]
+        XCTAssertEqual(SecItemAdd(query as CFDictionary, nil), errSecSuccess)
+        let store = TokenStore(service: service)
+        defer {
+            SecItemDelete([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+            ] as CFDictionary)
+        }
+
+        let legacyTokens = try await store.loadPendingRevocationTokens()
+        XCTAssertEqual(legacyTokens, ["legacy-revocation-token"])
+        let legacyIntent = try await store.loadPendingRevocations()
+        XCTAssertEqual(legacyIntent, [PendingSessionRevocation(
+            token: "legacy-revocation-token",
+            eraseLocalReplicaOnLaunch: true,
+            localReplicaAccountId: nil
+        )])
+        try await store.savePendingRevocationToken("queued-revocation-token")
+        let migratedTokens = try await store.loadPendingRevocationTokens()
+        XCTAssertEqual(migratedTokens, ["legacy-revocation-token", "queued-revocation-token"])
+    }
+
+    func testPendingRevocationQueueMigratesTheLegacyStringArrayFormat() async throws {
+        let service = "com.toj.pending-revocation-array-migration.\(UUID().uuidString)"
+        let data = try JSONEncoder().encode(["first-token", "first-token", "second-token", ""])
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "pending-session-revocation",
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: data,
+        ]
+        XCTAssertEqual(SecItemAdd(query as CFDictionary, nil), errSecSuccess)
+        let store = TokenStore(service: service)
+        defer {
+            SecItemDelete([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+            ] as CFDictionary)
+        }
+
+        let migratedIntents = try await store.loadPendingRevocations()
+        XCTAssertEqual(migratedIntents, [
+            PendingSessionRevocation(
+                token: "first-token",
+                eraseLocalReplicaOnLaunch: true,
+                localReplicaAccountId: nil
+            ),
+            PendingSessionRevocation(
+                token: "second-token",
+                eraseLocalReplicaOnLaunch: true,
+                localReplicaAccountId: nil
+            ),
+        ])
+    }
+
+    func testPendingRevocationIntentCannotBeDowngradedBeforeLocalCleanup() async throws {
+        let store = TokenStore(service: "com.toj.pending-revocation-intent.\(UUID().uuidString)")
+        defer { Task { try? await store.clearPendingRevocationToken() } }
+
+        try await store.savePendingRevocationToken(
+            "token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "preserved-account"
+        )
+        try await store.savePendingRevocationToken(
+            "token",
+            localReplicaAccountId: "erased-account"
+        )
+        try await store.savePendingRevocationToken(
+            "token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "must-not-downgrade"
+        )
+        try await store.savePendingRevocationToken(
+            "replacement-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "erased-account"
+        )
+        try await store.savePendingRevocationToken(
+            "other-account-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "other-account"
+        )
+        let upgradedIntents = try await store.loadPendingRevocations()
+        XCTAssertEqual(upgradedIntents, [
+            PendingSessionRevocation(
+                token: "token",
+                eraseLocalReplicaOnLaunch: true,
+                localReplicaAccountId: "erased-account"
+            ),
+            PendingSessionRevocation(
+                token: "replacement-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "erased-account"
+            ),
+            PendingSessionRevocation(
+                token: "other-account-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "other-account"
+            ),
+        ])
+
+        try await store.markPendingRevocationLocalErasureCompleted(accountId: "erased-account")
+        let remoteOnlyIntents = try await store.loadPendingRevocations()
+        XCTAssertEqual(remoteOnlyIntents, [
+            PendingSessionRevocation(
+                token: "token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: nil
+            ),
+            PendingSessionRevocation(
+                token: "replacement-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: nil
+            ),
+            PendingSessionRevocation(
+                token: "other-account-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "other-account"
+            ),
+        ])
+    }
+
+    func testSuccessfulAuthenticationMakesOnlyItsPreservedRevocationsRemoteOnly() async throws {
+        let store = TokenStore(service: "com.toj.pending-revocation-auth.\(UUID().uuidString)")
+        defer { Task { try? await store.clearPendingRevocationToken() } }
+        try await store.savePendingRevocationToken(
+            "token-a",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account-a"
+        )
+        try await store.savePendingRevocationToken(
+            "token-b",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account-b"
+        )
+
+        try await store.markPendingRevocationsRemoteOnly(localReplicaAccountId: "account-a")
+        let resolvedIntents = try await store.loadPendingRevocations()
+        XCTAssertEqual(resolvedIntents, [
+            PendingSessionRevocation(
+                token: "token-a",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: nil
+            ),
+            PendingSessionRevocation(
+                token: "token-b",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "account-b"
+            ),
+        ])
+    }
+
+    func testCanceledStagedLoginMakesOnlyItsExactRevocationRemoteOnly() async throws {
+        let store = TokenStore(service: "com.toj.pending-revocation-cancel.\(UUID().uuidString)")
+        defer { Task { try? await store.clearPendingRevocationToken() } }
+        try await store.savePendingRevocationToken(
+            "staged-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "preserved-account"
+        )
+        try await store.savePendingRevocationToken(
+            "security-reissue-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "preserved-account"
+        )
+        try await store.savePendingRevocationToken(
+            "destructive-token",
+            localReplicaAccountId: "preserved-account"
+        )
+
+        try await store.markPendingRevocationRemoteOnly(ifMatches: "staged-token")
+
+        let pendingRevocations = try await store.loadPendingRevocations()
+        XCTAssertEqual(pendingRevocations, [
+            PendingSessionRevocation(
+                token: "staged-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: nil
+            ),
+            PendingSessionRevocation(
+                token: "security-reissue-token",
+                eraseLocalReplicaOnLaunch: false,
+                localReplicaAccountId: "preserved-account"
+            ),
+            PendingSessionRevocation(
+                token: "destructive-token",
+                eraseLocalReplicaOnLaunch: true,
+                localReplicaAccountId: "preserved-account"
+            ),
+        ])
+    }
+
+    func testPendingRevocationLaunchPolicySeparatesErasePreserveAndRemoteOnlyIntents() {
+        let saved = storedSession(accountId: "account-a", deviceId: "device-a", suffix: 1)
+        let remoteOnly = PendingSessionRevocation(
+            token: "old-unrelated-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: nil
+        )
+        let preserve = PendingSessionRevocation(
+            token: "abandoned-replacement-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account-a"
+        )
+        let eraseRotatedAccount = PendingSessionRevocation(
+            token: "superseded-access-token",
+            eraseLocalReplicaOnLaunch: true,
+            localReplicaAccountId: "account-a"
+        )
+
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: saved,
+            pendingRevocations: [remoteOnly],
+            hasPendingLocalErasure: false
+        ), .restoreSavedSession)
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: saved,
+            pendingRevocations: [remoteOnly],
+            hasPendingLocalErasure: false,
+            pendingReauthenticationAccountId: "account-a"
+        ), .requireAuthentication(localReplicaAccountId: "account-a"))
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: saved,
+            pendingRevocations: [preserve],
+            hasPendingLocalErasure: false
+        ), .requireAuthentication(localReplicaAccountId: "account-a"))
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: nil,
+            pendingRevocations: [preserve],
+            hasPendingLocalErasure: false
+        ), .requireAuthentication(localReplicaAccountId: "account-a"))
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: nil,
+            pendingRevocations: [remoteOnly],
+            hasPendingLocalErasure: false
+        ), .restoreSavedSession)
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: saved,
+            pendingRevocations: [eraseRotatedAccount, preserve],
+            hasPendingLocalErasure: false
+        ), .eraseLocalReplica)
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: saved,
+            pendingRevocations: [],
+            hasPendingLocalErasure: true
+        ), .eraseLocalReplica)
+    }
+
+    func testPendingReauthenticationPersistsIndependentlyFromSessionAndRevocationCleanup() async throws {
+        let store = TokenStore(service: "com.toj.pending-reauthentication.\(UUID().uuidString)")
+        defer { Task { try? await store.clearAllStoredData() } }
+        let session = storedSession(accountId: "account-a", deviceId: "device-a", suffix: 9)
+        try await store.save(session)
+        try await store.savePendingReauthentication(accountId: "account-a")
+        try await store.savePendingRevocationToken(
+            "staged-other-account-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account-a"
+        )
+
+        try await store.clearSession(ifTokenMatches: session.session.token)
+        try await store.clearPendingRevocationToken(ifMatches: "staged-other-account-token")
+
+        let persistedSession = try await store.load()
+        XCTAssertNil(persistedSession)
+        let pendingAccountId = try await store.loadPendingReauthenticationAccountId()
+        XCTAssertEqual(pendingAccountId, "account-a")
+        XCTAssertEqual(PendingRevocationLaunchPolicy.action(
+            savedSession: nil,
+            pendingRevocations: [],
+            hasPendingLocalErasure: false,
+            pendingReauthenticationAccountId: pendingAccountId
+        ), .requireAuthentication(localReplicaAccountId: "account-a"))
+        try await store.clearPendingReauthentication()
+        let clearedAccountId = try await store.loadPendingReauthenticationAccountId()
+        XCTAssertNil(clearedAccountId)
     }
 
     func testPendingLocalErasureSurvivesProfileCleanupUntilExplicitlyCleared() async throws {
@@ -4827,7 +5204,7 @@ final class CloudLocalStoreTests: XCTestCase {
         let service = "com.toj.account-catalog.tests.\(UUID().uuidString)"
         let catalog = AccountCatalog(service: service)
         let deployment = try XCTUnwrap(
-            URL(string: "https://Cloud.Example.test/cloud/?ignored=true#fragment")
+            URL(string: "https://Cloud.Example.test/Cloud/?ignored=true#fragment")
         )
         let accountIds = (0..<4).map { _ in UUID().uuidString.lowercased() }
         let sessions = accountIds.enumerated().map { index, accountId in
@@ -4840,7 +5217,7 @@ final class CloudLocalStoreTests: XCTestCase {
         var snapshot = try await catalog.snapshot()
         XCTAssertEqual(snapshot.accounts.map(\.accountId), Array(accountIds.prefix(3)))
         XCTAssertEqual(snapshot.activeAccountId, accountIds[2])
-        XCTAssertEqual(Set(snapshot.accounts.map(\.deployment)), ["https://cloud.example.test/cloud"])
+        XCTAssertEqual(Set(snapshot.accounts.map(\.deployment)), ["https://cloud.example.test/Cloud"])
         let firstInstallationId = try await catalog.installationId()
         let secondInstallationId = try await catalog.installationId()
         XCTAssertEqual(firstInstallationId, secondInstallationId)
@@ -4993,6 +5370,44 @@ final class CloudLocalStoreTests: XCTestCase {
 
         try? AccountLocalStoreFactory.destroy(accountId: firstId)
         try? AccountLocalStoreFactory.destroy(accountId: secondId)
+    }
+
+    func testSignInAgainRuntimeKeepsReplicaButDoesNotRestoreCredentials() async throws {
+        let accountId = UUID().uuidString.lowercased()
+        let deployment = try XCTUnwrap(URL(string: "https://cloud.example.test/cloud"))
+        let session = storedSession(
+            accountId: accountId,
+            deviceId: UUID().uuidString.lowercased(),
+            suffix: 41
+        )
+        let account = CatalogAccount(
+            accountId: accountId,
+            deployment: AccountCatalog.normalizedDeployment(deployment),
+            storedSession: session,
+            state: .signInAgain,
+            generation: 2,
+            addedAt: Date(),
+            lastActivatedAt: Date()
+        )
+        let runtime = try MessagingAccountRuntime(
+            account: account,
+            config: CloudConfig(baseURL: deployment)
+        )
+        try await runtime.tokenStore.save(session)
+
+        try await runtime.start(with: account)
+
+        let authorization = await runtime.credentialCoordinator.authorizationToken(
+            matching: session.session.token
+        )
+        XCTAssertNil(authorization)
+        let persisted = try await runtime.tokenStore.load()
+        XCTAssertNil(persisted)
+        let requiresSignIn = await runtime.requiresSignIn
+        XCTAssertTrue(requiresSignIn)
+
+        try await runtime.shutDownForRemoval()
+        try? AccountLocalStoreFactory.destroy(accountId: accountId)
     }
 
     private func makeStore() throws -> CloudLocalStore {

@@ -81,6 +81,7 @@ export async function messagingFeatureSchemaState(
   }
   const inFlight = (async (): Promise<MessagingFeatureSchemaState> => {
     const tableRows = await sql`
+      /* messaging_feature_required_tables */
       SELECT required.name, to_regclass('public.' || required.name) IS NOT NULL AS present
       FROM unnest(${sql.array([...REQUIRED_TABLES], "text")}::text[]) required(name)`;
     const missingTables = tableRows.filter((row: any) => !row.present)

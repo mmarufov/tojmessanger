@@ -597,6 +597,9 @@ export async function drainLinkPreviewFanout(sql: SQL, maxRows = 100): Promise<n
     );
     transactions += 1;
     if (!result.found) break;
+    // Another fanout worker may own every waiter for the selected cache row. Do not burn the rest
+    // of this tick repeatedly selecting that row while SKIP LOCKED correctly returns no progress.
+    if (result.processed === 0) break;
     processed += result.processed;
   }
   recordResolvedPreviewWaiters(processed);
@@ -747,6 +750,7 @@ export function startLinkPreviewWorker(
   const shutdownDrainMilliseconds = Math.max(1_000, options.shutdownDrainMilliseconds ?? 15_000);
   let running: Promise<void> | null = null;
   let stopped = false;
+  let heartbeatRunning = false;
   const controllers = new Set<AbortController>();
   const tick = async () => {
     if (running || stopped) return;
@@ -769,10 +773,14 @@ export function startLinkPreviewWorker(
     });
   };
   const heartbeat = async () => {
+    if (stopped || heartbeatRunning) return;
+    heartbeatRunning = true;
     try {
       await touchWorkerHeartbeat(sql, "link_preview", workerId);
     } catch {
       // The cached heartbeat snapshot fails closed; this timer keeps retrying independently.
+    } finally {
+      heartbeatRunning = false;
     }
   };
   void heartbeat();

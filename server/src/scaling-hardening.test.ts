@@ -10,6 +10,7 @@ import {
 import { productivityNeedsForPath, startCloudServer } from "./cloud";
 import { scheduledItemAAD, seal } from "./crypto";
 import { makeSql } from "./db";
+import { clearMessagingFeatureReadinessCache } from "./messaging-feature-readiness";
 import { drainLinkPreviewFanout } from "./link-previews";
 import { createMediaUpload, mediaLimits } from "./media";
 import {
@@ -18,6 +19,7 @@ import {
   scheduledDeliveryWorkerConcurrency,
 } from "./productivity-runtime";
 import {
+  cancelScheduledDelivery,
   createScheduledDelivery,
   drainScheduledDeliveries,
   listScheduledDeliveries,
@@ -42,6 +44,14 @@ const MANAGED_ENV = [
   "TOJ_LINK_PREVIEWS_V1_ENABLED",
   "TOJ_LINK_PREVIEWS_ALLOWLIST",
   "TOJ_LINK_PREVIEWS_ROLLOUT_PERCENT",
+  "TOJ_AUTH_SESSIONS_V2_ENABLED",
+  "TOJ_TWO_FACTOR_ENABLED",
+  "TOJ_PINNED_MESSAGES_ENABLED",
+  "TOJ_AUTO_DELETE_ENABLED",
+  "TOJ_POLLS_ENABLED",
+  "TOJ_STICKER_PACKS_ENABLED",
+  "TOJ_GIPHY_ENABLED",
+  "TOJ_MULTI_ACCOUNT_PUSH_ENABLED",
 ] as const;
 const originalEnvironment = new Map(MANAGED_ENV.map((name) => [name, process.env[name]]));
 
@@ -66,7 +76,7 @@ async function pair() {
 
 function countedSql(base: SQL, onQuery?: (text: string) => void): { sql: SQL; count: () => number } {
   let calls = 0;
-  const sql = new Proxy(base, {
+  const wrap = (candidate: SQL): SQL => new Proxy(candidate, {
     apply(target, _thisArg, args) {
       calls += 1;
       const strings = args[0];
@@ -75,9 +85,15 @@ function countedSql(base: SQL, onQuery?: (text: string) => void): { sql: SQL; co
     },
     get(target, property, receiver) {
       const value = Reflect.get(target, property, receiver);
+      if (property === "begin" && typeof value === "function") {
+        return (callback: (tx: SQL) => unknown) => Reflect.apply(value, target, [
+          (tx: SQL) => callback(wrap(tx)),
+        ]);
+      }
       return typeof value === "function" ? value.bind(target) : value;
     },
   }) as SQL;
+  const sql = wrap(base);
   return { sql, count: () => calls };
 }
 
@@ -114,6 +130,64 @@ function blockedScheduledDispatchSql(base: SQL) {
     release,
     active: () => active,
     maximumActive: () => maximumActive,
+  };
+}
+
+function pausedScheduledCompletionSql(base: SQL) {
+  let ownsDeliveryRow = false;
+  let ownershipFollowedAccountLock = false;
+  let ownershipTransactionQueries: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const wrap = (
+    candidate: SQL,
+    transactionState?: { accountLockObserved: boolean; queries: string[] },
+  ): SQL => new Proxy(candidate, {
+    apply(target, _thisArg, args) {
+      const strings = args[0];
+      const query = Array.isArray(strings) ? strings.join("?") : String(strings);
+      const normalizedQuery = query.replace(/\s+/g, " ").trim();
+      transactionState?.queries.push(normalizedQuery);
+      if (normalizedQuery.includes("pg_advisory_xact_lock")) {
+        if (transactionState) transactionState.accountLockObserved = true;
+      }
+      const result = Reflect.apply(target, target, args);
+      if (
+        (normalizedQuery.includes("SELECT 1 FROM scheduled_deliveries")
+          || normalizedQuery.includes("SELECT account_id FROM scheduled_deliveries"))
+        && normalizedQuery.includes("state = 'processing'")
+        && normalizedQuery.includes("lease_token =")
+        && normalizedQuery.includes("FOR UPDATE")
+      ) {
+        return (async () => {
+          const rows = await result;
+          if (rows.length > 0) {
+            ownsDeliveryRow = true;
+            ownershipFollowedAccountLock = transactionState?.accountLockObserved === true;
+            ownershipTransactionQueries = transactionState?.queries ?? [];
+            await gate;
+          }
+          return rows;
+        })();
+      }
+      return result;
+    },
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (property === "begin" && typeof value === "function") {
+        return (callback: (tx: SQL) => unknown) => Reflect.apply(value, target, [
+          (tx: SQL) => callback(wrap(tx, { accountLockObserved: false, queries: [] })),
+        ]);
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as SQL;
+  return {
+    sql: wrap(base),
+    release,
+    ownsDeliveryRow: () => ownsDeliveryRow,
+    ownershipFollowedAccountLock: () => ownershipFollowedAccountLock,
+    ownershipTransactionQueries: () => ownershipTransactionQueries,
   };
 }
 
@@ -447,6 +521,66 @@ describe("dark-gated scaling hardening", () => {
       .toBe("delivered");
   });
 
+  test("scheduled completion follows mutation lock order while cancellation races", async () => {
+    const { alice, dialogId } = await pair();
+    const scheduleId = crypto.randomUUID();
+    const created = await createScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      body: {
+        scheduleId,
+        clientMutationId: crypto.randomUUID(),
+        dialogId,
+        deliverAt: new Date(Date.now() + 61_000).toISOString(),
+        items: [{
+          clientMsgId: crypto.randomUUID(),
+          kind: "text",
+          body: "completion-cancel-lock-order",
+        }],
+      },
+    });
+    await db`
+      UPDATE scheduled_deliveries SET deliver_at = now(), available_at = now()
+      WHERE id = ${scheduleId}`;
+
+    const paused = pausedScheduledCompletionSql(db);
+    const worker = drainScheduledDeliveries(paused.sql, 1, { concurrency: 1 });
+    await waitUntil(
+      () => paused.ownsDeliveryRow(),
+      "scheduled completion did not acquire its delivery row",
+    );
+    const observedOwnershipOrder = {
+      followed: paused.ownershipFollowedAccountLock(),
+      queries: paused.ownershipTransactionQueries(),
+    };
+    const cancellation = cancelScheduledDelivery(db, {
+      accountId: alice.accountId,
+      deviceId: alice.deviceId,
+      deliveryId: scheduleId,
+      body: {
+        clientMutationId: crypto.randomUUID(),
+        expectedRevision: created.scheduledDelivery.revision,
+      },
+    });
+    await Bun.sleep(50);
+    paused.release();
+
+    const settled = await Promise.race([
+      Promise.allSettled([worker, cancellation]),
+      Bun.sleep(5_000).then(() => { throw new Error("scheduled cancellation race stalled"); }),
+    ]);
+    expect(observedOwnershipOrder).toEqual(expect.objectContaining({ followed: true }));
+    expect(settled[0]).toEqual(expect.objectContaining({ status: "fulfilled", value: 1 }));
+    expect(settled[1].status).toBe("rejected");
+    if (settled[1].status === "rejected") {
+      expect(["already_delivered", "schedule_processing"])
+        .toContain(settled[1].reason?.code);
+    }
+    expect((await db`
+      SELECT state FROM scheduled_deliveries WHERE id = ${scheduleId}`)[0].state)
+      .toBe("delivered");
+  }, 15_000);
+
   test("scheduled worker shutdown stops new claims and drains active work", async () => {
     const { alice, dialogId } = await pair();
     const scheduleIds: string[] = [];
@@ -495,6 +629,14 @@ describe("dark-gated scaling hardening", () => {
   });
 
   test("worker settings are bounded and unrelated authenticated paths perform no health query", async () => {
+    delete process.env.TOJ_AUTH_SESSIONS_V2_ENABLED;
+    delete process.env.TOJ_TWO_FACTOR_ENABLED;
+    delete process.env.TOJ_PINNED_MESSAGES_ENABLED;
+    delete process.env.TOJ_AUTO_DELETE_ENABLED;
+    delete process.env.TOJ_POLLS_ENABLED;
+    delete process.env.TOJ_STICKER_PACKS_ENABLED;
+    delete process.env.TOJ_GIPHY_ENABLED;
+    delete process.env.TOJ_MULTI_ACCOUNT_PUSH_ENABLED;
     expect(scheduledDeliveryWorkerConcurrency()).toBe(8);
     expect(linkPreviewWorkerConcurrency()).toBe(4);
     expect(productivityWorkerLeaseSeconds()).toBe(120);
@@ -529,9 +671,13 @@ describe("dark-gated scaling hardening", () => {
 
     let heartbeatQueries = 0;
     let productivitySchemaQueries = 0;
+    let v2AuthenticationQueries = 0;
+    let messagingSchemaQueries = 0;
     const counted = countedSql(db, (query) => {
       if (query.includes("FROM worker_heartbeats")) heartbeatQueries += 1;
       if (query.includes("cloud_productivity_required_tables")) productivitySchemaQueries += 1;
+      if (query.includes("FROM session_access_tokens")) v2AuthenticationQueries += 1;
+      if (query.includes("messaging_feature_required_tables")) messagingSchemaQueries += 1;
     });
     clearCloudProductivityReadinessCache(counted.sql);
     clearWorkerHeartbeatCache(counted.sql);
@@ -545,14 +691,39 @@ describe("dark-gated scaling hardening", () => {
       expect(capabilities.every((body: any) =>
         body.capabilities.includes("scheduled_delivery_v1")
         && body.capabilities.includes("link_previews_v1")
+        && !body.capabilities.includes("two_factor_v1")
       )).toBe(true);
       expect(heartbeatQueries).toBe(1);
       expect(productivitySchemaQueries).toBe(1);
+      expect(v2AuthenticationQueries).toBe(0);
+      expect(messagingSchemaQueries).toBe(1);
 
       heartbeatQueries = 0;
       const profile = await fetch(`http://127.0.0.1:${server.port}/v1/profile`, { headers });
       expect(profile.status).toBe(200);
       expect(heartbeatQueries).toBe(0);
+
+      const bob = await account("+16505554805", "Health Peer");
+      const direct = await getOrCreateDirectDialog(
+        db,
+        alice.accountId,
+        bob.accountId,
+        alice.deviceId,
+      );
+      messagingSchemaQueries = 0;
+      clearMessagingFeatureReadinessCache(counted.sql);
+      const sent = await fetch(`http://127.0.0.1:${server.port}/v1/messages/send`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          dialogId: direct.dialogId,
+          clientMsgId: crypto.randomUUID(),
+          kind: "text",
+          body: "Dark features must stay off the hot path",
+        }),
+      });
+      expect(sent.status).toBe(200);
+      expect(messagingSchemaQueries).toBe(0);
 
       await db`UPDATE worker_heartbeats SET last_seen_at = now() - interval '31 seconds'`;
       clearWorkerHeartbeatCache(counted.sql);

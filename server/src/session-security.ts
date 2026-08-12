@@ -9,6 +9,8 @@ export const SESSION_IDLE_TTL_MS = 30 * 24 * 60 * 60_000;
 export const SESSION_ABSOLUTE_TTL_MS = 180 * 24 * 60 * 60_000;
 export const ROTATION_RECEIPT_TTL_MS = 5 * 60_000;
 const SESSION_REVOCATION_CHANNEL = "toj_session_revocations";
+const ACCESS_TOKEN_PREFIX = "toj.v2.access.";
+const REFRESH_TOKEN_PREFIX = "toj.v2.refresh.";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export type AuthV2Session = {
@@ -29,8 +31,12 @@ type DeviceRegistration = {
   now?: Date;
 };
 
-function token(): string {
-  return randomBytes(32).toString("base64url");
+function token(prefix: string): string {
+  return `${prefix}${randomBytes(32).toString("base64url")}`;
+}
+
+export function isV2AccessToken(value: string): boolean {
+  return value.startsWith(ACCESS_TOKEN_PREFIX);
 }
 
 function date(value: unknown): Date {
@@ -52,14 +58,15 @@ function responseFromRow(row: any, accessToken: string, refreshToken: string): A
 /** Issue a v2 device grant. Callers may pass a transaction for atomic login completion. */
 export async function issueV2Session(sql: SQL, registration: DeviceRegistration): Promise<AuthV2Session> {
   const now = registration.now ?? new Date();
-  const accessToken = token();
-  const refreshToken = token();
+  const accessToken = token(ACCESS_TOKEN_PREFIX);
+  const refreshToken = token(REFRESH_TOKEN_PREFIX);
   const accessExpiresAt = new Date(now.getTime() + ACCESS_TOKEN_TTL_MS);
   const absoluteExpiresAt = new Date(now.getTime() + SESSION_ABSOLUTE_TTL_MS);
   let deviceId = registration.existingDeviceId;
   if (deviceId) {
     const updated = await sql`
-      UPDATE devices SET auth_scheme = 'v2', auth_token_hash = ${hashToken(token())}, last_seen_at = ${now}
+      UPDATE devices SET auth_scheme = 'v2',
+        auth_token_hash = ${hashToken(token(ACCESS_TOKEN_PREFIX))}, last_seen_at = ${now}
       WHERE id = ${deviceId} AND account_id = ${registration.accountId} AND revoked_at IS NULL
       RETURNING id`;
     if (!updated.length) throw new AuthError("device is no longer active", 401, undefined, "device_revoked");
@@ -86,7 +93,7 @@ export async function issueV2Session(sql: SQL, registration: DeviceRegistration)
       INSERT INTO devices (account_id, platform, device_name, auth_token_hash, auth_scheme, last_seen_at)
       VALUES (
         ${registration.accountId}, ${registration.platform}, ${registration.deviceName ?? null},
-        ${hashToken(token())}, 'v2', ${now}
+        ${hashToken(token(ACCESS_TOKEN_PREFIX))}, 'v2', ${now}
       ) RETURNING id`;
     deviceId = String(inserted[0].id);
   }
@@ -251,8 +258,8 @@ export async function refreshV2Session(
       );
     }
 
-    const nextAccess = token();
-    const nextRefresh = token();
+    const nextAccess = token(ACCESS_TOKEN_PREFIX);
+    const nextRefresh = token(REFRESH_TOKEN_PREFIX);
     const accessExpiresAt = new Date(now.getTime() + ACCESS_TOKEN_TTL_MS);
     await tx`
       INSERT INTO session_refresh_token_history (token_digest, session_id)

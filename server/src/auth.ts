@@ -9,6 +9,7 @@ import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
 export { AuthError } from "./auth-error";
 import {
+  isV2AccessToken,
   issueV2Session,
   notifySessionRevocation,
   resolveV2Access,
@@ -498,6 +499,8 @@ export async function completeTwoFactorLogin(
       return new AuthError("too many attempts; request a new SMS code", 429, undefined, "challenge_locked");
     }
     const accountId = String(challenge.account_id);
+    const accountBudgetHash = hashToken(`two-factor-account|${accountId}`);
+    await tx`SELECT pg_advisory_xact_lock(${accountBudgetHash.readBigInt64BE(0)})`;
     const networkHash = input.networkKey
       ? hashToken(`two-factor-network|${input.networkKey}`)
       : null;
@@ -790,6 +793,7 @@ export async function disableTwoFactor(
       );
     }
     await tx`UPDATE security_step_up_tickets SET consumed_at = now() WHERE id = ${ticket.id}`;
+    await tx`DELETE FROM two_factor_recovery_codes WHERE account_id = ${input.accountId}`;
     await tx`DELETE FROM account_two_factor WHERE account_id = ${input.accountId}`;
     const revokedDeviceIds = await revokeOtherAccountDevices(tx, input.accountId, input.currentDeviceId);
     const session = await issueV2Session(tx, {
@@ -1058,12 +1062,15 @@ export async function resolveDevice(
   sql: SQL,
   token: string,
 ): Promise<{ accountId: string; deviceId: string; accessExpiresAt?: string }> {
-  const v2 = await resolveV2Access(sql, token);
-  if (v2) return {
-    accountId: v2.accountId,
-    deviceId: v2.deviceId,
-    accessExpiresAt: v2.accessExpiresAt.toISOString(),
-  };
+  if (isV2AccessToken(token)) {
+    const v2 = await resolveV2Access(sql, token);
+    if (!v2) throw new AuthError("invalid device token", 401, undefined, "device_revoked");
+    return {
+      accountId: v2.accountId,
+      deviceId: v2.deviceId,
+      accessExpiresAt: v2.accessExpiresAt.toISOString(),
+    };
+  }
   const rows = await sql`
     SELECT d.id, d.account_id FROM devices d
     JOIN accounts a ON a.id = d.account_id
@@ -1229,7 +1236,7 @@ export async function deleteAccount(
       UPDATE push_deliveries SET status = 'dead', claimed_at = NULL,
         last_error = 'account deleted'
       WHERE account_id = ${accountId} AND status IN ('pending','sending')`;
-    await tx`
+    const revokedDevices = await tx`
       UPDATE devices SET
         device_name = NULL,
         auth_token_hash = digest(id::text || gen_random_uuid()::text, 'sha256'),
@@ -1246,7 +1253,14 @@ export async function deleteAccount(
         voip_push_token_key_id = NULL,
         voip_push_environment = NULL,
         voip_push_updated_at = now()
-      WHERE account_id = ${accountId}`;
+      WHERE account_id = ${accountId}
+      RETURNING id`;
+    for (const device of revokedDevices) {
+      // Account deletion must close authenticated sockets on every server process, not only the
+      // node that handled the request. NOTIFY is transaction-bound and therefore cannot escape a
+      // later rollback.
+      await notifySessionRevocation(tx, accountId, String(device.id), "device_revoked");
+    }
     // Device rows are revoked and locked before call rows, matching call-mutation lock order.
     // The injected call cleanup therefore commits atomically with account deletion without letting
     // an in-flight device mutation recreate state after the termination scan.

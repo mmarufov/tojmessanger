@@ -83,13 +83,20 @@ actor MessagingAccountRuntime {
         guard account.accountId == accountId else { throw MessagingAccountRuntimeError.accountNotReady }
         catalogGeneration = account.generation
         callbackFence &+= 1
-        try await tokenStore.save(account.storedSession)
-        await credentialCoordinator.install(
-            account.storedSession,
-            config: api.config,
-            tokenStore: tokenStore
-        )
         requiresSignIn = account.state == .signInAgain
+        if requiresSignIn {
+            // A locally preserved replica may be rendered while reauthentication is required, but
+            // revoked/expired credentials must never be reinstalled for background work.
+            try await tokenStore.clear()
+            await credentialCoordinator.clear()
+        } else {
+            try await tokenStore.save(account.storedSession)
+            await credentialCoordinator.install(
+                account.storedSession,
+                config: api.config,
+                tokenStore: tokenStore
+            )
+        }
         try await mediaEngine.warmCache(localStore: localStore)
     }
 

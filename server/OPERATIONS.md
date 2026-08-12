@@ -448,11 +448,12 @@ bun run worker:link-preview
 
 The HTTP process also starts both workers for local development and single-process test deployments.
 Set `TOJ_PRODUCTIVITY_WORKERS_DISABLED=1` there when dedicated worker services are active.
-The scheduled-delivery management capability is advertised whenever its schema is complete and the
-account is in rollout. A stale scheduled-worker heartbeat does not hide previously accepted rows,
-sync updates, or cancellation: reads and cancellation remain available. Only create and reschedule
+The scheduled-delivery management capability is advertised only when its schema is complete, the
+account is in rollout, and the scheduled worker heartbeat is fresh. A stale heartbeat removes the
+capability but does not hide previously accepted rows, sync updates, or cancellation from a client
+that already knows the route: reads and cancellation remain available. Only create and reschedule
 fail closed with `503 scheduled_worker_unavailable` and `Retry-After` until a heartbeat is fresher
-than 30 seconds. Link-preview advertisement still requires its worker heartbeat. Folder capability
+than 30 seconds. Link-preview advertisement also requires its worker heartbeat. Folder capability
 does not require a worker.
 
 Deploy in this order: expand/validate/contract migration; compatible HTTP nodes with all feature

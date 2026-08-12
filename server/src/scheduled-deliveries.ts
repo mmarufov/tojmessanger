@@ -1021,13 +1021,22 @@ async function markPermanentFailure(
   code: string,
 ): Promise<void> {
   await sql.begin(async (tx) => {
-    const row = (await tx`
+    const candidate = (await tx`
       SELECT account_id FROM scheduled_deliveries
       WHERE id = ${claim.id} AND state = 'processing' AND lease_token = ${claim.leaseToken}
-      FOR UPDATE`)[0];
-    if (!row) return;
-    const accountId = String(row.account_id);
+    `)[0];
+    if (!candidate) return;
+    const accountId = String(candidate.account_id);
+    // Scheduled mutations acquire the account advisory lock before their delivery row. Follow the
+    // same order here, then revalidate token ownership under the row lock; reversing those locks can
+    // deadlock a cancellation against worker completion.
     await lockAccountMutations(tx, [accountId]);
+    const owned = (await tx`
+      SELECT 1 FROM scheduled_deliveries
+      WHERE id = ${claim.id} AND account_id = ${accountId}
+        AND state = 'processing' AND lease_token = ${claim.leaseToken}
+      FOR UPDATE`)[0];
+    if (!owned) return;
     const collection = (await tx`
       UPDATE account_scheduled_delivery_states
       SET revision = revision + 1, updated_at = now()
@@ -1135,13 +1144,19 @@ async function dispatchClaim(sql: SQL, claim: WorkerClaim): Promise<void> {
       lastMsgId = result.messages.at(-1)!.msg_id;
     }
     await sql.begin(async (tx) => {
-      const row = (await tx`
+      const candidate = (await tx`
         SELECT account_id FROM scheduled_deliveries
         WHERE id = ${claim.id} AND state = 'processing' AND lease_token = ${claim.leaseToken}
-        FOR UPDATE`)[0];
-      if (!row) return;
-      const completedAccountId = String(row.account_id);
+      `)[0];
+      if (!candidate) return;
+      const completedAccountId = String(candidate.account_id);
       await lockAccountMutations(tx, [completedAccountId]);
+      const owned = (await tx`
+        SELECT 1 FROM scheduled_deliveries
+        WHERE id = ${claim.id} AND account_id = ${completedAccountId}
+          AND state = 'processing' AND lease_token = ${claim.leaseToken}
+        FOR UPDATE`)[0];
+      if (!owned) return;
       const collection = (await tx`
         UPDATE account_scheduled_delivery_states
         SET revision = revision + 1, updated_at = now()
@@ -1279,6 +1294,7 @@ export function startScheduledDeliveryWorker(
   const shutdownDrainMilliseconds = Math.max(1_000, options.shutdownDrainMilliseconds ?? 15_000);
   let stopped = false;
   let running: Promise<void> | null = null;
+  let heartbeatRunning = false;
   const tick = async () => {
     if (stopped || running) return;
     const work = (async () => {
@@ -1298,10 +1314,14 @@ export function startScheduledDeliveryWorker(
     });
   };
   const heartbeat = async () => {
+    if (stopped || heartbeatRunning) return;
+    heartbeatRunning = true;
     try {
       await touchWorkerHeartbeat(sql, "scheduled_delivery", workerId);
     } catch {
       // The cached heartbeat snapshot fails closed; the worker keeps retrying independently.
+    } finally {
+      heartbeatRunning = false;
     }
   };
   void heartbeat();

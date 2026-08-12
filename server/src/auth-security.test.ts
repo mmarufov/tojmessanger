@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { Client } from "pg";
 import { makeSql } from "./db";
 import {
   checkVerification,
@@ -6,8 +7,11 @@ import {
   completeSecurityStepUp,
   completeTwoFactorLogin,
   configureTwoFactor,
+  deleteAccount,
+  disableTwoFactor,
   regenerateTwoFactorRecoveryCodes,
   resolveDevice,
+  startAccountDeletion,
   startSecurityChange,
   startVerification,
   twoFactorStatus,
@@ -40,6 +44,8 @@ describe("auth protocol v2 and two-step verification", () => {
   test("refresh rotation is crash-safe and detects a different replay", async () => {
     const legacy = await legacyAccount("+16505557101");
     const upgraded = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+    expect(upgraded.accessToken.startsWith("toj.v2.access.")).toBe(true);
+    expect(upgraded.refreshToken.startsWith("toj.v2.refresh.")).toBe(true);
     expect((await resolveDevice(db, upgraded.accessToken)).deviceId).toBe(legacy.deviceId);
     await expect(resolveDevice(db, legacy.token)).rejects.toMatchObject({ code: "device_revoked" });
 
@@ -307,6 +313,47 @@ describe("auth protocol v2 and two-step verification", () => {
     });
   });
 
+  test("parallel challenges cannot overrun the account-wide attempt budget", async () => {
+    const phone = "+16505557110";
+    const legacy = await legacyAccount(phone);
+    const security = await startSecurityChange(db, legacy.accountId);
+    const stepUp = await completeSecurityStepUp(db, legacy.accountId, security.code!);
+    await configureTwoFactor(db, {
+      accountId: legacy.accountId,
+      currentDeviceId: legacy.deviceId,
+      stepUpToken: stepUp.stepUpToken,
+      password: "account budget concurrency password",
+    });
+
+    async function makeChallenge(deviceName: string) {
+      await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+      const otp = await startVerification(db, phone);
+      const result = await checkVerificationV2(db, phone, otp.code!, "ios", deviceName, "Alice");
+      if (result.state !== "two_factor_required") throw new Error("expected challenge");
+      return result.challengeId;
+    }
+
+    const firstChallenge = await makeChallenge("Budget A");
+    const secondChallenge = await makeChallenge("Budget B");
+    await db`
+      INSERT INTO two_factor_attempt_budgets (account_id)
+      SELECT ${legacy.accountId} FROM generate_series(1, 19)`;
+
+    const attempts = await Promise.allSettled([
+      completeTwoFactorLogin(db, { challengeId: firstChallenge, password: "wrong password" }),
+      completeTwoFactorLogin(db, { challengeId: secondChallenge, password: "wrong password" }),
+    ]);
+    expect(attempts.every((attempt) => attempt.status === "rejected")).toBe(true);
+    const codes = attempts.map((attempt) =>
+      attempt.status === "rejected" ? attempt.reason?.code : undefined,
+    );
+    expect(codes.sort()).toEqual(["challenge_locked", "incorrect_second_factor"]);
+    const budget = await db`
+      SELECT count(*) AS count FROM two_factor_attempt_budgets
+      WHERE account_id = ${legacy.accountId}`;
+    expect(Number(budget[0].count)).toBe(20);
+  });
+
   test("recovery codes can be replaced without changing the password", async () => {
     const legacy = await legacyAccount("+16505557106");
     const security = await startSecurityChange(db, legacy.accountId);
@@ -331,5 +378,68 @@ describe("auth protocol v2 and two-step verification", () => {
     expect(regenerated.recoveryCodes).not.toEqual(enabled.recoveryCodes);
     expect((await resolveDevice(db, regenerated.session.accessToken)).accountId)
       .toBe(legacy.accountId);
+
+    await db`UPDATE otp_challenges SET created_at = created_at - interval '31 seconds'`;
+    const disableSecurity = await startSecurityChange(db, legacy.accountId);
+    const disableStepUp = await completeSecurityStepUp(
+      db,
+      legacy.accountId,
+      disableSecurity.code!,
+    );
+    await disableTwoFactor(db, {
+      accountId: legacy.accountId,
+      currentDeviceId: legacy.deviceId,
+      stepUpToken: disableStepUp.stepUpToken,
+      currentCredential: "password retained during regeneration",
+    });
+    expect(await twoFactorStatus(db, legacy.accountId)).toEqual({
+      enabled: false,
+      recoveryCodesRemaining: 0,
+    });
+    const remainingCodes = await db`
+      SELECT count(*) AS count FROM two_factor_recovery_codes
+      WHERE account_id = ${legacy.accountId}`;
+    expect(Number(remainingCodes[0].count)).toBe(0);
   });
+
+  test("account deletion publishes committed revocations for every device", async () => {
+    const legacy = await legacyAccount("+16505557111");
+    const second = await issueV2Session(db, {
+      accountId: legacy.accountId,
+      platform: "ios",
+      deviceName: "Second iPhone",
+    });
+    const deletion = await startAccountDeletion(db, legacy.accountId);
+    if (!deletion.code) throw new Error("missing deletion code");
+
+    const listener = new Client({ connectionString: TEST_URL });
+    const received = new Set<string>();
+    let resolveAll!: () => void;
+    const allReceived = new Promise<void>((resolve) => { resolveAll = resolve; });
+    listener.on("notification", (notification) => {
+      if (notification.channel !== "toj_session_revocations" || !notification.payload) return;
+      const wakeup = JSON.parse(notification.payload) as {
+        accountId: string;
+        deviceId: string;
+        reason: string;
+      };
+      if (wakeup.accountId !== legacy.accountId || wakeup.reason !== "device_revoked") return;
+      received.add(wakeup.deviceId);
+      if (received.size === 2) resolveAll();
+    });
+
+    try {
+      await listener.connect();
+      await listener.query("LISTEN toj_session_revocations");
+      await deleteAccount(db, legacy.accountId, deletion.code);
+      await Promise.race([
+        allReceived,
+        Bun.sleep(2_000).then(() => { throw new Error("timed out waiting for revocations"); }),
+      ]);
+      expect(received).toEqual(new Set([legacy.deviceId, second.deviceId]));
+    } finally {
+      await listener.query("UNLISTEN toj_session_revocations").catch(() => {});
+      await listener.end().catch(() => {});
+    }
+  }, 10_000);
 });

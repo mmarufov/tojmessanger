@@ -458,6 +458,30 @@ export function isMessagingFeaturePath(pathname: string): boolean {
     || /^\/v1\/dialogs\/[0-9a-f-]+\/(pins|auto-delete|polls\/)/i.test(pathname);
 }
 
+function messagingFeatureNeedsSchema(
+  pathname: string,
+  flags: MessagingFeatureFlags,
+): boolean {
+  if (pathname === "/v1/messages/send") {
+    return flags.polls || flags.stickerPacks || flags.giphy;
+  }
+  if (pathname === "/v1/stickers" || pathname === "/v1/stickers/preferences") {
+    return flags.stickerPacks;
+  }
+  if (pathname === "/v1/giphy/config") return flags.giphy;
+  if (pathname === "/v1/devices/push-v2" || pathname === "/v1/devices/voip-push-v2") {
+    return flags.multiAccountPush;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/pins(?:\/\d+)?$/i.test(pathname)) {
+    return flags.pinnedMessages;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/auto-delete$/i.test(pathname)) {
+    return flags.autoDeleteCreation;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/polls\//i.test(pathname)) return flags.polls;
+  return false;
+}
+
 export function startCloudServer(
   port = Number(process.env.PORT ?? 8788),
   db: Db = defaultSql,
@@ -612,7 +636,8 @@ export function startCloudServer(
             && chatFoldersEnabledForAccount(capabilitySession!.accountId);
           const scheduledDelivery = Boolean(capabilitySession)
             && productivitySchema.ready
-            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId);
+            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId)
+            && await workerHeartbeatFresh(db, "scheduled_delivery");
           const linkPreviews = Boolean(capabilitySession)
             && productivitySchema.ready
             && linkPreviewsEnabledForAccount(capabilitySession!.accountId)
@@ -793,11 +818,18 @@ export function startCloudServer(
           const linkPreviewsAvailable = Boolean(productivitySchema?.ready)
             && linkPreviewsEnabledForAccount(session.accountId)
             && (!productivityNeeds.previewWorker || await workerHeartbeatFresh(db, "link_preview"));
-          const messagingSchema = isMessagingFeaturePath(url.pathname)
+          const requestedMessagingFeatures = isMessagingFeaturePath(url.pathname)
+            ? messagingFeatureFlagsForAccount(session.accountId)
+            : disabledMessagingFeatures;
+          const messagingSchemaNeeded = messagingFeatureNeedsSchema(
+            url.pathname,
+            requestedMessagingFeatures,
+          );
+          const messagingSchema = messagingSchemaNeeded
             ? await messagingFeatureSchemaState(db)
             : null;
-          const messagingFeatures = messagingSchema?.ready
-            ? messagingFeatureFlagsForAccount(session.accountId)
+          const messagingFeatures = messagingSchemaNeeded && messagingSchema?.ready
+            ? requestedMessagingFeatures
             : disabledMessagingFeatures;
 
           if (uploadPartMatch && req.method === "PUT") {

@@ -3,11 +3,78 @@ import LocalAuthentication
 import Observation
 import Security
 
+nonisolated struct PendingSessionRevocation: Codable, Equatable, Sendable {
+    let token: String
+    var eraseLocalReplicaOnLaunch: Bool
+    var localReplicaAccountId: String?
+}
+
+nonisolated enum PendingRevocationLaunchAction: Equatable, Sendable {
+    case restoreSavedSession
+    case requireAuthentication(localReplicaAccountId: String?)
+    case eraseLocalReplica
+}
+
+nonisolated enum PendingRevocationLaunchPolicy {
+    static func action(
+        savedSession: StoredCloudSession?,
+        pendingRevocations: [PendingSessionRevocation],
+        hasPendingLocalErasure: Bool,
+        pendingReauthenticationAccountId: String? = nil
+    ) -> PendingRevocationLaunchAction {
+        if hasPendingLocalErasure { return .eraseLocalReplica }
+
+        if let savedSession {
+            // A credential rotation can persist its replacement immediately before an explicit
+            // logout wins. Match the account as well as the superseded token so that crash window
+            // cannot resurrect a session the user asked Toj to remove.
+            if pendingRevocations.contains(where: {
+                $0.eraseLocalReplicaOnLaunch
+                    && ($0.token == savedSession.session.token
+                        || $0.localReplicaAccountId == savedSession.session.accountId)
+            }) {
+                return .eraseLocalReplica
+            }
+            if let pendingReauthenticationAccountId {
+                return .requireAuthentication(
+                    localReplicaAccountId: pendingReauthenticationAccountId
+                )
+            }
+            if pendingRevocations.contains(where: {
+                !$0.eraseLocalReplicaOnLaunch
+                    && ($0.token == savedSession.session.token
+                        || $0.localReplicaAccountId == savedSession.session.accountId)
+            }) {
+                return .requireAuthentication(
+                    localReplicaAccountId: savedSession.session.accountId
+                )
+            }
+            return .restoreSavedSession
+        }
+
+        if pendingRevocations.contains(where: \.eraseLocalReplicaOnLaunch) {
+            // This is also the conservative behavior for markers written by older builds, which
+            // carried no account metadata and only represented interrupted explicit sign-out.
+            return .eraseLocalReplica
+        }
+        if let pendingReauthenticationAccountId {
+            return .requireAuthentication(
+                localReplicaAccountId: pendingReauthenticationAccountId
+            )
+        }
+        if let pending = pendingRevocations.first(where: { $0.localReplicaAccountId != nil }) {
+            return .requireAuthentication(localReplicaAccountId: pending.localReplicaAccountId)
+        }
+        return .restoreSavedSession
+    }
+}
+
 actor TokenStore {
     private let service: String
     private let sessionAccount = "device-session"
     private let pendingRevocationAccount = "pending-session-revocation"
     private let pendingLocalErasureAccount = "pending-local-erasure"
+    private let pendingReauthenticationAccount = "pending-reauthentication"
     private let pendingRefreshRotationAccount = "pending-refresh-rotation"
     private let profileAccountPrefix = "profile-"
     private let encoder = JSONEncoder()
@@ -69,17 +136,148 @@ actor TokenStore {
         try clearData(account: profileAccountPrefix + accountId)
     }
 
-    func loadPendingRevocationToken() throws -> String? {
-        guard let data = try loadData(account: pendingRevocationAccount) else { return nil }
-        return String(data: data, encoding: .utf8)
+    func loadPendingRevocations() throws -> [PendingSessionRevocation] {
+        guard let data = try loadData(account: pendingRevocationAccount) else { return [] }
+        if let queued = try? decoder.decode([PendingSessionRevocation].self, from: data) {
+            return Self.normalizedPendingRevocations(queued)
+        }
+        if let queued = try? decoder.decode([String].self, from: data) {
+            return Self.normalizedPendingRevocations(queued.map {
+                PendingSessionRevocation(
+                    token: $0,
+                    eraseLocalReplicaOnLaunch: true,
+                    localReplicaAccountId: nil
+                )
+            })
+        }
+        // Pre-queue builds stored one raw UTF-8 token. Read it indefinitely so an update cannot
+        // lose the only credential capable of cleaning up an abandoned server session.
+        guard let legacy = String(data: data, encoding: .utf8), !legacy.isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return [PendingSessionRevocation(
+            token: legacy,
+            eraseLocalReplicaOnLaunch: true,
+            localReplicaAccountId: nil
+        )]
     }
 
-    func savePendingRevocationToken(_ token: String) throws {
-        try saveData(Data(token.utf8), account: pendingRevocationAccount)
+    func loadPendingRevocationTokens() throws -> [String] {
+        try loadPendingRevocations().map(\.token)
+    }
+
+    func loadPendingRevocationToken() throws -> String? {
+        try loadPendingRevocationTokens().first
+    }
+
+    func savePendingRevocationToken(
+        _ token: String,
+        eraseLocalReplicaOnLaunch: Bool = true,
+        localReplicaAccountId: String? = nil
+    ) throws {
+        guard !token.isEmpty else { return }
+        var queued = try loadPendingRevocations()
+        if let index = queued.firstIndex(where: { $0.token == token }) {
+            let wasErasing = queued[index].eraseLocalReplicaOnLaunch
+            queued[index].eraseLocalReplicaOnLaunch = wasErasing || eraseLocalReplicaOnLaunch
+            if queued[index].localReplicaAccountId == nil
+                || (!wasErasing && eraseLocalReplicaOnLaunch) {
+                queued[index].localReplicaAccountId = localReplicaAccountId
+            }
+        } else {
+            queued.append(PendingSessionRevocation(
+                token: token,
+                eraseLocalReplicaOnLaunch: eraseLocalReplicaOnLaunch,
+                localReplicaAccountId: localReplicaAccountId
+            ))
+        }
+        try saveData(encoder.encode(queued), account: pendingRevocationAccount)
     }
 
     func clearPendingRevocationToken() throws {
         try clearData(account: pendingRevocationAccount)
+    }
+
+    /// Clears only the revocation intent owned by this exact credential. A late successful revoke
+    /// must never erase a newer or different account's crash-recovery marker.
+    func clearPendingRevocationToken(ifMatches token: String) throws {
+        var queued = try loadPendingRevocations()
+        guard queued.contains(where: { $0.token == token }) else { return }
+        queued.removeAll(where: { $0.token == token })
+        if queued.isEmpty {
+            try clearPendingRevocationToken()
+        } else {
+            try saveData(encoder.encode(queued), account: pendingRevocationAccount)
+        }
+    }
+
+    /// Keeps an unreachable server credential queued without letting it fence or erase the local
+    /// replica. This exact-token transition is used when a staged different-account login is
+    /// canceled; changing every marker for that account could weaken an unrelated security reissue.
+    func markPendingRevocationRemoteOnly(ifMatches token: String) throws {
+        var queued = try loadPendingRevocations()
+        guard let index = queued.firstIndex(where: { $0.token == token }) else { return }
+        guard !queued[index].eraseLocalReplicaOnLaunch,
+              queued[index].localReplicaAccountId != nil
+        else { return }
+        queued[index].localReplicaAccountId = nil
+        try saveData(encoder.encode(queued), account: pendingRevocationAccount)
+    }
+
+    /// Once the destructive replica cleanup commits, queued tokens remain useful for remote
+    /// revocation but must no longer erase a future login if the network cleanup is still retrying.
+    func markPendingRevocationLocalErasureCompleted(accountId: String?) throws {
+        var queued = try loadPendingRevocations()
+        var changed = false
+        for index in queued.indices {
+            let representedErasedReplica = accountId != nil
+                && queued[index].localReplicaAccountId == accountId
+            guard queued[index].eraseLocalReplicaOnLaunch || representedErasedReplica else {
+                continue
+            }
+            if queued[index].eraseLocalReplicaOnLaunch
+                || queued[index].localReplicaAccountId != nil {
+                queued[index].eraseLocalReplicaOnLaunch = false
+                queued[index].localReplicaAccountId = nil
+                changed = true
+            }
+        }
+        guard changed else { return }
+        try saveData(encoder.encode(queued), account: pendingRevocationAccount)
+    }
+
+    /// A successful login for the preserved replica resolves only its local ambiguity. Abandoned
+    /// tokens still stay queued for best-effort server revocation.
+    func markPendingRevocationsRemoteOnly(localReplicaAccountId accountId: String) throws {
+        var queued = try loadPendingRevocations()
+        var changed = false
+        for index in queued.indices
+        where !queued[index].eraseLocalReplicaOnLaunch
+            && queued[index].localReplicaAccountId == accountId {
+            queued[index].localReplicaAccountId = nil
+            changed = true
+        }
+        guard changed else { return }
+        try saveData(encoder.encode(queued), account: pendingRevocationAccount)
+    }
+
+    private static func normalizedPendingRevocations(
+        _ queued: [PendingSessionRevocation]
+    ) -> [PendingSessionRevocation] {
+        queued.reduce(into: []) { result, pending in
+            guard !pending.token.isEmpty else { return }
+            guard let index = result.firstIndex(where: { $0.token == pending.token }) else {
+                result.append(pending)
+                return
+            }
+            let wasErasing = result[index].eraseLocalReplicaOnLaunch
+            result[index].eraseLocalReplicaOnLaunch = wasErasing
+                || pending.eraseLocalReplicaOnLaunch
+            if result[index].localReplicaAccountId == nil
+                || (!wasErasing && pending.eraseLocalReplicaOnLaunch) {
+                result[index].localReplicaAccountId = pending.localReplicaAccountId
+            }
+        }
     }
 
     /// Crash-safe marker written before explicit logout starts deleting local state. Its payload
@@ -94,6 +292,26 @@ actor TokenStore {
 
     func clearPendingLocalErasure() throws {
         try clearData(account: pendingLocalErasureAccount)
+    }
+
+    /// Persists the account identity of an encrypted replica whose remote session expired. The
+    /// session credential itself can then be removed without letting a relaunch forget that the
+    /// preserved replica must be reauthenticated or explicitly erased before account replacement.
+    func savePendingReauthentication(accountId: String) throws {
+        guard !accountId.isEmpty else { throw CocoaError(.fileWriteInvalidFileName) }
+        try saveData(Data(accountId.utf8), account: pendingReauthenticationAccount)
+    }
+
+    func loadPendingReauthenticationAccountId() throws -> String? {
+        guard let data = try loadData(account: pendingReauthenticationAccount) else { return nil }
+        guard let accountId = String(data: data, encoding: .utf8), !accountId.isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return accountId
+    }
+
+    func clearPendingReauthentication() throws {
+        try clearData(account: pendingReauthenticationAccount)
     }
 
     func loadPendingRefreshRotation() throws -> String? {

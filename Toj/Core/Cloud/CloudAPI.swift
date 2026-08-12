@@ -1012,10 +1012,12 @@ actor SessionCredentialCoordinator {
         self.config = config
         self.tokenStore = tokenStore
         storedSession = session
-        acceptedAccessTokens.insert(session.session.token)
-        if acceptedAccessTokens.count > 3 {
-            acceptedAccessTokens = [session.session.token]
-        }
+        // An explicit install is an authoritative session boundary (login, upgrade, restore, or
+        // security reissue). Only refreshes performed inside this actor retain their preceding
+        // access-token alias for in-flight retries. Otherwise an old account token could be
+        // rebound to another account, or a late device_revoked response from a security reissue
+        // could tear down the replacement session.
+        acceptedAccessTokens = [session.session.token]
     }
 
     func clear() {
