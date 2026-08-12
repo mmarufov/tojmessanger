@@ -97,7 +97,10 @@ BEGIN
     ('message_link_previews', 'original_url_key_id', 'original_url_nonce', 'original_url_ciphertext'),
     ('link_preview_snapshots', 'url_key_id', 'url_nonce', 'url_ciphertext'),
     ('link_preview_snapshots', 'metadata_key_id', 'metadata_nonce', 'metadata_ciphertext'),
-    ('link_preview_assets', 'key_id', 'nonce', 'ciphertext')
+    ('link_preview_assets', 'key_id', 'nonce', 'ciphertext'),
+    ('message_polls', 'payload_key_id', 'payload_nonce', 'payload_ciphertext'),
+    ('push_installations', 'normal_token_key_id', 'normal_token_nonce', 'normal_token_ciphertext'),
+    ('push_installations', 'voip_token_key_id', 'voip_token_nonce', 'voip_token_ciphertext')
   ) AS domains(table_name, key_column, nonce_column, ciphertext_column)
   LOOP
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON public.%I',

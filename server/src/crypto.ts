@@ -129,6 +129,11 @@ export function bodyAAD(dialogId: string, msgId: number | bigint, senderId: stri
   return Buffer.from(`toj/msg|${dialogId}|${msgId}|${senderId}`, "utf8");
 }
 
+/** Poll payloads have a distinct namespace so ciphertext cannot be swapped with message bodies. */
+export function pollAAD(dialogId: string, msgId: number | bigint): Buffer {
+  return Buffer.from(`toj/poll|${dialogId}|${msgId}`, "utf8");
+}
+
 /** Binds an encrypted cloud draft body to one account/dialog server revision. */
 export function draftBodyAAD(accountId: string, dialogId: string, revision: number | bigint): Buffer {
   return Buffer.from(`toj/draft|${accountId}|${dialogId}|${revision}`, "utf8");
@@ -181,6 +186,19 @@ export function voipPushTokenAAD(deviceId: string): Buffer {
   return Buffer.from(`toj/apns-voip-token|${deviceId}`, "utf8");
 }
 
+/** Installation-scoped APNs tokens are shared by up to three independently authenticated devices. */
+export function installationPushTokenAAD(
+  installationId: string,
+  kind: "normal" | "voip",
+): Buffer {
+  return Buffer.from(`toj/apns-installation-${kind}|${installationId}`, "utf8");
+}
+
+/** Binds a crash-safe refresh receipt to one device session and rotation request. */
+export function sessionRotationAAD(sessionId: string, rotationId: string): Buffer {
+  return Buffer.from(`toj/session-rotation|${sessionId}|${rotationId}`, "utf8");
+}
+
 /** Binds an encrypted media chunk to its upload and exact plaintext offset. */
 export function mediaChunkAAD(mediaId: string, offset: number | bigint): Buffer {
   return Buffer.from(`toj/media|${mediaId}|${offset}`, "utf8");
@@ -225,10 +243,12 @@ export function requestFingerprintHMAC(
   domain:
     | "draft-mutation"
     | "message-send"
+    | "message-send-v2"
     | "media-group-send"
     | "chat-folder-mutation"
     | "scheduled-delivery-mutation"
-    | "abuse-report",
+    | "abuse-report"
+    | "messaging-feature",
   canonicalPayload: Uint8Array | string,
 ): Buffer {
   return requestFingerprintIndex(domain, canonicalPayload).digest;
@@ -237,10 +257,12 @@ export function requestFingerprintIndex(
   domain:
     | "draft-mutation"
     | "message-send"
+    | "message-send-v2"
     | "media-group-send"
     | "chat-folder-mutation"
     | "scheduled-delivery-mutation"
-    | "abuse-report",
+    | "abuse-report"
+    | "messaging-feature",
   canonicalPayload: Uint8Array | string,
   keyId?: string,
 ): VersionedBlindIndex {

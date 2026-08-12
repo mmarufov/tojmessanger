@@ -105,7 +105,8 @@ BEGIN
       AND convalidated
       AND pg_get_expr(conbin, conrelid, TRUE) = ANY(ARRAY[
         $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text])$constraint$,
-        $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])$constraint$
+        $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text])$constraint$,
+        $constraint$type = ANY (ARRAY['message.new'::text, 'message.edited'::text, 'message.deleted'::text, 'message.expired'::text, 'message.preview_updated'::text, 'reaction.updated'::text, 'read.updated'::text, 'dialog.created'::text, 'member.added'::text, 'member.removed'::text, 'member.role_changed'::text, 'member.left'::text, 'dialog.profile_updated'::text, 'dialog.closed'::text, 'dialog.access_revoked'::text, 'dialog.preferences_updated'::text, 'profile.updated'::text, 'draft.updated'::text, 'security.changed'::text, 'chat_folders.updated'::text, 'scheduled.created'::text, 'scheduled.updated'::text, 'scheduled.canceled'::text, 'scheduled.failed'::text, 'pin.updated'::text, 'dialog.auto_delete_updated'::text, 'poll.updated'::text, 'sticker_preferences.updated'::text])$constraint$
       ])
   ) THEN
     RETURN;
@@ -118,10 +119,13 @@ BEGIN
   ) THEN
     ALTER TABLE account_events
       ADD CONSTRAINT account_events_type_check_v5 CHECK (type IN
-        ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-         'dialog.created','member.added','member.removed','member.role_changed','member.left',
-         'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-         'dialog.preferences_updated','profile.updated','draft.updated'))
+        ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+         'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+         'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+         'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+         'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+         'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+         'poll.updated','sticker_preferences.updated'))
       NOT VALID;
   END IF;
 END;

@@ -266,8 +266,16 @@ async function appendSnapshotEvent(
       AND id <> ${deviceId}
       AND platform = 'ios'
       AND revoked_at IS NULL
-      AND push_token_hash IS NOT NULL
-      AND push_token_ciphertext IS NOT NULL
+      AND (
+        (push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          JOIN push_installations installation USING (installation_id)
+          WHERE binding.device_id = devices.id AND binding.account_id = devices.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+      )
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
   await notifySyncWakeups(sql, [{ accountId, pts, ptsCount: 1 }]);
   return pts;

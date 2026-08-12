@@ -221,9 +221,12 @@ CREATE TABLE IF NOT EXISTS link_preview_cache_entries (
   fetched_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ,
   last_error_code TEXT,
+  fanout_pending BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE link_preview_cache_entries
+  ADD COLUMN IF NOT EXISTS fanout_pending BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS message_link_previews (
   dialog_id UUID NOT NULL,
@@ -299,22 +302,61 @@ CREATE TABLE IF NOT EXISTS link_preview_action_budgets (
 
 -- Add a replacement event constraint without scanning the live table in this phase.
 DO $$
+DECLARE
+  current_definition TEXT;
 BEGIN
+  SELECT pg_get_constraintdef(oid, TRUE)
+  INTO current_definition
+  FROM pg_constraint
+  WHERE conrelid = 'account_events'::regclass
+    AND conname = 'account_events_type_check'
+    AND contype = 'c'
+    AND convalidated;
+
+  -- A newer deployment can have appended event types after this migration first shipped. Preserve
+  -- that forward-compatible constraint instead of recreating v6 and later replacing it with an
+  -- older set. Remove an abandoned v6 candidate so the contract phase cannot swap it in.
+  IF current_definition IS NOT NULL
+     AND strpos(current_definition, quote_literal('message.expired')) > 0
+     AND strpos(current_definition, quote_literal('message.preview_updated')) > 0
+     AND strpos(current_definition, quote_literal('security.changed')) > 0
+     AND strpos(current_definition, quote_literal('chat_folders.updated')) > 0
+     AND strpos(current_definition, quote_literal('scheduled.created')) > 0
+     AND strpos(current_definition, quote_literal('scheduled.updated')) > 0
+     AND strpos(current_definition, quote_literal('scheduled.canceled')) > 0
+     AND strpos(current_definition, quote_literal('scheduled.failed')) > 0
+     AND strpos(current_definition, quote_literal('pin.updated')) > 0
+     AND strpos(current_definition, quote_literal('dialog.auto_delete_updated')) > 0
+     AND strpos(current_definition, quote_literal('poll.updated')) > 0
+     AND strpos(current_definition, quote_literal('sticker_preferences.updated')) > 0 THEN
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'account_events'::regclass
+        AND conname = 'account_events_type_check_v6'
+    ) THEN
+      ALTER TABLE account_events DROP CONSTRAINT account_events_type_check_v6;
+    END IF;
+    RETURN;
+  END IF;
+
+  -- A failed or out-of-order older deployment may have left the original productivity-only v6
+  -- candidate behind. Never trust its name as proof of its contents.
   IF EXISTS (
     SELECT 1 FROM pg_constraint
     WHERE conrelid = 'account_events'::regclass
       AND conname = 'account_events_type_check_v6'
   ) THEN
-    RETURN;
+    ALTER TABLE account_events DROP CONSTRAINT account_events_type_check_v6;
   END IF;
   ALTER TABLE account_events
     ADD CONSTRAINT account_events_type_check_v6 CHECK (type IN (
-      'message.new','message.edited','message.deleted','message.preview_updated',
+      'message.new','message.edited','message.deleted','message.expired','message.preview_updated',
       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
-      'chat_folders.updated','scheduled.created','scheduled.updated',
-      'scheduled.canceled','scheduled.failed'
+      'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+      'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+      'poll.updated','sticker_preferences.updated'
     )) NOT VALID;
 END;
 $$;

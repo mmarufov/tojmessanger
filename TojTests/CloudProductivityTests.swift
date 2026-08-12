@@ -4,6 +4,15 @@ import XCTest
 @testable import Toj
 
 final class CloudProductivityTests: XCTestCase {
+    func testMediaLimitRemainsDarkGatedAtTwentyFiveMegabytes() {
+        let exactLimit = Int64(25 * 1024 * 1024)
+        XCTAssertEqual(TojMediaLimits.maximumMessageBytes, exactLimit)
+        XCTAssertEqual(TojMediaLimits.maximumMessageBytesInt, Int(exactLimit))
+        XCTAssertEqual(TojMediaLimits.displayMaximum, "25 MB")
+        XCTAssertLessThan(TojMediaLimits.maximumMessageBytes, Int64(25 * 1024 * 1024 + 1))
+        XCTAssertLessThan(TojMediaLimits.maximumMessageBytes, Int64(100 * 1024 * 1024))
+    }
+
     func testLinkCandidateUsesUTF16RangeAndPreservesExactMessageSubstring() throws {
         let text = "👨‍👩‍👧‍👦 see https://example.com/path"
         let candidate = try XCTUnwrap(CloudLinkPreviewCandidate.first(in: text))

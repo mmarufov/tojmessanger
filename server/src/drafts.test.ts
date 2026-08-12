@@ -644,7 +644,7 @@ describe("cloud drafts and media groups", () => {
     try {
       const response = await fetch(`http://127.0.0.1:${server.port}/v1/capabilities`);
       const body = await response.json() as { api_version: number; capabilities: string[] };
-      expect(body.api_version).toBe(5);
+      expect(body.api_version).toBe(6);
       expect(body.capabilities).toContain("cloud_drafts_v1");
       expect(body.capabilities).not.toContain("media_groups_v1");
     } finally {

@@ -12,6 +12,8 @@ struct CloudRootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var model = CloudAppModel.shared
+    @State private var appLock = AppLockController.shared
+    @State private var pendingLockedDeepLink: URL?
 
     var body: some View {
         Group {
@@ -48,6 +50,11 @@ struct CloudRootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             guard !Self.isRunningUnitTests else { return }
+            if phase == .active {
+                appLock.becameActive()
+            } else {
+                appLock.becameInactive()
+            }
             Task {
                 let isActive = phase == .active
                 await model.setForegroundActive(isActive)
@@ -71,6 +78,15 @@ struct CloudRootView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .overlay {
+            // This synchronous, opaque layer is present during the inactive transition itself;
+            // the full-screen lock gate below owns interaction once the scene is active again.
+            if appLock.privacyShieldVisible {
+                TojTheme.canvas
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
             }
         }
         .fullScreenCover(isPresented: Binding(
@@ -99,7 +115,97 @@ struct CloudRootView: View {
         )) {
             TojGroupCallScreen(coordinator: model.groupCallCoordinator)
         }
-        .onOpenURL { model.handleDeepLink($0) }
+        .onOpenURL { url in
+            // Do not let an external navigation mutate or reveal account state behind the lock.
+            // Keep only the newest user intent and deliver it after device-owner authentication.
+            if appLock.presentsGate {
+                pendingLockedDeepLink = url
+            } else {
+                model.handleDeepLink(url)
+            }
+        }
+        .onChange(of: appLock.presentsGate) { _, presentsGate in
+            guard !presentsGate, let url = pendingLockedDeepLink else { return }
+            pendingLockedDeepLink = nil
+            model.handleDeepLink(url)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { appLock.presentsGate },
+            set: { _ in }
+        )) {
+            AppLockGateView(controller: appLock)
+                .interactiveDismissDisabled()
+        }
+        .sheet(isPresented: Binding(
+            get: { !model.recoveredTwoFactorCodes.isEmpty },
+            set: { _ in }
+        )) {
+            RecoveryCodesView(codes: model.recoveredTwoFactorCodes) {
+                model.acknowledgeRecoveryCodes()
+            }
+            .interactiveDismissDisabled()
+        }
+        .alert("Replace saved chats?", isPresented: Binding(
+            get: { model.requiresDifferentAccountCleanupConfirmation },
+            set: { _ in }
+        )) {
+            Button("Keep saved chats", role: .cancel) {
+                Task { await model.cancelDifferentAccountSignIn() }
+            }
+            Button("Erase and continue", role: .destructive) {
+                Task { await model.confirmDifferentAccountSignIn() }
+            }
+        } message: {
+            Text("This phone number belongs to a different Toj account. Continuing permanently removes the encrypted replica and pending outbox for the previous account from this device.")
+        }
+    }
+}
+
+private struct AppLockGateView: View {
+    @Bindable var controller: AppLockController
+
+    var body: some View {
+        ZStack {
+            TojTheme.canvas.ignoresSafeArea()
+            VStack(spacing: 20) {
+                TojMark(size: 76)
+                if controller.isLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundStyle(TojTheme.gold)
+                    Text("Toj is locked")
+                        .font(TojTheme.heading(.title2, weight: .bold))
+                        .foregroundStyle(TojTheme.text)
+                    Text("Authenticate with Face ID, Touch ID, or your device passcode.")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .multilineTextAlignment(.center)
+                    Button {
+                        Task { await controller.unlock() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if controller.authenticationInFlight { ProgressView() }
+                            Text("Unlock Toj")
+                        }
+                        .frame(maxWidth: 280, minHeight: 52)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(TojTheme.gold)
+                    .disabled(controller.authenticationInFlight)
+                    if let error = controller.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 300)
+                    }
+                }
+            }
+            .padding(28)
+        }
+        .task {
+            if controller.isLocked { await controller.unlock() }
+        }
     }
 }
 
@@ -149,7 +255,7 @@ private struct CloudAuthView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var focusedField: Field?
 
-    private enum Field { case phone, name, code }
+    private enum Field { case phone, name, code, password, recovery, newPassword }
 
     private var canStart: Bool {
         model.canRequestCode && !model.displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -164,14 +270,12 @@ private struct CloudAuthView: View {
                     .shadow(color: .black.opacity(0.65), radius: 28, y: 18)
                     .padding(.bottom, 28)
 
-                Text(model.requestedCode ? "Enter your code" : "Welcome to Toj")
+                Text(authTitle)
                     .font(TojTheme.heading(.largeTitle, weight: .bold))
                     .foregroundStyle(TojTheme.text)
                     .multilineTextAlignment(.center)
 
-                Text(model.requestedCode
-                     ? "We sent a six-digit code to your phone."
-                     : "Fast, private messaging made for your people.")
+                Text(authSubtitle)
                     .font(.subheadline)
                     .foregroundStyle(TojTheme.secondaryText)
                     .multilineTextAlignment(.center)
@@ -179,7 +283,37 @@ private struct CloudAuthView: View {
                     .padding(.horizontal, 24)
 
                 VStack(spacing: 12) {
-                    if model.requestedCode {
+                    if model.twoFactorChallengeId != nil {
+                        if model.usesTwoFactorRecovery {
+                            TojInputField(
+                                title: "Recovery code",
+                                placeholder: "XXXX-XXXX-XXXX-XXXX",
+                                text: $model.twoFactorRecoveryCode,
+                                contentType: nil,
+                                keyboard: .asciiCapable
+                            )
+                            .focused($focusedField, equals: .recovery)
+                            TojInputField(
+                                title: "New two-step password",
+                                placeholder: "At least 8 characters",
+                                text: $model.twoFactorReplacementPassword,
+                                contentType: .newPassword,
+                                keyboard: .default,
+                                isSecure: true
+                            )
+                            .focused($focusedField, equals: .newPassword)
+                        } else {
+                            TojInputField(
+                                title: "Two-step password",
+                                placeholder: "Password",
+                                text: $model.twoFactorPassword,
+                                contentType: .password,
+                                keyboard: .default,
+                                isSecure: true
+                            )
+                            .focused($focusedField, equals: .password)
+                        }
+                    } else if model.requestedCode {
                         TojInputField(
                             title: "Verification code",
                             placeholder: "000000",
@@ -225,7 +359,7 @@ private struct CloudAuthView: View {
                         if model.authRequestInFlight || model.authVerifyInFlight {
                             ProgressView().tint(TojTheme.canvas)
                         }
-                        Text(model.requestedCode ? "Sign in" : "Get code")
+                        Text(primaryTitle)
                             .font(.headline)
                     }
                     .frame(maxWidth: .infinity, minHeight: 54)
@@ -264,7 +398,15 @@ private struct CloudAuthView: View {
                 .accessibilityHint("Opens local sample chats without creating an account")
                 #endif
 
-                if model.requestedCode {
+                if model.twoFactorChallengeId != nil {
+                    Button(model.usesTwoFactorRecovery ? "Use password instead" : "Use a recovery code") {
+                        model.usesTwoFactorRecovery.toggle()
+                        focusedField = model.usesTwoFactorRecovery ? .recovery : .password
+                    }
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(TojTheme.text)
+                    .padding(.top, 18)
+                } else if model.requestedCode {
                     HStack(spacing: 18) {
                         Button("Change number") { model.resetAuthCode() }
                         if model.resendSeconds > 0 {
@@ -296,6 +438,9 @@ private struct CloudAuthView: View {
         .onChange(of: model.requestedCode) { _, requested in
             focusedField = requested ? .code : nil
         }
+        .onChange(of: model.twoFactorChallengeId) { _, challenge in
+            focusedField = challenge == nil ? nil : .password
+        }
         .animation(reduceMotion ? .easeOut(duration: 0.15) : TojTheme.stateAnimation, value: model.requestedCode)
     }
 
@@ -304,13 +449,38 @@ private struct CloudAuthView: View {
     }
 
     private var primaryEnabled: Bool {
-        model.requestedCode ? model.canVerifyCode : canStart
+        if model.twoFactorChallengeId != nil { return model.canVerifySecondFactor }
+        return model.requestedCode ? model.canVerifyCode : canStart
+    }
+
+    private var authTitle: LocalizedStringKey {
+        if model.twoFactorChallengeId != nil { return "Two-step verification" }
+        return model.requestedCode ? "Enter your code" : "Welcome to Toj"
+    }
+
+    private var authSubtitle: LocalizedStringKey {
+        if model.twoFactorChallengeId != nil {
+            return model.usesTwoFactorRecovery
+                ? "Enter one saved recovery code and choose a replacement password."
+                : "Enter the account password you set in Privacy and Security."
+        }
+        return model.requestedCode
+            ? "We sent a six-digit code to your phone."
+            : "Fast, private messaging made for your people."
+    }
+
+    private var primaryTitle: LocalizedStringKey {
+        if model.twoFactorChallengeId != nil {
+            return model.usesTwoFactorRecovery ? "Recover and sign in" : "Continue"
+        }
+        return model.requestedCode ? "Sign in" : "Get code"
     }
 
     private var shouldShowStatus: Bool {
         model.status == "Code requested"
             || model.status.hasPrefix("Code request failed")
             || model.status.hasPrefix("Sign in failed")
+            || model.status.hasPrefix("Two-step")
     }
 
     private var statusIsError: Bool {
@@ -321,7 +491,9 @@ private struct CloudAuthView: View {
     private func primaryAction() {
         focusedField = nil
         Task {
-            if model.requestedCode {
+            if model.twoFactorChallengeId != nil {
+                await model.verifySecondFactor()
+            } else if model.requestedCode {
                 await model.verifyCode()
             } else {
                 await model.requestCode()
@@ -336,6 +508,7 @@ private struct TojInputField: View {
     @Binding var text: String
     let contentType: UITextContentType?
     let keyboard: UIKeyboardType
+    var isSecure = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -343,7 +516,13 @@ private struct TojInputField: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(TojTheme.secondaryText)
                 .textCase(.uppercase)
-            TextField(placeholder, text: $text)
+            Group {
+                if isSecure {
+                    SecureField(placeholder, text: $text)
+                } else {
+                    TextField(placeholder, text: $text)
+                }
+            }
                 .font(.body.weight(.medium))
                 .foregroundStyle(TojTheme.text)
                 .textContentType(contentType)
@@ -2008,13 +2187,18 @@ private struct CloudSettingsView: View {
                             divider: true,
                             detail: "Fine-tuned alerts, tones and notification controls are on the way."
                         )
-                        settingsLink(
-                            title: "Privacy and Security",
-                            icon: "lock.fill",
-                            colors: [Color(hex: 0xC4C7CE), Color(hex: 0x858B96)],
-                            divider: true,
-                            detail: "Advanced privacy controls and security options are coming soon."
-                        )
+                        NavigationLink {
+                            PrivacySecuritySettingsView(model: model)
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Privacy and Security",
+                                icon: "lock.fill",
+                                colors: [Color(hex: 0xC4C7CE), Color(hex: 0x858B96)],
+                                value: nil,
+                                showsDivider: true
+                            )
+                        }
+                        .buttonStyle(.tojPressable(scale: 0.985))
                         NavigationLink {
                             DataStorageSettingsView(model: model)
                         } label: {
@@ -2508,6 +2692,415 @@ private struct SettingsComingSoonView: View {
     }
 }
 
+private struct PrivacySecuritySettingsView: View {
+    @Bindable var model: CloudAppModel
+    @State private var appLock = AppLockController.shared
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 10) {
+                    SettingsIconTile(
+                        systemImage: "lock.shield.fill",
+                        colors: [Color(hex: 0xC4C7CE), Color(hex: 0x858B96)],
+                        size: 72
+                    )
+                    Text("Privacy and Security")
+                        .font(TojTheme.heading(.title2, weight: .bold))
+                    Text("Control local access to this device, protect sign-in with a password, and review active sessions.")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 340)
+                }
+                .padding(.vertical, 18)
+
+                TojSectionCard("App Lock") {
+                    Toggle(isOn: Binding(
+                        get: { appLock.isEnabled },
+                        set: { enabled in
+                            Task { _ = await appLock.setEnabled(enabled) }
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Require device authentication")
+                                .font(.body.weight(.medium))
+                            Text("Use Face ID, Touch ID, or your device passcode.")
+                                .font(.caption)
+                                .foregroundStyle(TojTheme.secondaryText)
+                        }
+                    }
+                    .tint(TojTheme.secure)
+                    .padding(.horizontal, 15)
+                    .frame(minHeight: 68)
+                    .disabled(appLock.authenticationInFlight)
+
+                    if appLock.isEnabled {
+                        Divider()
+                            .overlay(TojTheme.hairlineStrong)
+                            .padding(.leading, 15)
+                        HStack {
+                            Text("Auto-lock")
+                                .font(.body.weight(.medium))
+                            Spacer()
+                            Menu(appLock.timeout.title) {
+                                ForEach(AppLockTimeout.allCases) { timeout in
+                                    Button {
+                                        Task { _ = await appLock.setTimeout(timeout) }
+                                    } label: {
+                                        if appLock.timeout == timeout {
+                                            Label(timeout.title, systemImage: "checkmark")
+                                        } else {
+                                            Text(timeout.title)
+                                        }
+                                    }
+                                }
+                            }
+                            .disabled(appLock.authenticationInFlight)
+                        }
+                        .padding(.horizontal, 15)
+                        .frame(minHeight: 58)
+                    }
+                }
+
+                Text("App Lock protects against casual access on this device. It does not add message encryption or stop background sync, notifications, and calls.")
+                    .font(.caption)
+                    .foregroundStyle(TojTheme.secondaryText)
+                    .padding(.horizontal, 8)
+
+                TojSectionCard("Account protection") {
+                    NavigationLink {
+                        TwoFactorSettingsView(model: model)
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Two-Step Verification",
+                            icon: "key.fill",
+                            colors: model.twoFactorEnabled
+                                ? [Color(hex: 0x55DE81), Color(hex: 0x22B95A)]
+                                : [Color(hex: 0x727986), Color(hex: 0x414752)],
+                            value: model.twoFactorEnabled ? "On" : "Off",
+                            showsDivider: true
+                        )
+                    }
+                    .buttonStyle(.tojPressable(scale: 0.985))
+
+                    NavigationLink {
+                        SettingsDevicesView(model: model)
+                    } label: {
+                        SettingsRowLabel(
+                            title: "Active Sessions",
+                            icon: "iphone.gen3",
+                            colors: [Color(hex: 0xFFC85A), Color(hex: 0xF59B22)],
+                            value: model.devices.isEmpty ? nil : "\(model.devices.count)",
+                            showsDivider: false
+                        )
+                    }
+                    .buttonStyle(.tojPressable(scale: 0.985))
+                }
+
+                if let error = appLock.errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(TojTheme.canvas)
+        .navigationTitle("Privacy and Security")
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            await model.loadTwoFactorStatus()
+            await model.loadDevices()
+        }
+    }
+}
+
+private struct TwoFactorSettingsView: View {
+    @Bindable var model: CloudAppModel
+    @State private var stage: Stage = .overview
+    @State private var password = ""
+    @State private var confirmation = ""
+    @State private var currentCredential = ""
+
+    private enum Stage {
+        case overview
+        case code
+        case configure
+        case regenerate
+        case disable
+    }
+
+    private var validPassword: Bool {
+        password.count >= 8 && password.count <= 128 && password == confirmation
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 10) {
+                    SettingsIconTile(
+                        systemImage: model.twoFactorEnabled ? "checkmark.shield.fill" : "key.fill",
+                        colors: model.twoFactorEnabled
+                            ? [Color(hex: 0x55DE81), Color(hex: 0x22B95A)]
+                            : [Color(hex: 0x727986), Color(hex: 0x414752)],
+                        size: 72
+                    )
+                    Text(model.twoFactorEnabled ? "Two-Step Verification is on" : "Add a sign-in password")
+                        .font(TojTheme.heading(.title2, weight: .bold))
+                        .multilineTextAlignment(.center)
+                    Text("Your SMS code is always checked first. The password protects creation of every new device session.")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 340)
+                }
+                .padding(.vertical, 18)
+
+                switch stage {
+                case .overview:
+                    overview
+                case .code:
+                    securityCodeEntry
+                case .configure:
+                    passwordConfiguration
+                case .regenerate:
+                    recoveryCodeRegeneration
+                case .disable:
+                    disableConfirmation
+                }
+            }
+            .padding(16)
+            .padding(.bottom, 24)
+        }
+        .background(TojTheme.canvas)
+        .navigationTitle("Two-Step Verification")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await model.loadTwoFactorStatus() }
+    }
+
+    private var overview: some View {
+        VStack(spacing: 18) {
+            if model.twoFactorEnabled {
+                TojSectionCard("Recovery") {
+                    HStack {
+                        Label("Unused recovery codes", systemImage: "number.square.fill")
+                        Spacer()
+                        Text("\(model.twoFactorRecoveryCodesRemaining)")
+                            .foregroundStyle(TojTheme.secondaryText)
+                    }
+                    .padding(.horizontal, 15)
+                    .frame(minHeight: 58)
+                }
+            }
+
+            Button(model.twoFactorEnabled ? "Change password and replace codes" : "Set up two-step verification") {
+                beginStepUp(next: .configure)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.gold)
+            .frame(maxWidth: .infinity)
+
+            if model.twoFactorEnabled {
+                Button("Replace recovery codes") {
+                    beginStepUp(next: .regenerate)
+                }
+                .buttonStyle(.bordered)
+
+                Button("Turn off two-step verification", role: .destructive) {
+                    beginStepUp(next: .disable)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var securityCodeEntry: some View {
+        VStack(spacing: 16) {
+            Text("Enter the fresh six-digit code sent to your phone.")
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            TextField("6-digit code", text: $model.securityCode)
+                .keyboardType(.numberPad)
+                .textContentType(.oneTimeCode)
+                .multilineTextAlignment(.center)
+                .font(.title2.monospacedDigit().weight(.semibold))
+                .padding(.horizontal, 17)
+                .frame(height: 56)
+                .background(TojTheme.raised, in: Capsule())
+            Button("Verify code") {
+                Task {
+                    if await model.verifySecurityChangeCode() {
+                        stage = pendingStage
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.gold)
+            .disabled(model.securityCode.filter(\.isNumber).count != 6 || model.securityChangeInFlight)
+            Button("Send a new code") {
+                Task { _ = await model.requestSecurityChangeCode() }
+            }
+            .disabled(model.securityChangeInFlight)
+        }
+    }
+
+    private var passwordConfiguration: some View {
+        VStack(spacing: 14) {
+            if model.twoFactorEnabled {
+                SecureField("Current password or recovery code", text: $currentCredential)
+                    .textContentType(.password)
+                    .tojSecurityField()
+            }
+            SecureField("New password", text: $password)
+                .textContentType(.newPassword)
+                .tojSecurityField()
+            SecureField("Confirm new password", text: $confirmation)
+                .textContentType(.newPassword)
+                .tojSecurityField()
+            Text("Use 8–128 characters. Spaces are kept exactly as entered. Ten new one-time recovery codes will be shown once.")
+                .font(.caption)
+                .foregroundStyle(TojTheme.secondaryText)
+            Button(model.twoFactorEnabled ? "Update protection" : "Enable two-step verification") {
+                Task {
+                    let saved = await model.saveTwoFactor(
+                        password: password,
+                        currentCredential: model.twoFactorEnabled ? currentCredential : nil
+                    )
+                    if saved { stage = .overview }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.gold)
+            .disabled(!validPassword || (model.twoFactorEnabled && currentCredential.isEmpty) || model.securityChangeInFlight)
+        }
+    }
+
+    private var disableConfirmation: some View {
+        VStack(spacing: 14) {
+            Text("Enter your current password or an unused recovery code. Other sessions will be signed out.")
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            SecureField("Password or recovery code", text: $currentCredential)
+                .textContentType(.password)
+                .tojSecurityField()
+            Button("Turn off two-step verification", role: .destructive) {
+                Task {
+                    if await model.disableTwoFactor(currentCredential: currentCredential) {
+                        stage = .overview
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.danger)
+            .disabled(currentCredential.isEmpty || model.securityChangeInFlight)
+        }
+    }
+
+    private var recoveryCodeRegeneration: some View {
+        VStack(spacing: 14) {
+            Text("Enter your current password or an unused recovery code. Every old recovery code will stop working and other sessions will be signed out.")
+                .font(.subheadline)
+                .foregroundStyle(TojTheme.secondaryText)
+                .multilineTextAlignment(.center)
+            SecureField("Password or recovery code", text: $currentCredential)
+                .textContentType(.password)
+                .tojSecurityField()
+            Button("Replace recovery codes") {
+                Task {
+                    if await model.regenerateTwoFactorRecoveryCodes(
+                        currentCredential: currentCredential
+                    ) {
+                        stage = .overview
+                    }
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(TojTheme.gold)
+            .disabled(currentCredential.isEmpty || model.securityChangeInFlight)
+        }
+    }
+
+    @State private var pendingStage: Stage = .configure
+
+    private func beginStepUp(next: Stage) {
+        pendingStage = next
+        Task {
+            if await model.requestSecurityChangeCode() {
+                stage = .code
+            }
+        }
+    }
+}
+
+private extension View {
+    func tojSecurityField() -> some View {
+        padding(.horizontal, 17)
+            .frame(height: 56)
+            .background(TojTheme.raised, in: Capsule())
+    }
+}
+
+private struct RecoveryCodesView: View {
+    let codes: [String]
+    let onDone: () -> Void
+    @State private var acknowledged = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 18) {
+                    Image(systemName: "key.viewfinder")
+                        .font(.system(size: 38, weight: .semibold))
+                        .foregroundStyle(TojTheme.gold)
+                        .frame(width: 82, height: 82)
+                        .background(TojTheme.raised, in: Circle())
+                    Text("Save your recovery codes")
+                        .font(TojTheme.heading(.title2, weight: .bold))
+                    Text("Each code works once after SMS verification. Keep them offline; Toj cannot show this batch again.")
+                        .font(.subheadline)
+                        .foregroundStyle(TojTheme.secondaryText)
+                        .multilineTextAlignment(.center)
+
+                    VStack(spacing: 0) {
+                        ForEach(Array(codes.enumerated()), id: \.offset) { index, code in
+                            Text(code)
+                                .font(.body.monospaced().weight(.semibold))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, minHeight: 42)
+                            if index < codes.count - 1 { Divider().overlay(TojTheme.hairline) }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .background(TojTheme.raised, in: RoundedRectangle(cornerRadius: 20))
+
+                    ShareLink(item: codes.joined(separator: "\n")) {
+                        Label("Save or share codes", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Toggle("I saved these recovery codes", isOn: $acknowledged)
+                        .tint(TojTheme.secure)
+                        .font(.subheadline.weight(.medium))
+
+                    Button("Done", action: onDone)
+                        .buttonStyle(.borderedProminent)
+                        .tint(TojTheme.gold)
+                        .disabled(!acknowledged)
+                }
+                .padding(22)
+            }
+            .background(TojTheme.canvas)
+            .navigationTitle("Recovery Codes")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
 private struct SettingsDevicesView: View {
     @Bindable var model: CloudAppModel
 
@@ -2574,6 +3167,11 @@ private struct DeviceRow: View {
                 Text(device.current ? "This device" : TojDateFormatting.lastSeen(device.lastSeenAt ?? device.createdAt))
                     .font(.caption)
                     .foregroundStyle(device.current ? TojTheme.secure : TojTheme.secondaryText)
+                if let expiresAt = device.sessionExpiresAt {
+                    Text("Session expires \(TojDateFormatting.lastSeen(expiresAt))")
+                        .font(.caption2)
+                        .foregroundStyle(TojTheme.tertiaryText)
+                }
             }
             Spacer()
             if !device.current {

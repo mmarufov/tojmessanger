@@ -17,6 +17,7 @@ WHERE namespace.nspname = 'public'
     'link_preview_cache_ready_idx',
     'message_link_previews_snapshot_idx',
     'link_preview_waiters_message_idx',
+    'link_preview_cache_fanout_pending_idx',
     'chat_folders_title_key_migration_idx',
     'scheduled_items_payload_key_migration_idx',
     'link_preview_cache_key_migration_idx',
@@ -49,6 +50,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS message_link_previews_snapshot_idx
   ON message_link_previews(snapshot_id) WHERE snapshot_id IS NOT NULL;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS link_preview_waiters_message_idx
   ON link_preview_waiters(dialog_id, msg_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS link_preview_cache_fanout_pending_idx
+  ON link_preview_cache_entries(updated_at, url_lookup_hmac)
+  WHERE fanout_pending;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS chat_folders_title_key_migration_idx
   ON chat_folders(title_key_id, account_id, folder_id);
 CREATE INDEX CONCURRENTLY IF NOT EXISTS scheduled_items_payload_key_migration_idx

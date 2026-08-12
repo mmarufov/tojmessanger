@@ -35,8 +35,8 @@ export const DEFAULT_MEDIA_CHUNK_BYTES = 1024 * 1024;
 export const MEDIA_PART_SIZE = 256 * 1024;
 export const LARGE_MEDIA_PART_SIZE = 512 * 1024;
 export const LARGE_MEDIA_THRESHOLD = 10 * 1024 * 1024;
-const DEFAULT_MAX_OBJECT_BYTES = 100 * 1024 * 1024;
-const DEFAULT_ACCOUNT_QUOTA_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_OBJECT_BYTES = 25 * 1024 * 1024;
+const DEFAULT_ACCOUNT_QUOTA_BYTES = 250 * 1024 * 1024;
 const MAX_THUMBNAIL_BYTES = 256 * 1024;
 const DEFAULT_MAX_ACTIVE_UPLOADS = 10;
 const DEFAULT_MAX_DAILY_UPLOADS = 100;
@@ -61,15 +61,25 @@ async function requireActiveMediaAccount(sql: SQL, accountId: string): Promise<v
 }
 
 function boundedEnv(name: string, fallback: number, lower: number, upper: number): number {
-  const parsed = Number(process.env[name] ?? fallback);
-  return Number.isSafeInteger(parsed) && parsed >= lower && parsed <= upper ? parsed : fallback;
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < lower || parsed > upper) {
+    throw new Error(`${name} must be an integer from ${lower} through ${upper}`);
+  }
+  return parsed;
 }
 
 export function mediaLimits() {
   return {
     chunkBytes: boundedEnv("TOJ_MEDIA_CHUNK_BYTES", DEFAULT_MEDIA_CHUNK_BYTES, 64 * 1024, 1024 * 1024),
-    maxObjectBytes: boundedEnv("TOJ_MEDIA_MAX_OBJECT_BYTES", DEFAULT_MAX_OBJECT_BYTES, 1024, 2 * 1024 * 1024 * 1024),
-    accountQuotaBytes: boundedEnv("TOJ_MEDIA_ACCOUNT_QUOTA_BYTES", DEFAULT_ACCOUNT_QUOTA_BYTES, 1024, 10 * 1024 * 1024 * 1024),
+    maxObjectBytes: boundedEnv("TOJ_MEDIA_MAX_OBJECT_BYTES", DEFAULT_MAX_OBJECT_BYTES, 1024, DEFAULT_MAX_OBJECT_BYTES),
+    accountQuotaBytes: boundedEnv(
+      "TOJ_MEDIA_ACCOUNT_QUOTA_BYTES",
+      DEFAULT_ACCOUNT_QUOTA_BYTES,
+      1024,
+      DEFAULT_ACCOUNT_QUOTA_BYTES,
+    ),
     maxActiveUploads: boundedEnv("TOJ_MEDIA_MAX_ACTIVE_UPLOADS", DEFAULT_MAX_ACTIVE_UPLOADS, 1, 100),
     maxDailyUploads: boundedEnv("TOJ_MEDIA_MAX_DAILY_UPLOADS", DEFAULT_MAX_DAILY_UPLOADS, 1, 10_000),
     thumbnailBytes: MAX_THUMBNAIL_BYTES,
@@ -531,6 +541,7 @@ async function requireMediaAccess(sql: SQL, accountId: string, mediaId: string) 
         JOIN dialog_members dm ON dm.dialog_id = m.dialog_id
         JOIN dialogs d ON d.id = m.dialog_id
         WHERE m.media_id = mo.id AND m.state = 'visible'
+          AND (m.expires_at IS NULL OR m.expires_at > now())
           AND dm.account_id = ${accountId} AND dm.left_at IS NULL
           AND (
             d.type <> 'saved'
@@ -617,7 +628,9 @@ export async function cancelMediaUpload(sql: SQL, accountId: string, deviceId: s
       SELECT owner_account_id, status FROM media_objects WHERE id = ${mediaId} FOR UPDATE`)[0];
     if (!row || row.owner_account_id !== accountId) throw new MediaError("upload not found", 404);
     const referenced = await tx`
-      SELECT 1 FROM messages WHERE media_id = ${mediaId} AND state = 'visible'
+      SELECT 1 FROM messages
+      WHERE media_id = ${mediaId} AND state = 'visible'
+        AND (expires_at IS NULL OR expires_at > now())
       UNION ALL
       SELECT 1 FROM dialogs WHERE photo_media_id = ${mediaId}
       UNION ALL

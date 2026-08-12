@@ -7,7 +7,12 @@ import {
 } from "node:http2";
 import { createPrivateKey, sign } from "node:crypto";
 import {
-  pushTokenAAD, tokenHashCandidates, tokenHashIndex, voipPushTokenAAD,
+  hashToken,
+  installationPushTokenAAD,
+  pushTokenAAD,
+  tokenHashCandidates,
+  tokenHashIndex,
+  voipPushTokenAAD,
 } from "./crypto";
 import { CryptoUnavailableError, openForScope, sealForScope } from "./envelope-crypto";
 import {
@@ -17,12 +22,16 @@ import {
 
 export type PushEnvironment = "sandbox" | "production";
 
+/** Installation push credentials are shared across every account bound to the installation. */
+const INSTALLATION_PUSH_SCOPE = { kind: "service", serviceName: "push-installation" } as const;
+
 export class PushError extends Error {}
 
 const TOKEN_MIN_BYTES = 16;
 const TOKEN_MAX_BYTES = 512;
 const MAX_ATTEMPTS = 8;
 const CLAIM_TIMEOUT_SECONDS = 5 * 60;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function normalizeDeviceToken(value: string): string {
   const token = value.trim().toLowerCase();
@@ -286,6 +295,347 @@ export async function unregisterVoIPPushToken(sql: SQL, deviceId: string): Promi
   return { registered: false };
 }
 
+type InstallationPushRegistration = {
+  accountId: string;
+  deviceId: string;
+  installationId: string;
+  token: string;
+  environment: string;
+  kind: "normal" | "voip";
+};
+
+function rethrowInstallationRegistrationError(error: unknown): never {
+  if (
+    error && typeof error === "object"
+    && [String((error as any).code ?? ""), String((error as any).errno ?? "")]
+      .includes("23514")
+    && String((error as any).message ?? "").includes("at most three active accounts")
+  ) {
+    throw new PushError("installation may bind at most three active accounts");
+  }
+  throw error;
+}
+
+async function registerInstallationPushTokenInTransaction(
+  tx: SQL,
+  input: InstallationPushRegistration,
+): Promise<{ registered: true; routingHandle: string }> {
+  if (!UUID_PATTERN.test(input.installationId)) {
+    throw new PushError("invalid installation id");
+  }
+  const token = normalizeDeviceToken(input.token);
+  const environment = validateEnvironment(input.environment);
+  const tokenHash = hashToken(`apns-installation-${input.kind}|${environment}|${token}`);
+  // One installation credential is shared by every account bound to it, so it is sealed under a
+  // service scope rather than the registering account's key. Account scoping would leave the
+  // other bindings unable to decrypt the same ciphertext.
+  const sealed = await sealForScope(
+    tx,
+    INSTALLATION_PUSH_SCOPE,
+    token,
+    installationPushTokenAAD(input.installationId, input.kind),
+  );
+  const registrationLock = tokenHash.readBigInt64BE(0);
+  // Registration is rare and ownership changes touch two unique token indexes plus bindings.
+  // A single catalog lock prevents opposing token swaps from deadlocking and makes transfers
+  // deterministic across application versions.
+  await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
+  await tx`SELECT pg_advisory_xact_lock(${registrationLock})`;
+  const device = (await tx`
+    SELECT id FROM devices
+    WHERE id = ${input.deviceId} AND account_id = ${input.accountId}
+      AND platform = 'ios' AND revoked_at IS NULL
+    FOR UPDATE`)[0];
+  if (!device) throw new PushError("active iOS device required");
+
+  if (input.kind === "normal") {
+    await tx`
+      DELETE FROM push_account_bindings binding
+      USING push_installations installation
+      WHERE binding.installation_id = installation.installation_id
+        AND installation.installation_id <> ${input.installationId}
+        AND installation.normal_environment = ${environment}
+        AND installation.normal_token_hash = ${tokenHash}
+        AND NOT binding.voip_enabled`;
+    await tx`
+      UPDATE push_account_bindings binding SET normal_enabled = FALSE, updated_at = now()
+      FROM push_installations installation
+      WHERE binding.installation_id = installation.installation_id
+        AND installation.installation_id <> ${input.installationId}
+        AND installation.normal_environment = ${environment}
+        AND installation.normal_token_hash = ${tokenHash}
+        AND binding.voip_enabled`;
+    await tx`
+      UPDATE push_installations SET
+        normal_token_hash = NULL, normal_token_ciphertext = NULL, normal_token_nonce = NULL,
+        normal_token_key_id = NULL, normal_environment = NULL, updated_at = now()
+      WHERE installation_id <> ${input.installationId}
+        AND normal_environment = ${environment} AND normal_token_hash = ${tokenHash}`;
+    await tx`
+      INSERT INTO push_installations (
+        installation_id, normal_token_hash, normal_token_ciphertext, normal_token_nonce,
+        normal_token_key_id, normal_environment
+      ) VALUES (
+        ${input.installationId}, ${tokenHash}, ${sealed.ciphertext}, ${sealed.nonce},
+        ${sealed.keyId}, ${environment}
+      )
+      ON CONFLICT (installation_id) DO UPDATE SET
+        normal_token_hash = excluded.normal_token_hash,
+        normal_token_ciphertext = excluded.normal_token_ciphertext,
+        normal_token_nonce = excluded.normal_token_nonce,
+        normal_token_key_id = excluded.normal_token_key_id,
+        normal_environment = excluded.normal_environment,
+        updated_at = now()`;
+  } else {
+    await tx`
+      DELETE FROM push_account_bindings binding
+      USING push_installations installation
+      WHERE binding.installation_id = installation.installation_id
+        AND installation.installation_id <> ${input.installationId}
+        AND installation.voip_environment = ${environment}
+        AND installation.voip_token_hash = ${tokenHash}
+        AND NOT binding.normal_enabled`;
+    await tx`
+      UPDATE push_account_bindings binding SET voip_enabled = FALSE, updated_at = now()
+      FROM push_installations installation
+      WHERE binding.installation_id = installation.installation_id
+        AND installation.installation_id <> ${input.installationId}
+        AND installation.voip_environment = ${environment}
+        AND installation.voip_token_hash = ${tokenHash}
+        AND binding.normal_enabled`;
+    await tx`
+      UPDATE push_installations SET
+        voip_token_hash = NULL, voip_token_ciphertext = NULL, voip_token_nonce = NULL,
+        voip_token_key_id = NULL, voip_environment = NULL, updated_at = now()
+      WHERE installation_id <> ${input.installationId}
+        AND voip_environment = ${environment} AND voip_token_hash = ${tokenHash}`;
+    await tx`
+      INSERT INTO push_installations (
+        installation_id, voip_token_hash, voip_token_ciphertext, voip_token_nonce,
+        voip_token_key_id, voip_environment
+      ) VALUES (
+        ${input.installationId}, ${tokenHash}, ${sealed.ciphertext}, ${sealed.nonce},
+        ${sealed.keyId}, ${environment}
+      )
+      ON CONFLICT (installation_id) DO UPDATE SET
+        voip_token_hash = excluded.voip_token_hash,
+        voip_token_ciphertext = excluded.voip_token_ciphertext,
+        voip_token_nonce = excluded.voip_token_nonce,
+        voip_token_key_id = excluded.voip_token_key_id,
+        voip_environment = excluded.voip_environment,
+        updated_at = now()`;
+  }
+  await tx`
+    DELETE FROM push_account_bindings
+    WHERE device_id = ${input.deviceId}
+      AND (installation_id <> ${input.installationId} OR account_id <> ${input.accountId})`;
+  const binding = (await tx`
+    INSERT INTO push_account_bindings (
+      installation_id, account_id, device_id, active, normal_enabled, voip_enabled
+    ) VALUES (
+      ${input.installationId}, ${input.accountId}, ${input.deviceId}, TRUE,
+      ${input.kind === "normal"}, ${input.kind === "voip"}
+    )
+    ON CONFLICT (installation_id, account_id) DO UPDATE SET
+      device_id = excluded.device_id,
+      active = TRUE,
+      normal_enabled = push_account_bindings.normal_enabled OR excluded.normal_enabled,
+      voip_enabled = push_account_bindings.voip_enabled OR excluded.voip_enabled,
+      updated_at = now()
+    RETURNING routing_handle`)[0];
+  if (input.kind === "normal") {
+    await tx`
+      UPDATE devices SET
+        push_token_hash = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+        push_token_key_id = NULL, push_environment = NULL, push_updated_at = now()
+      WHERE id = ${input.deviceId}`;
+  } else {
+    await tx`
+      UPDATE devices SET
+        voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+        voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
+        voip_push_environment = NULL, voip_push_updated_at = now()
+      WHERE id = ${input.deviceId}`;
+  }
+  return { registered: true, routingHandle: String(binding.routing_handle) };
+}
+
+export async function registerInstallationPushToken(
+  sql: SQL,
+  input: InstallationPushRegistration,
+): Promise<{ registered: true; routingHandle: string }> {
+  try {
+    return await sql.begin(async (tx) =>
+      await registerInstallationPushTokenInTransaction(tx, input)
+    );
+  } catch (error) {
+    rethrowInstallationRegistrationError(error);
+  }
+}
+
+export async function unregisterInstallationPushBinding(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  installationId: string,
+): Promise<{ registered: false }> {
+  if (!UUID_PATTERN.test(installationId)) throw new PushError("invalid installation id");
+  await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
+    await tx`
+      DELETE FROM push_account_bindings
+      WHERE installation_id = ${installationId} AND account_id = ${accountId}
+        AND device_id = ${deviceId}`;
+    await tx`
+      DELETE FROM push_installations installation
+      WHERE installation.installation_id = ${installationId}
+        AND NOT EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          WHERE binding.installation_id = installation.installation_id
+        )`;
+  });
+  return { registered: false };
+}
+
+export async function unregisterInstallationTokenKind(
+  sql: SQL,
+  accountId: string,
+  deviceId: string,
+  installationId: string,
+  kind: "normal" | "voip",
+): Promise<{ registered: false }> {
+  if (!UUID_PATTERN.test(installationId)) throw new PushError("invalid installation id");
+  await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
+    const binding = (await tx`
+      SELECT normal_enabled, voip_enabled FROM push_account_bindings
+      WHERE installation_id = ${installationId} AND account_id = ${accountId}
+        AND device_id = ${deviceId} AND active
+      FOR UPDATE`)[0];
+    if (!binding) return;
+    if (kind === "normal") {
+      await tx`
+        UPDATE push_account_bindings SET
+          normal_enabled = FALSE,
+          active = voip_enabled,
+          updated_at = now()
+        WHERE installation_id = ${installationId} AND account_id = ${accountId}
+          AND device_id = ${deviceId}`;
+      await tx`
+        UPDATE push_installations installation SET
+          normal_token_hash = NULL, normal_token_ciphertext = NULL, normal_token_nonce = NULL,
+          normal_token_key_id = NULL, normal_environment = NULL, updated_at = now()
+        WHERE installation.installation_id = ${installationId}
+          AND NOT EXISTS (
+            SELECT 1 FROM push_account_bindings other
+            WHERE other.installation_id = installation.installation_id
+              AND other.active AND other.normal_enabled
+          )`;
+    } else {
+      await tx`
+        UPDATE push_account_bindings SET
+          voip_enabled = FALSE,
+          active = normal_enabled,
+          updated_at = now()
+        WHERE installation_id = ${installationId} AND account_id = ${accountId}
+          AND device_id = ${deviceId}`;
+      await tx`
+        UPDATE push_installations installation SET
+          voip_token_hash = NULL, voip_token_ciphertext = NULL, voip_token_nonce = NULL,
+          voip_token_key_id = NULL, voip_environment = NULL, updated_at = now()
+        WHERE installation.installation_id = ${installationId}
+          AND NOT EXISTS (
+            SELECT 1 FROM push_account_bindings other
+            WHERE other.installation_id = installation.installation_id
+              AND other.active AND other.voip_enabled
+          )`;
+    }
+    await tx`
+      DELETE FROM push_account_bindings
+      WHERE installation_id = ${installationId} AND account_id = ${accountId}
+        AND device_id = ${deviceId} AND NOT active`;
+    await tx`
+      DELETE FROM push_installations installation
+      WHERE installation.installation_id = ${installationId}
+        AND NOT EXISTS (
+          SELECT 1 FROM push_account_bindings other
+          WHERE other.installation_id = installation.installation_id
+        )`;
+  });
+  return { registered: false };
+}
+
+export async function registerInstallationVoIPPushToken(
+  sql: SQL,
+  input: {
+    accountId: string;
+    deviceId: string;
+    installationId: string;
+    token: string;
+    environment: string;
+    supportedCallProtocolVersions?: unknown;
+    supportedCallMediaProfileVersions?: unknown;
+    callViewVersion?: unknown;
+    supportedGroupCallVersions?: unknown;
+    groupCallViewVersion?: unknown;
+    supportsGroupScreenShare?: unknown;
+  },
+) {
+  let supportedCallProtocolVersions: number[];
+  let supportedCallMediaProfileVersions: number[];
+  try {
+    supportedCallProtocolVersions = normalizeCallVersionCapabilities(
+      input.supportedCallProtocolVersions,
+    );
+    supportedCallMediaProfileVersions = normalizeCallVersionCapabilities(
+      input.supportedCallMediaProfileVersions,
+    );
+  } catch (error) {
+    if (error instanceof CallVersionCapabilityError) throw new PushError(error.message);
+    throw error;
+  }
+  const callViewVersion = input.callViewVersion == null ? 1 : Number(input.callViewVersion);
+  if (!Number.isSafeInteger(callViewVersion) || callViewVersion < 1 || callViewVersion > 0xffff) {
+    throw new PushError("invalid call view version");
+  }
+  const group = normalizeGroupCallCapabilities(
+    input.supportedGroupCallVersions,
+    input.groupCallViewVersion,
+    input.supportsGroupScreenShare,
+  );
+  try {
+    return await sql.begin(async (tx) => {
+      const registration = await registerInstallationPushTokenInTransaction(tx, {
+        ...input,
+        kind: "voip",
+      });
+      const updated = await tx`
+        UPDATE devices SET
+          supported_call_protocol_versions = ${tx.array(supportedCallProtocolVersions, "INT4")},
+          supported_call_media_profile_versions = ${tx.array(supportedCallMediaProfileVersions, "INT4")},
+          call_view_version = ${callViewVersion},
+          supported_group_call_versions = ${tx.array(group.versions, "INT4")},
+          group_call_view_version = ${group.viewVersion},
+          supports_group_screen_share = ${group.supportsScreenShare}
+        WHERE id = ${input.deviceId} AND account_id = ${input.accountId}
+          AND platform = 'ios' AND revoked_at IS NULL
+        RETURNING id`;
+      if (!updated.length) throw new PushError("active iOS device required");
+      return {
+        ...registration,
+        supportedCallProtocolVersions,
+        supportedCallMediaProfileVersions,
+        callViewVersion,
+        supportedGroupCallVersions: group.versions,
+        groupCallViewVersion: group.viewVersion,
+        supportsGroupScreenShare: group.supportsScreenShare,
+      };
+    });
+  } catch (error) {
+    rethrowInstallationRegistrationError(error);
+  }
+}
+
 /**
  * Group media capability is independent from PushKit and microphone permission: a member may
  * discover a room, join muted, and grant microphone/camera access only after a foreground tap.
@@ -331,17 +681,37 @@ export async function enqueuePushDeliveries(sql: SQL, p: {
   senderAccountId: string;
   sourceDeviceId?: string | null;
   alertRecipients?: boolean;
+  forceAlert?: boolean;
 }): Promise<void> {
   await sql`
     INSERT INTO push_deliveries (account_id, pts, device_id, alert)
     SELECT ${p.accountId}, ${p.pts}, d.id,
-           ${p.alertRecipients !== false && p.accountId !== p.senderAccountId}
+           ${p.forceAlert === true
+             || (p.alertRecipients !== false && p.accountId !== p.senderAccountId)}
     FROM devices d
     WHERE d.account_id = ${p.accountId}
       AND d.platform = 'ios'
       AND d.revoked_at IS NULL
-      AND d.push_token_hash IS NOT NULL
-      AND d.push_token_ciphertext IS NOT NULL
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM push_account_bindings binding
+          JOIN push_installations installation
+            ON installation.installation_id = binding.installation_id
+          WHERE binding.device_id = d.id AND binding.account_id = d.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_hash IS NOT NULL
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+        OR (
+          d.push_token_hash IS NOT NULL AND d.push_token_ciphertext IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM push_account_bindings binding
+            WHERE binding.device_id = d.id AND binding.account_id = d.account_id
+              AND binding.active AND binding.normal_enabled
+          )
+        )
+      )
       AND (${p.sourceDeviceId ?? null}::uuid IS NULL OR d.id <> ${p.sourceDeviceId ?? null})
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
 }
@@ -352,6 +722,7 @@ export type APNsSyncSendRequest = {
   environment: PushEnvironment;
   pts: number;
   alert: boolean;
+  routingHandle?: string;
 };
 
 export type APNsVoIPSendRequest = {
@@ -362,6 +733,7 @@ export type APNsVoIPSendRequest = {
   callerAccountId: string;
   initialKind: "voice" | "video";
   expiresAt: string;
+  routingHandle?: string;
 };
 
 export type APNsSendRequest = APNsSyncSendRequest | APNsVoIPSendRequest;
@@ -373,7 +745,9 @@ export interface PushSender {
   close?(): void;
 }
 
-export function buildAPNsPayload(request: Pick<APNsSyncSendRequest, "pts" | "alert">): Record<string, unknown> {
+export function buildAPNsPayload(
+  request: Pick<APNsSyncSendRequest, "pts" | "alert" | "routingHandle">,
+): Record<string, unknown> {
   return request.alert
     ? {
         aps: {
@@ -381,13 +755,16 @@ export function buildAPNsPayload(request: Pick<APNsSyncSendRequest, "pts" | "ale
           sound: "default",
           "content-available": 1,
         },
-        toj: { pts: request.pts },
+        toj: { pts: request.pts, ...(request.routingHandle ? { routingHandle: request.routingHandle } : {}) },
       }
-    : { aps: { "content-available": 1 }, toj: { pts: request.pts } };
+    : {
+        aps: { "content-available": 1 },
+        toj: { pts: request.pts, ...(request.routingHandle ? { routingHandle: request.routingHandle } : {}) },
+      };
 }
 
 export function buildVoIPAPNsPayload(
-  request: Pick<APNsVoIPSendRequest, "callId" | "callerAccountId" | "initialKind" | "expiresAt">,
+  request: Pick<APNsVoIPSendRequest, "callId" | "callerAccountId" | "initialKind" | "expiresAt" | "routingHandle">,
 ): Record<string, unknown> {
   return {
     aps: { "content-available": 1 },
@@ -395,7 +772,9 @@ export function buildVoIPAPNsPayload(
       v: 1,
       type: request.initialKind === "video" ? "video_call" : "voice_call",
       callId: request.callId,
-      callerAccountId: request.callerAccountId,
+      ...(request.routingHandle
+        ? { routingHandle: request.routingHandle }
+        : { callerAccountId: request.callerAccountId }),
       expiresAt: request.expiresAt,
     },
   };
@@ -536,6 +915,8 @@ type ClaimedDelivery = {
   push_token_nonce: Uint8Array | null;
   push_token_key_id: string | null;
   push_environment: PushEnvironment | null;
+  installation_id: string | null;
+  routing_handle: string | null;
 };
 
 async function claimDeliveries(sql: SQL, limit: number): Promise<ClaimedDelivery[]> {
@@ -544,30 +925,66 @@ async function claimDeliveries(sql: SQL, limit: number): Promise<ClaimedDelivery
     WHERE status IN ('pending','sending') AND expires_at <= now()`;
   return await sql`
     WITH picked AS (
-      SELECT id FROM push_deliveries
-      WHERE expires_at > now()
+      SELECT delivery.id,
+             CASE
+               WHEN delivery.alert AND event.msg_id IS NOT NULL THEN
+                 message.state = 'visible'
+                 AND (message.expires_at IS NULL OR message.expires_at > now())
+               ELSE delivery.alert
+             END AS effective_alert
+      FROM push_deliveries delivery
+      LEFT JOIN account_events event
+        ON event.account_id = delivery.account_id AND event.pts = delivery.pts
+      LEFT JOIN messages message
+        ON message.dialog_id = event.dialog_id AND message.msg_id = event.msg_id
+      WHERE delivery.expires_at > now()
         AND (
-          (status = 'pending' AND available_at <= now())
-          OR (status = 'sending' AND claimed_at < now() - (${CLAIM_TIMEOUT_SECONDS} * interval '1 second'))
+          (delivery.status = 'pending' AND delivery.available_at <= now())
+          OR (delivery.status = 'sending'
+            AND delivery.claimed_at < now() - (${CLAIM_TIMEOUT_SECONDS} * interval '1 second'))
         )
-      ORDER BY available_at, created_at
-      FOR UPDATE SKIP LOCKED
+      ORDER BY delivery.available_at, delivery.created_at
+      FOR UPDATE OF delivery SKIP LOCKED
       LIMIT ${limit}
     )
     UPDATE push_deliveries pd SET status = 'sending', claimed_at = now()
     FROM picked, devices d
     JOIN accounts account ON account.id = d.account_id
+    LEFT JOIN push_account_bindings binding
+      ON binding.device_id = d.id AND binding.account_id = d.account_id
+     AND binding.active AND binding.normal_enabled
+    LEFT JOIN push_installations installation
+      ON installation.installation_id = binding.installation_id
     WHERE pd.id = picked.id AND d.id = pd.device_id
       AND account.status IN ('active','limited')
       AND d.revoked_at IS NULL
-      AND d.push_token_hash IS NOT NULL
-      AND d.push_token_ciphertext IS NOT NULL
-      AND d.push_token_nonce IS NOT NULL
-      AND d.push_token_key_id IS NOT NULL
-      AND d.push_environment IS NOT NULL
-    RETURNING pd.id, d.account_id, pd.device_id, pd.pts, pd.alert, pd.attempts, pd.expires_at,
-              d.push_token_ciphertext, d.push_token_nonce, d.push_token_key_id,
-              d.push_environment` as ClaimedDelivery[];
+      -- The credential comes from the installation when a binding is active and from the
+      -- device row otherwise; require a complete envelope on whichever side is used.
+      AND CASE WHEN binding.installation_id IS NOT NULL THEN
+            installation.normal_token_ciphertext IS NOT NULL
+            AND installation.normal_token_nonce IS NOT NULL
+            AND installation.normal_token_key_id IS NOT NULL
+            AND installation.normal_environment IS NOT NULL
+          ELSE
+            d.push_token_hash IS NOT NULL
+            AND d.push_token_ciphertext IS NOT NULL
+            AND d.push_token_nonce IS NOT NULL
+            AND d.push_token_key_id IS NOT NULL
+            AND d.push_environment IS NOT NULL
+          END
+    RETURNING pd.id, d.account_id, pd.device_id, pd.pts, picked.effective_alert AS alert,
+              pd.attempts, pd.expires_at,
+              CASE WHEN binding.installation_id IS NOT NULL
+                THEN installation.normal_token_ciphertext ELSE d.push_token_ciphertext END
+                AS push_token_ciphertext,
+              CASE WHEN binding.installation_id IS NOT NULL
+                THEN installation.normal_token_nonce ELSE d.push_token_nonce END AS push_token_nonce,
+              CASE WHEN binding.installation_id IS NOT NULL
+                THEN installation.normal_token_key_id ELSE d.push_token_key_id END AS push_token_key_id,
+              CASE WHEN binding.installation_id IS NOT NULL
+                THEN installation.normal_environment ELSE d.push_environment END AS push_environment,
+              binding.installation_id,
+              binding.routing_handle` as ClaimedDelivery[];
 }
 
 function retryable(status: number, reason?: string): boolean {
@@ -611,8 +1028,12 @@ async function sendClaimedDelivery(
   delivery: ClaimedDelivery,
   token: string,
 ): Promise<void> {
+  // Installation-bound deliveries hash into their own namespace; device-bound ones keep the
+  // original namespace so existing registrations stay resolvable.
   const tokenHashes = tokenHashCandidates(
-    `apns|${delivery.push_environment}|${token}`,
+    delivery.installation_id
+      ? `apns-installation-normal|${delivery.push_environment}|${token}`
+      : `apns|${delivery.push_environment}|${token}`,
   ).map((candidate) => candidate.digest);
   await sql.begin(async (tx) => {
     // A ban locks the account first, then devices and deliveries. Holding the same locks in the
@@ -621,21 +1042,41 @@ async function sendClaimedDelivery(
     // ban can revoke the account. A check performed outside this transaction leaves a race window.
     const account = (await tx`
       SELECT status FROM accounts WHERE id = ${delivery.account_id} FOR SHARE`)[0];
-    const device = (await tx`
-      SELECT account_id, revoked_at, push_environment, push_token_hash
-      FROM devices WHERE id = ${delivery.device_id} FOR UPDATE`)[0];
+    // An installation credential is shared by several accounts and registration re-locks the
+    // device row, so locking the device across this send would block the very rotation the
+    // hash-predicated invalidation below is designed to tolerate. The account lock still gives
+    // bans their linearization point; only device-bound sends fence the device row itself.
+    const device = delivery.installation_id
+      ? (await tx`
+          SELECT account_id, revoked_at, push_environment, push_token_hash
+          FROM devices WHERE id = ${delivery.device_id}`)[0]
+      : (await tx`
+          SELECT account_id, revoked_at, push_environment, push_token_hash
+          FROM devices WHERE id = ${delivery.device_id} FOR UPDATE`)[0];
+    const installation = delivery.installation_id
+      ? (await tx`
+          SELECT normal_token_hash, normal_environment
+          FROM push_installations WHERE installation_id = ${delivery.installation_id}`)[0]
+      : null;
     const currentDelivery = (await tx`
       SELECT id, account_id, device_id, pts, alert, attempts, expires_at, status
       FROM push_deliveries
       WHERE id = ${delivery.id} AND account_id = ${delivery.account_id}
         AND device_id = ${delivery.device_id}
       FOR UPDATE`)[0];
-    const tokenStillCurrent = device?.push_token_hash != null
-      && tokenHashes.some((hash) => Buffer.from(device.push_token_hash).equals(hash));
+    // The credential lives on the installation when the delivery was routed through a binding.
+    const storedTokenHash = delivery.installation_id
+      ? installation?.normal_token_hash
+      : device?.push_token_hash;
+    const storedEnvironment = delivery.installation_id
+      ? installation?.normal_environment
+      : device?.push_environment;
+    const tokenStillCurrent = storedTokenHash != null
+      && tokenHashes.some((hash) => Buffer.from(storedTokenHash).equals(hash));
     const current = (account?.status === "active" || account?.status === "limited")
       && device?.account_id === delivery.account_id
       && !device?.revoked_at
-      && device?.push_environment === delivery.push_environment
+      && storedEnvironment === delivery.push_environment
       && tokenStillCurrent
       && currentDelivery?.status === "sending"
       && new Date(currentDelivery.expires_at).getTime() > Date.now();
@@ -659,6 +1100,7 @@ async function sendClaimedDelivery(
         environment: delivery.push_environment!,
         pts: Number(currentDelivery.pts),
         alert: Boolean(currentDelivery.alert),
+        routingHandle: delivery.routing_handle ?? undefined,
       });
       if (result.status === 200) {
         await tx`
@@ -667,19 +1109,46 @@ async function sendClaimedDelivery(
               last_error = NULL, claimed_at = NULL
           WHERE id = ${delivery.id} AND status = 'sending'`;
       } else if (invalidDeviceToken(result.status, result.reason)) {
-        // The device row is locked, and the hash predicate also protects against any future
-        // refactor that narrows the lock lifetime.
-        await tx`
-          UPDATE devices SET
-            push_token_hash = NULL, push_token_hash_key_id = NULL,
-            push_token_ciphertext = NULL, push_token_nonce = NULL,
-            push_token_key_id = NULL, push_environment = NULL, push_updated_at = now()
-          WHERE id = ${delivery.device_id}
-            AND push_token_hash IN (
-              SELECT decode(value, 'hex') FROM unnest(
-                ${tx.array(tokenHashes.map((hash) => hash.toString("hex")), "text")}::text[]
-              ) AS candidate(value)
-            )`;
+        // APNs may answer after iOS has already rotated to a new token. The row is locked, and
+        // the hash predicate additionally ensures a stale Unregistered response only clears the
+        // token that produced it and never erases a replacement registration.
+        const hashPredicate = tx.array(
+          tokenHashes.map((hash) => hash.toString("hex")),
+          "text",
+        );
+        if (delivery.installation_id) {
+          const invalidated = await tx`
+            UPDATE push_installations SET
+              normal_token_hash = NULL, normal_token_ciphertext = NULL,
+              normal_token_nonce = NULL, normal_token_key_id = NULL,
+              normal_environment = NULL, updated_at = now()
+            WHERE installation_id = ${delivery.installation_id}
+              AND normal_token_hash IN (
+                SELECT decode(value, 'hex') FROM unnest(${hashPredicate}::text[])
+                  AS candidate(value)
+              )
+            RETURNING installation_id`;
+          if (invalidated.length) {
+            await tx`
+              UPDATE push_account_bindings SET
+                normal_enabled = FALSE, active = voip_enabled, updated_at = now()
+              WHERE installation_id = ${delivery.installation_id}`;
+            await tx`
+              DELETE FROM push_account_bindings
+              WHERE installation_id = ${delivery.installation_id} AND NOT active`;
+          }
+        } else {
+          await tx`
+            UPDATE devices SET
+              push_token_hash = NULL, push_token_hash_key_id = NULL,
+              push_token_ciphertext = NULL, push_token_nonce = NULL,
+              push_token_key_id = NULL, push_environment = NULL, push_updated_at = now()
+            WHERE id = ${delivery.device_id}
+              AND push_token_hash IN (
+                SELECT decode(value, 'hex') FROM unnest(${hashPredicate}::text[])
+                  AS candidate(value)
+              )`;
+        }
         await tx`
           UPDATE push_deliveries
           SET status = 'dead', attempts = attempts + 1,
@@ -713,11 +1182,15 @@ export async function processPushBatch(sql: SQL, sender: PushSender, limit = 50)
 
     let token: string;
     try {
-      token = (await openForScope(sql, { kind: "account", accountId: delivery.account_id }, {
+      token = (await openForScope(sql, delivery.installation_id
+        ? INSTALLATION_PUSH_SCOPE
+        : { kind: "account", accountId: delivery.account_id }, {
         keyId: delivery.push_token_key_id,
         nonce: Buffer.from(delivery.push_token_nonce),
         ciphertext: Buffer.from(delivery.push_token_ciphertext),
-      }, pushTokenAAD(delivery.device_id))).toString("utf8");
+      }, delivery.installation_id
+        ? installationPushTokenAAD(delivery.installation_id, "normal")
+        : pushTokenAAD(delivery.device_id))).toString("utf8");
     } catch (error) {
       if (error instanceof CryptoUnavailableError) {
         await sql`
@@ -751,6 +1224,8 @@ type ClaimedVoIPDelivery = {
   voip_push_token_nonce: Uint8Array | null;
   voip_push_token_key_id: string | null;
   voip_push_environment: PushEnvironment | null;
+  installation_id: string | null;
+  routing_handle: string | null;
 };
 
 async function claimVoIPDeliveries(sql: SQL, limit: number): Promise<ClaimedVoIPDelivery[]> {
@@ -762,26 +1237,42 @@ async function claimVoIPDeliveries(sql: SQL, limit: number): Promise<ClaimedVoIP
       SELECT pd.id FROM voip_push_deliveries pd
       JOIN calls c ON c.id = pd.call_id
       JOIN devices d ON d.id = pd.device_id
+      LEFT JOIN push_account_bindings binding
+        ON binding.device_id = d.id AND binding.account_id = d.account_id
+       AND binding.active AND binding.voip_enabled
+      LEFT JOIN push_installations installation
+        ON installation.installation_id = binding.installation_id
       WHERE pd.expires_at > now() AND c.state = 'requested' AND c.expires_at > now()
         AND d.revoked_at IS NULL
-        AND d.voip_push_token_hash IS NOT NULL
-        AND d.voip_push_token_ciphertext IS NOT NULL
-        AND d.voip_push_token_nonce IS NOT NULL
-        AND d.voip_push_token_key_id IS NOT NULL
-        AND d.voip_push_environment IS NOT NULL
+        AND (CASE WHEN binding.installation_id IS NOT NULL
+          THEN installation.voip_token_ciphertext ELSE d.voip_push_token_ciphertext END) IS NOT NULL
         AND ((pd.status = 'pending' AND pd.available_at <= now())
           OR (pd.status = 'sending'
             AND pd.claimed_at < now() - (${CLAIM_TIMEOUT_SECONDS} * interval '1 second')))
       ORDER BY pd.available_at, pd.created_at
-      FOR UPDATE SKIP LOCKED LIMIT ${limit}
+      FOR UPDATE OF pd SKIP LOCKED LIMIT ${limit}
     )
     UPDATE voip_push_deliveries pd SET status = 'sending', claimed_at = now()
     FROM picked, devices d
+    LEFT JOIN push_account_bindings binding
+      ON binding.device_id = d.id AND binding.account_id = d.account_id
+     AND binding.active AND binding.voip_enabled
+    LEFT JOIN push_installations installation
+      ON installation.installation_id = binding.installation_id
     WHERE pd.id = picked.id AND d.id = pd.device_id
     RETURNING pd.id, d.account_id, pd.call_id, pd.caller_account_id, pd.initial_kind,
       pd.device_id, pd.attempts, pd.expires_at,
-      d.voip_push_token_ciphertext, d.voip_push_token_nonce, d.voip_push_token_key_id,
-      d.voip_push_environment` as ClaimedVoIPDelivery[];
+      CASE WHEN binding.installation_id IS NOT NULL
+        THEN installation.voip_token_ciphertext ELSE d.voip_push_token_ciphertext END
+        AS voip_push_token_ciphertext,
+      CASE WHEN binding.installation_id IS NOT NULL
+        THEN installation.voip_token_nonce ELSE d.voip_push_token_nonce END AS voip_push_token_nonce,
+      CASE WHEN binding.installation_id IS NOT NULL
+        THEN installation.voip_token_key_id ELSE d.voip_push_token_key_id END AS voip_push_token_key_id,
+      CASE WHEN binding.installation_id IS NOT NULL
+        THEN installation.voip_environment ELSE d.voip_push_environment END AS voip_push_environment,
+      binding.installation_id,
+      binding.routing_handle` as ClaimedVoIPDelivery[];
 }
 
 async function retryOrKillVoIP(sql: SQL, delivery: ClaimedVoIPDelivery, error: string): Promise<void> {
@@ -809,8 +1300,12 @@ async function sendClaimedVoIPDelivery(
   delivery: ClaimedVoIPDelivery,
   token: string,
 ): Promise<void> {
+  // Installation-bound deliveries hash into their own namespace; device-bound ones keep the
+  // original namespace so existing registrations stay resolvable.
   const tokenHashes = tokenHashCandidates(
-    `apns-voip|${delivery.voip_push_environment}|${token}`,
+    delivery.installation_id
+      ? `apns-installation-voip|${delivery.voip_push_environment}|${token}`
+      : `apns-voip|${delivery.voip_push_environment}|${token}`,
   ).map((candidate) => candidate.digest);
   await sql.begin(async (tx) => {
     // Keep the account and device eligibility locks across the bounded APNs request. This gives
@@ -822,23 +1317,48 @@ async function sendClaimedVoIPDelivery(
       SELECT status FROM accounts WHERE id = ${delivery.account_id} FOR SHARE`)[0];
     const call = (await tx`
       SELECT state, expires_at FROM calls WHERE id = ${delivery.call_id}`)[0];
-    const device = (await tx`
-      SELECT account_id, revoked_at, voip_push_environment, voip_push_token_hash
-      FROM devices WHERE id = ${delivery.device_id} FOR SHARE`)[0];
+    // As on the normal path, an installation-bound send must leave the device row unlocked so a
+    // concurrent re-registration can rotate the shared credential while this request is in flight.
+    const device = delivery.installation_id
+      ? (await tx`
+          SELECT account_id, revoked_at, voip_push_environment, voip_push_token_hash
+          FROM devices WHERE id = ${delivery.device_id}`)[0]
+      : (await tx`
+          SELECT account_id, revoked_at, voip_push_environment, voip_push_token_hash
+          FROM devices WHERE id = ${delivery.device_id} FOR SHARE`)[0];
+    // When the delivery was routed through a binding the credential lives on the installation,
+    // and the binding must still be active for this device/account pair.
+    const installation = delivery.installation_id
+      ? (await tx`
+          SELECT installation.voip_token_hash, installation.voip_environment
+          FROM push_installations installation
+          JOIN push_account_bindings binding
+            ON binding.installation_id = installation.installation_id
+           AND binding.active AND binding.voip_enabled
+           AND binding.device_id = ${delivery.device_id}
+           AND binding.account_id = ${delivery.account_id}
+          WHERE installation.installation_id = ${delivery.installation_id}`)[0]
+      : null;
     const currentDelivery = (await tx`
       SELECT id, status, attempts, expires_at
       FROM voip_push_deliveries
       WHERE id = ${delivery.id} AND call_id = ${delivery.call_id}
         AND device_id = ${delivery.device_id}`)[0];
-    const tokenStillCurrent = device?.voip_push_token_hash != null
-      && tokenHashes.some((hash) => Buffer.from(device.voip_push_token_hash).equals(hash));
+    const storedTokenHash = delivery.installation_id
+      ? installation?.voip_token_hash
+      : device?.voip_push_token_hash;
+    const storedEnvironment = delivery.installation_id
+      ? installation?.voip_environment
+      : device?.voip_push_environment;
+    const tokenStillCurrent = storedTokenHash != null
+      && tokenHashes.some((hash) => Buffer.from(storedTokenHash).equals(hash));
     const now = Date.now();
     const current = (account?.status === "active" || account?.status === "limited")
       && call?.state === "requested"
       && new Date(call.expires_at).getTime() > now
       && device?.account_id === delivery.account_id
       && !device?.revoked_at
-      && device?.voip_push_environment === delivery.voip_push_environment
+      && storedEnvironment === delivery.voip_push_environment
       && tokenStillCurrent
       && currentDelivery?.status === "sending"
       && new Date(currentDelivery.expires_at).getTime() > now;
@@ -865,6 +1385,7 @@ async function sendClaimedVoIPDelivery(
         callerAccountId: delivery.caller_account_id,
         initialKind: delivery.initial_kind,
         expiresAt: new Date(currentDelivery.expires_at).toISOString(),
+        routingHandle: delivery.routing_handle ?? undefined,
       });
       if (result.status === 200) {
         await tx`
@@ -873,18 +1394,46 @@ async function sendClaimedVoIPDelivery(
               last_error = NULL, claimed_at = NULL
           WHERE id = ${delivery.id} AND status = 'sending'`;
       } else if (invalidDeviceToken(result.status, result.reason)) {
-        await tx`
-          UPDATE devices SET
-            voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
-            voip_push_token_ciphertext = NULL,
-            voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
-            voip_push_environment = NULL, voip_push_updated_at = now()
-          WHERE id = ${delivery.device_id}
-            AND voip_push_token_hash IN (
-              SELECT decode(value, 'hex') FROM unnest(
-                ${tx.array(tokenHashes.map((hash) => hash.toString("hex")), "text")}::text[]
-              ) AS candidate(value)
-            )`;
+        // A stale Unregistered response must only clear the token that produced it, never a
+        // replacement registration that arrived while this request was in flight.
+        const hashPredicate = tx.array(
+          tokenHashes.map((hash) => hash.toString("hex")),
+          "text",
+        );
+        if (delivery.installation_id) {
+          const invalidated = await tx`
+            UPDATE push_installations SET
+              voip_token_hash = NULL, voip_token_ciphertext = NULL,
+              voip_token_nonce = NULL, voip_token_key_id = NULL,
+              voip_environment = NULL, updated_at = now()
+            WHERE installation_id = ${delivery.installation_id}
+              AND voip_token_hash IN (
+                SELECT decode(value, 'hex') FROM unnest(${hashPredicate}::text[])
+                  AS candidate(value)
+              )
+            RETURNING installation_id`;
+          if (invalidated.length) {
+            await tx`
+              UPDATE push_account_bindings SET
+                voip_enabled = FALSE, active = normal_enabled, updated_at = now()
+              WHERE installation_id = ${delivery.installation_id}`;
+            await tx`
+              DELETE FROM push_account_bindings
+              WHERE installation_id = ${delivery.installation_id} AND NOT active`;
+          }
+        } else {
+          await tx`
+            UPDATE devices SET
+              voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
+              voip_push_token_ciphertext = NULL,
+              voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
+              voip_push_environment = NULL, voip_push_updated_at = now()
+            WHERE id = ${delivery.device_id}
+              AND voip_push_token_hash IN (
+                SELECT decode(value, 'hex') FROM unnest(${hashPredicate}::text[])
+                  AS candidate(value)
+              )`;
+        }
         await tx`
           UPDATE voip_push_deliveries
           SET status = 'dead', attempts = attempts + 1,
@@ -916,11 +1465,15 @@ async function processVoIPDelivery(sql: SQL, sender: PushSender, delivery: Claim
   }
   let token: string;
   try {
-    token = (await openForScope(sql, { kind: "account", accountId: delivery.account_id }, {
+    token = (await openForScope(sql, delivery.installation_id
+      ? INSTALLATION_PUSH_SCOPE
+      : { kind: "account", accountId: delivery.account_id }, {
       keyId: delivery.voip_push_token_key_id,
       nonce: Buffer.from(delivery.voip_push_token_nonce),
       ciphertext: Buffer.from(delivery.voip_push_token_ciphertext),
-    }, voipPushTokenAAD(delivery.device_id))).toString("utf8");
+    }, delivery.installation_id
+      ? installationPushTokenAAD(delivery.installation_id, "voip")
+      : voipPushTokenAAD(delivery.device_id))).toString("utf8");
   } catch (error) {
     if (error instanceof CryptoUnavailableError) {
       await sql`

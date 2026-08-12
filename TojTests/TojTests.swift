@@ -392,6 +392,57 @@ final class WebRTCEngineContractTests: XCTestCase {
         XCTAssertNil(
             CallLaunchSessionPolicy.session(from: nil, pendingRevocationToken: nil)
         )
+
+        let rotated = StoredCloudSession(
+            session: CloudSession(
+                accountId: "account",
+                deviceId: "device",
+                token: "replacement-token"
+            ),
+            phone: "+992",
+            displayName: "Alice"
+        )
+        let interruptedSignOut = PendingSessionRevocation(
+            token: "superseded-token",
+            eraseLocalReplicaOnLaunch: true,
+            localReplicaAccountId: "account"
+        )
+        let requiresAuthentication = PendingSessionRevocation(
+            token: "abandoned-reissue-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: "account"
+        )
+        let unrelatedRemoteCleanup = PendingSessionRevocation(
+            token: "unrelated-token",
+            eraseLocalReplicaOnLaunch: false,
+            localReplicaAccountId: nil
+        )
+        XCTAssertNil(CallLaunchSessionPolicy.session(
+            from: rotated,
+            pendingRevocations: [interruptedSignOut],
+            hasPendingLocalErasure: false
+        ))
+        XCTAssertNil(CallLaunchSessionPolicy.session(
+            from: rotated,
+            pendingRevocations: [requiresAuthentication],
+            hasPendingLocalErasure: false
+        ))
+        XCTAssertNil(CallLaunchSessionPolicy.session(
+            from: rotated,
+            pendingRevocations: [],
+            hasPendingLocalErasure: true
+        ))
+        XCTAssertEqual(CallLaunchSessionPolicy.session(
+            from: rotated,
+            pendingRevocations: [unrelatedRemoteCleanup],
+            hasPendingLocalErasure: false
+        ), rotated.session)
+        XCTAssertNil(CallLaunchSessionPolicy.session(
+            from: rotated,
+            pendingRevocations: [unrelatedRemoteCleanup],
+            hasPendingLocalErasure: false,
+            pendingReauthenticationAccountId: "account"
+        ))
     }
 
     func testPrivacyModeMapsToICEPolicy() {

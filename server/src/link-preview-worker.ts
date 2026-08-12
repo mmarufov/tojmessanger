@@ -4,7 +4,7 @@ import { startLinkPreviewWorker } from "./link-previews";
 const stop = startLinkPreviewWorker(sql, { pollMilliseconds: 2_000 });
 
 async function shutdown(): Promise<void> {
-  stop();
+  await stop();
   await sql.end();
   process.exit(0);
 }

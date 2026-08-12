@@ -273,7 +273,9 @@ describe("cloud productivity features", () => {
       const capabilities = await (await fetch(`${base}/v1/capabilities`, { headers })).json() as {
         capabilities: string[];
       };
-      expect(capabilities.capabilities).toContain("scheduled_delivery_v1");
+      // A stale worker closes new-product discovery, but existing scheduled state remains
+      // readable/cancelable below so rollback and outage recovery cannot strand user data.
+      expect(capabilities.capabilities).not.toContain("scheduled_delivery_v1");
 
       const listed = await fetch(`${base}/v1/scheduled-messages?limit=100`, { headers });
       expect(listed.status).toBe(200);

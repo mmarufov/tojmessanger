@@ -2944,7 +2944,7 @@ describe("M3 cloud sync", () => {
         api_version: number;
         capabilities: string[];
       };
-      expect(capabilities.api_version).toBe(5);
+      expect(capabilities.api_version).toBe(6);
       expect(capabilities.capabilities).not.toContain("dialog_preferences_v1");
       expect((await fetch(
         `${base}/v1/dialogs/${crypto.randomUUID()}/preferences`,

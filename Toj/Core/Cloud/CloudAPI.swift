@@ -338,11 +338,66 @@ nonisolated struct CloudSession: Codable, Equatable, Sendable {
     let accountId: String
     let deviceId: String
     let token: String
+    let refreshToken: String?
+    let accessTokenExpiresAt: String?
+    let sessionExpiresAt: String?
+    let tokenVersion: Int
 
     enum CodingKeys: String, CodingKey {
         case accountId
         case deviceId
         case token
+        case accessToken
+        case refreshToken
+        case accessTokenExpiresAt
+        case sessionExpiresAt
+        case tokenVersion
+    }
+
+    init(
+        accountId: String,
+        deviceId: String,
+        token: String,
+        refreshToken: String? = nil,
+        accessTokenExpiresAt: String? = nil,
+        sessionExpiresAt: String? = nil,
+        tokenVersion: Int = 1
+    ) {
+        self.accountId = accountId
+        self.deviceId = deviceId
+        self.token = token
+        self.refreshToken = refreshToken
+        self.accessTokenExpiresAt = accessTokenExpiresAt
+        self.sessionExpiresAt = sessionExpiresAt
+        self.tokenVersion = tokenVersion
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        accountId = try container.decode(String.self, forKey: .accountId)
+        deviceId = try container.decode(String.self, forKey: .deviceId)
+        token = try container.decodeIfPresent(String.self, forKey: .accessToken)
+            ?? container.decode(String.self, forKey: .token)
+        refreshToken = try container.decodeIfPresent(String.self, forKey: .refreshToken)
+        accessTokenExpiresAt = try container.decodeIfPresent(String.self, forKey: .accessTokenExpiresAt)
+        sessionExpiresAt = try container.decodeIfPresent(String.self, forKey: .sessionExpiresAt)
+        tokenVersion = try container.decodeIfPresent(Int.self, forKey: .tokenVersion)
+            ?? (refreshToken == nil ? 1 : 2)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(accountId, forKey: .accountId)
+        try container.encode(deviceId, forKey: .deviceId)
+        if tokenVersion >= 2 {
+            try container.encode(token, forKey: .accessToken)
+        } else {
+            try container.encode(token, forKey: .token)
+        }
+        try container.encodeIfPresent(refreshToken, forKey: .refreshToken)
+        try container.encodeIfPresent(accessTokenExpiresAt, forKey: .accessTokenExpiresAt)
+        try container.encodeIfPresent(sessionExpiresAt, forKey: .sessionExpiresAt)
+        try container.encode(tokenVersion, forKey: .tokenVersion)
     }
 }
 
@@ -355,6 +410,34 @@ nonisolated struct StoredCloudSession: Codable, Equatable, Sendable {
 nonisolated struct AuthStartResponse: Codable, Sendable {
     let code: String?
     let retryAfter: Int?
+}
+
+nonisolated struct AuthV2CheckResponse: Codable, Sendable {
+    let state: String
+    let session: CloudSession?
+    let challengeId: String?
+    let expiresAt: String?
+}
+
+nonisolated struct TwoFactorLoginResponse: Codable, Sendable {
+    let session: CloudSession
+    let recoveryCodes: [String]?
+}
+
+nonisolated struct TwoFactorStatusResponse: Codable, Sendable {
+    let enabled: Bool
+    let recoveryCodesRemaining: Int
+}
+
+nonisolated struct SecurityStepUpResponse: Codable, Sendable {
+    let stepUpToken: String
+    let expiresAt: String
+}
+
+nonisolated struct TwoFactorConfigurationResponse: Codable, Sendable {
+    let enabled: Bool
+    let recoveryCodes: [String]?
+    let session: CloudSession
 }
 
 nonisolated struct ContactLookupResponse: Codable, Sendable {
@@ -814,7 +897,26 @@ nonisolated struct CloudDevice: Codable, Identifiable, Equatable, Sendable {
     let deviceName: String?
     let createdAt: String
     let lastSeenAt: String?
+    let sessionExpiresAt: String?
     let current: Bool
+
+    init(
+        id: String,
+        platform: String,
+        deviceName: String?,
+        createdAt: String,
+        lastSeenAt: String?,
+        sessionExpiresAt: String? = nil,
+        current: Bool
+    ) {
+        self.id = id
+        self.platform = platform
+        self.deviceName = deviceName
+        self.createdAt = createdAt
+        self.lastSeenAt = lastSeenAt
+        self.sessionExpiresAt = sessionExpiresAt
+        self.current = current
+    }
 }
 
 private struct DeviceListResponse: Codable, Sendable {
@@ -917,9 +1019,155 @@ nonisolated func cloudScheduledCreateCanTerminalizePermanentFailure(
     !wasPreviouslyAttempted
 }
 
+actor SessionCredentialCoordinator {
+    static let shared = SessionCredentialCoordinator()
+
+    private var storedSession: StoredCloudSession?
+    private var config: CloudConfig = .current
+    private var tokenStore = TokenStore()
+    private var acceptedAccessTokens: Set<String> = []
+    private var refreshTask: Task<CloudSession, Error>?
+    private var generation: UInt64 = 0
+    private let networkSession: URLSession
+    private let updatesContinuation: AsyncStream<SessionCredentialEvent>.Continuation
+    nonisolated let updates: AsyncStream<SessionCredentialEvent>
+
+    init(networkSession: URLSession = .shared) {
+        self.networkSession = networkSession
+        (updates, updatesContinuation) = AsyncStream.makeStream(of: SessionCredentialEvent.self)
+    }
+
+    func install(_ session: StoredCloudSession, config: CloudConfig, tokenStore: TokenStore) {
+        generation &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        self.config = config
+        self.tokenStore = tokenStore
+        storedSession = session
+        // An explicit install is an authoritative session boundary (login, upgrade, restore, or
+        // security reissue). Only refreshes performed inside this actor retain their preceding
+        // access-token alias for in-flight retries. Otherwise an old account token could be
+        // rebound to another account, or a late device_revoked response from a security reissue
+        // could tear down the replacement session.
+        acceptedAccessTokens = [session.session.token]
+    }
+
+    func clear() {
+        generation &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        storedSession = nil
+        acceptedAccessTokens.removeAll()
+    }
+
+    func authorizationToken(matching supplied: String) -> String? {
+        guard let storedSession,
+              storedSession.session.tokenVersion >= 2,
+              acceptedAccessTokens.contains(supplied)
+        else { return nil }
+        return storedSession.session.token
+    }
+
+    func refreshIfNeeded(matching supplied: String, force: Bool = false) async throws -> String? {
+        guard let stored = storedSession,
+              stored.session.tokenVersion >= 2,
+              stored.session.refreshToken != nil,
+              acceptedAccessTokens.contains(supplied)
+        else { return nil }
+        if !force, let expiry = Self.date(stored.session.accessTokenExpiresAt),
+           expiry.timeIntervalSinceNow > 120 {
+            return stored.session.token
+        }
+        if let refreshTask {
+            let waitingGeneration = generation
+            let refreshed = try await refreshTask.value
+            guard generation == waitingGeneration,
+                  storedSession?.session.deviceId == stored.session.deviceId
+            else { throw CancellationError() }
+            return refreshed.token
+        }
+        let refreshGeneration = generation
+        let task = Task<CloudSession, Error> {
+            guard let refreshToken = stored.session.refreshToken else {
+                throw CloudAPIError(status: 401, message: "Session refresh unavailable", retryAfter: nil)
+            }
+            let pending = try await tokenStore.loadPendingRefreshRotation()
+            let rotationId = pending ?? UUID().uuidString.lowercased()
+            if pending == nil { try await tokenStore.savePendingRefreshRotation(rotationId) }
+            return try await CloudAPI(
+                config: config,
+                session: networkSession,
+                credentialCoordinator: nil
+            ).refreshSession(refreshToken: refreshToken, rotationId: rotationId)
+        }
+        refreshTask = task
+        do {
+            let refreshed = try await task.value
+            guard generation == refreshGeneration,
+                  storedSession?.session.deviceId == stored.session.deviceId
+            else { throw CancellationError() }
+            let replacement = StoredCloudSession(
+                session: refreshed,
+                phone: stored.phone,
+                displayName: stored.displayName
+            )
+            try await tokenStore.save(replacement)
+            guard generation == refreshGeneration else {
+                try? await tokenStore.clearSession(ifTokenMatches: replacement.session.token)
+                throw CancellationError()
+            }
+            try await tokenStore.clearPendingRefreshRotation()
+            acceptedAccessTokens.insert(replacement.session.token)
+            storedSession = replacement
+            refreshTask = nil
+            updatesContinuation.yield(.updated(replacement))
+            return replacement.session.token
+        } catch {
+            refreshTask = nil
+            if let apiError = error as? CloudAPIError,
+               ["session_expired", "device_revoked", "refresh_reuse_detected"].contains(apiError.code) {
+                try? await tokenStore.clearPendingRefreshRotation()
+                handleAuthenticationFailure(code: apiError.code, matching: stored.session.token)
+            }
+            throw error
+        }
+    }
+
+    func handleAuthenticationFailure(code: String?, matching supplied: String) {
+        guard let code,
+              let stored = storedSession,
+              acceptedAccessTokens.contains(supplied)
+        else { return }
+        let event: SessionCredentialEvent
+        switch code {
+        case "session_expired": event = .authenticationRequired(stored)
+        case "device_revoked", "refresh_reuse_detected": event = .securityRevoked(stored)
+        default: return
+        }
+        generation &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        storedSession = nil
+        acceptedAccessTokens.removeAll()
+        updatesContinuation.yield(event)
+    }
+
+    private static func date(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        return ISO8601DateFormatter().date(from: value)
+    }
+}
+
+nonisolated enum SessionCredentialEvent: Sendable {
+    case updated(StoredCloudSession)
+    case authenticationRequired(StoredCloudSession)
+    case securityRevoked(StoredCloudSession)
+}
+
 struct CloudAPI: Sendable {
     let config: CloudConfig
     var session: URLSession = .shared
+    var credentialCoordinator: SessionCredentialCoordinator? = .shared
 
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -959,6 +1207,122 @@ struct CloudAPI: Sendable {
                 "displayName": displayName
             ],
             token: nil
+        )
+    }
+
+    func checkAuthV2(
+        phone: String,
+        code: String,
+        displayName: String,
+        deviceName: String
+    ) async throws -> AuthV2CheckResponse {
+        try await post(
+            "v1/auth/check",
+            body: [
+                "phone": phone,
+                "code": code,
+                "platform": "ios",
+                "deviceName": deviceName,
+                "displayName": displayName,
+                "authProtocolVersion": "2"
+            ],
+            token: nil
+        )
+    }
+
+    func completeTwoFactorLogin(
+        challengeId: String,
+        password: String?,
+        recoveryCode: String?,
+        newPassword: String?
+    ) async throws -> TwoFactorLoginResponse {
+        struct Request: Encodable {
+            let challengeId: String
+            let password: String?
+            let recoveryCode: String?
+            let newPassword: String?
+        }
+        return try await post(
+            "v1/auth/two-factor/check",
+            body: Request(
+                challengeId: challengeId,
+                password: password,
+                recoveryCode: recoveryCode,
+                newPassword: newPassword
+            ),
+            token: nil
+        )
+    }
+
+    func upgradeSession(token: String) async throws -> CloudSession {
+        struct Response: Decodable { let session: CloudSession }
+        let response: Response = try await post("v1/session/upgrade", body: EmptyBody(), token: token)
+        return response.session
+    }
+
+    func refreshSession(refreshToken: String, rotationId: String) async throws -> CloudSession {
+        try await post(
+            "v1/session/refresh",
+            body: ["refreshToken": refreshToken, "rotationId": rotationId],
+            token: nil
+        )
+    }
+
+    func twoFactorStatus(token: String) async throws -> TwoFactorStatusResponse {
+        try await get("v1/security/two-factor", token: token)
+    }
+
+    func startSecurityStepUp(token: String) async throws -> AuthStartResponse {
+        try await post("v1/security/step-up/start", body: EmptyBody(), token: token)
+    }
+
+    func checkSecurityStepUp(code: String, token: String) async throws -> SecurityStepUpResponse {
+        try await post("v1/security/step-up/check", body: ["code": code], token: token)
+    }
+
+    func configureTwoFactor(
+        stepUpToken: String,
+        password: String,
+        currentCredential: String?,
+        token: String
+    ) async throws -> TwoFactorConfigurationResponse {
+        struct Request: Encodable {
+            let stepUpToken: String
+            let password: String
+            let currentCredential: String?
+        }
+        return try await put(
+            "v1/security/two-factor",
+            body: Request(
+                stepUpToken: stepUpToken,
+                password: password,
+                currentCredential: currentCredential
+            ),
+            token: token
+        )
+    }
+
+    func disableTwoFactor(
+        stepUpToken: String,
+        currentCredential: String,
+        token: String
+    ) async throws -> TwoFactorConfigurationResponse {
+        try await delete(
+            "v1/security/two-factor",
+            body: ["stepUpToken": stepUpToken, "currentCredential": currentCredential],
+            token: token
+        )
+    }
+
+    func regenerateTwoFactorRecoveryCodes(
+        stepUpToken: String,
+        currentCredential: String,
+        token: String
+    ) async throws -> TwoFactorConfigurationResponse {
+        try await post(
+            "v1/security/two-factor/recovery-codes",
+            body: ["stepUpToken": stepUpToken, "currentCredential": currentCredential],
+            token: token
         )
     }
 
@@ -1996,25 +2360,59 @@ struct CloudAPI: Sendable {
     }
 
     private func run<Response: Decodable>(_ request: URLRequest) async throws -> Response {
-        let (data, response) = try await session.data(for: request)
+        var authorizedRequest = request
+        let suppliedToken = Self.bearerToken(in: request)
+        if let suppliedToken,
+           let replacement = await credentialCoordinator?.authorizationToken(matching: suppliedToken) {
+            authorizedRequest.setValue("Bearer \(replacement)", forHTTPHeaderField: "Authorization")
+        }
+        var (data, response) = try await session.data(for: authorizedRequest)
         guard let http = response as? HTTPURLResponse else {
             throw CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil)
         }
-        guard (200..<300).contains(http.statusCode) else {
+        if http.statusCode == 401,
+           let serverError = try? decoder.decode(ServerError.self, from: data),
+           serverError.code == "access_token_expired",
+           let sentToken = Self.bearerToken(in: authorizedRequest),
+           let refreshed = try await credentialCoordinator?.refreshIfNeeded(
+               matching: sentToken,
+               force: true
+           ) {
+            authorizedRequest.setValue("Bearer \(refreshed)", forHTTPHeaderField: "Authorization")
+            (data, response) = try await session.data(for: authorizedRequest)
+        }
+        guard let finalHTTP = response as? HTTPURLResponse else {
+            throw CloudAPIError(status: -1, message: "Invalid server response", retryAfter: nil)
+        }
+        guard (200..<300).contains(finalHTTP.statusCode) else {
             let serverError = try? decoder.decode(ServerError.self, from: data)
             let message = serverError?.error
                 ?? String(data: data, encoding: .utf8)
-                ?? "HTTP \(http.statusCode)"
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
-            throw CloudAPIError(
-                status: http.statusCode,
+                ?? "HTTP \(finalHTTP.statusCode)"
+            let retryAfter = finalHTTP.value(forHTTPHeaderField: "Retry-After").flatMap(Int.init)
+            let error = CloudAPIError(
+                status: finalHTTP.statusCode,
                 message: message,
                 retryAfter: retryAfter,
                 code: serverError?.code,
                 existingCallId: serverError?.existingCallId
             )
+            if let sentToken = Self.bearerToken(in: authorizedRequest) {
+                await credentialCoordinator?.handleAuthenticationFailure(
+                    code: error.code,
+                    matching: sentToken
+                )
+            }
+            throw error
         }
         return try decoder.decode(Response.self, from: data)
+    }
+
+    private static func bearerToken(in request: URLRequest) -> String? {
+        guard let value = request.value(forHTTPHeaderField: "Authorization"),
+              value.lowercased().hasPrefix("bearer ")
+        else { return nil }
+        return String(value.dropFirst(7))
     }
 }
 
