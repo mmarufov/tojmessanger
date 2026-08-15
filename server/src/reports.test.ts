@@ -13,6 +13,7 @@ import {
 } from "./envelope-crypto";
 import {
   processVoIPPushBatch,
+  registerInstallationPushToken,
   registerVoIPPushToken,
   type APNsSendRequest,
   type APNsSendResult,
@@ -699,6 +700,15 @@ describe.serial("abuse reports", () => {
     await registerVoIPPushToken(
       db, bob.deviceId, "aa".repeat(32), "sandbox", [1], [1], 1,
     );
+    const installationId = crypto.randomUUID();
+    await registerInstallationPushToken(db, {
+      accountId: bob.accountId,
+      deviceId: bob.deviceId,
+      installationId,
+      token: "ab".repeat(32),
+      environment: "sandbox",
+      kind: "normal",
+    });
     const callId = crypto.randomUUID();
     await createCall(db, {
       callerAccountId: alice.accountId,
@@ -732,6 +742,10 @@ describe.serial("abuse reports", () => {
       voip_push_token_hash: null, voip_push_token_hash_key_id: null,
     });
     expect(bannedDevice.revoked_at).not.toBeNull();
+    expect(await db`SELECT 1 FROM push_account_bindings
+      WHERE installation_id = ${installationId} AND account_id = ${bob.accountId}`).toHaveLength(0);
+    expect(await db`SELECT 1 FROM push_installations
+      WHERE installation_id = ${installationId}`).toHaveLength(0);
     expect((await db`SELECT state, end_reason FROM calls WHERE id = ${callId}`)[0])
       .toMatchObject({ state: "ended", end_reason: "account_banned" });
 

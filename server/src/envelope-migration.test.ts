@@ -5,9 +5,11 @@ import {
   chatFolderTitleAAD,
   draftBodyAAD,
   draftResponseAAD,
+  installationPushTokenAAD,
   mediaChunkAAD,
   mediaFileNameAAD,
   mediaThumbnailAAD,
+  pollAAD,
   linkPreviewAssetAAD,
   linkPreviewMetadataAAD,
   linkPreviewURLAAD,
@@ -16,6 +18,7 @@ import {
   reportEvidenceAAD,
   scheduledItemAAD,
   seal,
+  sessionRotationAAD,
   voipPushTokenAAD,
 } from "./crypto";
 import { makeSql } from "./db";
@@ -29,7 +32,7 @@ beforeEach(async () => {
   delete process.env.TOJ_KEY_ENCRYPTION_PROVIDER;
   resetEnvelopeCryptoInstancesForTests();
   await db`TRUNCATE accounts, otp_challenges, link_preview_cache_entries,
-    link_preview_snapshots, link_preview_assets, service_data_keys,
+    link_preview_snapshots, link_preview_assets, push_installations, service_data_keys,
     crypto_migration_cursors RESTART IDENTITY CASCADE`;
 });
 
@@ -54,12 +57,31 @@ describe.serial("envelope ciphertext migration", () => {
     const scheduledClientMessageId = crypto.randomUUID();
     const snapshotId = crypto.randomUUID();
     const assetId = crypto.randomUUID();
+    const installationId = crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
+    const rotationId = crypto.randomUUID();
     const lookup = Buffer.alloc(32, 0x31);
     const body = seal("message", bodyAAD(dialogId, messageId, account.accountId));
+    const poll = seal(
+      JSON.stringify({
+        question: "Legacy poll", options: ["One", "Two"],
+        correctOptionIndex: null, explanation: null,
+      }),
+      pollAAD(dialogId, messageId),
+    );
     const draft = seal("draft", draftBodyAAD(account.accountId, dialogId, 1));
     const response = seal("{}", draftResponseAAD(account.accountId, operationId));
     const push = seal("aa".repeat(32), pushTokenAAD(account.deviceId));
     const voip = seal("bb".repeat(32), voipPushTokenAAD(account.deviceId));
+    const installationPush = seal(
+      "cc".repeat(32), installationPushTokenAAD(installationId, "normal"),
+    );
+    const installationVoIP = seal(
+      "dd".repeat(32), installationPushTokenAAD(installationId, "voip"),
+    );
+    const rotationReceipt = seal(
+      JSON.stringify({ tokenVersion: 2 }), sessionRotationAAD(sessionId, rotationId),
+    );
     const fileName = seal("private.jpg", mediaFileNameAAD(mediaId));
     const thumbnail = seal(Buffer.from("thumb"), mediaThumbnailAAD(mediaId));
     const chunk = seal(Buffer.from("media"), mediaChunkAAD(mediaId, 0));
@@ -98,6 +120,11 @@ describe.serial("envelope ciphertext migration", () => {
         body_key_id, body_nonce, body_ciphertext
       ) VALUES (${dialogId}, 1, ${account.accountId}, ${account.deviceId},
         ${crypto.randomUUID()}, 'text', ${body.keyId}, ${body.nonce}, ${body.ciphertext})`;
+      await tx`INSERT INTO message_polls(
+        dialog_id, msg_id, payload_key_id, payload_nonce, payload_ciphertext,
+        option_count, multiple_choice, anonymous, quiz
+      ) VALUES (${dialogId}, 1, ${poll.keyId}, ${poll.nonce}, ${poll.ciphertext},
+        2, FALSE, TRUE, FALSE)`;
       await tx`INSERT INTO account_dialog_drafts(
         account_id, dialog_id, state, body_key_id, body_nonce, body_ciphertext,
         revision, operation_id, source_device_id
@@ -114,6 +141,27 @@ describe.serial("envelope ciphertext migration", () => {
         voip_push_token_key_id = ${voip.keyId}, voip_push_token_nonce = ${voip.nonce},
         voip_push_token_ciphertext = ${voip.ciphertext}
         WHERE id = ${account.deviceId}`;
+      await tx`INSERT INTO push_installations(
+        installation_id,
+        normal_token_hash, normal_token_ciphertext, normal_token_nonce,
+        normal_token_key_id, normal_environment,
+        voip_token_hash, voip_token_ciphertext, voip_token_nonce,
+        voip_token_key_id, voip_environment
+      ) VALUES (${installationId}, ${Buffer.alloc(32, 0x41)}, ${installationPush.ciphertext},
+        ${installationPush.nonce}, ${installationPush.keyId}, 'sandbox',
+        ${Buffer.alloc(32, 0x42)}, ${installationVoIP.ciphertext},
+        ${installationVoIP.nonce}, ${installationVoIP.keyId}, 'sandbox')`;
+      await tx`INSERT INTO device_sessions(
+        id, device_id, refresh_token_hash, absolute_expires_at
+      ) VALUES (${sessionId}, ${account.deviceId}, ${Buffer.alloc(32, 0x43)},
+        now() + interval '1 day')`;
+      await tx`INSERT INTO session_rotation_receipts(
+        session_id, rotation_id, request_token_digest,
+        response_ciphertext, response_nonce, response_key_id,
+        response_generation, expires_at
+      ) VALUES (${sessionId}, ${rotationId}, ${Buffer.alloc(32, 0x44)},
+        ${rotationReceipt.ciphertext}, ${rotationReceipt.nonce}, ${rotationReceipt.keyId},
+        1, now() + interval '5 minutes')`;
       await tx`INSERT INTO media_objects(
         id, owner_account_id, kind, content_type, file_name_key_id, file_name_nonce,
         file_name_ciphertext, byte_size, expected_sha256, uploaded_bytes, status,
@@ -183,10 +231,17 @@ describe.serial("envelope ciphertext migration", () => {
     const keys = (await db`
       SELECT phone_key_id AS key_id FROM accounts WHERE id = ${account.accountId}
       UNION ALL SELECT body_key_id FROM messages WHERE dialog_id = ${dialogId}
+      UNION ALL SELECT payload_key_id FROM message_polls WHERE dialog_id = ${dialogId}
       UNION ALL SELECT body_key_id FROM account_dialog_drafts WHERE account_id = ${account.accountId}
       UNION ALL SELECT response_key_id FROM draft_mutation_requests WHERE account_id = ${account.accountId}
       UNION ALL SELECT push_token_key_id FROM devices WHERE id = ${account.deviceId}
       UNION ALL SELECT voip_push_token_key_id FROM devices WHERE id = ${account.deviceId}
+      UNION ALL SELECT normal_token_key_id FROM push_installations
+        WHERE installation_id = ${installationId}
+      UNION ALL SELECT voip_token_key_id FROM push_installations
+        WHERE installation_id = ${installationId}
+      UNION ALL SELECT response_key_id FROM session_rotation_receipts
+        WHERE session_id = ${sessionId} AND rotation_id = ${rotationId}
       UNION ALL SELECT file_name_key_id FROM media_objects WHERE id = ${mediaId}
       UNION ALL SELECT thumbnail_key_id FROM media_objects WHERE id = ${mediaId}
       UNION ALL SELECT key_id FROM media_chunks WHERE media_id = ${mediaId}
@@ -201,7 +256,7 @@ describe.serial("envelope ciphertext migration", () => {
       UNION ALL SELECT metadata_key_id FROM link_preview_snapshots WHERE id = ${snapshotId}
       UNION ALL SELECT key_id FROM link_preview_assets WHERE id = ${assetId}`)
       .map((row: any) => String(row.key_id));
-    expect(keys).toHaveLength(18);
+    expect(keys).toHaveLength(22);
     expect(keys.every((keyId) => keyId !== "dev-v1")).toBeTrue();
 
     const migratedMessage = (await db`SELECT body_key_id, body_nonce, body_ciphertext

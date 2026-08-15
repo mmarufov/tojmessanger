@@ -3,6 +3,7 @@ import { checkVerification, startVerification } from "./auth";
 import { bodyAAD, open as legacyOpen, seal as legacySeal } from "./crypto";
 import { makeSql } from "./db";
 import { lockMutationKeys } from "./locks";
+import { refreshV2Session, upgradeLegacySession } from "./session-security";
 import {
   activateCryptoWriteMode,
   assertCryptoConfiguration,
@@ -170,6 +171,22 @@ describe.serial("provider-neutral envelope encryption", () => {
     }
     expect(disabledTrigger?.ready).toBe(false);
     expect(disabledTrigger?.missing).toContain("crypto_write_fence_messages_body_key_id");
+
+    let disabledReceiptTrigger: Awaited<ReturnType<typeof envelopeSchemaReadiness>> | null = null;
+    try {
+      await db.begin(async (tx) => {
+        await tx`ALTER TABLE session_rotation_receipts DISABLE TRIGGER
+          crypto_write_fence_session_rotation_receipts_response_key_id`;
+        disabledReceiptTrigger = await envelopeSchemaReadiness(tx);
+        throw new Error("rollback receipt-trigger fixture");
+      });
+    } catch (error) {
+      expect(String(error)).toContain("rollback receipt-trigger fixture");
+    }
+    expect(disabledReceiptTrigger?.ready).toBe(false);
+    expect(disabledReceiptTrigger?.missing).toContain(
+      "crypto_write_fence_session_rotation_receipts_response_key_id",
+    );
   });
 
   test("transaction batches resolve one active key only once per scope", async () => {
@@ -853,6 +870,66 @@ describe.serial("provider-neutral envelope encryption", () => {
     }
     expect((await db`SELECT write_mode FROM crypto_write_state WHERE singleton`)[0].write_mode)
       .toBe("legacy");
+  });
+
+  test("final writer mode seals and idempotently replays v2 rotation receipts", async () => {
+    const account = await makeAccount();
+    const session = await upgradeLegacySession(db, account.accountId, account.deviceId);
+    const rotationId = cryptoUUID();
+    try {
+      process.env.TOJ_KEY_ENCRYPTION_PROVIDER = "local";
+      process.env.TOJ_CRYPTO_MODE = "envelope-canary";
+      resetEnvelopeCryptoInstancesForTests();
+      await activateCryptoWriteMode(db, "envelope-canary");
+
+      process.env.TOJ_CRYPTO_MODE = "envelope";
+      resetEnvelopeCryptoInstancesForTests();
+      await activateCryptoWriteMode(db, "envelope");
+
+      const rotated = await refreshV2Session(db, session.refreshToken, rotationId);
+      expect(await refreshV2Session(db, session.refreshToken, rotationId)).toEqual(rotated);
+      const receipt = (await db`
+        SELECT response_key_id
+        FROM session_rotation_receipts
+        WHERE rotation_id = ${rotationId}`)[0];
+      expect(String(receipt.response_key_id)).not.toBe("dev-v1");
+    } finally {
+      await resetCryptoWriteState();
+      delete process.env.TOJ_CRYPTO_MODE;
+      delete process.env.TOJ_KEY_ENCRYPTION_PROVIDER;
+      resetEnvelopeCryptoInstancesForTests();
+    }
+  });
+
+  test("final writer activation fails closed for unsupported legacy report snapshots", async () => {
+    const account = await makeAccount();
+    try {
+      await db`
+        INSERT INTO user_reports (
+          id, reporter_account_id, reported_account_id, reason,
+          message_snapshot_ciphertext, message_snapshot_nonce, message_snapshot_key_id
+        ) VALUES (
+          ${cryptoUUID()}, ${account.accountId}, ${account.accountId}, 'other',
+          ${Buffer.from("legacy")}, ${Buffer.alloc(12)}, 'dev-v1'
+        )`;
+      process.env.TOJ_KEY_ENCRYPTION_PROVIDER = "local";
+      process.env.TOJ_CRYPTO_MODE = "envelope-canary";
+      resetEnvelopeCryptoInstancesForTests();
+      await activateCryptoWriteMode(db, "envelope-canary");
+
+      process.env.TOJ_CRYPTO_MODE = "envelope";
+      resetEnvelopeCryptoInstancesForTests();
+      await expect(activateCryptoWriteMode(db, "envelope")).rejects.toThrow(
+        "legacy user_reports snapshots must be resolved",
+      );
+      expect((await db`SELECT write_mode FROM crypto_write_state WHERE singleton`)[0].write_mode)
+        .toBe("envelope-canary");
+    } finally {
+      await resetCryptoWriteState();
+      delete process.env.TOJ_CRYPTO_MODE;
+      delete process.env.TOJ_KEY_ENCRYPTION_PROVIDER;
+      resetEnvelopeCryptoInstancesForTests();
+    }
   });
 
   test("final envelope startup can remove the legacy ciphertext secret after migration", () => {

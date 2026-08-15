@@ -10,11 +10,14 @@ import {
   mediaChunkAAD,
   mediaFileNameAAD,
   mediaThumbnailAAD,
+  installationPushTokenAAD,
+  pollAAD,
   PHONE_AAD,
   pushTokenAAD,
   reportActionNoteAAD,
   reportEvidenceAAD,
   scheduledItemAAD,
+  sessionRotationAAD,
   voipPushTokenAAD,
 } from "./crypto";
 import {
@@ -27,9 +30,12 @@ import {
 export const ENVELOPE_MIGRATION_DOMAINS = [
   "phone-identity",
   "messages",
+  "message-polls",
   "drafts",
   "draft-responses",
   "push-tokens",
+  "installation-push-tokens",
+  "session-rotation-receipts",
   "media-metadata",
   "media-chunks",
   "moderation-evidence",
@@ -54,9 +60,15 @@ type MigrationBatchResult = { migrated: number; contended: boolean };
 const MIGRATION_INDEXES: Record<EnvelopeMigrationDomain, string[]> = {
   "phone-identity": ["accounts_phone_key_migration_idx"],
   messages: ["messages_body_key_migration_idx"],
+  "message-polls": ["message_polls_payload_key_migration_idx"],
   drafts: ["drafts_body_key_migration_idx"],
   "draft-responses": ["draft_responses_key_migration_idx"],
   "push-tokens": ["devices_push_key_migration_idx", "devices_voip_key_migration_idx"],
+  "installation-push-tokens": [
+    "push_installations_normal_key_migration_idx",
+    "push_installations_voip_key_migration_idx",
+  ],
+  "session-rotation-receipts": ["session_rotation_receipts_key_migration_idx"],
   "media-metadata": ["media_file_name_key_migration_idx", "media_thumbnail_key_migration_idx"],
   "media-chunks": ["media_chunks_key_migration_idx"],
   "moderation-evidence": ["abuse_reports_evidence_key_migration_idx"],
@@ -170,6 +182,42 @@ async function migrateMessages(
   });
 }
 
+async function migrateMessagePolls(
+  sql: SQL, fromKeyId: string, limit: number,
+): Promise<MigrationBatchResult> {
+  const rows = await sql`
+    SELECT poll.dialog_id, poll.msg_id, poll.payload_key_id AS key_id,
+           poll.payload_nonce AS nonce, poll.payload_ciphertext AS ciphertext,
+           message.sender_account_id
+    FROM message_polls poll
+    JOIN messages message
+      ON message.dialog_id = poll.dialog_id AND message.msg_id = poll.msg_id
+    WHERE poll.payload_key_id = ${fromKeyId}
+    ORDER BY poll.dialog_id, poll.msg_id
+    FOR UPDATE OF poll SKIP LOCKED LIMIT ${limit}`;
+  return migrationBatch(sql, rows.map((row: any) => ({
+    kind: "account", accountId: String(row.sender_account_id),
+  })), async () => {
+    let migrated = 0;
+    for (const row of rows) {
+      const sealed = await reseal(
+        sql,
+        { kind: "account", accountId: String(row.sender_account_id) },
+        row as any,
+        pollAAD(String(row.dialog_id), n(row.msg_id)),
+      );
+      if (!sealed) continue;
+      const updated = await sql`UPDATE message_polls
+        SET payload_key_id = ${sealed.keyId}, payload_nonce = ${sealed.nonce},
+            payload_ciphertext = ${sealed.ciphertext}
+        WHERE dialog_id = ${row.dialog_id} AND msg_id = ${row.msg_id}
+          AND payload_key_id = ${fromKeyId} RETURNING msg_id`;
+      migrated += updated.length;
+    }
+    return migrated;
+  });
+}
+
 async function migrateDrafts(
   sql: SQL, fromKeyId: string, limit: number,
 ): Promise<MigrationBatchResult> {
@@ -272,6 +320,99 @@ async function migratePushTokens(
         }
       }
       if (touched) migrated += 1;
+    }
+    return migrated;
+  });
+}
+
+async function migrateInstallationPushTokens(
+  sql: SQL, fromKeyId: string, limit: number,
+): Promise<MigrationBatchResult> {
+  const rows = await sql`
+    SELECT installation_id,
+           normal_token_key_id, normal_token_nonce, normal_token_ciphertext,
+           voip_token_key_id, voip_token_nonce, voip_token_ciphertext
+    FROM push_installations
+    WHERE normal_token_key_id = ${fromKeyId} OR voip_token_key_id = ${fromKeyId}
+    ORDER BY installation_id FOR UPDATE SKIP LOCKED LIMIT ${limit}`;
+  const scope: KeyScope = { kind: "service", serviceName: "push-installation" };
+  return migrationBatch(sql, [scope], async () => {
+    let migrated = 0;
+    for (const row of rows) {
+      let touched = false;
+      if (row.normal_token_key_id === fromKeyId) {
+        if (!row.normal_token_nonce || !row.normal_token_ciphertext) {
+          throw new Error(`installation ${row.installation_id} has an incomplete push-token ciphertext tuple`);
+        }
+        const sealed = await reseal(sql, scope, {
+          key_id: row.normal_token_key_id,
+          nonce: row.normal_token_nonce,
+          ciphertext: row.normal_token_ciphertext,
+        }, installationPushTokenAAD(String(row.installation_id), "normal"));
+        if (sealed) {
+          const updated = await sql`UPDATE push_installations
+            SET normal_token_key_id = ${sealed.keyId}, normal_token_nonce = ${sealed.nonce},
+                normal_token_ciphertext = ${sealed.ciphertext}
+            WHERE installation_id = ${row.installation_id}
+              AND normal_token_key_id = ${fromKeyId} RETURNING installation_id`;
+          touched ||= updated.length > 0;
+        }
+      }
+      if (row.voip_token_key_id === fromKeyId) {
+        if (!row.voip_token_nonce || !row.voip_token_ciphertext) {
+          throw new Error(`installation ${row.installation_id} has an incomplete VoIP-token ciphertext tuple`);
+        }
+        const sealed = await reseal(sql, scope, {
+          key_id: row.voip_token_key_id,
+          nonce: row.voip_token_nonce,
+          ciphertext: row.voip_token_ciphertext,
+        }, installationPushTokenAAD(String(row.installation_id), "voip"));
+        if (sealed) {
+          const updated = await sql`UPDATE push_installations
+            SET voip_token_key_id = ${sealed.keyId}, voip_token_nonce = ${sealed.nonce},
+                voip_token_ciphertext = ${sealed.ciphertext}
+            WHERE installation_id = ${row.installation_id}
+              AND voip_token_key_id = ${fromKeyId} RETURNING installation_id`;
+          touched ||= updated.length > 0;
+        }
+      }
+      if (touched) migrated += 1;
+    }
+    return migrated;
+  });
+}
+
+async function migrateSessionRotationReceipts(
+  sql: SQL, fromKeyId: string, limit: number,
+): Promise<MigrationBatchResult> {
+  const rows = await sql`
+    SELECT receipt.session_id, receipt.rotation_id,
+           receipt.response_key_id AS key_id, receipt.response_nonce AS nonce,
+           receipt.response_ciphertext AS ciphertext, device.account_id
+    FROM session_rotation_receipts receipt
+    JOIN device_sessions session ON session.id = receipt.session_id
+    JOIN devices device ON device.id = session.device_id
+    WHERE receipt.response_key_id = ${fromKeyId}
+    ORDER BY receipt.session_id, receipt.rotation_id
+    FOR UPDATE OF receipt SKIP LOCKED LIMIT ${limit}`;
+  return migrationBatch(sql, rows.map((row: any) => ({
+    kind: "account", accountId: String(row.account_id),
+  })), async () => {
+    let migrated = 0;
+    for (const row of rows) {
+      const sealed = await reseal(
+        sql,
+        { kind: "account", accountId: String(row.account_id) },
+        row as any,
+        sessionRotationAAD(String(row.session_id), String(row.rotation_id)),
+      );
+      if (!sealed) continue;
+      const updated = await sql`UPDATE session_rotation_receipts
+        SET response_key_id = ${sealed.keyId}, response_nonce = ${sealed.nonce},
+            response_ciphertext = ${sealed.ciphertext}
+        WHERE session_id = ${row.session_id} AND rotation_id = ${row.rotation_id}
+          AND response_key_id = ${fromKeyId} RETURNING rotation_id`;
+      migrated += updated.length;
     }
     return migrated;
   });
@@ -625,9 +766,12 @@ const handlers: Record<EnvelopeMigrationDomain, (
 ) => Promise<MigrationBatchResult>> = {
   "phone-identity": migratePhoneIdentity,
   messages: migrateMessages,
+  "message-polls": migrateMessagePolls,
   drafts: migrateDrafts,
   "draft-responses": migrateDraftResponses,
   "push-tokens": migratePushTokens,
+  "installation-push-tokens": migrateInstallationPushTokens,
+  "session-rotation-receipts": migrateSessionRotationReceipts,
   "media-metadata": migrateMediaMetadata,
   "media-chunks": migrateMediaChunks,
   "moderation-evidence": migrateModerationEvidence,
@@ -649,6 +793,9 @@ async function remaining(sql: SQL, domain: EnvelopeMigrationDomain, keyId: strin
     case "messages":
       rows = await sql`SELECT 1 FROM messages WHERE body_key_id = ${keyId} LIMIT 1`;
       break;
+    case "message-polls":
+      rows = await sql`SELECT 1 FROM message_polls WHERE payload_key_id = ${keyId} LIMIT 1`;
+      break;
     case "drafts":
       rows = await sql`SELECT 1 FROM account_dialog_drafts WHERE body_key_id = ${keyId} LIMIT 1`;
       break;
@@ -658,6 +805,14 @@ async function remaining(sql: SQL, domain: EnvelopeMigrationDomain, keyId: strin
     case "push-tokens":
       rows = await sql`SELECT 1 FROM devices
         WHERE push_token_key_id = ${keyId} OR voip_push_token_key_id = ${keyId} LIMIT 1`;
+      break;
+    case "installation-push-tokens":
+      rows = await sql`SELECT 1 FROM push_installations
+        WHERE normal_token_key_id = ${keyId} OR voip_token_key_id = ${keyId} LIMIT 1`;
+      break;
+    case "session-rotation-receipts":
+      rows = await sql`SELECT 1 FROM session_rotation_receipts
+        WHERE response_key_id = ${keyId} LIMIT 1`;
       break;
     case "media-metadata":
       rows = await sql`SELECT 1 FROM media_objects

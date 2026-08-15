@@ -1085,6 +1085,14 @@ export async function envelopeSchemaReadiness(sql: SQL): Promise<{ ready: boolea
       "metadata_key_id", "metadata_nonce", "metadata_ciphertext",
     ],
     link_preview_assets: ["key_id", "nonce", "ciphertext"],
+    message_polls: ["payload_key_id", "payload_nonce", "payload_ciphertext"],
+    push_installations: [
+      "normal_token_key_id", "normal_token_nonce", "normal_token_ciphertext",
+      "voip_token_key_id", "voip_token_nonce", "voip_token_ciphertext",
+    ],
+    session_rotation_receipts: [
+      "response_key_id", "response_nonce", "response_ciphertext",
+    ],
   };
   const rows = await sql`
     SELECT table_name, column_name, is_nullable FROM information_schema.columns
@@ -1126,6 +1134,8 @@ export async function envelopeSchemaReadiness(sql: SQL): Promise<{ ready: boolea
     "scheduled_items_payload_key_migration_idx", "link_preview_cache_key_migration_idx",
     "message_link_preview_key_migration_idx", "link_preview_snapshot_url_key_migration_idx",
     "link_preview_snapshot_metadata_key_migration_idx", "link_preview_assets_key_migration_idx",
+    "message_polls_payload_key_migration_idx", "push_installations_normal_key_migration_idx",
+    "push_installations_voip_key_migration_idx", "session_rotation_receipts_key_migration_idx",
   ];
   const indexes = await sql`
     SELECT class.relname AS name, index.indisvalid, index.indisready, index.indislive
@@ -1240,6 +1250,22 @@ export async function envelopeSchemaReadiness(sql: SQL): Promise<{ ready: boolea
     crypto_write_fence_link_preview_assets_key_id: {
       table: "link_preview_assets", functionName: "toj_reject_legacy_ciphertext_v1",
       args: "key_id\\000nonce\\000ciphertext\\000",
+    },
+    crypto_write_fence_message_polls_payload_key_id: {
+      table: "message_polls", functionName: "toj_reject_legacy_ciphertext_v1",
+      args: "payload_key_id\\000payload_nonce\\000payload_ciphertext\\000",
+    },
+    crypto_write_fence_push_installations_normal_token_key_id: {
+      table: "push_installations", functionName: "toj_reject_legacy_ciphertext_v1",
+      args: "normal_token_key_id\\000normal_token_nonce\\000normal_token_ciphertext\\000",
+    },
+    crypto_write_fence_push_installations_voip_token_key_id: {
+      table: "push_installations", functionName: "toj_reject_legacy_ciphertext_v1",
+      args: "voip_token_key_id\\000voip_token_nonce\\000voip_token_ciphertext\\000",
+    },
+    crypto_write_fence_session_rotation_receipts_response_key_id: {
+      table: "session_rotation_receipts", functionName: "toj_reject_legacy_ciphertext_v1",
+      args: "response_key_id\\000response_nonce\\000response_ciphertext\\000",
     },
   };
   const triggers = await sql`
@@ -1385,7 +1411,11 @@ export async function keyReferenceCount(sql: SQL, keyId: string): Promise<number
       + (SELECT count(*) FROM message_link_previews WHERE original_url_key_id = ${keyId})
       + (SELECT count(*) FROM link_preview_snapshots
           WHERE url_key_id = ${keyId} OR metadata_key_id = ${keyId})
-      + (SELECT count(*) FROM link_preview_assets WHERE key_id = ${keyId}) AS count`)[0];
+      + (SELECT count(*) FROM link_preview_assets WHERE key_id = ${keyId})
+      + (SELECT count(*) FROM message_polls WHERE payload_key_id = ${keyId})
+      + (SELECT count(*) FROM push_installations
+          WHERE normal_token_key_id = ${keyId} OR voip_token_key_id = ${keyId})
+      + (SELECT count(*) FROM session_rotation_receipts WHERE response_key_id = ${keyId}) AS count`)[0];
   return Number(row.count);
 }
 
@@ -1432,9 +1462,17 @@ export async function activateCryptoWriteMode(
       await tx.unsafe(`LOCK TABLE
         abuse_report_actions, abuse_reports, account_dialog_drafts, accounts, chat_folders,
         devices, draft_mutation_requests, link_preview_assets, link_preview_cache_entries,
-        link_preview_snapshots, media_chunks, media_objects, message_link_previews, messages,
-        scheduled_delivery_items, user_reports
+        link_preview_snapshots, media_chunks, media_objects, message_link_previews, message_polls,
+        messages, push_installations, scheduled_delivery_items, session_rotation_receipts,
+        user_reports
         IN SHARE ROW EXCLUSIVE MODE`);
+      const unsupportedLegacyReports = await tx`
+        SELECT 1 FROM user_reports WHERE message_snapshot_key_id IS NOT NULL LIMIT 1`;
+      if (unsupportedLegacyReports.length) {
+        throw new Error(
+          "legacy user_reports snapshots must be resolved before final envelope activation",
+        );
+      }
     }
     const updated = (await tx`
       UPDATE crypto_write_state

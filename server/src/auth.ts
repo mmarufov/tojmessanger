@@ -2,11 +2,11 @@ import type { SQL } from "bun";
 import { randomBytes, randomInt } from "node:crypto";
 import {
   PHONE_AAD, phoneLookupCandidates, phoneLookupIndex,
-  codeHashIndex, hashToken, tokenHashCandidates, tokenHashIndex,
+  codeHashIndex, tokenHashCandidates, tokenHashIndex,
   normalizePhone, constantTimeEqual,
 } from "./crypto";
 import { CryptoUnavailableError, openForScope, sealForScope } from "./envelope-crypto";
-import { enqueuePushDeliveries } from "./push";
+import { enqueuePushDeliveries, revokePushBindingsForDevice } from "./push";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { COMMON_PASSWORDS_V1 } from "./common-passwords-v1";
 import { AuthError } from "./auth-error";
@@ -519,28 +519,32 @@ function normalizedRecoveryCode(value: unknown): string {
   return value.toUpperCase().replace(/[^2-9A-HJ-NP-Z]/g, "");
 }
 
-function recoveryCodeHash(accountId: string, value: string): Buffer {
-  return hashToken(`toj/recovery/v1|${accountId}|${value}`);
+function recoveryCodeInput(accountId: string, value: string): string {
+  return `toj/recovery/v1|${accountId}|${value}`;
 }
 
 async function replaceRecoveryCodes(sql: SQL, accountId: string): Promise<string[]> {
   const codes = Array.from({ length: 10 }, recoveryCode);
   await sql`DELETE FROM two_factor_recovery_codes WHERE account_id = ${accountId}`;
   for (const code of codes) {
+    const index = tokenHashIndex(recoveryCodeInput(accountId, normalizedRecoveryCode(code)));
     await sql`
-      INSERT INTO two_factor_recovery_codes (account_id, code_hash)
-      VALUES (${accountId}, ${recoveryCodeHash(accountId, normalizedRecoveryCode(code))})`;
+      INSERT INTO two_factor_recovery_codes (account_id, code_hash, code_key_id)
+      VALUES (${accountId}, ${index.digest}, ${index.keyId})`;
   }
   return codes;
 }
 
 async function revokeOtherAccountDevices(sql: SQL, accountId: string, keepDeviceId?: string): Promise<string[]> {
+  await sql`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
   const rows = await sql`
     UPDATE devices SET
       revoked_at = COALESCE(revoked_at, now()),
-      push_token_hash = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+      push_token_hash = NULL, push_token_hash_key_id = NULL,
+      push_token_ciphertext = NULL, push_token_nonce = NULL,
       push_token_key_id = NULL, push_environment = NULL, push_updated_at = now(),
-      voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+      voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
+      voip_push_token_ciphertext = NULL,
       voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
       voip_push_environment = NULL, voip_push_updated_at = now()
     WHERE account_id = ${accountId} AND revoked_at IS NULL
@@ -550,6 +554,7 @@ async function revokeOtherAccountDevices(sql: SQL, accountId: string, keepDevice
     UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'security_change'
     WHERE device_id IN ${sql(rows.map((row) => String(row.id)))}`;
   for (const row of rows) {
+    await revokePushBindingsForDevice(sql, String(row.id));
     await notifySessionRevocation(sql, accountId, String(row.id), "security_change");
   }
   return rows.map((row) => String(row.id));
@@ -575,29 +580,38 @@ export async function completeTwoFactorLogin(
       return new AuthError("too many attempts; request a new SMS code", 429, undefined, "challenge_locked");
     }
     const accountId = String(challenge.account_id);
-    const accountBudgetHash = hashToken(`two-factor-account|${accountId}`);
-    await tx`SELECT pg_advisory_xact_lock(${accountBudgetHash.readBigInt64BE(0)})`;
-    const networkHash = input.networkKey
-      ? hashToken(`two-factor-network|${input.networkKey}`)
-      : null;
-    if (networkHash) await tx`SELECT pg_advisory_xact_lock(${networkHash.readBigInt64BE(0)})`;
+    const accountBudgetLocks = tokenHashCandidates(`two-factor-account|${accountId}`)
+      .map((candidate) => candidate.digest.readBigInt64BE(0))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    for (const lock of accountBudgetLocks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
+    const networkInput = input.networkKey ? `two-factor-network|${input.networkKey}` : null;
+    const networkCandidates = networkInput ? tokenHashCandidates(networkInput) : [];
+    const networkIndex = networkInput ? tokenHashIndex(networkInput) : null;
+    const networkLocks = networkCandidates
+      .map((candidate) => candidate.digest.readBigInt64BE(0))
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    for (const lock of networkLocks) await tx`SELECT pg_advisory_xact_lock(${lock})`;
     const accountAttempts = Number((await tx`
       SELECT count(*) AS count FROM two_factor_attempt_budgets
       WHERE account_id = ${accountId} AND accepted_at > now() - interval '15 minutes'`)[0].count);
     if (accountAttempts >= TWO_FACTOR_ACCOUNT_WINDOW_LIMIT) {
       return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
     }
-    if (networkHash) {
+    if (networkCandidates.length) {
       const networkAttempts = Number((await tx`
         SELECT count(*) AS count FROM two_factor_attempt_budgets
-        WHERE network_hash = ${networkHash} AND accepted_at > now() - interval '15 minutes'`)[0].count);
+        WHERE network_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(
+            ${tx.array(networkCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+          ) AS candidate(value)
+        ) AND accepted_at > now() - interval '15 minutes'`)[0].count);
       if (networkAttempts >= TWO_FACTOR_NETWORK_WINDOW_LIMIT) {
         return new AuthError("too many two-step attempts; try again later", 429, 900, "challenge_locked");
       }
     }
     await tx`
-      INSERT INTO two_factor_attempt_budgets (account_id, network_hash)
-      VALUES (${accountId}, ${networkHash})`;
+      INSERT INTO two_factor_attempt_budgets (account_id, network_hash, network_key_id)
+      VALUES (${accountId}, ${networkIndex?.digest ?? null}, ${networkIndex?.keyId ?? null})`;
     const factor = (await tx`
       SELECT password_hash FROM account_two_factor WHERE account_id = ${accountId} FOR UPDATE`)[0];
     if (!factor) return new AuthError("two-step verification is no longer enabled", 409, undefined, "factor_changed");
@@ -608,10 +622,17 @@ export async function completeTwoFactorLogin(
       accepted = await Bun.password.verify(input.password, String(factor.password_hash));
     } else {
       const normalized = normalizedRecoveryCode(input.recoveryCode);
+      const recoveryCandidates = normalized.length === 16
+        ? tokenHashCandidates(recoveryCodeInput(accountId, normalized))
+        : [];
       const recovery = normalized.length === 16 ? (await tx`
         SELECT id FROM two_factor_recovery_codes
         WHERE account_id = ${accountId}
-          AND code_hash = ${recoveryCodeHash(accountId, normalized)}
+          AND code_hash IN (
+            SELECT decode(value, 'hex') FROM unnest(
+              ${tx.array(recoveryCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+            ) AS candidate(value)
+          )
           AND consumed_at IS NULL
         FOR UPDATE`)[0] : null;
       if (recovery) {
@@ -735,9 +756,10 @@ export async function completeSecurityStepUp(
       return new AuthError("incorrect code", 401);
     }
     await tx`UPDATE otp_challenges SET consumed_at = now() WHERE id = ${challenge.id}`;
+    const ticketIndex = tokenHashIndex(ticket);
     await tx`
-      INSERT INTO security_step_up_tickets (account_id, token_hash, expires_at)
-      VALUES (${accountId}, ${hashToken(ticket)}, ${expiresAt})`;
+      INSERT INTO security_step_up_tickets (account_id, token_hash, token_key_id, expires_at)
+      VALUES (${accountId}, ${ticketIndex.digest}, ${ticketIndex.keyId}, ${expiresAt})`;
     return { stepUpToken: ticket, expiresAt: expiresAt.toISOString() };
   });
   if (result instanceof AuthError) throw result;
@@ -752,9 +774,14 @@ async function requireStepUp(
   if (typeof tokenValue !== "string") {
     return new AuthError("security verification required", 401, undefined, "step_up_expired");
   }
+  const candidates = tokenHashCandidates(tokenValue);
   const ticket = (await sql`
     SELECT id, attempts FROM security_step_up_tickets
-    WHERE account_id = ${accountId} AND token_hash = ${hashToken(tokenValue)}
+    WHERE account_id = ${accountId} AND token_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(candidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+      ) AS candidate(value)
+    )
       AND consumed_at IS NULL AND expires_at > now()
     FOR UPDATE`)[0];
   if (!ticket) return new AuthError("security verification expired", 401, undefined, "step_up_expired");
@@ -776,9 +803,16 @@ async function verifyCurrentFactor(
     return true;
   }
   const normalized = normalizedRecoveryCode(credential);
+  const recoveryCandidates = normalized.length === 16
+    ? tokenHashCandidates(recoveryCodeInput(accountId, normalized))
+    : [];
   const recovered = normalized.length === 16 ? await sql`
     UPDATE two_factor_recovery_codes SET consumed_at = now()
-    WHERE account_id = ${accountId} AND code_hash = ${recoveryCodeHash(accountId, normalized)}
+    WHERE account_id = ${accountId} AND code_hash IN (
+      SELECT decode(value, 'hex') FROM unnest(
+        ${sql.array(recoveryCandidates.map((candidate) => candidate.digest.toString("hex")), "text")}::text[]
+      ) AS candidate(value)
+    )
       AND consumed_at IS NULL RETURNING id` : [];
   return recovered.length > 0;
 }
@@ -1228,6 +1262,8 @@ export async function revokeDevice(
   options: { beforeCommit?: (tx: SQL) => Promise<void> } = {},
 ): Promise<{ revoked: true }> {
   return await sql.begin(async (tx) => {
+    const account = await tx`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
+    if (!account.length) throw new AuthError("device not found", 404);
     const rows = await tx`
       UPDATE devices SET
         revoked_at = COALESCE(revoked_at, now()),
@@ -1250,6 +1286,7 @@ export async function revokeDevice(
       WHERE id = ${deviceId} AND account_id = ${accountId}
       RETURNING id`;
     if (rows.length === 0) throw new AuthError("device not found", 404);
+    await revokePushBindingsForDevice(tx, deviceId);
     await tx`
       UPDATE device_sessions SET revoked_at = COALESCE(revoked_at, now()), revocation_reason = 'device_revoked'
       WHERE device_id = ${deviceId}`;

@@ -7,7 +7,6 @@ import {
 } from "node:http2";
 import { createPrivateKey, sign } from "node:crypto";
 import {
-  hashToken,
   installationPushTokenAAD,
   pushTokenAAD,
   tokenHashCandidates,
@@ -325,7 +324,13 @@ async function registerInstallationPushTokenInTransaction(
   }
   const token = normalizeDeviceToken(input.token);
   const environment = validateEnvironment(input.environment);
-  const tokenHash = hashToken(`apns-installation-${input.kind}|${environment}|${token}`);
+  const tokenInput = `apns-installation-${input.kind}|${environment}|${token}`;
+  const tokenIndex = tokenHashIndex(tokenInput);
+  const tokenHashes = tokenHashCandidates(tokenInput).map((candidate) => candidate.digest);
+  const tokenHashPredicate = tx.array(
+    tokenHashes.map((hash) => hash.toString("hex")),
+    "text",
+  );
   // One installation credential is shared by every account bound to it, so it is sealed under a
   // service scope rather than the registering account's key. Account scoping would leave the
   // other bindings unable to decrypt the same ciphertext.
@@ -335,12 +340,10 @@ async function registerInstallationPushTokenInTransaction(
     token,
     installationPushTokenAAD(input.installationId, input.kind),
   );
-  const registrationLock = tokenHash.readBigInt64BE(0);
   // Registration is rare and ownership changes touch two unique token indexes plus bindings.
   // A single catalog lock prevents opposing token swaps from deadlocking and makes transfers
   // deterministic across application versions.
   await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
-  await tx`SELECT pg_advisory_xact_lock(${registrationLock})`;
   const device = (await tx`
     SELECT id FROM devices
     WHERE id = ${input.deviceId} AND account_id = ${input.accountId}
@@ -355,7 +358,10 @@ async function registerInstallationPushTokenInTransaction(
       WHERE binding.installation_id = installation.installation_id
         AND installation.installation_id <> ${input.installationId}
         AND installation.normal_environment = ${environment}
-        AND installation.normal_token_hash = ${tokenHash}
+        AND installation.normal_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )
         AND NOT binding.voip_enabled`;
     await tx`
       UPDATE push_account_bindings binding SET normal_enabled = FALSE, updated_at = now()
@@ -363,24 +369,35 @@ async function registerInstallationPushTokenInTransaction(
       WHERE binding.installation_id = installation.installation_id
         AND installation.installation_id <> ${input.installationId}
         AND installation.normal_environment = ${environment}
-        AND installation.normal_token_hash = ${tokenHash}
+        AND installation.normal_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )
         AND binding.voip_enabled`;
     await tx`
       UPDATE push_installations SET
-        normal_token_hash = NULL, normal_token_ciphertext = NULL, normal_token_nonce = NULL,
+        normal_token_hash = NULL, normal_token_hash_key_id = NULL,
+        normal_token_ciphertext = NULL, normal_token_nonce = NULL,
         normal_token_key_id = NULL, normal_environment = NULL, updated_at = now()
       WHERE installation_id <> ${input.installationId}
-        AND normal_environment = ${environment} AND normal_token_hash = ${tokenHash}`;
+        AND normal_environment = ${environment}
+        AND normal_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )`;
     await tx`
       INSERT INTO push_installations (
-        installation_id, normal_token_hash, normal_token_ciphertext, normal_token_nonce,
+        installation_id, normal_token_hash, normal_token_hash_key_id,
+        normal_token_ciphertext, normal_token_nonce,
         normal_token_key_id, normal_environment
       ) VALUES (
-        ${input.installationId}, ${tokenHash}, ${sealed.ciphertext}, ${sealed.nonce},
+        ${input.installationId}, ${tokenIndex.digest}, ${tokenIndex.keyId},
+        ${sealed.ciphertext}, ${sealed.nonce},
         ${sealed.keyId}, ${environment}
       )
       ON CONFLICT (installation_id) DO UPDATE SET
         normal_token_hash = excluded.normal_token_hash,
+        normal_token_hash_key_id = excluded.normal_token_hash_key_id,
         normal_token_ciphertext = excluded.normal_token_ciphertext,
         normal_token_nonce = excluded.normal_token_nonce,
         normal_token_key_id = excluded.normal_token_key_id,
@@ -393,7 +410,10 @@ async function registerInstallationPushTokenInTransaction(
       WHERE binding.installation_id = installation.installation_id
         AND installation.installation_id <> ${input.installationId}
         AND installation.voip_environment = ${environment}
-        AND installation.voip_token_hash = ${tokenHash}
+        AND installation.voip_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )
         AND NOT binding.normal_enabled`;
     await tx`
       UPDATE push_account_bindings binding SET voip_enabled = FALSE, updated_at = now()
@@ -401,24 +421,35 @@ async function registerInstallationPushTokenInTransaction(
       WHERE binding.installation_id = installation.installation_id
         AND installation.installation_id <> ${input.installationId}
         AND installation.voip_environment = ${environment}
-        AND installation.voip_token_hash = ${tokenHash}
+        AND installation.voip_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )
         AND binding.normal_enabled`;
     await tx`
       UPDATE push_installations SET
-        voip_token_hash = NULL, voip_token_ciphertext = NULL, voip_token_nonce = NULL,
+        voip_token_hash = NULL, voip_token_hash_key_id = NULL,
+        voip_token_ciphertext = NULL, voip_token_nonce = NULL,
         voip_token_key_id = NULL, voip_environment = NULL, updated_at = now()
       WHERE installation_id <> ${input.installationId}
-        AND voip_environment = ${environment} AND voip_token_hash = ${tokenHash}`;
+        AND voip_environment = ${environment}
+        AND voip_token_hash IN (
+          SELECT decode(value, 'hex') FROM unnest(${tokenHashPredicate}::text[])
+            AS candidate(value)
+        )`;
     await tx`
       INSERT INTO push_installations (
-        installation_id, voip_token_hash, voip_token_ciphertext, voip_token_nonce,
+        installation_id, voip_token_hash, voip_token_hash_key_id,
+        voip_token_ciphertext, voip_token_nonce,
         voip_token_key_id, voip_environment
       ) VALUES (
-        ${input.installationId}, ${tokenHash}, ${sealed.ciphertext}, ${sealed.nonce},
+        ${input.installationId}, ${tokenIndex.digest}, ${tokenIndex.keyId},
+        ${sealed.ciphertext}, ${sealed.nonce},
         ${sealed.keyId}, ${environment}
       )
       ON CONFLICT (installation_id) DO UPDATE SET
         voip_token_hash = excluded.voip_token_hash,
+        voip_token_hash_key_id = excluded.voip_token_hash_key_id,
         voip_token_ciphertext = excluded.voip_token_ciphertext,
         voip_token_nonce = excluded.voip_token_nonce,
         voip_token_key_id = excluded.voip_token_key_id,
@@ -446,13 +477,15 @@ async function registerInstallationPushTokenInTransaction(
   if (input.kind === "normal") {
     await tx`
       UPDATE devices SET
-        push_token_hash = NULL, push_token_ciphertext = NULL, push_token_nonce = NULL,
+        push_token_hash = NULL, push_token_hash_key_id = NULL,
+        push_token_ciphertext = NULL, push_token_nonce = NULL,
         push_token_key_id = NULL, push_environment = NULL, push_updated_at = now()
       WHERE id = ${input.deviceId}`;
   } else {
     await tx`
       UPDATE devices SET
-        voip_push_token_hash = NULL, voip_push_token_ciphertext = NULL,
+        voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
+        voip_push_token_ciphertext = NULL,
         voip_push_token_nonce = NULL, voip_push_token_key_id = NULL,
         voip_push_environment = NULL, voip_push_updated_at = now()
       WHERE id = ${input.deviceId}`;
@@ -481,6 +514,7 @@ export async function unregisterInstallationPushBinding(
 ): Promise<{ registered: false }> {
   if (!UUID_PATTERN.test(installationId)) throw new PushError("invalid installation id");
   await sql.begin(async (tx) => {
+    await tx`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
     await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
     await tx`
       DELETE FROM push_account_bindings
@@ -497,6 +531,23 @@ export async function unregisterInstallationPushBinding(
   return { registered: false };
 }
 
+/** Remove every installation route for a device that has already been revoked in this transaction. */
+export async function revokePushBindingsForDevice(sql: SQL, deviceId: string): Promise<void> {
+  const removed = await sql`
+    DELETE FROM push_account_bindings
+    WHERE device_id = ${deviceId}
+    RETURNING installation_id`;
+  if (!removed.length) return;
+  const installationIds = [...new Set(removed.map((row: any) => String(row.installation_id)))];
+  await sql`
+    DELETE FROM push_installations installation
+    WHERE installation.installation_id IN ${sql(installationIds)}
+      AND NOT EXISTS (
+        SELECT 1 FROM push_account_bindings binding
+        WHERE binding.installation_id = installation.installation_id
+      )`;
+}
+
 export async function unregisterInstallationTokenKind(
   sql: SQL,
   accountId: string,
@@ -506,6 +557,7 @@ export async function unregisterInstallationTokenKind(
 ): Promise<{ registered: false }> {
   if (!UUID_PATTERN.test(installationId)) throw new PushError("invalid installation id");
   await sql.begin(async (tx) => {
+    await tx`SELECT id FROM accounts WHERE id = ${accountId} FOR UPDATE`;
     await tx`SELECT pg_advisory_xact_lock(hashtextextended('push-installation-registration-v1', 0))`;
     const binding = (await tx`
       SELECT normal_enabled, voip_enabled FROM push_account_bindings
@@ -523,7 +575,8 @@ export async function unregisterInstallationTokenKind(
           AND device_id = ${deviceId}`;
       await tx`
         UPDATE push_installations installation SET
-          normal_token_hash = NULL, normal_token_ciphertext = NULL, normal_token_nonce = NULL,
+          normal_token_hash = NULL, normal_token_hash_key_id = NULL,
+          normal_token_ciphertext = NULL, normal_token_nonce = NULL,
           normal_token_key_id = NULL, normal_environment = NULL, updated_at = now()
         WHERE installation.installation_id = ${installationId}
           AND NOT EXISTS (
@@ -541,7 +594,8 @@ export async function unregisterInstallationTokenKind(
           AND device_id = ${deviceId}`;
       await tx`
         UPDATE push_installations installation SET
-          voip_token_hash = NULL, voip_token_ciphertext = NULL, voip_token_nonce = NULL,
+          voip_token_hash = NULL, voip_token_hash_key_id = NULL,
+          voip_token_ciphertext = NULL, voip_token_nonce = NULL,
           voip_token_key_id = NULL, voip_environment = NULL, updated_at = now()
         WHERE installation.installation_id = ${installationId}
           AND NOT EXISTS (
@@ -1055,8 +1109,14 @@ async function sendClaimedDelivery(
           FROM devices WHERE id = ${delivery.device_id} FOR UPDATE`)[0];
     const installation = delivery.installation_id
       ? (await tx`
-          SELECT normal_token_hash, normal_environment
-          FROM push_installations WHERE installation_id = ${delivery.installation_id}`)[0]
+          SELECT installation.normal_token_hash, installation.normal_environment
+          FROM push_installations installation
+          JOIN push_account_bindings binding
+            ON binding.installation_id = installation.installation_id
+           AND binding.active AND binding.normal_enabled
+           AND binding.device_id = ${delivery.device_id}
+           AND binding.account_id = ${delivery.account_id}
+          WHERE installation.installation_id = ${delivery.installation_id}`)[0]
       : null;
     const currentDelivery = (await tx`
       SELECT id, account_id, device_id, pts, alert, attempts, expires_at, status
@@ -1119,7 +1179,8 @@ async function sendClaimedDelivery(
         if (delivery.installation_id) {
           const invalidated = await tx`
             UPDATE push_installations SET
-              normal_token_hash = NULL, normal_token_ciphertext = NULL,
+              normal_token_hash = NULL, normal_token_hash_key_id = NULL,
+              normal_token_ciphertext = NULL,
               normal_token_nonce = NULL, normal_token_key_id = NULL,
               normal_environment = NULL, updated_at = now()
             WHERE installation_id = ${delivery.installation_id}
@@ -1403,7 +1464,8 @@ async function sendClaimedVoIPDelivery(
         if (delivery.installation_id) {
           const invalidated = await tx`
             UPDATE push_installations SET
-              voip_token_hash = NULL, voip_token_ciphertext = NULL,
+              voip_token_hash = NULL, voip_token_hash_key_id = NULL,
+              voip_token_ciphertext = NULL,
               voip_token_nonce = NULL, voip_token_key_id = NULL,
               voip_environment = NULL, updated_at = now()
             WHERE installation_id = ${delivery.installation_id}

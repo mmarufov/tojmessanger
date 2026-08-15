@@ -245,6 +245,7 @@ CREATE TABLE IF NOT EXISTS device_sessions (
   id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   device_id           UUID NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
   refresh_token_hash  BYTEA NOT NULL UNIQUE,
+  refresh_token_hash_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   rotation_generation BIGINT NOT NULL DEFAULT 0,
   last_activity_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   absolute_expires_at TIMESTAMPTZ NOT NULL,
@@ -252,29 +253,38 @@ CREATE TABLE IF NOT EXISTS device_sessions (
   revocation_reason   TEXT,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS refresh_token_hash_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS device_sessions_active_idx
   ON device_sessions(last_activity_at, absolute_expires_at) WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS session_access_tokens (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   token_digest BYTEA NOT NULL UNIQUE,
+  token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE session_access_tokens ADD COLUMN IF NOT EXISTS token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS session_access_tokens_session_idx
   ON session_access_tokens(session_id, expires_at DESC);
 
 CREATE TABLE IF NOT EXISTS session_refresh_token_history (
   token_digest BYTEA PRIMARY KEY,
+  token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   used_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE session_refresh_token_history ADD COLUMN IF NOT EXISTS token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 
 CREATE TABLE IF NOT EXISTS session_rotation_receipts (
   session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
   rotation_id UUID NOT NULL,
   request_token_digest BYTEA NOT NULL,
+  request_token_digest_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   response_ciphertext BYTEA NOT NULL,
   response_nonce BYTEA NOT NULL,
   response_key_id TEXT NOT NULL,
@@ -284,6 +294,8 @@ CREATE TABLE IF NOT EXISTS session_rotation_receipts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (session_id, rotation_id)
 );
+ALTER TABLE session_rotation_receipts ADD COLUMN IF NOT EXISTS request_token_digest_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 ALTER TABLE session_rotation_receipts
   ADD COLUMN IF NOT EXISTS response_generation BIGINT;
 -- Rotation receipts live for only five minutes. Receipts written by the pre-generation binary
@@ -321,10 +333,13 @@ CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   code_hash BYTEA NOT NULL,
+  code_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (account_id, code_hash)
 );
+ALTER TABLE two_factor_recovery_codes ADD COLUMN IF NOT EXISTS code_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 CREATE INDEX IF NOT EXISTS two_factor_recovery_active_idx
   ON two_factor_recovery_codes(account_id) WHERE consumed_at IS NULL;
 
@@ -346,8 +361,16 @@ CREATE TABLE IF NOT EXISTS two_factor_attempt_budgets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   network_hash BYTEA,
+  network_key_id TEXT DEFAULT 'legacy-v1',
   accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE two_factor_attempt_budgets ADD COLUMN IF NOT EXISTS network_key_id
+  TEXT DEFAULT 'legacy-v1';
+DO $$ BEGIN
+  ALTER TABLE two_factor_attempt_budgets ADD CONSTRAINT two_factor_attempt_network_key_check
+    CHECK (network_hash IS NULL OR network_key_id IS NOT NULL) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 CREATE INDEX IF NOT EXISTS two_factor_attempt_account_idx
   ON two_factor_attempt_budgets(account_id, accepted_at DESC);
 CREATE INDEX IF NOT EXISTS two_factor_attempt_network_idx
@@ -357,12 +380,15 @@ CREATE TABLE IF NOT EXISTS security_step_up_tickets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   token_hash BYTEA NOT NULL UNIQUE,
+  token_key_id TEXT NOT NULL DEFAULT 'legacy-v1',
   attempts INT NOT NULL DEFAULT 0,
   expires_at TIMESTAMPTZ NOT NULL,
   consumed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS token_key_id
+  TEXT NOT NULL DEFAULT 'legacy-v1';
 
 -- Persisted, per-account discovery budget. This makes phone enumeration expensive even across
 -- server restarts and multiple app processes; repeated lookups of the same contact are idempotent

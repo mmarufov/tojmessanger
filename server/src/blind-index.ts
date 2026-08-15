@@ -218,6 +218,15 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     message_link_previews: ["url_lookup_key_id"],
     link_preview_waiters: ["url_lookup_key_id"],
     link_preview_assets: ["digest_key_id"],
+    device_sessions: ["refresh_token_hash_key_id"],
+    session_access_tokens: ["token_digest_key_id"],
+    session_refresh_token_history: ["token_digest_key_id"],
+    session_rotation_receipts: ["request_token_digest_key_id"],
+    two_factor_recovery_codes: ["code_key_id"],
+    two_factor_attempt_budgets: ["network_key_id"],
+    security_step_up_tickets: ["token_key_id"],
+    messaging_feature_mutations: ["fingerprint_key_id"],
+    push_installations: ["normal_token_hash_key_id", "voip_token_hash_key_id"],
   };
   const columns = await sql`
     SELECT table_name, column_name, column_default FROM information_schema.columns
@@ -233,6 +242,16 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     "otp_challenges.network_key_id",
     "call_invite_attempts.network_key_id",
     "message_link_previews.url_lookup_key_id",
+    "device_sessions.refresh_token_hash_key_id",
+    "session_access_tokens.token_digest_key_id",
+    "session_refresh_token_history.token_digest_key_id",
+    "session_rotation_receipts.request_token_digest_key_id",
+    "two_factor_recovery_codes.code_key_id",
+    "two_factor_attempt_budgets.network_key_id",
+    "security_step_up_tickets.token_key_id",
+    "messaging_feature_mutations.fingerprint_key_id",
+    "push_installations.normal_token_hash_key_id",
+    "push_installations.voip_token_hash_key_id",
   ];
   const defaults = new Map(columns.map((row: any) => [
     `${row.table_name}.${row.column_name}`, String(row.column_default ?? ""),
@@ -249,6 +268,9 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
     "call_invite_attempts_network_hash_key_check",
     "send_requests_fingerprint_key_check",
     "message_link_previews_url_hash_key_check",
+    "two_factor_attempt_network_key_check",
+    "push_installations_normal_hash_key_check",
+    "push_installations_voip_hash_key_check",
   ];
   const constraints = await sql`
     SELECT conname FROM pg_constraint
@@ -308,6 +330,22 @@ export async function blindIndexDatabaseReadiness(sql: SQL): Promise<{
       UNION ALL SELECT 'preview.message-url', COALESCE(url_lookup_key_id, 'unlabeled')
         FROM message_link_previews WHERE url_lookup_hmac IS NOT NULL AND state = 'pending'
       UNION ALL SELECT 'preview.waiter-url', url_lookup_key_id FROM link_preview_waiters
+      UNION ALL SELECT 'sessions.refresh', refresh_token_hash_key_id FROM device_sessions
+      UNION ALL SELECT 'sessions.access', token_digest_key_id FROM session_access_tokens
+      UNION ALL SELECT 'sessions.refresh-history', token_digest_key_id
+        FROM session_refresh_token_history
+      UNION ALL SELECT 'sessions.rotation-receipt', request_token_digest_key_id
+        FROM session_rotation_receipts
+      UNION ALL SELECT 'two-factor.recovery', code_key_id FROM two_factor_recovery_codes
+      UNION ALL SELECT 'two-factor.network-budget', COALESCE(network_key_id, 'unlabeled')
+        FROM two_factor_attempt_budgets WHERE network_hash IS NOT NULL
+      UNION ALL SELECT 'two-factor.step-up', token_key_id FROM security_step_up_tickets
+      UNION ALL SELECT 'messaging-feature.receipt', fingerprint_key_id
+        FROM messaging_feature_mutations
+      UNION ALL SELECT 'push-installation.normal', COALESCE(normal_token_hash_key_id, 'unlabeled')
+        FROM push_installations WHERE normal_token_hash IS NOT NULL
+      UNION ALL SELECT 'push-installation.voip', COALESCE(voip_token_hash_key_id, 'unlabeled')
+        FROM push_installations WHERE voip_token_hash IS NOT NULL
     ) all_references
     WHERE key_id IS NOT NULL AND key_id NOT IN ('random-deleted', 'expired')
     GROUP BY domain, key_id ORDER BY domain, key_id`;

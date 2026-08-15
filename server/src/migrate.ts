@@ -490,6 +490,12 @@ await $`psql ${url} -v ON_ERROR_STOP=1 -c ${`
   ALTER TABLE dialogs VALIDATE CONSTRAINT dialogs_auto_delete_seconds_check;
   ALTER TABLE push_account_bindings
     VALIDATE CONSTRAINT push_account_bindings_enabled_check;
+  ALTER TABLE push_installations
+    VALIDATE CONSTRAINT push_installations_normal_hash_key_check;
+  ALTER TABLE push_installations
+    VALIDATE CONSTRAINT push_installations_voip_hash_key_check;
+  ALTER TABLE two_factor_attempt_budgets
+    VALIDATE CONSTRAINT two_factor_attempt_network_key_check;
   DO $$
   BEGIN
     IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'messages'::regclass

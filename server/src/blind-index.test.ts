@@ -13,6 +13,9 @@ import { backfillBlindIndexKeyLabels } from "./blind-index-label-migration";
 import { makeSql } from "./db";
 import { getOrCreateDirectDialog, sendMessage } from "./sync";
 import { cleanupExpiredData } from "./ops";
+import { refreshV2Session, resolveV2Access, upgradeLegacySession } from "./session-security";
+import { mutatePinnedMessage } from "./messaging-features";
+import { registerInstallationPushToken } from "./push";
 
 const originalKeyring = process.env.TOJ_BLIND_INDEX_KEYRING;
 const originalActive = process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
@@ -22,7 +25,7 @@ const db = makeSql(TEST_URL);
 
 beforeEach(async () => {
   delete process.env.TOJ_BLIND_INDEX_LEGACY_DISABLED;
-  await db`TRUNCATE accounts, otp_challenges RESTART IDENTITY CASCADE`;
+  await db`TRUNCATE accounts, otp_challenges, push_installations RESTART IDENTITY CASCADE`;
 });
 
 afterEach(() => {
@@ -243,6 +246,124 @@ describe.serial("versioned blind-index keyring", () => {
     // Disabled preview rows no longer perform deterministic lookup and therefore do not pin a
     // historical key; the still-live call-attempt budget does.
     expect(crossDomain.unknownKeyIds).toEqual(["retired-call"]);
+  });
+
+  test("keeps v2 access and refresh credentials valid across blind-index activation", async () => {
+    delete process.env.TOJ_BLIND_INDEX_KEYRING;
+    delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+    const legacy = await checkVerification(
+      db, "+16505559303", (await startVerification(db, "+16505559303")).code,
+      "ios", "Session iPhone", "Session",
+    );
+    const session = await upgradeLegacySession(db, legacy.accountId, legacy.deviceId);
+
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "lookup-v2": Buffer.alloc(32, 0x57).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "lookup-v2";
+
+    await expect(resolveV2Access(db, session.accessToken)).resolves.toMatchObject({
+      accountId: legacy.accountId,
+      deviceId: legacy.deviceId,
+    });
+    const rotated = await refreshV2Session(db, session.refreshToken, crypto.randomUUID());
+    await expect(resolveV2Access(db, rotated.accessToken)).resolves.toMatchObject({
+      deviceId: legacy.deviceId,
+    });
+    expect((await db`SELECT refresh_token_hash_key_id FROM device_sessions
+      WHERE device_id = ${legacy.deviceId}`)[0].refresh_token_hash_key_id).toBe("lookup-v2");
+    expect((await db`SELECT token_digest_key_id FROM session_access_tokens
+      WHERE session_id = (SELECT id FROM device_sessions WHERE device_id = ${legacy.deviceId})
+      ORDER BY created_at DESC LIMIT 1`)[0].token_digest_key_id).toBe("lookup-v2");
+    expect((await db`SELECT request_token_digest_key_id FROM session_rotation_receipts
+      WHERE session_id = (SELECT id FROM device_sessions WHERE device_id = ${legacy.deviceId})`)[0]
+      .request_token_digest_key_id).toBe("legacy-v1");
+  });
+
+  test("keeps messaging-feature idempotency receipts valid across blind-index activation", async () => {
+    delete process.env.TOJ_BLIND_INDEX_KEYRING;
+    delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+    const first = await checkVerification(
+      db, "+16505559304", (await startVerification(db, "+16505559304")).code,
+      "ios", "Mutation iPhone", "Mutation",
+    );
+    const second = await checkVerification(
+      db, "+16505559305", (await startVerification(db, "+16505559305")).code,
+      "ios", "Peer iPhone", "Peer",
+    );
+    const dialog = await getOrCreateDirectDialog(db, first.accountId, second.accountId);
+    const message = await sendMessage(db, {
+      senderAccountId: first.accountId,
+      senderDeviceId: first.deviceId,
+      dialogId: dialog.dialogId,
+      clientMsgId: crypto.randomUUID(),
+      body: "pin across rotation",
+    });
+    const operationId = crypto.randomUUID();
+    const input = {
+      actorAccountId: first.accountId,
+      actorDeviceId: first.deviceId,
+      operationId,
+      dialogId: dialog.dialogId,
+      msgId: message.msgId,
+      pinned: true,
+      notifyMembers: false,
+    };
+    expect((await mutatePinnedMessage(db, input)).duplicate).toBe(false);
+
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "lookup-v2": Buffer.alloc(32, 0x58).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "lookup-v2";
+
+    expect((await mutatePinnedMessage(db, input)).duplicate).toBe(true);
+    expect((await db`SELECT fingerprint_key_id FROM messaging_feature_mutations
+      WHERE actor_account_id = ${first.accountId} AND operation_id = ${operationId}`)[0]
+      .fingerprint_key_id).toBe("lookup-v2");
+  });
+
+  test("transfers an installation token across blind-index versions", async () => {
+    delete process.env.TOJ_BLIND_INDEX_KEYRING;
+    delete process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID;
+    const account = await checkVerification(
+      db, "+16505559306", (await startVerification(db, "+16505559306")).code,
+      "ios", "Push iPhone", "Push",
+    );
+    const firstInstallationId = crypto.randomUUID();
+    const secondInstallationId = crypto.randomUUID();
+    const token = "ab".repeat(32);
+    await registerInstallationPushToken(db, {
+      accountId: account.accountId,
+      deviceId: account.deviceId,
+      installationId: firstInstallationId,
+      token,
+      environment: "sandbox",
+      kind: "normal",
+    });
+
+    process.env.TOJ_BLIND_INDEX_KEYRING = JSON.stringify({
+      "lookup-v2": Buffer.alloc(32, 0x59).toString("base64"),
+    });
+    process.env.TOJ_BLIND_INDEX_ACTIVE_KEY_ID = "lookup-v2";
+    await registerInstallationPushToken(db, {
+      accountId: account.accountId,
+      deviceId: account.deviceId,
+      installationId: secondInstallationId,
+      token,
+      environment: "sandbox",
+      kind: "normal",
+    });
+
+    expect((await db`SELECT normal_token_hash, normal_token_hash_key_id
+      FROM push_installations WHERE installation_id = ${firstInstallationId}`)[0])
+      .toMatchObject({ normal_token_hash: null, normal_token_hash_key_id: null });
+    expect((await db`SELECT normal_token_hash_key_id FROM push_installations
+      WHERE installation_id = ${secondInstallationId}`)[0].normal_token_hash_key_id)
+      .toBe("lookup-v2");
+    expect(await db`SELECT installation_id FROM push_account_bindings
+      WHERE device_id = ${account.deviceId}`).toEqual([
+      expect.objectContaining({ installation_id: secondInstallationId }),
+    ]);
   });
 
   test("expires durable send fingerprints without reusing the operation ID", async () => {

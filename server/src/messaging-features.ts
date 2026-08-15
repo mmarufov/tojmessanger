@@ -1,7 +1,7 @@
 import type { SQL } from "bun";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { requireActiveDevice } from "./auth";
-import { bodyAAD, requestFingerprintHMAC } from "./crypto";
+import { bodyAAD, requestFingerprintIndex } from "./crypto";
 import { sealForScope } from "./envelope-crypto";
 import {
   DialogAccessError,
@@ -152,10 +152,11 @@ function validateMutationIdentity(identity: MutationIdentity): void {
   }
 }
 
-function fingerprint(operation: FeatureOperation, payload: unknown): Buffer {
-  return requestFingerprintHMAC(
+function fingerprint(operation: FeatureOperation, payload: unknown, keyId?: string) {
+  return requestFingerprintIndex(
     "messaging-feature",
     JSON.stringify({ operation, payload }),
+    keyId,
   );
 }
 
@@ -173,15 +174,21 @@ async function claimMutation(
   ]);
   const payloadFingerprint = fingerprint(operation, payload);
   const existing = (await sql`
-    SELECT operation, dialog_id, msg_id, payload_fingerprint, response, completed_at
+    SELECT operation, dialog_id, msg_id, payload_fingerprint, fingerprint_key_id,
+           response, completed_at
     FROM messaging_feature_mutations
     WHERE actor_account_id = ${identity.actorAccountId}
       AND operation_id = ${identity.operationId}
     FOR UPDATE`)[0];
   if (existing) {
+    const expected = fingerprint(
+      operation,
+      payload,
+      String(existing.fingerprint_key_id ?? "legacy-v1"),
+    );
     const existingFingerprint = Buffer.from(existing.payload_fingerprint);
-    const sameFingerprint = existingFingerprint.length === payloadFingerprint.length
-      && timingSafeEqual(existingFingerprint, payloadFingerprint);
+    const sameFingerprint = existingFingerprint.length === expected.digest.length
+      && timingSafeEqual(existingFingerprint, expected.digest);
     if (
       existing.operation !== operation
       || String(existing.dialog_id ?? "") !== String(dialogId ?? "")
@@ -197,6 +204,13 @@ async function claimMutation(
     if (existing.completed_at == null) {
       throw new MessagingFeatureError("operation is already in progress", 409, "operation_in_progress");
     }
+    if (String(existing.fingerprint_key_id) !== payloadFingerprint.keyId) {
+      await sql`UPDATE messaging_feature_mutations
+        SET payload_fingerprint = ${payloadFingerprint.digest},
+            fingerprint_key_id = ${payloadFingerprint.keyId}
+        WHERE actor_account_id = ${identity.actorAccountId}
+          AND operation_id = ${identity.operationId}`;
+    }
     return {
       duplicate: true,
       response: typeof existing.response === "string"
@@ -206,10 +220,11 @@ async function claimMutation(
   }
   await sql`
     INSERT INTO messaging_feature_mutations (
-      actor_account_id, operation_id, operation, dialog_id, msg_id, payload_fingerprint
+      actor_account_id, operation_id, operation, dialog_id, msg_id,
+      payload_fingerprint, fingerprint_key_id
     ) VALUES (
       ${identity.actorAccountId}, ${identity.operationId}, ${operation},
-      ${dialogId}, ${msgId}, ${payloadFingerprint}
+      ${dialogId}, ${msgId}, ${payloadFingerprint.digest}, ${payloadFingerprint.keyId}
     )`;
   return { duplicate: false };
 }

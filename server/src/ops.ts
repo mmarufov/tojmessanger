@@ -172,16 +172,6 @@ export class OperationalMetrics {
     this.scheduledCancellationsDuringOutage += 1;
   }
 
-  recordSavedMessagesEnsure(
-    result: "created" | "existing" | "repaired" | "error",
-    durationMs: number,
-  ): void {
-    this.savedMessageEnsures.set(result, (this.savedMessageEnsures.get(result) ?? 0) + 1);
-    this.savedMessageEnsureCount += 1;
-    this.savedMessageEnsureSumSeconds += durationMs / 1_000;
-    if (result === "repaired") this.savedMessageInvariantViolations += 1;
-  }
-
   render(): string {
     const lines = [
       "# HELP toj_process_uptime_seconds Process uptime in seconds.",

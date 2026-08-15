@@ -22,6 +22,7 @@ import {
   type CallRow,
 } from "./calls";
 import { handoffOwnedGroupsForDeletedAccount } from "./groups";
+import { revokePushBindingsForDevice } from "./push";
 import {
   requireGroupCallSFUBarrierApplied,
   revokeGroupCallAccountTx,
@@ -792,7 +793,7 @@ async function banReportedAccount(sql: SQL, accountId: string): Promise<{
   const endedCalls = await terminateCallsForAccountTx(sql, accountId, "account_banned");
   const affectedGroupCallIds = await revokeGroupCallAccountTx(sql, accountId);
   await handoffOwnedGroupsForDeletedAccount(sql, accountId);
-  await sql`
+  const revokedDevices = await sql`
     UPDATE devices SET revoked_at = COALESCE(revoked_at, now()),
       auth_token_hash = digest(id::text || gen_random_uuid()::text, 'sha256'),
       auth_token_key_id = 'random-deleted',
@@ -802,7 +803,11 @@ async function banReportedAccount(sql: SQL, accountId: string): Promise<{
       voip_push_token_hash = NULL, voip_push_token_hash_key_id = NULL,
       voip_push_token_ciphertext = NULL, voip_push_token_nonce = NULL,
       voip_push_token_key_id = NULL, voip_push_environment = NULL
-    WHERE account_id = ${accountId}`;
+    WHERE account_id = ${accountId}
+    RETURNING id`;
+  for (const device of revokedDevices) {
+    await revokePushBindingsForDevice(sql, String(device.id));
+  }
   await sql`
     UPDATE push_deliveries SET status = 'dead', last_error = 'account banned', claimed_at = NULL
     WHERE account_id = ${accountId} AND status IN ('pending','sending')`;
