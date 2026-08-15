@@ -6619,6 +6619,15 @@ final class CloudAppModel {
             foregrounded: true
         )
         guard launchPhase == .localReady, storedSession != nil else { return }
+        #if DEBUG
+        if TelegramFastUITestFixture.enabled {
+            // The fixture token is deliberately non-routable. Keep deterministic UI scenarios
+            // behind the same online-service boundary as before credential refresh was added, or
+            // its expected presence state is immediately replaced by a transport failure.
+            await startOnlineServices()
+            return
+        }
+        #endif
         await prepareCurrentCredentials()
         guard launchPhase == .localReady, storedSession != nil else { return }
         startCredentialRefreshLoopIfNeeded()
