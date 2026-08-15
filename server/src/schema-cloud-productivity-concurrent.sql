@@ -20,6 +20,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS message_link_previews_snapshot_idx
   ON message_link_previews(snapshot_id) WHERE snapshot_id IS NOT NULL;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS link_preview_waiters_message_idx
   ON link_preview_waiters(dialog_id, msg_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS link_preview_cache_fanout_pending_idx
+  ON link_preview_cache_entries(updated_at, url_lookup_hmac)
+  WHERE fanout_pending;
 
 INSERT INTO schema_migrations(name) VALUES ('cloud-productivity-indexes-v1')
 ON CONFLICT DO NOTHING;

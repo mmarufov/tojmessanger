@@ -11,6 +11,12 @@ import { sendMediaGroup, sendMessage, SyncError } from "./sync";
 import { notifySyncWakeups } from "./sync-wakeup";
 import { touchWorkerHeartbeat } from "./cloud-productivity-readiness";
 import { linkPreviewsEnabledForAccount } from "./cloud-productivity-readiness";
+import {
+  adjustProductivityActiveJobs,
+  productivityWorkerLeaseSeconds,
+  recordProductivityLeaseRenewalFailure,
+  scheduledDeliveryWorkerConcurrency,
+} from "./productivity-runtime";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_TEXT_BYTES = 16 * 1024;
@@ -382,10 +388,17 @@ export async function listScheduledDeliveries(
   return await sql.begin(async (tx) => {
     // Every scheduled mutation and worker state transition takes this account lock. Holding it
     // while assembling one page makes the attached collection revision describe these exact rows,
-    // rather than a newer revision sampled after an older row query.
-    await lockAccountMutations(tx, [accountId]);
+    // rather than a newer revision sampled after an older row query. Acquire the advisory lock in
+    // the revision statement itself so every non-empty page remains exactly three SQL statements.
     const state = (await tx`
-      SELECT revision FROM account_scheduled_delivery_states WHERE account_id = ${accountId}`)[0];
+      SELECT schedule_state.revision
+      FROM (
+        SELECT pg_advisory_xact_lock(
+          hashtextextended(${`account-mutation:${accountId}`}, 0)
+        )
+      ) AS held
+      LEFT JOIN account_scheduled_delivery_states schedule_state
+        ON schedule_state.account_id = ${accountId}`)[0];
     const rows = await tx`
       SELECT id, account_id, dialog_id, deliver_at, state, silent, reminder, revision,
              attempts, last_error_code, delivered_first_msg_id, delivered_last_msg_id,
@@ -467,8 +480,16 @@ async function appendScheduleEvent(
       AND (${input.sourceDeviceId ?? null}::uuid IS NULL OR id <> ${input.sourceDeviceId ?? null}::uuid)
       AND platform = 'ios'
       AND revoked_at IS NULL
-      AND push_token_hash IS NOT NULL
-      AND push_token_ciphertext IS NOT NULL
+      AND (
+        (push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          JOIN push_installations installation USING (installation_id)
+          WHERE binding.device_id = devices.id AND binding.account_id = devices.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+      )
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
   await notifySyncWakeups(sql, [{ accountId: input.accountId, pts, ptsCount: 1 }]);
   return pts;
@@ -931,7 +952,7 @@ export async function cancelScheduledDelivery(
   });
 }
 
-async function claimDue(sql: SQL, limit: number): Promise<WorkerClaim[]> {
+async function claimDue(sql: SQL, limit: number, leaseSeconds: number): Promise<WorkerClaim[]> {
   return await sql.begin(async (tx) => {
     const rows = await tx`
       WITH candidates AS (
@@ -948,7 +969,8 @@ async function claimDue(sql: SQL, limit: number): Promise<WorkerClaim[]> {
       )
       UPDATE scheduled_deliveries delivery SET
         state = 'processing', attempts = delivery.attempts + 1,
-        claimed_at = now(), lease_expires_at = now() + interval '30 seconds',
+        claimed_at = now(),
+        lease_expires_at = now() + (${leaseSeconds}::text || ' seconds')::interval,
         lease_token = gen_random_uuid(), updated_at = now()
       FROM candidates
       WHERE delivery.id = candidates.id
@@ -958,6 +980,24 @@ async function claimDue(sql: SQL, limit: number): Promise<WorkerClaim[]> {
       leaseToken: String(row.lease_token),
     }));
   });
+}
+
+async function renewScheduledDeliveryLease(
+  sql: SQL,
+  claim: WorkerClaim,
+  leaseSeconds: number,
+): Promise<boolean> {
+  try {
+    const rows = await sql`
+      UPDATE scheduled_deliveries
+      SET lease_expires_at = now() + (${leaseSeconds}::text || ' seconds')::interval,
+          updated_at = now()
+      WHERE id = ${claim.id} AND state = 'processing' AND lease_token = ${claim.leaseToken}
+      RETURNING id`;
+    return rows.length === 1;
+  } catch {
+    return false;
+  }
 }
 
 async function returnForRetry(
@@ -981,13 +1021,22 @@ async function markPermanentFailure(
   code: string,
 ): Promise<void> {
   await sql.begin(async (tx) => {
-    const row = (await tx`
+    const candidate = (await tx`
       SELECT account_id FROM scheduled_deliveries
       WHERE id = ${claim.id} AND state = 'processing' AND lease_token = ${claim.leaseToken}
-      FOR UPDATE`)[0];
-    if (!row) return;
-    const accountId = String(row.account_id);
+    `)[0];
+    if (!candidate) return;
+    const accountId = String(candidate.account_id);
+    // Scheduled mutations acquire the account advisory lock before their delivery row. Follow the
+    // same order here, then revalidate token ownership under the row lock; reversing those locks can
+    // deadlock a cancellation against worker completion.
     await lockAccountMutations(tx, [accountId]);
+    const owned = (await tx`
+      SELECT 1 FROM scheduled_deliveries
+      WHERE id = ${claim.id} AND account_id = ${accountId}
+        AND state = 'processing' AND lease_token = ${claim.leaseToken}
+      FOR UPDATE`)[0];
+    if (!owned) return;
     const collection = (await tx`
       UPDATE account_scheduled_delivery_states
       SET revision = revision + 1, updated_at = now()
@@ -1095,13 +1144,19 @@ async function dispatchClaim(sql: SQL, claim: WorkerClaim): Promise<void> {
       lastMsgId = result.messages.at(-1)!.msg_id;
     }
     await sql.begin(async (tx) => {
-      const row = (await tx`
+      const candidate = (await tx`
         SELECT account_id FROM scheduled_deliveries
         WHERE id = ${claim.id} AND state = 'processing' AND lease_token = ${claim.leaseToken}
-        FOR UPDATE`)[0];
-      if (!row) return;
-      const completedAccountId = String(row.account_id);
+      `)[0];
+      if (!candidate) return;
+      const completedAccountId = String(candidate.account_id);
       await lockAccountMutations(tx, [completedAccountId]);
+      const owned = (await tx`
+        SELECT 1 FROM scheduled_deliveries
+        WHERE id = ${claim.id} AND account_id = ${completedAccountId}
+          AND state = 'processing' AND lease_token = ${claim.leaseToken}
+        FOR UPDATE`)[0];
+      if (!owned) return;
       const collection = (await tx`
         UPDATE account_scheduled_delivery_states
         SET revision = revision + 1, updated_at = now()
@@ -1141,9 +1196,40 @@ async function dispatchClaim(sql: SQL, claim: WorkerClaim): Promise<void> {
   }
 }
 
-export async function drainScheduledDeliveries(sql: SQL, limit = 100): Promise<number> {
-  const claims = await claimDue(sql, Math.max(1, Math.min(100, limit)));
-  for (const claim of claims) await dispatchClaim(sql, claim);
+export async function drainScheduledDeliveries(
+  sql: SQL,
+  limit = scheduledDeliveryWorkerConcurrency(),
+  options: { concurrency?: number; leaseSeconds?: number; renewEveryMilliseconds?: number } = {},
+): Promise<number> {
+  const concurrency = Math.max(1, Math.min(32, options.concurrency ?? scheduledDeliveryWorkerConcurrency()));
+  const leaseSeconds = Math.max(30, Math.min(600, options.leaseSeconds ?? productivityWorkerLeaseSeconds()));
+  const renewEveryMilliseconds = Math.max(1_000, Math.min(
+    30_000,
+    Math.floor(leaseSeconds * 1_000 / 3),
+    options.renewEveryMilliseconds ?? 30_000,
+  ));
+  const claims = await claimDue(sql, Math.max(1, Math.min(concurrency, limit)), leaseSeconds);
+  await Promise.all(claims.map(async (claim) => {
+    let finished = false;
+    let renewalRunning = false;
+    const renew = async () => {
+      if (finished || renewalRunning) return;
+      renewalRunning = true;
+      const owned = await renewScheduledDeliveryLease(sql, claim, leaseSeconds);
+      renewalRunning = false;
+      if (!owned && !finished) recordProductivityLeaseRenewalFailure("scheduled_delivery");
+    };
+    const renewalTimer = setInterval(() => void renew(), renewEveryMilliseconds);
+    renewalTimer.unref?.();
+    adjustProductivityActiveJobs("scheduled_delivery", 1);
+    try {
+      await dispatchClaim(sql, claim);
+    } finally {
+      finished = true;
+      clearInterval(renewalTimer);
+      adjustProductivityActiveJobs("scheduled_delivery", -1);
+    }
+  }));
   return claims.length;
 }
 
@@ -1190,31 +1276,72 @@ export async function failScheduledDeliveriesForRevokedDialogInTransaction(
 
 export function startScheduledDeliveryWorker(
   sql: SQL,
-  options: { pollMilliseconds?: number; workerId?: string } = {},
-): () => void {
+  options: {
+    pollMilliseconds?: number;
+    workerId?: string;
+    concurrency?: number;
+    leaseSeconds?: number;
+    renewEveryMilliseconds?: number;
+    heartbeatMilliseconds?: number;
+    shutdownDrainMilliseconds?: number;
+  } = {},
+): () => Promise<void> {
   const workerId = options.workerId ?? crypto.randomUUID();
   const pollMilliseconds = Math.max(250, options.pollMilliseconds ?? 1_000);
+  const concurrency = Math.max(1, Math.min(32, options.concurrency ?? scheduledDeliveryWorkerConcurrency()));
+  const leaseSeconds = Math.max(30, Math.min(600, options.leaseSeconds ?? productivityWorkerLeaseSeconds()));
+  const heartbeatMilliseconds = Math.max(1_000, options.heartbeatMilliseconds ?? 10_000);
+  const shutdownDrainMilliseconds = Math.max(1_000, options.shutdownDrainMilliseconds ?? 15_000);
   let stopped = false;
-  let running = false;
+  let running: Promise<void> | null = null;
+  let heartbeatRunning = false;
   const tick = async () => {
     if (stopped || running) return;
-    running = true;
+    const work = (async () => {
+      try {
+        await drainScheduledDeliveries(sql, concurrency, {
+          concurrency,
+          leaseSeconds,
+          renewEveryMilliseconds: options.renewEveryMilliseconds,
+        });
+      } catch {
+        // No identifiers or schedule content belong in logs. Health is represented by heartbeat age.
+      }
+    })();
+    running = work;
+    await work.finally(() => {
+      if (running === work) running = null;
+    });
+  };
+  const heartbeat = async () => {
+    if (stopped || heartbeatRunning) return;
+    heartbeatRunning = true;
     try {
       await touchWorkerHeartbeat(sql, "scheduled_delivery", workerId);
-      let drained = 0;
-      do {
-        drained = await drainScheduledDeliveries(sql);
-      } while (!stopped && drained === 100);
     } catch {
-      // No identifiers or schedule content belong in logs. Health is represented by heartbeat age.
+      // The cached heartbeat snapshot fails closed; the worker keeps retrying independently.
     } finally {
-      running = false;
+      heartbeatRunning = false;
     }
   };
+  void heartbeat();
   void tick();
   const timer = setInterval(() => void tick(), pollMilliseconds);
-  return () => {
+  const heartbeatTimer = setInterval(() => void heartbeat(), heartbeatMilliseconds);
+  timer.unref?.();
+  heartbeatTimer.unref?.();
+  return async () => {
     stopped = true;
     clearInterval(timer);
+    clearInterval(heartbeatTimer);
+    const active = running;
+    if (!active) return;
+    await Promise.race([
+      active,
+      new Promise<void>((resolve) => {
+        const drainTimer = setTimeout(resolve, shutdownDrainMilliseconds);
+        drainTimer.unref?.();
+      }),
+    ]);
   };
 }

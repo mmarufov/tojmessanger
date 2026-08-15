@@ -166,8 +166,16 @@ export async function fanoutDialogEvent(sql: SQL, options: FanoutOptions): Promi
     JOIN devices device ON device.account_id = event.account_id
     WHERE device.platform = 'ios'
       AND device.revoked_at IS NULL
-      AND device.push_token_hash IS NOT NULL
-      AND device.push_token_ciphertext IS NOT NULL
+      AND (
+        (device.push_token_hash IS NOT NULL AND device.push_token_ciphertext IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          JOIN push_installations installation USING (installation_id)
+          WHERE binding.device_id = device.id AND binding.account_id = device.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+      )
       AND (${sourceDeviceId}::uuid IS NULL OR device.id <> ${sourceDeviceId}::uuid)
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
 
@@ -203,7 +211,16 @@ export async function appendAccessRevokedEvent(
     SELECT ${accountId}, ${pts}, id, false
     FROM devices
     WHERE account_id = ${accountId} AND platform = 'ios' AND revoked_at IS NULL
-      AND push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL
+      AND (
+        (push_token_hash IS NOT NULL AND push_token_ciphertext IS NOT NULL)
+        OR EXISTS (
+          SELECT 1 FROM push_account_bindings binding
+          JOIN push_installations installation USING (installation_id)
+          WHERE binding.device_id = devices.id AND binding.account_id = devices.account_id
+            AND binding.active AND binding.normal_enabled
+            AND installation.normal_token_ciphertext IS NOT NULL
+        )
+      )
     ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
   return { accountId, pts, ptsCount: 1 };
 }

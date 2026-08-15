@@ -3,6 +3,15 @@ import { sql as defaultSql } from "./db";
 import {
   startVerification,
   checkVerification,
+  checkVerificationV2,
+  completeTwoFactorLogin,
+  twoFactorStatus,
+  startSecurityChange,
+  completeSecurityStepUp,
+  configureTwoFactor,
+  regenerateTwoFactorRecoveryCodes,
+  disableTwoFactor,
+  sendSecurityChangeAlert,
   resolveDevice,
   lookupAccountByPhone,
   lookupAccountByUsername,
@@ -17,13 +26,21 @@ import {
   type OTPDelivery,
 } from "./auth";
 import {
+  refreshV2Session,
+  startSessionRevocationListener,
+  upgradeLegacySession,
+} from "./session-security";
+import {
   APNsClient,
   PushError,
   registerGroupCallCapabilities,
+  registerInstallationPushToken,
+  registerInstallationVoIPPushToken,
   registerPushToken,
   registerVoIPPushToken,
   startPushWorker,
   unregisterPushToken,
+  unregisterInstallationTokenKind,
   unregisterVoIPPushToken,
   type PushSender,
 } from "./push";
@@ -208,10 +225,30 @@ import {
   type PresenceBroadcast,
   validPresenceDialogId,
 } from "./presence";
+import { productivityMetrics } from "./productivity-runtime";
+import {
+  closePoll,
+  getStickerCatalog,
+  giphyClientConfiguration,
+  listPinnedMessages,
+  listPollVoters,
+  messagingFeatureFlagsForAccount,
+  messagingFeatureFlagsFromEnvironment,
+  MessagingFeatureError,
+  mutatePinnedMessage,
+  mutateStickerPreference,
+  publicSupportConfiguration,
+  setDialogAutoDelete,
+  voteInPoll,
+  type MessagingFeatureFlags,
+} from "./messaging-features";
+import { MessagingContentError } from "./messaging-content";
+import { messagingFeatureSchemaState } from "./messaging-feature-readiness";
 
 type SocketData = {
   accountId: string;
   deviceId: string;
+  accessExpiresAt?: string;
   connectionId: string;
   presenceEpoch: string | null;
   presenceActive: boolean;
@@ -234,7 +271,7 @@ const jsonHeaders = { "content-type": "application/json", "cache-control": "no-s
 const MAX_JSON_BYTES = 64 * 1024;
 
 export const CLOUD_CAPABILITIES = {
-  api_version: 5,
+  api_version: 6,
   capabilities: [
     "core_text",
     "replies",
@@ -247,6 +284,14 @@ export const CLOUD_CAPABILITIES = {
     "profiles",
   ],
 } as const;
+
+function authSessionsV2Configured(): boolean {
+  return process.env.TOJ_AUTH_SESSIONS_V2_ENABLED === "1";
+}
+
+function twoFactorConfigured(): boolean {
+  return authSessionsV2Configured() && process.env.TOJ_TWO_FACTOR_ENABLED === "1";
+}
 
 function cloudCapabilities(
   voiceCalls: boolean,
@@ -263,8 +308,12 @@ function cloudCapabilities(
   linkPreviews: boolean,
   profilePhotos: boolean,
   presence: boolean,
+  messaging: MessagingFeatureFlags,
+  twoFactorAvailable = twoFactorConfigured(),
 ) {
   const capabilities = [...CLOUD_CAPABILITIES.capabilities];
+  if (authSessionsV2Configured()) capabilities.push("auth_sessions_v2");
+  if (twoFactorAvailable) capabilities.push("two_factor_v1");
   if (voiceCalls) capabilities.push("voice_calls_v1");
   if (videoCalls) capabilities.push("video_calls_v1");
   if (groups) capabilities.push("groups_v1");
@@ -279,7 +328,18 @@ function cloudCapabilities(
   if (linkPreviews) capabilities.push("link_previews_v1");
   if (profilePhotos) capabilities.push("profile_photos_v1");
   if (presence) capabilities.push("presence_v1");
-  return { ...CLOUD_CAPABILITIES, capabilities };
+  if (messaging.pinnedMessages) capabilities.push("pinned_messages_v1");
+  if (messaging.autoDeleteCreation) capabilities.push("auto_delete_v1");
+  if (messaging.polls) capabilities.push("polls_v1");
+  if (messaging.stickerPacks) capabilities.push("sticker_packs_v1");
+  if (messaging.giphy) capabilities.push("giphy_v1");
+  if (messaging.multiAccountPush) capabilities.push("multi_account_push_v1");
+  if (messaging.support) capabilities.push("support_v1");
+  return {
+    ...CLOUD_CAPABILITIES,
+    capabilities,
+    ...publicSupportConfiguration(messaging),
+  };
 }
 
 function json(value: unknown, status = 200, extraHeaders: HeadersInit = {}): Response {
@@ -444,6 +504,63 @@ function networkKey(req: Request, server: { requestIP(request: Request): { addre
   return forwarded || server.requestIP(req)?.address || null;
 }
 
+export function productivityNeedsForPath(pathname: string): {
+  schema: boolean;
+  scheduledWorker: boolean;
+  previewWorker: boolean;
+} {
+  const scheduled = pathname === "/v1/scheduled-messages"
+    || pathname.startsWith("/v1/scheduled-messages/");
+  const previewAsset = pathname.startsWith("/v1/link-previews/assets/");
+  const chatFolders = pathname === "/v1/chat-folders" || pathname.startsWith("/v1/chat-folders/");
+  const sync = pathname === "/v1/sync/state"
+    || pathname === "/v1/sync/difference"
+    || pathname === "/v1/bootstrap/start"
+    || pathname === "/v1/bootstrap/dialogs";
+  const messages = pathname === "/v1/history"
+    || pathname === "/v1/read"
+    || pathname.startsWith("/v1/messages/");
+  return {
+    schema: scheduled || previewAsset || chatFolders || sync || messages,
+    scheduledWorker: scheduled || sync,
+    previewWorker: previewAsset || sync || messages,
+  };
+}
+
+export function isMessagingFeaturePath(pathname: string): boolean {
+  return pathname === "/v1/messages/send"
+    || pathname === "/v1/stickers"
+    || pathname === "/v1/stickers/preferences"
+    || pathname === "/v1/giphy/config"
+    || pathname === "/v1/devices/push-v2"
+    || pathname === "/v1/devices/voip-push-v2"
+    || /^\/v1\/dialogs\/[0-9a-f-]+\/(pins|auto-delete|polls\/)/i.test(pathname);
+}
+
+function messagingFeatureNeedsSchema(
+  pathname: string,
+  flags: MessagingFeatureFlags,
+): boolean {
+  if (pathname === "/v1/messages/send") {
+    return flags.polls || flags.stickerPacks || flags.giphy;
+  }
+  if (pathname === "/v1/stickers" || pathname === "/v1/stickers/preferences") {
+    return flags.stickerPacks;
+  }
+  if (pathname === "/v1/giphy/config") return flags.giphy;
+  if (pathname === "/v1/devices/push-v2" || pathname === "/v1/devices/voip-push-v2") {
+    return flags.multiAccountPush;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/pins(?:\/\d+)?$/i.test(pathname)) {
+    return flags.pinnedMessages;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/auto-delete$/i.test(pathname)) {
+    return flags.autoDeleteCreation;
+  }
+  if (/^\/v1\/dialogs\/[0-9a-f-]+\/polls\//i.test(pathname)) return flags.polls;
+  return false;
+}
+
 export function startCloudServer(
   port = Number(process.env.PORT ?? 8788),
   db: Db = defaultSql,
@@ -451,6 +568,9 @@ export function startCloudServer(
   otpDelivery: OTPDelivery | null = otpDeliveryFromEnvironment(),
   options: CloudServerOptions = {},
 ) {
+  // Refuse unsafe media configuration before the process begins accepting traffic. The current
+  // PostgreSQL-backed architecture is intentionally hard-capped at 25 MB per object.
+  void mediaLimits();
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
   const presenceSocketCleanupTasks = new Set<Promise<void>>();
   const recentPresenceDeliveries = new Map<string, number>();
@@ -508,6 +628,16 @@ export function startCloudServer(
   const cloudDraftsAvailable = process.env.TOJ_CLOUD_DRAFTS_V1_ENABLED === "1";
   const mediaGroupsAvailable = process.env.TOJ_MEDIA_GROUPS_V1_ENABLED === "1";
   const dialogPreferencesConfigured = dialogPreferencesCapabilityEnabled();
+  const configuredMessagingFeatures = messagingFeatureFlagsFromEnvironment();
+  const disabledMessagingFeatures: MessagingFeatureFlags = {
+    pinnedMessages: false,
+    autoDeleteCreation: false,
+    polls: false,
+    stickerPacks: false,
+    giphy: false,
+    multiAccountPush: false,
+    support: false,
+  };
   const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
   const profilePhotosConfigured = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED === "1";
   let profilePhotosSchemaCache: { ready: boolean; expiresAt: number } | null = null;
@@ -664,6 +794,10 @@ export function startCloudServer(
     }
     return await realtimePresenceSchemaProbe;
   };
+  const stopSessionRevocations = backgroundWorkers ? startSessionRevocationListener(
+    process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
+    (wakeup) => disconnectDevice(sockets, wakeup.accountId, wakeup.deviceId),
+  ) : () => {};
 
   const server = Bun.serve<SocketData>({
     port,
@@ -720,11 +854,20 @@ export function startCloudServer(
             && chatFoldersEnabledForAccount(capabilitySession!.accountId);
           const scheduledDelivery = Boolean(capabilitySession)
             && productivitySchema.ready
-            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId);
+            && scheduledDeliveryEnabledForAccount(capabilitySession!.accountId)
+            && await workerHeartbeatFresh(db, "scheduled_delivery");
           const linkPreviews = Boolean(capabilitySession)
             && productivitySchema.ready
             && linkPreviewsEnabledForAccount(capabilitySession!.accountId)
             && await workerHeartbeatFresh(db, "link_preview");
+          const messagingSchema = await messagingFeatureSchemaState(db);
+          const messagingFeatures = capabilitySession && messagingSchema.ready
+            ? messagingFeatureFlagsForAccount(capabilitySession.accountId)
+            : { ...disabledMessagingFeatures, support: configuredMessagingFeatures.support };
+          const accountTwoFactorAvailable = twoFactorConfigured() || Boolean(
+            capabilitySession?.accessExpiresAt
+            && (await twoFactorStatus(db, capabilitySession.accountId)).enabled,
+          );
           response = json(cloudCapabilities(
             callsAvailable,
             accountVideoAvailable,
@@ -744,6 +887,8 @@ export function startCloudServer(
             capabilitySession != null
               && presenceSchema.ready
               && presenceEnabledForAccount(capabilitySession.accountId),
+            messagingFeatures,
+            accountTwoFactorAvailable,
           ));
         }
 
@@ -755,7 +900,8 @@ export function startCloudServer(
             metrics.render()
               + await dialogPreferenceBacklogMetrics(db)
               + await groupCallBacklogMetrics(db)
-              + await presenceMetrics(db),
+              + await presenceMetrics(db)
+              + await productivityMetrics(db),
             { headers: { "content-type": "text/plain; version=0.0.4" } },
           );
         }
@@ -793,7 +939,44 @@ export function startCloudServer(
         else if (url.pathname === "/v1/auth/check" && req.method === "POST") {
           const body = await readJson(req);
           if (!body.phone || !body.code) throw new AuthError("phone and code required", 400);
-          response = json(await checkVerification(db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName));
+          if (Number(body.authProtocolVersion ?? 1) >= 2) {
+            if (!authSessionsV2Configured()) {
+              throw new AuthError("auth protocol v2 unavailable", 409, undefined, "capability_unavailable");
+            }
+            response = json(await checkVerificationV2(
+              db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
+            ));
+          } else {
+            response = json(await checkVerification(
+              db, body.phone, body.code, body.platform ?? "ios", body.deviceName, body.displayName,
+            ));
+          }
+        }
+
+        else if (url.pathname === "/v1/auth/two-factor/check" && req.method === "POST") {
+          // Completion remains available after enrollment is dark-gated so an SMS challenge
+          // created immediately before rollback cannot strand an already-protected account.
+          const body = await readJson(req);
+          const result = await completeTwoFactorLogin(db, {
+            challengeId: body.challengeId,
+            password: body.password,
+            recoveryCode: body.recoveryCode,
+            newPassword: body.newPassword,
+            networkKey: networkKey(req, server),
+          });
+          if (result.recoveryCodes) metrics.recordAuthSecurity("recovery_used");
+          response = json(result);
+        }
+
+        else if (url.pathname === "/v1/session/refresh" && req.method === "POST") {
+          // The switch controls advertisement and new admission, never credentials that were
+          // already issued. Otherwise a rollback would log out every v2 device after 15 minutes.
+          const body = await readJson(req);
+          if (!body.refreshToken || !body.rotationId) {
+            throw new AuthError("refreshToken and rotationId required", 400);
+          }
+          response = json(await refreshV2Session(db, body.refreshToken, body.rotationId));
+          metrics.recordAuthSecurity("refresh_success");
         }
 
         else if (
@@ -864,16 +1047,33 @@ export function startCloudServer(
           const downloadChunkMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/chunks$/i);
           const downloadThumbnailMatch = url.pathname.match(/^\/v1\/media\/([0-9a-f-]+)\/thumbnail$/i);
           const previewAssetMatch = url.pathname.match(/^\/v1\/link-previews\/assets\/([0-9a-f-]+)$/i);
-          const productivitySchema = await cloudProductivitySchemaState(db);
-          const chatFoldersAvailable = productivitySchema.ready
+          const productivityNeeds = productivityNeedsForPath(url.pathname);
+          const productivitySchema = productivityNeeds.schema
+            ? await cloudProductivitySchemaState(db)
+            : null;
+          const chatFoldersAvailable = Boolean(productivitySchema?.ready)
             && chatFoldersEnabledForAccount(session.accountId);
-          const scheduledDeliveryAvailable = productivitySchema.ready
+          const scheduledDeliveryAvailable = Boolean(productivitySchema?.ready)
             && scheduledDeliveryEnabledForAccount(session.accountId);
           const scheduledDeliveryWorkerHealthy = scheduledDeliveryAvailable
-            && await workerHeartbeatFresh(db, "scheduled_delivery");
-          const linkPreviewsAvailable = productivitySchema.ready
+            && (!productivityNeeds.scheduledWorker
+              || await workerHeartbeatFresh(db, "scheduled_delivery"));
+          const linkPreviewsAvailable = Boolean(productivitySchema?.ready)
             && linkPreviewsEnabledForAccount(session.accountId)
-            && await workerHeartbeatFresh(db, "link_preview");
+            && (!productivityNeeds.previewWorker || await workerHeartbeatFresh(db, "link_preview"));
+          const requestedMessagingFeatures = isMessagingFeaturePath(url.pathname)
+            ? messagingFeatureFlagsForAccount(session.accountId)
+            : disabledMessagingFeatures;
+          const messagingSchemaNeeded = messagingFeatureNeedsSchema(
+            url.pathname,
+            requestedMessagingFeatures,
+          );
+          const messagingSchema = messagingSchemaNeeded
+            ? await messagingFeatureSchemaState(db)
+            : null;
+          const messagingFeatures = messagingSchemaNeeded && messagingSchema?.ready
+            ? requestedMessagingFeatures
+            : disabledMessagingFeatures;
 
           if (uploadPartMatch && req.method === "PUT") {
             const bytes = await readBinary(req, LARGE_MEDIA_PART_SIZE);
@@ -979,6 +1179,15 @@ export function startCloudServer(
           const scheduleRescheduleMatch = url.pathname.match(
             /^\/v1\/scheduled-messages\/([0-9a-f-]+)\/reschedule$/i,
           );
+          const pinsMatch = url.pathname.match(/^\/v1\/dialogs\/([0-9a-f-]+)\/pins$/i);
+          const pinMatch = url.pathname.match(/^\/v1\/dialogs\/([0-9a-f-]+)\/pins\/(\d+)$/i);
+          const autoDeleteMatch = url.pathname.match(/^\/v1\/dialogs\/([0-9a-f-]+)\/auto-delete$/i);
+          const pollActionMatch = url.pathname.match(
+            /^\/v1\/dialogs\/([0-9a-f-]+)\/polls\/(\d+)\/(vote|close)$/i,
+          );
+          const pollVotersMatch = url.pathname.match(
+            /^\/v1\/dialogs\/([0-9a-f-]+)\/polls\/(\d+)\/voters$/i,
+          );
 
         if (
           (url.pathname === "/v1/chat-folders" || url.pathname.startsWith("/v1/chat-folders/"))
@@ -1069,6 +1278,92 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/presence/query" && req.method === "POST") {
           response = json(await queryPresence(db, session.accountId, body.accountIds));
+        }
+
+        if (pinsMatch && req.method === "GET" && messagingFeatures.pinnedMessages) {
+          response = json(await listPinnedMessages(db, session.accountId, pinsMatch[1], {
+            before: url.searchParams.get("before") ?? undefined,
+            limit: Number(url.searchParams.get("limit") ?? 30),
+          }));
+        }
+        if (pinMatch && (req.method === "PUT" || req.method === "DELETE")
+          && messagingFeatures.pinnedMessages) {
+          const result = await mutatePinnedMessage(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            operationId: body.operationId ?? body.operation_id,
+            dialogId: pinMatch[1],
+            msgId: Number(pinMatch[2]),
+            pinned: req.method === "PUT",
+            notifyMembers: body.notifyMembers ?? body.notify_members,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+        if (autoDeleteMatch && req.method === "PUT" && messagingFeatures.autoDeleteCreation) {
+          const result = await setDialogAutoDelete(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            operationId: body.operationId ?? body.operation_id,
+            dialogId: autoDeleteMatch[1],
+            seconds: body.seconds ?? body.auto_delete_seconds ?? null,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+        if (pollActionMatch && req.method === "POST" && messagingFeatures.polls) {
+          const common = {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            operationId: body.operationId ?? body.operation_id,
+            dialogId: pollActionMatch[1],
+            msgId: Number(pollActionMatch[2]),
+          };
+          const result = pollActionMatch[3] === "vote"
+            ? await voteInPoll(db, {
+                ...common,
+                optionIndices: body.optionIndices ?? body.option_indices,
+              })
+            : await closePoll(db, common);
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+        if (pollVotersMatch && req.method === "GET" && messagingFeatures.polls) {
+          response = json(await listPollVoters(
+            db,
+            session.accountId,
+            pollVotersMatch[1],
+            Number(pollVotersMatch[2]),
+            {
+              optionIndex: url.searchParams.has("optionIndex")
+                ? Number(url.searchParams.get("optionIndex")) : undefined,
+              cursor: url.searchParams.get("cursor") ?? undefined,
+              limit: Number(url.searchParams.get("limit") ?? 50),
+            },
+          ));
+        }
+        if (url.pathname === "/v1/stickers" && req.method === "GET"
+          && messagingFeatures.stickerPacks) {
+          response = json(await getStickerCatalog(db, session.accountId, {
+            query: url.searchParams.get("query") ?? undefined,
+            limit: Number(url.searchParams.get("limit") ?? 100),
+          }));
+        }
+        if (url.pathname === "/v1/stickers/preferences" && req.method === "POST"
+          && messagingFeatures.stickerPacks) {
+          const result = await mutateStickerPreference(db, {
+            actorAccountId: session.accountId,
+            actorDeviceId: session.deviceId,
+            operationId: body.operationId ?? body.operation_id,
+            action: body.action,
+            itemId: body.itemId ?? body.item_id,
+          });
+          pushHints(sockets, result.pushes);
+          response = json(result);
+        }
+        if (url.pathname === "/v1/giphy/config" && req.method === "GET"
+          && messagingFeatures.giphy) {
+          response = json(giphyClientConfiguration(messagingFeatures));
         }
 
         if (url.pathname === "/v1/groups" && req.method === "POST") {
@@ -1411,6 +1706,33 @@ export function startCloudServer(
           response = json(await unregisterPushToken(db, session.deviceId));
         }
 
+        if (url.pathname === "/v1/devices/push-v2" && req.method === "PUT"
+          && messagingFeatures.multiAccountPush) {
+          if (!body.installationId || !body.token || !body.environment) {
+            throw new PushError("installationId, token, and environment required");
+          }
+          response = json(await registerInstallationPushToken(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            installationId: body.installationId,
+            token: body.token,
+            environment: body.environment,
+            kind: "normal",
+          }));
+        }
+
+        if (url.pathname === "/v1/devices/push-v2" && req.method === "DELETE"
+          && messagingFeatures.multiAccountPush) {
+          if (!body.installationId) throw new PushError("installationId required");
+          response = json(await unregisterInstallationTokenKind(
+            db,
+            session.accountId,
+            session.deviceId,
+            body.installationId,
+            "normal",
+          ));
+        }
+
         if (url.pathname === "/v1/devices/voip-push" && req.method === "PUT") {
           if (!body.token || !body.environment) throw new PushError("token and environment required");
           response = json(await registerVoIPPushToken(
@@ -1427,6 +1749,26 @@ export function startCloudServer(
           ));
         }
 
+        if (url.pathname === "/v1/devices/voip-push-v2" && req.method === "PUT"
+          && messagingFeatures.multiAccountPush) {
+          if (!body.installationId || !body.token || !body.environment) {
+            throw new PushError("installationId, token, and environment required");
+          }
+          response = json(await registerInstallationVoIPPushToken(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            installationId: body.installationId,
+            token: body.token,
+            environment: body.environment,
+            supportedCallProtocolVersions: body.supportedCallProtocolVersions,
+            supportedCallMediaProfileVersions: body.supportedCallMediaProfileVersions,
+            callViewVersion: body.callViewVersion,
+            supportedGroupCallVersions: body.supportedGroupCallVersions,
+            groupCallViewVersion: body.groupCallViewVersion,
+            supportsGroupScreenShare: body.supportsGroupScreenShare,
+          }));
+        }
+
         if (url.pathname === "/v1/devices/group-call-capabilities" && req.method === "PUT") {
           response = json(await registerGroupCallCapabilities(
             db,
@@ -1439,6 +1781,18 @@ export function startCloudServer(
 
         if (url.pathname === "/v1/devices/voip-push" && req.method === "DELETE") {
           response = json(await unregisterVoIPPushToken(db, session.deviceId));
+        }
+
+        if (url.pathname === "/v1/devices/voip-push-v2" && req.method === "DELETE"
+          && messagingFeatures.multiAccountPush) {
+          if (!body.installationId) throw new PushError("installationId required");
+          response = json(await unregisterInstallationTokenKind(
+            db,
+            session.accountId,
+            session.deviceId,
+            body.installationId,
+            "voip",
+          ));
         }
 
         if (blockMatch && req.method === "PUT") {
@@ -1572,6 +1926,94 @@ export function startCloudServer(
             bitrateBucket: body.bitrateBucket, recoveryCount: body.recoveryCount,
             appVersion: body.appVersion, region: body.region,
           }), 202);
+        }
+
+        if (url.pathname === "/v1/session/upgrade" && req.method === "POST") {
+          if (!authSessionsV2Configured()) response = new Response("not found", { status: 404 });
+          else response = json({ session: await upgradeLegacySession(db, session.accountId, session.deviceId) });
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "GET") {
+          const state = await twoFactorStatus(db, session.accountId);
+          if (!twoFactorConfigured() && !state.enabled) {
+            response = new Response("not found", { status: 404 });
+          } else response = json(state);
+        }
+
+        if (url.pathname === "/v1/security/step-up/start" && req.method === "POST") {
+          const state = await twoFactorStatus(db, session.accountId);
+          if (!twoFactorConfigured() && !state.enabled) {
+            response = new Response("not found", { status: 404 });
+          } else response = json(await startSecurityChange(db, session.accountId, {
+              networkKey: networkKey(req, server), delivery: otpDelivery,
+            }));
+        }
+
+        if (url.pathname === "/v1/security/step-up/check" && req.method === "POST") {
+          response = json(await completeSecurityStepUp(db, session.accountId, String(body.code ?? "")));
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "PUT") {
+          const wasEnabled = (await twoFactorStatus(db, session.accountId)).enabled;
+          if (!twoFactorConfigured() && !wasEnabled) response = new Response("not found", { status: 404 });
+          else {
+            const result = await configureTwoFactor(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              password: body.password,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            await sendSecurityChangeAlert(
+              db,
+              session.accountId,
+              wasEnabled ? "two_factor_changed" : "two_factor_enabled",
+              otpDelivery,
+            );
+            metrics.recordAuthSecurity("two_factor_configured");
+            response = json(result);
+          }
+        }
+
+        if (url.pathname === "/v1/security/two-factor" && req.method === "DELETE") {
+          const state = await twoFactorStatus(db, session.accountId);
+          if (!state.enabled) response = new Response("not found", { status: 404 });
+          else {
+            const result = await disableTwoFactor(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_disabled", otpDelivery);
+            metrics.recordAuthSecurity("two_factor_disabled");
+            response = json(result);
+          }
+        }
+
+        if (url.pathname === "/v1/security/two-factor/recovery-codes" && req.method === "POST") {
+          const state = await twoFactorStatus(db, session.accountId);
+          if (!state.enabled) response = new Response("not found", { status: 404 });
+          else {
+            const result = await regenerateTwoFactorRecoveryCodes(db, {
+              accountId: session.accountId,
+              currentDeviceId: session.deviceId,
+              stepUpToken: body.stepUpToken,
+              currentCredential: body.currentCredential,
+            });
+            for (const deviceId of result.revokedDeviceIds) {
+              disconnectDevice(sockets, session.accountId, deviceId);
+            }
+            await sendSecurityChangeAlert(db, session.accountId, "two_factor_changed", otpDelivery);
+            metrics.recordAuthSecurity("recovery_codes_regenerated");
+            response = json(result);
+          }
         }
 
         if (url.pathname === "/v1/session" && req.method === "DELETE") {
@@ -1752,6 +2194,12 @@ export function startCloudServer(
             silent: body.silent === true,
             linkPreviewCandidate: body.linkPreviewCandidate ?? body.link_preview_candidate,
             linkPreviewsEnabled: linkPreviewsAvailable,
+            poll: body.poll,
+            pollsEnabled: messagingFeatures.polls,
+            stickerId: body.stickerId ?? body.sticker_id,
+            stickersEnabled: messagingFeatures.stickerPacks,
+            giphyReference: body.giphy ?? body.external_media,
+            giphyEnabled: messagingFeatures.giphy,
           });
           pushHints(sockets, result.pushes);
           response = json(result);
@@ -1899,6 +2347,18 @@ export function startCloudServer(
           }
         }
       } catch (err) {
+        if (err instanceof AuthError) {
+          if (route === "/v1/session/refresh") metrics.recordAuthSecurity("refresh_failure");
+          if (err.code === "refresh_reuse_detected") {
+            metrics.recordAuthSecurity("refresh_replay_revocation");
+          } else if (err.code === "session_expired") {
+            metrics.recordAuthSecurity("session_expired");
+          } else if (err.code === "challenge_locked") {
+            metrics.recordAuthSecurity("second_factor_locked");
+          } else if (err.code === "incorrect_second_factor") {
+            metrics.recordAuthSecurity("second_factor_failure");
+          }
+        }
         const status = err instanceof AuthError
           ? err.status
           : err instanceof MediaError ? err.status
@@ -1914,6 +2374,8 @@ export function startCloudServer(
           : err instanceof ChatFolderError ? err.status
           : err instanceof ScheduledDeliveryError ? err.status
           : err instanceof LinkPreviewError ? err.status
+          : err instanceof MessagingFeatureError ? err.status
+          : err instanceof MessagingContentError ? err.status
           : err instanceof SyncError ? err.status
           : err instanceof PushError ? 400 : 500;
         if (status === 500) {
@@ -1940,6 +2402,7 @@ export function startCloudServer(
         if (status === 401) headers["www-authenticate"] = "Bearer";
         response = json({
           error: message,
+          ...(err instanceof AuthError && err.code ? { code: err.code } : {}),
           ...(err instanceof MediaError ? { code: err.code } : {}),
           ...(err instanceof CallError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof GroupCallError ? { code: err.code, ...err.details } : {}),
@@ -1953,6 +2416,8 @@ export function startCloudServer(
           ...(err instanceof ChatFolderError ? { code: err.code } : {}),
           ...(err instanceof ScheduledDeliveryError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof LinkPreviewError ? { code: err.code } : {}),
+          ...(err instanceof MessagingFeatureError ? { code: err.code } : {}),
+          ...(err instanceof MessagingContentError ? { code: err.code } : {}),
           ...(err instanceof SyncError ? { code: err.code, ...err.details } : {}),
         }, status, headers);
       }
@@ -1979,6 +2444,12 @@ export function startCloudServer(
           })
           .catch(() => ws.close(4001, "device revoked"));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
+        if (ws.data.accessExpiresAt) {
+          const delay = Math.max(0, new Date(ws.data.accessExpiresAt).getTime() - Date.now());
+          setTimeout(() => {
+            if (ws.readyState === 1) ws.close(4003, "access token expired");
+          }, Math.min(delay, 2_147_000_000));
+        }
       },
       close(ws) {
         const set = sockets.get(ws.data.accountId);
@@ -2138,20 +2609,23 @@ export function startCloudServer(
   });
 
   const originalStop = server.stop.bind(server);
-  server.stop = ((closeActiveConnections?: boolean) => {
+  server.stop = (async (closeActiveConnections?: boolean) => {
     stopPushWorker();
     stopMaintenanceWorker();
     stopCallCleanupWorker();
     stopGroupCallCleanupWorker();
     stopGroupCallSFUWorker();
-    stopScheduledDeliveryWorker();
-    stopLinkPreviewWorker();
     stopSyncNotifications();
     stopCallNotifications();
     stopGroupCallNotifications();
     stopPresenceNotifications();
     stopPresenceCleanup();
+    stopSessionRevocations();
     if (socketAuthorizationInterval) clearInterval(socketAuthorizationInterval);
+    await Promise.allSettled([
+      stopScheduledDeliveryWorker(),
+      stopLinkPreviewWorker(),
+    ]);
     const stopped = originalStop(closeActiveConnections);
     return Promise.resolve(stopped).then(async (value) => {
       await Promise.allSettled([...presenceSocketCleanupTasks]);

@@ -318,8 +318,16 @@ export async function updateDialogPreferences(
         AND device.id <> ${input.deviceId}
         AND device.platform = 'ios'
         AND device.revoked_at IS NULL
-        AND device.push_token_hash IS NOT NULL
-        AND device.push_token_ciphertext IS NOT NULL
+        AND (
+          (device.push_token_hash IS NOT NULL AND device.push_token_ciphertext IS NOT NULL)
+          OR EXISTS (
+            SELECT 1 FROM push_account_bindings binding
+            JOIN push_installations installation USING (installation_id)
+            WHERE binding.device_id = device.id AND binding.account_id = device.account_id
+              AND binding.active AND binding.normal_enabled
+              AND installation.normal_token_ciphertext IS NOT NULL
+          )
+        )
       ON CONFLICT (account_id, pts, device_id) DO NOTHING`;
     await tx`
       UPDATE dialog_preference_requests

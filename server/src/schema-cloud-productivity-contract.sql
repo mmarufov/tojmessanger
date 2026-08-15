@@ -19,7 +19,7 @@ BEGIN
       AND conname = 'account_events_type_check_v6'
       AND convalidated
   ) THEN
-    ALTER TABLE account_events DROP CONSTRAINT account_events_type_check;
+    ALTER TABLE account_events DROP CONSTRAINT IF EXISTS account_events_type_check;
     ALTER TABLE account_events
       RENAME CONSTRAINT account_events_type_check_v6 TO account_events_type_check;
   END IF;

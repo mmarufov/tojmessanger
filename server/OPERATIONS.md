@@ -30,13 +30,55 @@ until the row or runtime budget is exhausted. Defaults are 1,000 rows per table 
 rows, and five seconds; deployments can tune `TOJ_MAINTENANCE_BATCH_SIZE`,
 `TOJ_MAINTENANCE_MAX_ROWS_PER_TICK`, and `TOJ_MAINTENANCE_MAX_RUNTIME_MS`.
 
-Cleanup covers expired OTP challenges older than 24 hours, expired bootstrap snapshots, and terminal
-push deliveries older than seven days. Incomplete media uploads are resumable for 24 hours and are
+Cleanup covers expired OTP challenges older than 24 hours, expired bootstrap snapshots, terminal
+push deliveries older than seven days, bounded messaging-feature receipts, and already-stamped
+message expiries. Expiry enforcement is independent of feature admission: server reads hide an
+expired message immediately, then cleanup replaces live ciphertext with a tombstone and removes
+reactions, pins, polls/votes, preview data, and unreferenced media. Incomplete media uploads are
+resumable for 24 hours and are
 then removed with their encrypted chunks; expired upload-attempt rate records and unattached
 completed media are also removed. Completed dialog-preference idempotency records are retained until
 account deletion because an offline client can retry a lost response after any fixed cleanup window.
 Pending records are also never aged out. Message history and attached media are not deleted by this
 worker; account events follow the separately configured synchronization retention floor.
+
+## Session security and two-step verification rollout
+
+Authentication v2 and two-step verification are additive and dark by default. Run the migration and
+deploy the dual-stack server before shipping the compatible iOS client. The readiness probe requires
+the v2 session, access-token, rotation-receipt, two-step, recovery-code, challenge, and throttle tables
+even while admission is disabled.
+
+- `TOJ_AUTH_SESSIONS_V2_ENABLED=1` advertises `auth_sessions_v2`, enables legacy in-place upgrade,
+  and accepts rotating refresh credentials. Access tokens last 15 minutes, refresh activity lasts 30
+  days, and the device session has a non-extendable 180-day lifetime.
+- `TOJ_TWO_FACTOR_ENABLED=1` advertises `two_factor_v1`. It is ignored unless auth v2 is also enabled.
+  Do not set it until production SMS delivery, the migrated catalog, and v2 refresh metrics are healthy.
+- `TOJ_SECURITY_ALERT_SMS_WEBHOOK` is the optional provider adapter for non-secret security alerts.
+  Keep its authorization value in `TOJ_SECURITY_ALERT_SMS_TOKEN` in the deployment secret store.
+
+Roll out auth v2 to internal accounts first, then increase compatible-client admission through 1%,
+5%, 25%, 50%, and 100% release cohorts. Keep legacy authentication available for at least 30 days and
+until 95% of recently active eligible devices have upgraded. Announce a further 30-day deadline before
+rejecting legacy tokens. Enable two-step enrollment only after the v2 ramp is stable. Roll back by
+disabling enrollment first and then auth-v2 advertisement; retain the additive database objects,
+continue accepting credentials already issued to upgraded clients, and continue enforcing existing
+two-step enrollments. A rollback closes only new admission: already-created login challenges can be
+completed and already-enrolled accounts can inspect, disable, or recover their protection. Rotation
+receipts are fenced to the session generation so a late retry can never restore superseded credentials.
+
+Alert on sustained increases in `refresh_failure`, `refresh_replay_revocation`, or `session_expired`
+within `toj_auth_security_events_total`. Track `second_factor_failure`, `second_factor_locked`,
+`recovery_used`, `recovery_codes_regenerated`, `two_factor_configured`, and
+`two_factor_disabled` as aggregate counters only. No
+metric or log label may contain an account, phone number, token, recovery code, password, challenge,
+rotation ID, or network identifier.
+
+Ordinary idle or absolute expiry requires authentication but preserves the encrypted local replica and
+pending outbox. Explicit device revocation and refresh-token replay remain destructive client security
+events. Before broad release, verify signed-simulator Keychain and LocalAuthentication tests, then use
+physical devices to cover Face ID/passcode fallback, background refresh, push and VoIP notifications,
+CallKit answering, weak-network rotation response loss, and remote-device socket revocation.
 
 Only abandoned `pending` send claims expire after 24 hours. Completed send receipts remain durable so
 a device retrying after days can recover the canonical `client_msg_id`.
@@ -95,8 +137,8 @@ and thumbnails are AEAD-encrypted before PostgreSQL persistence. Deploy the sche
 clients that send media. These optional server settings are byte counts and are bounded to safe ranges:
 
 - `TOJ_MEDIA_CHUNK_BYTES` (legacy offset-v1 only; default 1048576)
-- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default 104857600 / 100 MB; configurable up to 2 GB)
-- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default 5368709120 / 5 GB)
+- `TOJ_MEDIA_MAX_OBJECT_BYTES` (default and hard maximum 26214400 / 25 MB)
+- `TOJ_MEDIA_ACCOUNT_QUOTA_BYTES` (default and hard maximum 262144000 / 250 MB)
 - `TOJ_MEDIA_MAX_ACTIVE_UPLOADS` (default 10)
 - `TOJ_MEDIA_MAX_DAILY_UPLOADS` (default 100)
 
@@ -111,6 +153,66 @@ order with up to three concurrent requests: 256 KiB parts through 10 MiB and 512
 10 MiB. Completion checks the exact part layout, declared byte count, SHA-256, media signature, and
 photo dimensions before making an object usable. The offset-v1 route remains available for older
 clients and cannot write into a multipart upload.
+
+The 25 MB object ceiling is a safety boundary, not a rollout default that may be raised casually.
+Startup rejects `TOJ_MEDIA_MAX_OBJECT_BYTES` above 26214400. Do not advertise or accept 100 MB
+objects until iOS uploads/downloads are file-streamed and media bytes live in external object
+storage instead of PostgreSQL chunks. The current 250 MB account quota is subject to the same
+architecture review before any increase.
+
+## Productivity workers and dark rollout
+
+Chat folders, scheduled delivery, and link previews retain independent account gates. Scheduled
+delivery and link previews must be deployed with their global switches off, rollout percentages at
+zero, and allowlists empty. A successful migration, readiness probe, or test run never authorizes
+rollout. The relevant variables are:
+
+- `TOJ_SCHEDULED_DELIVERY_V1_ENABLED`, `TOJ_SCHEDULED_DELIVERY_ALLOWLIST`, and
+  `TOJ_SCHEDULED_DELIVERY_ROLLOUT_PERCENT`
+- `TOJ_LINK_PREVIEWS_V1_ENABLED`, `TOJ_LINK_PREVIEWS_ALLOWLIST`, and
+  `TOJ_LINK_PREVIEWS_ROLLOUT_PERCENT`
+- `TOJ_SCHEDULED_DELIVERY_WORKER_CONCURRENCY` (default 8, integer 1–32)
+- `TOJ_LINK_PREVIEW_WORKER_CONCURRENCY` (default 4, integer 1–16)
+- `TOJ_PRODUCTIVITY_WORKER_LEASE_SECONDS` (default 120, integer 30–600)
+
+Workers claim only open concurrency slots. Claims carry token-owned leases, renewed at least every
+30 seconds (and every ten seconds at the minimum lease); a superseded token cannot complete or retry
+work. Heartbeats run independently every ten seconds. Shutdown stops new claims, aborts active
+preview fetches, and gives active jobs a bounded drain. Preview resolution commits quickly, then a
+restart-safe fanout drain handles at most 25 waiters per transaction and 100 per tick.
+
+Capability and relevant sync/message routes share one five-second, single-flight heartbeat snapshot.
+Freshness is evaluated against the 30-second boundary on each request and database errors fail
+closed. Media, call, group, and unrelated authenticated routes do not query productivity heartbeats.
+Monitor `toj_productivity_active_jobs`, `toj_productivity_lease_renewal_failures_total`,
+`toj_link_preview_resolved_waiters_total`, `toj_link_preview_oldest_fanout_seconds`, and
+`toj_productivity_heartbeat_cache_database_errors_total`. Halt rollout on lost leases, growing
+fanout age, heartbeat errors, duplicate scheduled sends, or preview backlog growth.
+
+## Messaging parity and multi-account dark rollout
+
+Messaging parity is additive and account-dark by default. Each creation/mutation capability requires
+both its global switch and either a matching account allowlist entry or a nonzero deterministic
+rollout percentage. Keep every percentage at zero and every allowlist empty after deployment:
+
+- `TOJ_PINNED_MESSAGES_ENABLED` with `TOJ_PINNED_MESSAGES_ALLOWLIST` /
+  `TOJ_PINNED_MESSAGES_ROLLOUT_PERCENT`
+- `TOJ_AUTO_DELETE_ENABLED` with `TOJ_AUTO_DELETE_ALLOWLIST` /
+  `TOJ_AUTO_DELETE_ROLLOUT_PERCENT`
+- `TOJ_POLLS_ENABLED` with `TOJ_POLLS_ALLOWLIST` / `TOJ_POLLS_ROLLOUT_PERCENT`
+- `TOJ_STICKER_PACKS_ENABLED` with `TOJ_STICKER_PACKS_ALLOWLIST` /
+  `TOJ_STICKER_PACKS_ROLLOUT_PERCENT`
+- `TOJ_GIPHY_ENABLED` with `TOJ_GIPHY_ALLOWLIST` / `TOJ_GIPHY_ROLLOUT_PERCENT`; this also requires
+  `TOJ_GIPHY_AGREEMENT_APPROVED=1` and a valid secret `TOJ_GIPHY_API_KEY`
+- `TOJ_MULTI_ACCOUNT_PUSH_ENABLED` with `TOJ_MULTI_ACCOUNT_PUSH_ALLOWLIST` /
+  `TOJ_MULTI_ACCOUNT_PUSH_ROLLOUT_PERCENT`
+
+`TOJ_SUPPORT_ENABLED` is a global documentation switch; `TOJ_SUPPORT_EMAIL` is published only when
+syntactically valid. Read/render and expiry enforcement remain installed when creation switches are
+closed. Never remove the additive schema to roll back. Before any internal enablement, require clean
+schema readiness plus physical-device APNs/VoIP routing proof; GIPHY also requires the production
+agreement, attribution, and privacy smoke test. Stop immediately for cross-account routing,
+post-expiry exposure, anonymous-voter disclosure, or unauthorized mutation.
 
 ## Encrypted backups
 
@@ -385,11 +487,12 @@ bun run worker:link-preview
 
 The HTTP process also starts both workers for local development and single-process test deployments.
 Set `TOJ_PRODUCTIVITY_WORKERS_DISABLED=1` there when dedicated worker services are active.
-The scheduled-delivery management capability is advertised whenever its schema is complete and the
-account is in rollout. A stale scheduled-worker heartbeat does not hide previously accepted rows,
-sync updates, or cancellation: reads and cancellation remain available. Only create and reschedule
+The scheduled-delivery management capability is advertised only when its schema is complete, the
+account is in rollout, and the scheduled worker heartbeat is fresh. A stale heartbeat removes the
+capability but does not hide previously accepted rows, sync updates, or cancellation from a client
+that already knows the route: reads and cancellation remain available. Only create and reschedule
 fail closed with `503 scheduled_worker_unavailable` and `Retry-After` until a heartbeat is fresher
-than 30 seconds. Link-preview advertisement still requires its worker heartbeat. Folder capability
+than 30 seconds. Link-preview advertisement also requires its worker heartbeat. Folder capability
 does not require a worker.
 
 Deploy in this order: expand/validate/contract migration; compatible HTTP nodes with all feature

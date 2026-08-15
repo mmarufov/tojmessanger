@@ -6715,18 +6715,18 @@
         }
       }
     },
-    "That file is larger than 100 MB" : {
+    "That file is larger than 25 MB" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Размер этого файла превышает 100 МБ."
+            "value" : "Размер этого файла превышает 25 МБ."
           }
         },
         "tg" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ин файл аз 100 МБ калонтар аст"
+            "value" : "Ин файл аз 25 МБ калонтар аст"
           }
         }
       }
@@ -7049,18 +7049,18 @@
         }
       }
     },
-    "This file is empty or larger than 100 MB" : {
+    "This file is empty or larger than 25 MB" : {
       "localizations" : {
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Этот файл пуст или превышает 100 МБ."
+            "value" : "Этот файл пуст или превышает 25 МБ."
           }
         },
         "tg" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ин файл холӣ ё калонтар аз 100 МБ аст"
+            "value" : "Ин файл холӣ ё калонтар аз 25 МБ аст"
           }
         }
       }

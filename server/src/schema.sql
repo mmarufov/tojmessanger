@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS devices (
   revoked_at            TIMESTAMPTZ,
   created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS auth_scheme TEXT NOT NULL DEFAULT 'legacy';
+DO $$ BEGIN
+  ALTER TABLE devices ADD CONSTRAINT devices_auth_scheme_check
+    CHECK (auth_scheme IN ('legacy','v2')) NOT VALID;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 -- Existing M3 deployments already have devices.push_token_ciphertext, so M4 adds the remaining
 -- token metadata with idempotent ALTERs. The token itself is never stored as plaintext.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_hash BYTEA;
@@ -119,7 +125,7 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
   code_salt         BYTEA,
   network_hash      BYTEA,
   purpose           TEXT NOT NULL DEFAULT 'login'
-                      CHECK (purpose IN ('login','account_deletion')),
+                      CHECK (purpose IN ('login','account_deletion','security_change')),
   attempts          INT NOT NULL DEFAULT 0,
   expires_at        TIMESTAMPTZ NOT NULL,
   consumed_at       TIMESTAMPTZ,
@@ -128,15 +134,142 @@ CREATE TABLE IF NOT EXISTS otp_challenges (
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS code_salt BYTEA;
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS network_hash BYTEA;
 ALTER TABLE otp_challenges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'login';
+ALTER TABLE otp_challenges DROP CONSTRAINT IF EXISTS otp_challenges_purpose_check;
 DO $$ BEGIN
   ALTER TABLE otp_challenges ADD CONSTRAINT otp_challenges_purpose_check
-    CHECK (purpose IN ('login','account_deletion'));
+    CHECK (purpose IN ('login','account_deletion','security_change'));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 CREATE INDEX IF NOT EXISTS otp_active_idx ON otp_challenges(phone_lookup_hash, expires_at) WHERE consumed_at IS NULL;
 CREATE INDEX IF NOT EXISTS otp_phone_requests_idx ON otp_challenges(phone_lookup_hash, created_at DESC);
 CREATE INDEX IF NOT EXISTS otp_network_requests_idx ON otp_challenges(network_hash, created_at DESC)
   WHERE network_hash IS NOT NULL;
+
+-- Auth protocol v2 keeps short-lived access credentials separate from the rotating device grant.
+-- Only HMACs are retained. A bounded encrypted receipt makes a committed rotation safe to retry
+-- after a client crash without turning an old refresh token into a second valid grant.
+CREATE TABLE IF NOT EXISTS device_sessions (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  device_id           UUID NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
+  refresh_token_hash  BYTEA NOT NULL UNIQUE,
+  rotation_generation BIGINT NOT NULL DEFAULT 0,
+  last_activity_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  absolute_expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at          TIMESTAMPTZ,
+  revocation_reason   TEXT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS device_sessions_active_idx
+  ON device_sessions(last_activity_at, absolute_expires_at) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS session_access_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_digest BYTEA NOT NULL UNIQUE,
+  session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS session_access_tokens_session_idx
+  ON session_access_tokens(session_id, expires_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_refresh_token_history (
+  token_digest BYTEA PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
+  used_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS session_rotation_receipts (
+  session_id UUID NOT NULL REFERENCES device_sessions(id) ON DELETE CASCADE,
+  rotation_id UUID NOT NULL,
+  request_token_digest BYTEA NOT NULL,
+  response_ciphertext BYTEA NOT NULL,
+  response_nonce BYTEA NOT NULL,
+  response_key_id TEXT NOT NULL,
+  response_generation BIGINT NOT NULL
+    CONSTRAINT session_rotation_receipts_generation_check CHECK (response_generation > 0),
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, rotation_id)
+);
+ALTER TABLE session_rotation_receipts
+  ADD COLUMN IF NOT EXISTS response_generation BIGINT;
+-- Rotation receipts live for only five minutes. Receipts written by the pre-generation binary
+-- cannot safely be replayed after a newer refresh, so discard them instead of guessing a value.
+DELETE FROM session_rotation_receipts WHERE response_generation IS NULL;
+ALTER TABLE session_rotation_receipts
+  ALTER COLUMN response_generation SET NOT NULL;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'session_rotation_receipts'::regclass
+      AND conname = 'session_rotation_receipts_generation_check'
+  ) THEN
+    ALTER TABLE session_rotation_receipts
+      ADD CONSTRAINT session_rotation_receipts_generation_check
+      CHECK (response_generation > 0) NOT VALID;
+  END IF;
+END $$;
+ALTER TABLE session_rotation_receipts
+  VALIDATE CONSTRAINT session_rotation_receipts_generation_check;
+CREATE INDEX IF NOT EXISTS session_rotation_receipts_expiry_idx
+  ON session_rotation_receipts(expires_at);
+INSERT INTO schema_migrations(name) VALUES ('session-rotation-generation-v1')
+ON CONFLICT (name) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS account_two_factor (
+  account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  password_hash TEXT NOT NULL,
+  enabled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS two_factor_recovery_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  code_hash BYTEA NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (account_id, code_hash)
+);
+CREATE INDEX IF NOT EXISTS two_factor_recovery_active_idx
+  ON two_factor_recovery_codes(account_id) WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS two_factor_login_challenges (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  platform TEXT NOT NULL CHECK (platform IN ('ios','android','web','desktop')),
+  device_name TEXT,
+  display_name TEXT,
+  attempts INT NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS two_factor_login_active_idx
+  ON two_factor_login_challenges(account_id, expires_at) WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS two_factor_attempt_budgets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  network_hash BYTEA,
+  accepted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS two_factor_attempt_account_idx
+  ON two_factor_attempt_budgets(account_id, accepted_at DESC);
+CREATE INDEX IF NOT EXISTS two_factor_attempt_network_idx
+  ON two_factor_attempt_budgets(network_hash, accepted_at DESC) WHERE network_hash IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS security_step_up_tickets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  token_hash BYTEA NOT NULL UNIQUE,
+  attempts INT NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE security_step_up_tickets ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
 
 -- Persisted, per-account discovery budget. This makes phone enumeration expensive even across
 -- server restarts and multiple app processes; repeated lookups of the same contact are idempotent
@@ -470,9 +603,13 @@ CREATE TABLE IF NOT EXISTS account_events (
   account_id        UUID   NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
   pts               BIGINT NOT NULL,
   type              TEXT   NOT NULL CHECK (type IN
-                       ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-                        'dialog.created','member.added','member.removed','member.role_changed','member.left',
-                        'dialog.profile_updated','dialog.closed','dialog.access_revoked','profile.updated')),
+                       ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+                        'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+                        'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+                        'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+                        'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+                        'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+                        'poll.updated','sticker_preferences.updated')),
   dialog_id         UUID,
   msg_id            BIGINT,
   actor_account_id  UUID REFERENCES accounts(id),
@@ -484,20 +621,39 @@ DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v2')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v2') THEN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v2 CHECK (type IN
-      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-       'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
   END IF;
 END $$;
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v3')
      AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v3') THEN
     ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v3 CHECK (type IN
-      ('message.new','message.edited','message.deleted','reaction.updated','read.updated',
-       'dialog.created','member.added','member.removed','member.role_changed','member.left',
-       'dialog.profile_updated','dialog.closed','dialog.access_revoked',
-       'dialog.preferences_updated','profile.updated','draft.updated')) NOT VALID;
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE name = 'account-events-type-v4')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'account_events_type_check_v4') THEN
+    ALTER TABLE account_events ADD CONSTRAINT account_events_type_check_v4 CHECK (type IN
+      ('message.new','message.edited','message.deleted','message.expired','message.preview_updated',
+       'reaction.updated','read.updated','dialog.created','member.added','member.removed',
+       'member.role_changed','member.left','dialog.profile_updated','dialog.closed',
+       'dialog.access_revoked','dialog.preferences_updated','profile.updated','draft.updated',
+       'security.changed','chat_folders.updated','scheduled.created','scheduled.updated',
+       'scheduled.canceled','scheduled.failed','pin.updated','dialog.auto_delete_updated',
+       'poll.updated','sticker_preferences.updated')) NOT VALID;
   END IF;
 END $$;
 
