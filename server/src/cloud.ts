@@ -441,6 +441,36 @@ function pushGroupCallHints(
   }
 }
 
+type SessionRevocationEvent = Extract<
+  PresenceBroadcast["event"],
+  { type: "session_revoked" }
+>;
+
+const revocationCloseScheduled = new WeakSet<ServerWebSocket<SocketData>>();
+
+/**
+ * Give the terminal control frame one event-loop turn to enter the socket transport before the
+ * close handshake. Closing synchronously after `send` can make the client observe only the close
+ * on a loaded runtime. The weak fence also prevents the presence and auth revocation listeners
+ * from scheduling duplicate frames or competing close codes for the same socket.
+ */
+function closeSocketForSessionRevocation(
+  socket: ServerWebSocket<SocketData>,
+  event: SessionRevocationEvent,
+  code: number,
+  reason: string,
+) {
+  if (revocationCloseScheduled.has(socket)) return;
+  revocationCloseScheduled.add(socket);
+  if (socket.readyState !== 1) {
+    socket.close(code, reason);
+    return;
+  }
+  socket.send(JSON.stringify(event));
+  const timer = setTimeout(() => socket.close(code, reason), 10);
+  timer.unref?.();
+}
+
 function disconnectDevice(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
@@ -448,12 +478,14 @@ function disconnectDevice(
 ) {
   for (const socket of sockets.get(accountId) ?? []) {
     if (socket.data.deviceId !== deviceId) continue;
-    if (socket.readyState === 1) {
-      socket.send(JSON.stringify({
+    closeSocketForSessionRevocation(
+      socket,
+      {
         type: "session_revoked", deviceId, reason: "device_revoked",
-      }));
-    }
-    socket.close(4001, "device revoked");
+      },
+      4001,
+      "device revoked",
+    );
   }
 }
 
@@ -462,12 +494,14 @@ function disconnectAccount(
   accountId: string,
 ) {
   for (const socket of sockets.get(accountId) ?? []) {
-    if (socket.readyState === 1) {
-      socket.send(JSON.stringify({
+    closeSocketForSessionRevocation(
+      socket,
+      {
         type: "session_revoked", deviceId: null, reason: "account_deleted",
-      }));
-    }
-    socket.close(4002, "account deleted");
+      },
+      4002,
+      "account deleted",
+    );
   }
   sockets.delete(accountId);
 }
@@ -483,8 +517,9 @@ function pushPresenceBroadcasts(
         if (broadcast.event.type === "session_revoked") {
           if (broadcast.event.deviceId == null
             || ws.data.deviceId === broadcast.event.deviceId) {
-            if (ws.readyState === 1) ws.send(payload);
-            ws.close(
+            closeSocketForSessionRevocation(
+              ws,
+              broadcast.event,
               broadcast.event.deviceId == null ? 4002 : 4001,
               broadcast.event.deviceId == null ? "account deleted" : "device revoked",
             );
@@ -693,14 +728,16 @@ export function startCloudServer(
       for (const [accountId, accountSockets] of sockets) {
         for (const socket of accountSockets) {
           if (active.has(`${accountId}\0${socket.data.deviceId}`)) continue;
-          if (socket.readyState === 1) {
-            socket.send(JSON.stringify({
+          closeSocketForSessionRevocation(
+            socket,
+            {
               type: "session_revoked",
               deviceId: socket.data.deviceId,
               reason: "device_revoked",
-            }));
-          }
-          socket.close(4001, "device revoked");
+            },
+            4001,
+            "device revoked",
+          );
         }
       }
     } catch (error) {
@@ -2442,7 +2479,16 @@ export function startCloudServer(
               ws.send(JSON.stringify({ type: "sync_hint", pts: state.pts, ptsCount: 0 }));
             }
           })
-          .catch(() => ws.close(4001, "device revoked"));
+          .catch(() => closeSocketForSessionRevocation(
+            ws,
+            {
+              type: "session_revoked",
+              deviceId: ws.data.deviceId,
+              reason: "device_revoked",
+            },
+            4001,
+            "device revoked",
+          ));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
         if (ws.data.accessExpiresAt) {
           const delay = Math.max(0, new Date(ws.data.accessExpiresAt).getTime() - Date.now());
@@ -2593,7 +2639,16 @@ export function startCloudServer(
           .catch((error) => {
             if (error instanceof AuthError) {
               recordPresenceRejectedFrame("unauthorized");
-              ws.close(4001, "device revoked");
+              closeSocketForSessionRevocation(
+                ws,
+                {
+                  type: "session_revoked",
+                  deviceId: ws.data.deviceId,
+                  reason: "device_revoked",
+                },
+                4001,
+                "device revoked",
+              );
             } else if (error instanceof PresenceError
               && error.code === "stale_presence_connection") {
               recordPresenceRejectedFrame("unauthorized");
