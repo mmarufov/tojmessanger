@@ -21,6 +21,7 @@ import {
   listDevices,
   startAccountDeletion,
   privateBetaOTPConfigured,
+  requireActiveDevice,
   AuthError,
   type OTPDelivery,
 } from "./auth";
@@ -128,6 +129,11 @@ import {
 } from "./groups";
 import { DialogAccessError } from "./dialog-access";
 import {
+  profilePhotosSchemaReadiness,
+  ProfilePhotoError,
+  updateProfilePhoto,
+} from "./profile-photos";
+import {
   ensureSavedMessages,
   savedMessagesConfigured,
   savedMessagesEnabledForAccount,
@@ -201,6 +207,24 @@ import {
   scheduledDeliveryEnabledForAccount,
   workerHeartbeatFresh,
 } from "./cloud-productivity-readiness";
+import {
+  heartbeatPresence,
+  PresenceError,
+  presenceConfigured,
+  presenceEnabledForAccount,
+  presenceMetrics,
+  presenceSchemaReadiness,
+  publishPresenceVisibility,
+  publishTyping,
+  queryPresence,
+  recordPresenceRejectedFrame,
+  nextPresenceConnectionEpoch,
+  setPresenceActivity,
+  startPresenceCleanupWorker,
+  startPresenceNotificationListener,
+  type PresenceBroadcast,
+  validPresenceDialogId,
+} from "./presence";
 import { productivityMetrics } from "./productivity-runtime";
 import {
   closePoll,
@@ -221,13 +245,26 @@ import {
 import { MessagingContentError } from "./messaging-content";
 import { messagingFeatureSchemaState } from "./messaging-feature-readiness";
 
-type SocketData = { accountId: string; deviceId: string; accessExpiresAt?: string };
+type SocketData = {
+  accountId: string;
+  deviceId: string;
+  accessExpiresAt?: string;
+  connectionId: string;
+  presenceEpoch: string | null;
+  presenceActive: boolean;
+  typingDialogs: Set<string>;
+  lastTypingAt: Map<string, number>;
+  activityDepth: number;
+  activityQueue: Promise<void>;
+};
 type Db = typeof defaultSql;
 
 export type CloudServerOptions = {
   /** Deterministic integration tests can disable all polling/listener side effects. */
   backgroundWorkers?: boolean;
   groupCallSFUControl?: GroupCallSFUControl;
+  /** Test-only override for the credential reconciliation cadence. */
+  socketAuthorizationIntervalMs?: number;
 };
 
 const jsonHeaders = { "content-type": "application/json", "cache-control": "no-store" };
@@ -269,6 +306,8 @@ function cloudCapabilities(
   chatFolders: boolean,
   scheduledDelivery: boolean,
   linkPreviews: boolean,
+  profilePhotos: boolean,
+  presence: boolean,
   messaging: MessagingFeatureFlags,
   twoFactorAvailable = twoFactorConfigured(),
 ) {
@@ -287,6 +326,8 @@ function cloudCapabilities(
   if (chatFolders) capabilities.push("chat_folders_v1");
   if (scheduledDelivery) capabilities.push("scheduled_delivery_v1");
   if (linkPreviews) capabilities.push("link_previews_v1");
+  if (profilePhotos) capabilities.push("profile_photos_v1");
+  if (presence) capabilities.push("presence_v1");
   if (messaging.pinnedMessages) capabilities.push("pinned_messages_v1");
   if (messaging.autoDeleteCreation) capabilities.push("auto_delete_v1");
   if (messaging.polls) capabilities.push("polls_v1");
@@ -400,13 +441,51 @@ function pushGroupCallHints(
   }
 }
 
+type SessionRevocationEvent = Extract<
+  PresenceBroadcast["event"],
+  { type: "session_revoked" }
+>;
+
+const revocationCloseScheduled = new WeakSet<ServerWebSocket<SocketData>>();
+
+/**
+ * Give the terminal control frame one event-loop turn to enter the socket transport before the
+ * close handshake. Closing synchronously after `send` can make the client observe only the close
+ * on a loaded runtime. The weak fence also prevents the presence and auth revocation listeners
+ * from scheduling duplicate frames or competing close codes for the same socket.
+ */
+function closeSocketForSessionRevocation(
+  socket: ServerWebSocket<SocketData>,
+  event: SessionRevocationEvent,
+  code: number,
+  reason: string,
+) {
+  if (revocationCloseScheduled.has(socket)) return;
+  revocationCloseScheduled.add(socket);
+  if (socket.readyState !== 1) {
+    socket.close(code, reason);
+    return;
+  }
+  socket.send(JSON.stringify(event));
+  const timer = setTimeout(() => socket.close(code, reason), 10);
+  timer.unref?.();
+}
+
 function disconnectDevice(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
   deviceId: string,
 ) {
   for (const socket of sockets.get(accountId) ?? []) {
-    if (socket.data.deviceId === deviceId) socket.close(4001, "device revoked");
+    if (socket.data.deviceId !== deviceId) continue;
+    closeSocketForSessionRevocation(
+      socket,
+      {
+        type: "session_revoked", deviceId, reason: "device_revoked",
+      },
+      4001,
+      "device revoked",
+    );
   }
 }
 
@@ -414,8 +493,43 @@ function disconnectAccount(
   sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
   accountId: string,
 ) {
-  for (const socket of sockets.get(accountId) ?? []) socket.close(4002, "account deleted");
+  for (const socket of sockets.get(accountId) ?? []) {
+    closeSocketForSessionRevocation(
+      socket,
+      {
+        type: "session_revoked", deviceId: null, reason: "account_deleted",
+      },
+      4002,
+      "account deleted",
+    );
+  }
   sockets.delete(accountId);
+}
+
+function pushPresenceBroadcasts(
+  sockets: Map<string, Set<ServerWebSocket<SocketData>>>,
+  broadcasts: PresenceBroadcast[],
+) {
+  for (const broadcast of broadcasts) {
+    const payload = JSON.stringify(broadcast.event);
+    for (const accountId of broadcast.recipientAccountIds) {
+      for (const ws of sockets.get(accountId) ?? []) {
+        if (broadcast.event.type === "session_revoked") {
+          if (broadcast.event.deviceId == null
+            || ws.data.deviceId === broadcast.event.deviceId) {
+            closeSocketForSessionRevocation(
+              ws,
+              broadcast.event,
+              broadcast.event.deviceId == null ? 4002 : 4001,
+              broadcast.event.deviceId == null ? "account deleted" : "device revoked",
+            );
+          }
+        } else if (ws.readyState === 1) {
+          ws.send(payload);
+        }
+      }
+    }
+  }
 }
 
 function networkKey(req: Request, server: { requestIP(request: Request): { address: string } | null }): string | null {
@@ -493,6 +607,34 @@ export function startCloudServer(
   // PostgreSQL-backed architecture is intentionally hard-capped at 25 MB per object.
   void mediaLimits();
   const sockets = new Map<string, Set<ServerWebSocket<SocketData>>>();
+  const presenceSocketCleanupTasks = new Set<Promise<void>>();
+  const recentPresenceDeliveries = new Map<string, number>();
+  const deliverPresenceBroadcasts = (broadcasts: PresenceBroadcast[]) => {
+    const now = Date.now();
+    const unique: PresenceBroadcast[] = [];
+    for (const broadcast of broadcasts) {
+      const recipientAccountIds = broadcast.recipientAccountIds.filter((accountId) => {
+        // Mixed-version notifications may not carry a publication ID. They have no matching local
+        // direct delivery on this new node, so pass them through without semantic coalescing.
+        if (!broadcast.deliveryId) return true;
+        const key = `${accountId}\0${broadcast.deliveryId}`;
+        const previous = recentPresenceDeliveries.get(key) ?? 0;
+        if (now - previous <= 5_000) return false;
+        // Refresh insertion order so the first entry remains the least-recently delivered key.
+        recentPresenceDeliveries.delete(key);
+        recentPresenceDeliveries.set(key, now);
+        if (recentPresenceDeliveries.size > 2_048) {
+          const oldest = recentPresenceDeliveries.keys().next().value;
+          if (oldest !== undefined) recentPresenceDeliveries.delete(oldest);
+        }
+        return true;
+      });
+      if (recipientAccountIds.length > 0) {
+        unique.push({ ...broadcast, recipientAccountIds });
+      }
+    }
+    if (unique.length > 0) pushPresenceBroadcasts(sockets, unique);
+  };
   const metrics = new OperationalMetrics();
   const requireScheduledWorkerOrReplay = async (
     accountId: string,
@@ -532,6 +674,32 @@ export function startCloudServer(
     support: false,
   };
   const productivityWorkersEnabled = process.env.TOJ_PRODUCTIVITY_WORKERS_DISABLED !== "1";
+  const profilePhotosConfigured = process.env.TOJ_PROFILE_PHOTOS_V1_ENABLED === "1";
+  let profilePhotosSchemaCache: { ready: boolean; expiresAt: number } | null = null;
+  let profilePhotosSchemaProbe: Promise<boolean> | null = null;
+  const profilePhotosAvailable = async (): Promise<boolean> => {
+    if (!profilePhotosConfigured) return false;
+    const now = Date.now();
+    if (profilePhotosSchemaCache && profilePhotosSchemaCache.expiresAt > now) {
+      return profilePhotosSchemaCache.ready;
+    }
+    if (!profilePhotosSchemaProbe) {
+      profilePhotosSchemaProbe = profilePhotosSchemaReadiness(db)
+        .then((state) => {
+          profilePhotosSchemaCache = {
+            ready: state.ready,
+            expiresAt: Date.now() + (state.ready ? 60_000 : 2_000),
+          };
+          return state.ready;
+        })
+        .catch(() => {
+          profilePhotosSchemaCache = { ready: false, expiresAt: Date.now() + 2_000 };
+          return false;
+        })
+        .finally(() => { profilePhotosSchemaProbe = null; });
+    }
+    return await profilePhotosSchemaProbe;
+  };
   const draftMediaAvailability = async () => {
     const schema = await draftMediaSchemaState(db);
     return {
@@ -540,6 +708,55 @@ export function startCloudServer(
     };
   };
   const backgroundWorkers = options.backgroundWorkers !== false;
+  let socketAuthorizationRunning = false;
+  const auditSocketAuthorizations = async () => {
+    if (socketAuthorizationRunning || sockets.size === 0) return;
+    socketAuthorizationRunning = true;
+    try {
+      const deviceIds = [...new Set(
+        [...sockets.values()].flatMap((set) => [...set].map((socket) => socket.data.deviceId)),
+      )];
+      if (deviceIds.length === 0) return;
+      const activeRows = await db`
+        SELECT device.id, device.account_id
+        FROM devices AS device
+        JOIN accounts AS account ON account.id = device.account_id
+        WHERE device.id = ANY(${db.array(deviceIds, "uuid")}::uuid[])
+          AND device.revoked_at IS NULL
+          AND account.status IN ('active','limited')`;
+      const active = new Set(activeRows.map((row) => `${row.account_id}\0${row.id}`));
+      for (const [accountId, accountSockets] of sockets) {
+        for (const socket of accountSockets) {
+          if (active.has(`${accountId}\0${socket.data.deviceId}`)) continue;
+          closeSocketForSessionRevocation(
+            socket,
+            {
+              type: "session_revoked",
+              deviceId: socket.data.deviceId,
+              reason: "device_revoked",
+            },
+            4001,
+            "device revoked",
+          );
+        }
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "cloud.ws_authorization_audit_error",
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      }));
+    } finally {
+      socketAuthorizationRunning = false;
+    }
+  };
+  const socketAuthorizationInterval = backgroundWorkers
+    ? setInterval(
+        () => { void auditSocketAuthorizations(); },
+        Math.max(250, options.socketAuthorizationIntervalMs ?? 5_000),
+      )
+    : null;
+  socketAuthorizationInterval?.unref?.();
   const stopPushWorker = backgroundWorkers ? startPushWorker(db, pushSender) : () => {};
   const stopMaintenanceWorker = backgroundWorkers
     ? startMaintenanceWorker(db, undefined, metrics) : () => {};
@@ -577,6 +794,43 @@ export function startCloudServer(
       pushGroupCallHints(sockets, hints);
     },
   ) : () => {};
+  const presenceDatabaseURL = process.env.TOJ_CALL_NOTIFY_DATABASE_URL
+    ?? process.env.DATABASE_URL ?? null;
+  // The same channel carries credential-revocation control frames, which must stay active even
+  // while the presence feature is dark or its schema has not reached this node yet.
+  const stopPresenceNotifications = backgroundWorkers ? startPresenceNotificationListener(
+    presenceDatabaseURL,
+    (broadcast) => deliverPresenceBroadcasts([broadcast]),
+  ) : () => {};
+  const stopPresenceCleanup = backgroundWorkers && presenceConfigured() ? startPresenceCleanupWorker(
+    db,
+    deliverPresenceBroadcasts,
+  ) : () => {};
+
+  let realtimePresenceSchemaCache: { ready: boolean; expiresAt: number } | null = null;
+  let realtimePresenceSchemaProbe: Promise<boolean> | null = null;
+  const realtimePresenceSchemaReady = async (): Promise<boolean> => {
+    const now = Date.now();
+    if (realtimePresenceSchemaCache && realtimePresenceSchemaCache.expiresAt > now) {
+      return realtimePresenceSchemaCache.ready;
+    }
+    if (!realtimePresenceSchemaProbe) {
+      realtimePresenceSchemaProbe = presenceSchemaReadiness(db)
+        .then((state) => {
+          realtimePresenceSchemaCache = {
+            ready: state.ready,
+            expiresAt: Date.now() + (state.ready ? 60_000 : 2_000),
+          };
+          return state.ready;
+        })
+        .catch(() => {
+          realtimePresenceSchemaCache = { ready: false, expiresAt: Date.now() + 2_000 };
+          return false;
+        })
+        .finally(() => { realtimePresenceSchemaProbe = null; });
+    }
+    return await realtimePresenceSchemaProbe;
+  };
   const stopSessionRevocations = backgroundWorkers ? startSessionRevocationListener(
     process.env.TOJ_CALL_NOTIFY_DATABASE_URL ?? process.env.DATABASE_URL ?? null,
     (wakeup) => disconnectDevice(sockets, wakeup.accountId, wakeup.deviceId),
@@ -612,6 +866,7 @@ export function startCloudServer(
               && savedMessagesEnabledForAccount(capabilitySession.accountId)
             : false;
           const groupCallSchema = await groupCallSchemaReadiness(db);
+          const presenceSchema = await presenceSchemaReadiness(db);
           const groupCallDevice = capabilitySession != null && groupCallSchema.ready
             ? (await db`
                 SELECT supports_group_screen_share
@@ -665,6 +920,10 @@ export function startCloudServer(
             chatFolders,
             scheduledDelivery,
             linkPreviews,
+            await profilePhotosAvailable(),
+            capabilitySession != null
+              && presenceSchema.ready
+              && presenceEnabledForAccount(capabilitySession.accountId),
             messagingFeatures,
             accountTwoFactorAvailable,
           ));
@@ -678,6 +937,7 @@ export function startCloudServer(
             metrics.render()
               + await dialogPreferenceBacklogMetrics(db)
               + await groupCallBacklogMetrics(db)
+              + await presenceMetrics(db)
               + await productivityMetrics(db),
             { headers: { "content-type": "text/plain; version=0.0.4" } },
           );
@@ -691,7 +951,16 @@ export function startCloudServer(
           if (!token) response = new Response("token required", { status: 401 });
           else {
           const dev = await resolveDevice(db, token);
-          if (server.upgrade(req, { data: dev })) response = undefined;
+          if (server.upgrade(req, { data: {
+            ...dev,
+            connectionId: crypto.randomUUID(),
+            presenceEpoch: null,
+            presenceActive: false,
+            typingDialogs: new Set<string>(),
+            lastTypingAt: new Map<string, number>(),
+            activityDepth: 0,
+            activityQueue: Promise.resolve(),
+          } })) response = undefined;
           else response = new Response("upgrade failed", { status: 400 });
           }
         }
@@ -788,6 +1057,17 @@ export function startCloudServer(
         ) {
           response = json({
             error: "dialog preferences capability unavailable",
+            code: "capability_unavailable",
+          }, 404);
+        }
+
+        else if (
+          url.pathname === "/v1/profile/photo"
+          && req.method === "PUT"
+          && !await profilePhotosAvailable()
+        ) {
+          response = json({
+            error: "profile photos capability unavailable",
             code: "capability_unavailable",
           }, 404);
         }
@@ -1031,6 +1311,10 @@ export function startCloudServer(
             metrics.recordScheduledCancellationDuringOutage();
           }
           response = json(result);
+        }
+
+        if (url.pathname === "/v1/presence/query" && req.method === "POST") {
+          response = json(await queryPresence(db, session.accountId, body.accountIds));
         }
 
         if (pinsMatch && req.method === "GET" && messagingFeatures.pinnedMessages) {
@@ -1552,11 +1836,18 @@ export function startCloudServer(
           const result = await blockAccount(db, session.accountId, blockMatch[1]);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
+          deliverPresenceBroadcasts(await publishPresenceVisibility(
+            db, session.accountId, blockMatch[1], false,
+          ));
           response = json({ blocked: result.blocked });
         }
 
         if (blockMatch && req.method === "DELETE") {
-          response = json(await unblockAccount(db, session.accountId, blockMatch[1]));
+          const result = await unblockAccount(db, session.accountId, blockMatch[1]);
+          deliverPresenceBroadcasts(await publishPresenceVisibility(
+            db, session.accountId, blockMatch[1], true,
+          ));
+          response = json(result);
         }
 
         if (url.pathname === "/v1/calls" && req.method === "POST") {
@@ -1769,6 +2060,7 @@ export function startCloudServer(
             session.deviceId,
             options.groupCallSFUControl,
           );
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectDevice(sockets, session.accountId, session.deviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
@@ -1791,6 +2083,7 @@ export function startCloudServer(
           );
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectAccount(sockets, session.accountId);
           response = json({ deleted: result.deleted });
         }
@@ -1811,6 +2104,7 @@ export function startCloudServer(
             targetDeviceId,
             options.groupCallSFUControl,
           );
+          deliverPresenceBroadcasts(result.presenceBroadcasts);
           disconnectDevice(sockets, session.accountId, targetDeviceId);
           pushCallHints(sockets, result.hints);
           pushHints(sockets, result.syncPushes);
@@ -1867,6 +2161,22 @@ export function startCloudServer(
           const result = await updateProfile(db, session.accountId, session.deviceId, body);
           pushHints(sockets, result.pushes);
           response = json(result.profile);
+        }
+
+        if (url.pathname === "/v1/profile/photo" && req.method === "PUT") {
+          const result = await updateProfilePhoto(db, {
+            accountId: session.accountId,
+            deviceId: session.deviceId,
+            mediaId: body.mediaId,
+            clientMutationId: body.clientMutationId,
+            basePhotoRevision: body.basePhotoRevision,
+          });
+          pushHints(sockets, result.pushes);
+          response = json({
+            profile: result.profile,
+            committedPhotoRevision: result.committedPhotoRevision,
+            duplicate: result.duplicate,
+          });
         }
 
         if (url.pathname === "/v1/dialogs/direct" && req.method === "POST") {
@@ -2094,6 +2404,8 @@ export function startCloudServer(
           : err instanceof GroupError ? err.status
           : err instanceof SavedMessagesError ? err.status
           : err instanceof DialogPreferenceError ? err.status
+          : err instanceof ProfilePhotoError ? err.status
+          : err instanceof PresenceError ? err.status
           : err instanceof DialogAccessError ? err.status
           : err instanceof DraftError ? err.status
           : err instanceof ChatFolderError ? err.status
@@ -2134,6 +2446,8 @@ export function startCloudServer(
           ...(err instanceof GroupError ? { code: err.code, ...err.details } : {}),
           ...(err instanceof SavedMessagesError ? { code: err.code } : {}),
           ...(err instanceof DialogPreferenceError ? { code: err.code } : {}),
+          ...(err instanceof ProfilePhotoError ? { code: err.code } : {}),
+          ...(err instanceof PresenceError ? { code: err.code } : {}),
           ...(err instanceof DialogAccessError ? { code: err.code } : {}),
           ...(err instanceof DraftError ? { code: err.code } : {}),
           ...(err instanceof ChatFolderError ? { code: err.code } : {}),
@@ -2158,13 +2472,23 @@ export function startCloudServer(
         sockets.set(ws.data.accountId, set);
         // Late-join hint: a client reconnecting after a gap learns the current cursor right away
         // instead of waiting for the next new event to produce a push.
-        getState(db, ws.data.accountId)
+        requireActiveDevice(db, ws.data.accountId, ws.data.deviceId)
+          .then(() => getState(db, ws.data.accountId))
           .then((state) => {
             if (ws.readyState === 1) {
               ws.send(JSON.stringify({ type: "sync_hint", pts: state.pts, ptsCount: 0 }));
             }
           })
-          .catch(() => {});
+          .catch(() => closeSocketForSessionRevocation(
+            ws,
+            {
+              type: "session_revoked",
+              deviceId: ws.data.deviceId,
+              reason: "device_revoked",
+            },
+            4001,
+            "device revoked",
+          ));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.open" }));
         if (ws.data.accessExpiresAt) {
           const delay = Math.max(0, new Date(ws.data.accessExpiresAt).getTime() - Date.now());
@@ -2179,10 +2503,162 @@ export function startCloudServer(
           set.delete(ws);
           if (set.size === 0) sockets.delete(ws.data.accountId);
         }
+        const cleanup = (async () => {
+          await ws.data.activityQueue.catch(() => {});
+          for (const dialogId of ws.data.typingDialogs) {
+            deliverPresenceBroadcasts(await publishTyping(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              dialogId,
+              typingSessionId: ws.data.connectionId,
+              active: false,
+              allowRevokedCleanup: true,
+            }));
+          }
+          ws.data.typingDialogs.clear();
+          if (ws.data.presenceActive) {
+            deliverPresenceBroadcasts(await setPresenceActivity(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+              active: false,
+              allowRevokedCleanup: true,
+            }));
+          }
+        })().catch(() => {});
+        presenceSocketCleanupTasks.add(cleanup);
+        void cleanup.finally(() => presenceSocketCleanupTasks.delete(cleanup));
         console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.ws.close" }));
       },
       message(ws, raw) {
-        if (String(raw) === "ping") ws.send("pong");
+        const text = String(raw);
+        if (text === "ping") { ws.send("pong"); return; }
+        if (Buffer.byteLength(text) > 4_096) {
+          recordPresenceRejectedFrame("oversized");
+          return;
+        }
+        const handleActivity = async () => {
+          let value: any;
+          try { value = JSON.parse(text); } catch {
+            recordPresenceRejectedFrame("malformed");
+            return;
+          }
+          if (!value || typeof value.type !== "string") {
+            recordPresenceRejectedFrame("malformed");
+            return;
+          }
+          if (!presenceEnabledForAccount(ws.data.accountId)
+            || !(await realtimePresenceSchemaReady())) {
+            recordPresenceRejectedFrame("unauthorized");
+            return;
+          }
+          if (value.type === "presence_activity") {
+            if (typeof value.active !== "boolean") {
+              recordPresenceRejectedFrame("malformed");
+              return;
+            }
+            if (value.active && ws.data.presenceEpoch == null) {
+              ws.data.presenceEpoch = await nextPresenceConnectionEpoch(db);
+            }
+            ws.data.presenceActive = value.active;
+            if (!value.active) {
+              for (const dialogId of ws.data.typingDialogs) {
+                deliverPresenceBroadcasts(await publishTyping(db, {
+                  accountId: ws.data.accountId,
+                  deviceId: ws.data.deviceId,
+                  dialogId,
+                  typingSessionId: ws.data.connectionId,
+                  active: false,
+                }));
+              }
+              ws.data.typingDialogs.clear();
+            }
+            deliverPresenceBroadcasts(await setPresenceActivity(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+              connectionEpoch: ws.data.presenceEpoch ?? undefined,
+              active: value.active,
+            }));
+          } else if (value.type === "presence_heartbeat" && ws.data.presenceActive) {
+            deliverPresenceBroadcasts(await heartbeatPresence(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              connectionId: ws.data.connectionId,
+              connectionEpoch: ws.data.presenceEpoch ?? undefined,
+            }));
+          } else if (value.type === "typing_activity") {
+            if (!ws.data.presenceActive
+              || !validPresenceDialogId(value.dialogId)
+              || typeof value.active !== "boolean") {
+              recordPresenceRejectedFrame("malformed");
+              return;
+            }
+            const now = Date.now();
+            const previous = ws.data.lastTypingAt.get(value.dialogId) ?? 0;
+            if (value.active && now - previous < 2_000) {
+              recordPresenceRejectedFrame("rate_limited");
+              return;
+            }
+            if (value.active
+              && !ws.data.typingDialogs.has(value.dialogId)
+              && ws.data.typingDialogs.size >= 8) {
+              recordPresenceRejectedFrame("rate_limited");
+              return;
+            }
+            const broadcasts = await publishTyping(db, {
+              accountId: ws.data.accountId,
+              deviceId: ws.data.deviceId,
+              dialogId: value.dialogId,
+              typingSessionId: ws.data.connectionId,
+              active: value.active,
+            });
+            if (value.active && broadcasts.length === 0) {
+              recordPresenceRejectedFrame("unauthorized");
+              return;
+            }
+            if (value.active) {
+              ws.data.lastTypingAt.set(value.dialogId, now);
+              ws.data.typingDialogs.add(value.dialogId);
+            } else {
+              ws.data.typingDialogs.delete(value.dialogId);
+              ws.data.lastTypingAt.delete(value.dialogId);
+            }
+            deliverPresenceBroadcasts(broadcasts);
+          } else {
+            recordPresenceRejectedFrame("unsupported");
+          }
+        };
+        if (ws.data.activityDepth >= 32) {
+          recordPresenceRejectedFrame("rate_limited");
+          return;
+        }
+        ws.data.activityDepth += 1;
+        ws.data.activityQueue = ws.data.activityQueue
+          .then(handleActivity, handleActivity)
+          .catch((error) => {
+            if (error instanceof AuthError) {
+              recordPresenceRejectedFrame("unauthorized");
+              closeSocketForSessionRevocation(
+                ws,
+                {
+                  type: "session_revoked",
+                  deviceId: ws.data.deviceId,
+                  reason: "device_revoked",
+                },
+                4001,
+                "device revoked",
+              );
+            } else if (error instanceof PresenceError
+              && error.code === "stale_presence_connection") {
+              recordPresenceRejectedFrame("unauthorized");
+              ws.data.presenceActive = false;
+              ws.close(4003, "connection superseded");
+            }
+          })
+          .finally(() => {
+            ws.data.activityDepth = Math.max(0, ws.data.activityDepth - 1);
+          });
       },
     },
   });
@@ -2197,12 +2673,19 @@ export function startCloudServer(
     stopSyncNotifications();
     stopCallNotifications();
     stopGroupCallNotifications();
+    stopPresenceNotifications();
+    stopPresenceCleanup();
     stopSessionRevocations();
+    if (socketAuthorizationInterval) clearInterval(socketAuthorizationInterval);
     await Promise.allSettled([
       stopScheduledDeliveryWorker(),
       stopLinkPreviewWorker(),
     ]);
-    return await originalStop(closeActiveConnections);
+    const stopped = originalStop(closeActiveConnections);
+    return Promise.resolve(stopped).then(async (value) => {
+      await Promise.allSettled([...presenceSocketCleanupTasks]);
+      return value;
+    });
   }) as typeof server.stop;
 
   console.log(JSON.stringify({ ts: new Date().toISOString(), event: "cloud.listening", port: server.port }));

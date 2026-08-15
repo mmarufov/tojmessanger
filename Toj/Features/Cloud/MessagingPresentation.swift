@@ -53,6 +53,8 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
     static let chatFolders = Self(rawValue: 1 << 22)
     static let scheduledDelivery = Self(rawValue: 1 << 23)
     static let linkPreviews = Self(rawValue: 1 << 24)
+    static let presence = Self(rawValue: 1 << 25)
+    static let profilePhotos = Self(rawValue: 1 << 26)
 
     static let productionText: Self = [.replies, .editing, .deletion, .forwarding, .reactions]
     static let demo: Self = [
@@ -60,6 +62,7 @@ nonisolated struct MessagingCapabilities: OptionSet, Sendable, Equatable {
         .reactions, .media, .voiceNotes, .groups, .calls, .profiles, .richSearch, .multipartMedia,
         .videoCalls,
         .cloudDrafts, .mediaGroups, .chatFolders, .scheduledDelivery, .linkPreviews,
+        .presence, .profilePhotos,
     ]
 }
 
